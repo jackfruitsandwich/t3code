@@ -55,6 +55,17 @@ Electron telemetry is unavailable. The native monitor still runs beside the
 server and tracks the server process tree. Power fields degrade to `unknown`
 instead of invoking platform shell commands.
 
+### WSL backend limitation
+
+Windows desktop packages currently ship the Windows resource-monitor executable.
+That executable cannot run inside the Linux WSL backend, so a WSL-only backend
+does not receive `resourceMonitorPath` and reports native process telemetry as
+unavailable. Electron host-power telemetry remains available over the inherited
+desktop pipe. Supporting native WSL process telemetry requires publishing a
+Linux sidecar for each supported architecture in the Windows artifact and
+converting its packaged path into the selected distro; the configuration
+deliberately does not pass the Windows `.exe` into WSL as a false fallback.
+
 ## Native monitor
 
 The executable lives in `native/resource-monitor`.
@@ -116,9 +127,10 @@ expansion preserves complete subtrees.
 ### Native history and streaming
 
 Every native sample is appended to a one-hour in-memory ring bounded to 3,600
-snapshots and 20,000 retained process rows. History stays in the sidecar until a
-`readHistory` request and is returned in bounded chunks. The first bound reached
-wins, so high process counts shorten the effective history window.
+snapshots, 20,000 retained process rows, and 64 MiB of retained history bytes.
+History stays in the sidecar until a `readHistory` request and is returned in
+bounded chunks. The first bound reached wins, so high process counts or large
+process names and command lines shorten the effective history window.
 
 Periodic snapshot streaming is disabled by default. The server enables it only
 while at least one diagnostics subscription is retained. `sampleNow` remains
@@ -166,9 +178,10 @@ columns are the operating system's cumulative counters for that process.
 
 Electron main owns `DesktopTelemetryPublisher`.
 
-Power events trigger an immediate snapshot. A low-rate 30-second heartbeat keeps
-the server-side power state fresh while diagnostics is closed. During that
-heartbeat Electron reads:
+Power events trigger an immediate snapshot. While diagnostics is closed, the
+server sends the configured active and idle host-power intervals to Electron
+(30 seconds and 2 minutes in the balanced profile). During those heartbeats
+Electron reads:
 
 - `powerMonitor.isOnBatteryPower()`;
 - `powerMonitor.getSystemIdleTime()`;

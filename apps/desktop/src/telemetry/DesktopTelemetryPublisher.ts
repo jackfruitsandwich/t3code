@@ -4,6 +4,7 @@ import {
   type DesktopTelemetryControlMessage,
   type HostPowerSnapshot,
 } from "@t3tools/contracts";
+import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
@@ -22,7 +23,8 @@ import * as ElectronPowerMonitor from "../electron/ElectronPowerMonitor.ts";
 const LIVE_SAMPLE_INTERVAL = Duration.seconds(1);
 const BATTERY_SAMPLE_INTERVAL = Duration.seconds(5);
 const CONSTRAINED_SAMPLE_INTERVAL = Duration.seconds(15);
-const BACKGROUND_HEARTBEAT_INTERVAL = Duration.seconds(30);
+const DEFAULT_HOST_POWER_ACTIVE_INTERVAL = Duration.seconds(30);
+const DEFAULT_HOST_POWER_IDLE_INTERVAL = Duration.minutes(2);
 const IDLE_THRESHOLD_SECONDS = 60;
 const encodeMessage = Schema.encodeSync(Schema.fromJsonString(DesktopHostTelemetryMessage));
 const textEncoder = new TextEncoder();
@@ -35,11 +37,20 @@ type PowerEvent =
   | { readonly type: "speedLimit"; readonly value: number };
 
 interface PowerState {
+  readonly idle: HostPowerSnapshot["idle"];
   readonly locked: HostPowerSnapshot["locked"];
+  readonly lockedEventPending: boolean;
   readonly suspended: boolean;
+  readonly suspendedEventPending: boolean;
   readonly onBattery: HostPowerSnapshot["onBattery"];
+  readonly onBatteryEventPending: boolean;
   readonly thermalState: HostPowerSnapshot["thermalState"];
   readonly speedLimitPercent: Option.Option<number>;
+}
+
+interface HostPowerIntervals {
+  readonly active: Duration.Duration;
+  readonly idle: Duration.Duration;
 }
 
 export class DesktopTelemetryPublisher extends Context.Service<
@@ -53,6 +64,7 @@ export class DesktopTelemetryPublisher extends Context.Service<
       sourceId: string,
       message: DesktopTelemetryControlMessage,
     ) => Effect.Effect<void>;
+    readonly removeControlSource: (sourceId: string) => Effect.Effect<void>;
   }
 >()("@t3tools/desktop/telemetry/DesktopTelemetryPublisher") {}
 
@@ -75,11 +87,23 @@ function idleState(value: ElectronPowerMonitor.ElectronIdleState): HostPowerSnap
 function updatePowerState(state: PowerState, event: PowerEvent): PowerState {
   switch (event.type) {
     case "locked":
-      return { ...state, locked: booleanState(event.value) };
+      return {
+        ...state,
+        locked: booleanState(event.value),
+        lockedEventPending: true,
+      };
     case "suspended":
-      return { ...state, suspended: event.value };
+      return {
+        ...state,
+        suspended: event.value,
+        suspendedEventPending: event.value,
+      };
     case "onBattery":
-      return { ...state, onBattery: booleanState(event.value) };
+      return {
+        ...state,
+        onBattery: booleanState(event.value),
+        onBatteryEventPending: true,
+      };
     case "thermal":
       return { ...state, thermalState: event.value };
     case "speedLimit":
@@ -87,8 +111,16 @@ function updatePowerState(state: PowerState, event: PowerEvent): PowerState {
   }
 }
 
-function sampleInterval(power: PowerState, diagnosticsDemand: boolean): Duration.Duration {
-  if (!diagnosticsDemand) return BACKGROUND_HEARTBEAT_INTERVAL;
+function sampleInterval(
+  power: PowerState,
+  diagnosticsDemand: boolean,
+  hostPowerIntervals: HostPowerIntervals,
+): Duration.Duration {
+  if (!diagnosticsDemand) {
+    return power.suspended || power.locked === "true" || power.idle === "true"
+      ? hostPowerIntervals.idle
+      : hostPowerIntervals.active;
+  }
   if (
     power.suspended ||
     power.locked === "true" ||
@@ -107,13 +139,21 @@ export const make = Effect.fn("desktop.telemetryPublisher.make")(function* () {
   yield* electronApp.whenReady;
 
   const initialPowerState: PowerState = {
+    idle: "unknown",
     locked: "unknown",
+    lockedEventPending: false,
     suspended: false,
+    suspendedEventPending: false,
     onBattery: booleanState(yield* powerMonitor.isOnBatteryPower),
+    onBatteryEventPending: false,
     thermalState: yield* powerMonitor.getCurrentThermalState,
     speedLimitPercent: Option.none(),
   };
   const powerState = yield* Ref.make(initialPowerState);
+  const hostPowerIntervals = yield* Ref.make<HostPowerIntervals>({
+    active: DEFAULT_HOST_POWER_ACTIVE_INTERVAL,
+    idle: DEFAULT_HOST_POWER_IDLE_INTERVAL,
+  });
   const powerEvents = yield* Queue.unbounded<PowerEvent>();
   const sampleTriggers = yield* Queue.sliding<void>(1);
   const diagnosticsDemandSources = yield* Ref.make<ReadonlySet<string>>(new Set());
@@ -158,8 +198,40 @@ export const make = Effect.fn("desktop.telemetryPublisher.make")(function* () {
       ],
       { concurrency: "unbounded" },
     );
+    const polledLocked =
+      systemIdleState === "unknown"
+        ? currentPower.locked
+        : booleanState(systemIdleState === "locked");
+    const polledOnBattery = booleanState(onBattery);
+    const observedPower = yield* Ref.modify(powerState, (latestPower) => {
+      const preserveEventLocked =
+        latestPower.lockedEventPending ||
+        latestPower.locked !== currentPower.locked ||
+        latestPower.lockedEventPending !== currentPower.lockedEventPending;
+      const preserveEventOnBattery =
+        latestPower.onBatteryEventPending ||
+        latestPower.onBattery !== currentPower.onBattery ||
+        latestPower.onBatteryEventPending !== currentPower.onBatteryEventPending;
+      const preserveEventSuspended =
+        latestPower.suspendedEventPending ||
+        latestPower.suspended !== currentPower.suspended ||
+        latestPower.suspendedEventPending !== currentPower.suspendedEventPending;
+      const next: PowerState = {
+        ...latestPower,
+        idle: idleState(systemIdleState),
+        locked: preserveEventLocked ? latestPower.locked : polledLocked,
+        lockedEventPending:
+          latestPower.lockedEventPending &&
+          (systemIdleState === "unknown" || polledLocked !== latestPower.locked),
+        suspended: preserveEventSuspended ? latestPower.suspended : false,
+        suspendedEventPending: false,
+        onBattery: preserveEventOnBattery ? latestPower.onBattery : polledOnBattery,
+        onBatteryEventPending:
+          latestPower.onBatteryEventPending && polledOnBattery !== latestPower.onBattery,
+      };
+      return [next, next] as const;
+    });
     const nextSequence = yield* Ref.modify(sequence, (current) => [current + 1, current + 1]);
-    const locked = systemIdleState === "locked" ? "true" : currentPower.locked;
     const snapshot: DesktopHostTelemetrySnapshot = {
       version: 1,
       type: "desktopTelemetry",
@@ -168,17 +240,17 @@ export const make = Effect.fn("desktop.telemetryPublisher.make")(function* () {
       electronPid: process.pid,
       power: {
         source: "electron-main",
-        idle: idleState(systemIdleState),
+        idle: observedPower.idle,
         idleSeconds,
-        locked,
-        suspended: currentPower.suspended,
-        onBattery: booleanState(onBattery),
+        locked: observedPower.locked,
+        suspended: observedPower.suspended,
+        onBattery: observedPower.onBattery,
         lowPowerMode: "unknown",
-        thermalState: currentPower.thermalState,
+        thermalState: observedPower.thermalState,
         stale: false,
         updatedAt: sampledAt,
       },
-      speedLimitPercent: currentPower.speedLimitPercent,
+      speedLimitPercent: observedPower.speedLimitPercent,
       electronProcesses: metrics.map((metric) => ({
         pid: metric.pid,
         creationTimeMs: metric.creationTime,
@@ -199,22 +271,25 @@ export const make = Effect.fn("desktop.telemetryPublisher.make")(function* () {
     yield* PubSub.publish(changes, snapshot);
   }).pipe(
     Effect.catchCause((cause) =>
-      Effect.logWarning("Failed to sample Electron telemetry", {
-        cause: String(cause),
-      }),
+      Cause.hasInterrupts(cause)
+        ? Effect.failCause(cause)
+        : Effect.logWarning("Failed to sample Electron telemetry", {
+            cause: String(cause),
+          }),
     ),
   );
 
   yield* Effect.gen(function* () {
     yield* sampleOnce;
     while (true) {
-      const [currentPower, demand] = yield* Effect.all([
+      const [currentPower, demand, intervals] = yield* Effect.all([
         Ref.get(powerState),
         Ref.get(diagnosticsDemandSources).pipe(Effect.map((sources) => sources.size > 0)),
+        Ref.get(hostPowerIntervals),
       ]);
       yield* Effect.raceFirst(
         Queue.take(sampleTriggers),
-        Effect.sleep(sampleInterval(currentPower, demand)),
+        Effect.sleep(sampleInterval(currentPower, demand, intervals)),
       );
       yield* sampleOnce;
     }
@@ -242,8 +317,28 @@ export const make = Effect.fn("desktop.telemetryPublisher.make")(function* () {
               : Queue.offer(sampleTriggers, undefined).pipe(Effect.asVoid),
           ),
         );
+      case "setHostPowerIntervals":
+        return Ref.set(hostPowerIntervals, {
+          active: Duration.millis(message.activeIntervalMs),
+          idle: Duration.millis(message.idleIntervalMs),
+        }).pipe(Effect.andThen(Queue.offer(sampleTriggers, undefined)), Effect.asVoid);
     }
   };
+  const removeControlSource: DesktopTelemetryPublisher["Service"]["removeControlSource"] = (
+    sourceId,
+  ) =>
+    Ref.modify(diagnosticsDemandSources, (sources) => {
+      const previous = sources.size > 0;
+      const next = new Set(sources);
+      next.delete(sourceId);
+      return [[previous, next.size > 0] as const, next] as const;
+    }).pipe(
+      Effect.flatMap(([previous, enabled]) =>
+        previous === enabled
+          ? Effect.void
+          : Queue.offer(sampleTriggers, undefined).pipe(Effect.asVoid),
+      ),
+    );
   const handleControl: DesktopTelemetryPublisher["Service"]["handleControl"] = (message) =>
     handleControlForSource("legacy", message);
 
@@ -275,6 +370,7 @@ export const make = Effect.fn("desktop.telemetryPublisher.make")(function* () {
     encoded,
     handleControl,
     handleControlForSource,
+    removeControlSource,
   });
 });
 

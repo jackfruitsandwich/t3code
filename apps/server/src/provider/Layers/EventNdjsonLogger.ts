@@ -181,8 +181,12 @@ function shouldPersist(stream: EventNdjsonStream, event: unknown): boolean {
   if (stream !== "canonical" || typeof event !== "object" || event === null) {
     return true;
   }
-  const type = Reflect.get(event, "type");
-  return typeof type !== "string" || !transientCanonicalEventTypes.has(type);
+  try {
+    const type = Reflect.get(event, "type");
+    return typeof type !== "string" || !transientCanonicalEventTypes.has(type);
+  } catch {
+    return true;
+  }
 }
 
 export function writeBatchedMessages(

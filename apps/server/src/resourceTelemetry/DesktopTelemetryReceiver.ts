@@ -9,6 +9,7 @@ import {
   DesktopTelemetryControlMessage,
   type ResourceTelemetrySourceStatus,
 } from "@t3tools/contracts";
+import { resolveServerBackgroundActivitySettings } from "@t3tools/shared/backgroundActivitySettings";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
@@ -24,6 +25,8 @@ import * as Stream from "effect/Stream";
 import * as Ndjson from "effect/unstable/encoding/Ndjson";
 
 import { ServerConfig } from "../config.ts";
+import { ServerSettingsService } from "../serverSettings.ts";
+import { subscribeBeforeSnapshotWithoutMutex } from "../utils/subscribeBeforeSnapshot.ts";
 
 const STALE_AFTER_MS = 90_000;
 const STALE_CHECK_INTERVAL = Duration.seconds(30);
@@ -137,7 +140,14 @@ export class DesktopTelemetryReceiver extends Context.Service<
       Scope.Scope
     >;
     readonly health: Effect.Effect<DesktopTelemetryReceiverHealth>;
-    readonly healthChanges: Stream.Stream<DesktopTelemetryReceiverHealth>;
+    readonly subscribeHealth: Effect.Effect<
+      {
+        readonly latest: DesktopTelemetryReceiverHealth;
+        readonly changes: Stream.Stream<DesktopTelemetryReceiverHealth>;
+      },
+      never,
+      Scope.Scope
+    >;
     readonly setDiagnosticsDemand: (
       enabled: boolean,
     ) => Effect.Effect<void, DesktopTelemetryControlFailed>;
@@ -152,6 +162,36 @@ const isDescriptorUnavailable = Schema.is(DesktopTelemetryDescriptorUnavailable)
 const isProtocolMismatch = Schema.is(DesktopTelemetryProtocolMismatch);
 const isDecodeFailed = Schema.is(DesktopTelemetryDecodeFailed);
 const isStreamFailed = Schema.is(DesktopTelemetryStreamFailed);
+
+export function isDesktopTelemetryContactStale(
+  lastContactAtMs: Option.Option<number>,
+  nowMs: number,
+): boolean {
+  return Option.exists(lastContactAtMs, (lastContact) => nowMs - lastContact >= STALE_AFTER_MS);
+}
+
+export function initialDesktopTelemetryContactAt(
+  desktopTelemetryFd: number | undefined,
+  nowMs: number,
+): Option.Option<number> {
+  return desktopTelemetryFd === undefined ? Option.none() : Option.some(nowMs);
+}
+
+export const recordDesktopTelemetrySampleHealth = Effect.fn(
+  "resourceTelemetry.desktopTelemetryReceiver.recordSampleHealth",
+)(function* (
+  health: Ref.Ref<DesktopTelemetryReceiverHealth>,
+  healthChanges: PubSub.PubSub<DesktopTelemetryReceiverHealth>,
+  sampledAt: DateTime.Utc,
+) {
+  const next: DesktopTelemetryReceiverHealth = {
+    status: "healthy",
+    lastSampleAt: Option.some(sampledAt),
+    lastError: Option.none(),
+  };
+  yield* Ref.set(health, next);
+  yield* PubSub.publish(healthChanges, next);
+});
 
 function normalizeReceiverError(error: unknown): DesktopTelemetryReceiverError {
   if (
@@ -228,7 +268,15 @@ export const writeAllToFileDescriptor = Effect.fn(
 
 export const make = Effect.fn("resourceTelemetry.desktopTelemetryReceiver.make")(function* () {
   const config = yield* ServerConfig;
+  const serverSettings = yield* ServerSettingsService;
   const latest = yield* Ref.make(Option.none<DesktopHostTelemetrySnapshot>());
+  const receiverStartedAt = yield* DateTime.now;
+  const lastContactAtMs = yield* Ref.make(
+    initialDesktopTelemetryContactAt(
+      config.desktopTelemetryFd,
+      DateTime.toEpochMillis(receiverStartedAt),
+    ),
+  );
   const changes = yield* PubSub.sliding<DesktopHostTelemetrySnapshot>(8);
   const healthChanges = yield* PubSub.sliding<DesktopTelemetryReceiverHealth>(4);
   const controlMutex = yield* Semaphore.make(1);
@@ -256,40 +304,14 @@ export const make = Effect.fn("resourceTelemetry.desktopTelemetryReceiver.make")
       Effect.asVoid,
     );
   const updateSampleHealth = (sampledAt: DateTime.Utc) =>
-    Ref.modify(health, (current) => {
-      const next: DesktopTelemetryReceiverHealth = {
-        status: "healthy",
-        lastSampleAt: Option.some(sampledAt),
-        lastError: Option.none(),
-      };
-      return [
-        current.status !== "healthy" || Option.isSome(current.lastError)
-          ? Option.some(next)
-          : Option.none(),
-        next,
-      ] as const;
-    }).pipe(
-      Effect.flatMap(
-        Option.match({
-          onNone: () => Effect.void,
-          onSome: (next) => PubSub.publish(healthChanges, next),
-        }),
-      ),
-      Effect.asVoid,
-    );
+    recordDesktopTelemetrySampleHealth(health, healthChanges, sampledAt);
 
-  const setDiagnosticsDemand: DesktopTelemetryReceiver["Service"]["setDiagnosticsDemand"] = (
-    enabled,
-  ) =>
+  const sendControlMessage = (message: DesktopTelemetryControlMessage) =>
     controlMutex.withPermits(1)(
       Effect.gen(function* () {
         const fd = config.desktopTelemetryControlFd;
         if (fd === undefined) return;
-        const encoded = yield* encodeControlMessage({
-          version: 1,
-          type: "setDiagnosticsDemand",
-          enabled,
-        }).pipe(
+        const encoded = yield* encodeControlMessage(message).pipe(
           Effect.mapError(
             (cause) =>
               new DesktopTelemetryControlFailed({
@@ -310,6 +332,55 @@ export const make = Effect.fn("resourceTelemetry.desktopTelemetryReceiver.make")
         );
       }),
     );
+  const setDiagnosticsDemand: DesktopTelemetryReceiver["Service"]["setDiagnosticsDemand"] = (
+    enabled,
+  ) =>
+    sendControlMessage({
+      version: 1,
+      type: "setDiagnosticsDemand",
+      enabled,
+    });
+
+  const sendHostPowerIntervals = (
+    settings: Parameters<typeof resolveServerBackgroundActivitySettings>[0],
+  ) => {
+    const resolved = resolveServerBackgroundActivitySettings(settings);
+    return sendControlMessage({
+      version: 1,
+      type: "setHostPowerIntervals",
+      activeIntervalMs: Math.max(
+        1,
+        Math.round(Duration.toMillis(resolved.hostPowerMonitorActiveInterval)),
+      ),
+      idleIntervalMs: Math.max(
+        1,
+        Math.round(Duration.toMillis(resolved.hostPowerMonitorIdleInterval)),
+      ),
+    });
+  };
+  if (config.desktopTelemetryControlFd !== undefined) {
+    const settingsChanges = yield* serverSettings.subscribeChanges;
+    const settings = yield* serverSettings.getSettings;
+    yield* sendHostPowerIntervals(settings).pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("Failed to configure desktop host-power intervals", {
+          cause: String(cause),
+        }),
+      ),
+    );
+    yield* settingsChanges.pipe(
+      Stream.runForEach((settings) =>
+        sendHostPowerIntervals(settings).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("Failed to update desktop host-power intervals", {
+              cause: String(cause),
+            }),
+          ),
+        ),
+      ),
+      Effect.forkScoped,
+    );
+  }
 
   if (config.desktopTelemetryFd !== undefined) {
     const fd = config.desktopTelemetryFd;
@@ -361,19 +432,29 @@ export const make = Effect.fn("resourceTelemetry.desktopTelemetryReceiver.make")
 
     yield* messages.pipe(
       Stream.runForEach((message) => {
+        const recordContact = DateTime.now.pipe(
+          Effect.flatMap((now) =>
+            Ref.set(lastContactAtMs, Option.some(DateTime.toEpochMillis(now))),
+          ),
+        );
         if (message.type === "desktopTelemetryHello") {
-          return updateHealth(
-            (current): DesktopTelemetryReceiverHealth => ({
-              ...current,
-              status: "healthy",
-              lastError: Option.none(),
-            }),
+          return recordContact.pipe(
+            Effect.andThen(
+              updateHealth(
+                (current): DesktopTelemetryReceiverHealth => ({
+                  ...current,
+                  status: "healthy",
+                  lastError: Option.none(),
+                }),
+              ),
+            ),
           );
         }
 
         const sampledAt = DateTime.makeUnsafe(message.sampledAtUnixMs);
         return snapshotMutex.withPermits(1)(
-          Ref.set(latest, Option.some(message)).pipe(
+          recordContact.pipe(
+            Effect.andThen(Ref.set(latest, Option.some(message))),
             Effect.andThen(updateSampleHealth(sampledAt)),
             Effect.andThen(PubSub.publish(changes, message)),
             Effect.asVoid,
@@ -407,11 +488,12 @@ export const make = Effect.fn("resourceTelemetry.desktopTelemetryReceiver.make")
           snapshotMutex.withPermits(1)(
             Effect.gen(function* () {
               const now = yield* DateTime.now;
+              const nowMs = DateTime.toEpochMillis(now);
               const staleSnapshot = yield* Ref.modify(latest, (current) => {
                 if (
                   Option.isNone(current) ||
                   current.value.power.stale ||
-                  DateTime.toEpochMillis(now) - current.value.sampledAtUnixMs < STALE_AFTER_MS
+                  nowMs - current.value.sampledAtUnixMs < STALE_AFTER_MS
                 ) {
                   return [Option.none<DesktopHostTelemetrySnapshot>(), current] as const;
                 }
@@ -421,7 +503,34 @@ export const make = Effect.fn("resourceTelemetry.desktopTelemetryReceiver.make")
                 };
                 return [Option.some(stale), Option.some(stale)] as const;
               });
-              if (Option.isNone(staleSnapshot)) return;
+              if (Option.isNone(staleSnapshot)) {
+                const lastContact = yield* Ref.get(lastContactAtMs);
+                if (!isDesktopTelemetryContactStale(lastContact, nowMs)) return;
+                const staleMessage = new DesktopTelemetryStale({
+                  fd,
+                  staleAfterMs: STALE_AFTER_MS,
+                }).message;
+                const changed = yield* Ref.modify(health, (current) => {
+                  if (
+                    current.status === "stopped" ||
+                    Option.isSome(current.lastSampleAt) ||
+                    (current.status === "degraded" &&
+                      Option.contains(current.lastError, staleMessage))
+                  ) {
+                    return [Option.none<DesktopTelemetryReceiverHealth>(), current] as const;
+                  }
+                  const next: DesktopTelemetryReceiverHealth = {
+                    ...current,
+                    status: "degraded",
+                    lastError: Option.some(staleMessage),
+                  };
+                  return [Option.some(next), next] as const;
+                });
+                if (Option.isSome(changed)) {
+                  yield* PubSub.publish(healthChanges, changed.value);
+                }
+                return;
+              }
               yield* updateHealth((currentHealth) => ({
                 ...currentHealth,
                 status: currentHealth.status === "stopped" ? "stopped" : "degraded",
@@ -454,7 +563,7 @@ export const make = Effect.fn("resourceTelemetry.desktopTelemetryReceiver.make")
       }),
     ),
     health: Ref.get(health),
-    healthChanges: Stream.fromPubSub(healthChanges),
+    subscribeHealth: subscribeBeforeSnapshotWithoutMutex(healthChanges, Ref.get(health)),
     setDiagnosticsDemand,
   });
 });
@@ -466,6 +575,13 @@ export const layerTest = (
 ): Layer.Layer<DesktopTelemetryReceiver> => {
   const latest = overrides.latest ?? Effect.succeedNone;
   const changes = overrides.changes ?? Stream.empty;
+  const health =
+    overrides.health ??
+    Effect.succeed({
+      status: "unavailable" as const,
+      lastSampleAt: Option.none<DateTime.Utc>(),
+      lastError: Option.some("Desktop telemetry test implementation is unavailable."),
+    });
   return Layer.succeed(
     DesktopTelemetryReceiver,
     DesktopTelemetryReceiver.of({
@@ -479,12 +595,15 @@ export const layerTest = (
             changes,
           })),
         ),
-      health: Effect.succeed({
-        status: "unavailable",
-        lastSampleAt: Option.none(),
-        lastError: Option.some("Desktop telemetry test implementation is unavailable."),
-      }),
-      healthChanges: Stream.empty,
+      health,
+      subscribeHealth:
+        overrides.subscribeHealth ??
+        health.pipe(
+          Effect.map((initial) => ({
+            latest: initial,
+            changes: Stream.empty,
+          })),
+        ),
       setDiagnosticsDemand: () => Effect.void,
       ...overrides,
     }),
