@@ -448,6 +448,69 @@ it.live(
         const eventCountAfterIncrement = yield* countPersistedEvents(harness);
         yield* importer.sweepNow();
         assert.equal(yield* countPersistedEvents(harness), eventCountAfterIncrement);
+
+        // Adoption: once a native T3 session runs on an imported thread, the
+        // importer hands the thread over — the cursor is stripped and later
+        // source-file growth is never re-imported (native turns would
+        // otherwise appear twice).
+        yield* harness.sessionDirectory.upsert({
+          threadId: claudeThreadId,
+          provider: CLAUDE_PROVIDER,
+          providerInstanceId: defaultInstanceIdForDriver(CLAUDE_PROVIDER),
+          status: "running",
+          runtimePayload: { model: "claude-fable-5", activeTurnId: "turn-adopted" },
+        });
+        const adoptionAppend = jsonl([
+          claudeUserEntry({
+            uuid: "user-3",
+            text: "This turn came through native T3 chat",
+            timestamp: "2026-07-01T10:10:00.000Z",
+            cwd: claudeCwd,
+          }),
+          claudeAssistantEntry({
+            uuid: "assistant-3",
+            text: "Replying natively.",
+            timestamp: "2026-07-01T10:10:30.000Z",
+            cwd: claudeCwd,
+          }),
+        ]);
+        const contentBeforeAdoption = yield* fileSystem.readFileString(claudeSessionPath);
+        yield* fileSystem.writeFileString(
+          claudeSessionPath,
+          contentBeforeAdoption + adoptionAppend,
+        );
+        yield* importer.sweepNow();
+
+        const adoptedThread = Option.getOrThrowWith(
+          yield* harness.snapshotQuery.getThreadDetailById(claudeThreadId),
+          () => new Error("expected claude thread after adoption"),
+        );
+        assert.equal(adoptedThread.messages.length, 4);
+        const adoptedBinding = Option.getOrThrowWith(
+          yield* harness.sessionDirectory.getBinding(claudeThreadId),
+          () => new Error("expected claude binding after adoption"),
+        );
+        const adoptedPayload = adoptedBinding.runtimePayload as Record<string, unknown>;
+        assert.equal(adoptedPayload.importCursor, null);
+        assert.equal(adoptedBinding.status, "running");
+
+        // The handoff is permanent: further growth imports nothing.
+        const contentAfterAdoption = yield* fileSystem.readFileString(claudeSessionPath);
+        yield* fileSystem.writeFileString(
+          claudeSessionPath,
+          contentAfterAdoption +
+            jsonl([
+              claudeUserEntry({
+                uuid: "user-4",
+                text: "One more terminal message",
+                timestamp: "2026-07-01T10:15:00.000Z",
+                cwd: claudeCwd,
+              }),
+            ]),
+        );
+        const eventCountAfterAdoption = yield* countPersistedEvents(harness);
+        yield* importer.sweepNow();
+        assert.equal(yield* countPersistedEvents(harness), eventCountAfterAdoption);
       }),
     ),
 );

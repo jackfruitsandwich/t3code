@@ -436,6 +436,34 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         readonly context: SweepContext;
       }) {
         const { driver, sessionId, parsed, cursor } = input;
+        // A native T3 session has run on this thread since import: the
+        // adapter owns the binding now (it flips status away from "stopped"
+        // and merges fields like model/activeTurnId into runtimePayload).
+        // Hand the thread over permanently — strip the import cursor so this
+        // source file is never tailed again and native turns aren't
+        // re-imported as duplicates. A terminal continuation of the source
+        // session forks to a new session id and imports as a fresh thread.
+        const runtimePayload = input.binding.runtimePayload;
+        const nativelyOwned =
+          (input.binding.status !== undefined && input.binding.status !== "stopped") ||
+          (isRecord(runtimePayload) &&
+            ("activeTurnId" in runtimePayload || "model" in runtimePayload));
+        if (nativelyOwned) {
+          yield* directory.upsert({
+            threadId: input.binding.threadId,
+            provider: driver,
+            providerInstanceId:
+              input.binding.providerInstanceId ?? defaultInstanceIdForDriver(driver),
+            status: input.binding.status ?? "stopped",
+            runtimePayload: { importCursor: null },
+          });
+          yield* Effect.logInfo("session.importer.thread-adopted", {
+            provider: driver,
+            sessionId,
+            threadId: input.binding.threadId,
+          });
+          return;
+        }
         if (parsed.lineCount <= cursor.lineCount) {
           return;
         }
