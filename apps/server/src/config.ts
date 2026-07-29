@@ -77,6 +77,7 @@ export class ServerConfig extends Context.Service<
     readonly startupPresentation: StartupPresentation;
     readonly desktopBootstrapToken: string | undefined;
     readonly autoBootstrapProjectFromCwd: boolean;
+    readonly importCliSessions: boolean;
     readonly logWebSocketEvents: boolean;
     readonly tailscaleServeEnabled: boolean;
     readonly tailscaleServePort: number;
@@ -180,6 +181,8 @@ const makeTest = Effect.fn("ServerConfig.makeTest")(function* (
     ...derivedPaths,
     mode: "web",
     autoBootstrapProjectFromCwd: false,
+    // Tests must never sweep the developer's real CLI session files.
+    importCliSessions: false,
     logWebSocketEvents: false,
     tailscaleServeEnabled: false,
     tailscaleServePort: 443,
