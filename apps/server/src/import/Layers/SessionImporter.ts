@@ -476,16 +476,23 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         const { driver, sessionId, parsed, cursor } = input;
         // A native T3 session has run on this thread since import: the
         // adapter owns the binding now (it flips status away from "stopped"
-        // and merges fields like model/activeTurnId into runtimePayload).
-        // Hand the thread over permanently — strip the import cursor so this
+        // and merges a real model/activeTurnId into runtimePayload). Hand
+        // the thread over permanently — strip the import cursor so this
         // source file is never tailed again and native turns aren't
         // re-imported as duplicates. A terminal continuation of the source
         // session forks to a new session id and imports as a fresh thread.
+        //
+        // The signals must be NON-NULL values, not key presence: provider
+        // lifecycle sweeps (e.g. stopAll on app quit) merge
+        // `activeTurnId: null` into every binding's runtimePayload, which a
+        // key-presence check misread as adoption and mass-stripped all
+        // import cursors.
         const runtimePayload = input.binding.runtimePayload;
+        const payloadRecord = isRecord(runtimePayload) ? runtimePayload : undefined;
         const nativelyOwned =
           (input.binding.status !== undefined && input.binding.status !== "stopped") ||
-          (isRecord(runtimePayload) &&
-            ("activeTurnId" in runtimePayload || "model" in runtimePayload));
+          (payloadRecord !== undefined &&
+            (Boolean(payloadRecord.activeTurnId) || Boolean(payloadRecord.model)));
         if (nativelyOwned) {
           yield* directory.upsert({
             threadId: input.binding.threadId,
@@ -641,7 +648,43 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
 
       const binding = context.bindingsBySource.get(key);
       if (binding !== undefined) {
-        const cursor = readImportCursor(binding.runtimePayload);
+        let cursor = readImportCursor(binding.runtimePayload);
+        // Self-heal: repair cursors falsely stripped by the key-presence
+        // adoption bug. An importer-created thread (cli-import- prefix)
+        // whose binding shows no real native activity (no truthy
+        // model/activeTurnId, not running) but lost its cursor gets it
+        // reconstructed at the current file position; a genuinely adopted
+        // thread keeps its handoff.
+        if (cursor === undefined && binding.threadId.startsWith("cli-import-")) {
+          const payload = isRecord(binding.runtimePayload) ? binding.runtimePayload : undefined;
+          const genuinelyAdopted =
+            (binding.status !== undefined && binding.status !== "stopped") ||
+            (payload !== undefined && (Boolean(payload.activeTurnId) || Boolean(payload.model)));
+          if (!genuinelyAdopted) {
+            cursor = {
+              sourceSessionId: sessionId,
+              sourcePath: filePath,
+              lineCount: parsed.lineCount,
+              // Chats keep the legacy epoch so the migration below still
+              // runs for them; everything else is stamped current.
+              ...(driver === CODEX_DRIVER && parsed.hasProject !== true
+                ? {}
+                : { epoch: IMPORT_EPOCH }),
+            };
+            yield* directory.upsert({
+              threadId: binding.threadId,
+              provider: driver,
+              providerInstanceId: binding.providerInstanceId ?? defaultInstanceIdForDriver(driver),
+              status: binding.status ?? "stopped",
+              runtimePayload: { importCursor: cursor },
+            });
+            yield* Effect.logInfo("session.importer.cursor-repaired", {
+              provider: driver,
+              sessionId,
+              threadId: binding.threadId,
+            });
+          }
+        }
         if (
           cursor === undefined ||
           cursor.sourceSessionId !== sessionId ||

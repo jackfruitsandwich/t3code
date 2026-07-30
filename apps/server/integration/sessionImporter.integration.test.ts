@@ -665,6 +665,94 @@ it.live(
           importCursor?: { epoch?: number };
         };
         assert.equal(migratedPayload.importCursor?.epoch, 2);
+
+        // Provider lifecycle sweeps merge `activeTurnId: null` into every
+        // binding on app quit. That must NOT read as adoption: imports keep
+        // flowing afterwards.
+        yield* harness.sessionDirectory.upsert({
+          threadId: codexThreadId,
+          provider: CODEX_PROVIDER,
+          providerInstanceId: defaultInstanceIdForDriver(CODEX_PROVIDER),
+          status: "stopped",
+          runtimePayload: { activeTurnId: null, lastRuntimeEvent: "provider.stopAll" },
+        });
+        const codexContentBefore = yield* fileSystem.readFileString(codexSessionPath);
+        yield* fileSystem.writeFileString(
+          codexSessionPath,
+          codexContentBefore +
+            jsonl([
+              codexEventMsg({
+                type: "user_message",
+                text: "After a quit-cycle sweep",
+                timestamp: "2026-07-05T08:00:00.000Z",
+              }),
+            ]),
+        );
+        yield* importer.sweepNow();
+        const codexAfterLifecycle = Option.getOrThrowWith(
+          yield* harness.snapshotQuery.getThreadDetailById(codexThreadId),
+          () => new Error("expected codex thread after lifecycle sweep"),
+        );
+        assert.include(
+          codexAfterLifecycle.messages.map((message) => message.text),
+          "After a quit-cycle sweep",
+          "lifecycle-contaminated binding must not be treated as adopted",
+        );
+
+        // Self-heal: a cursor falsely stripped (importCursor: null) on a
+        // binding with no real native activity gets reconstructed at the
+        // current file position, and later growth imports again.
+        yield* harness.sessionDirectory.upsert({
+          threadId: codexThreadId,
+          provider: CODEX_PROVIDER,
+          providerInstanceId: defaultInstanceIdForDriver(CODEX_PROVIDER),
+          status: "stopped",
+          runtimePayload: { importCursor: null },
+        });
+        const codexContentStripped = yield* fileSystem.readFileString(codexSessionPath);
+        yield* fileSystem.writeFileString(
+          codexSessionPath,
+          codexContentStripped +
+            jsonl([
+              codexEventMsg({
+                type: "agent_message",
+                text: "Lost while cursor was stripped",
+                timestamp: "2026-07-05T09:00:00.000Z",
+              }),
+            ]),
+        );
+        yield* importer.sweepNow();
+        const repairedBinding = Option.getOrThrowWith(
+          yield* harness.sessionDirectory.getBinding(codexThreadId),
+          () => new Error("expected repaired binding"),
+        );
+        const repairedPayload = repairedBinding.runtimePayload as {
+          importCursor?: { epoch?: number; lineCount?: number };
+        };
+        assert.equal(repairedPayload.importCursor?.epoch, 2, "repaired cursor carries epoch");
+        // Growth after the repair imports again.
+        const codexContentRepaired = yield* fileSystem.readFileString(codexSessionPath);
+        yield* fileSystem.writeFileString(
+          codexSessionPath,
+          codexContentRepaired +
+            jsonl([
+              codexEventMsg({
+                type: "user_message",
+                text: "Back in business",
+                timestamp: "2026-07-05T10:00:00.000Z",
+              }),
+            ]),
+        );
+        yield* importer.sweepNow();
+        const codexAfterRepair = Option.getOrThrowWith(
+          yield* harness.snapshotQuery.getThreadDetailById(codexThreadId),
+          () => new Error("expected codex thread after repair"),
+        );
+        assert.include(
+          codexAfterRepair.messages.map((message) => message.text),
+          "Back in business",
+          "imports must resume after cursor repair",
+        );
       }),
     ),
 );
