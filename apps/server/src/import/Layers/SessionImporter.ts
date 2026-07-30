@@ -62,8 +62,19 @@ import { SessionImporter, type SessionImporterShape } from "../Services/SessionI
 
 const DEFAULT_SWEEP_INTERVAL_MS = 30 * 1000;
 
+/**
+ * Import layout epoch. Bumped when the project-placement rules change so
+ * that migrated sessions can be re-dispatched under fresh command ids
+ * (epoch-1 receipts would otherwise shadow the re-import). Epoch 2: codex
+ * sessions without git metadata group into one shared "Chats" project
+ * instead of one project per cwd.
+ */
+const IMPORT_EPOCH = 2;
+
 const CLAUDE_DRIVER = ProviderDriverKind.make("claudeAgent");
 const CODEX_DRIVER = ProviderDriverKind.make("codex");
+
+const CHATS_PROJECT_TITLE = "Chats";
 
 class SessionImportError extends Schema.TaggedErrorClass<SessionImportError>()(
   "SessionImportError",
@@ -86,6 +97,8 @@ interface ImportCursor {
   readonly sourceSessionId: string;
   readonly sourcePath: string;
   readonly lineCount: number;
+  /** Layout epoch the thread was imported under; absent = epoch 1. */
+  readonly epoch?: number;
 }
 
 interface SweepStats {
@@ -97,6 +110,8 @@ interface SweepContext {
   readonly bindingsBySource: ReadonlyMap<string, ProviderRuntimeBindingWithMetadata>;
   readonly seenSessionIds: Set<string>;
   readonly stats: SweepStats;
+  /** Workspace root of the shared project holding project-less codex chats. */
+  readonly chatsWorkspaceRoot: string;
 }
 
 const sourceKey = (driver: ProviderDriverKind, sessionId: string) => `${driver}:${sessionId}`;
@@ -104,12 +119,18 @@ const sourceKey = (driver: ProviderDriverKind, sessionId: string) => `${driver}:
 const hashHex = (value: string) =>
   NodeCrypto.createHash("sha256").update(value).digest("hex").slice(0, 24);
 
-/** Deterministic T3 ids derived from the source session/workspace. */
-export const importedThreadId = (sessionId: string) => ThreadId.make(`cli-import-${sessionId}`);
+/**
+ * Deterministic T3 ids derived from the source session/workspace. Thread ids
+ * are epoch-scoped because deleted thread ids can never be re-created (the
+ * read model retains them), so a layout migration re-imports under a fresh
+ * id and tombstones the old binding.
+ */
+export const importedThreadId = (sessionId: string) =>
+  ThreadId.make(`cli-import-e${IMPORT_EPOCH}-${sessionId}`);
 export const importedProjectId = (workspaceRoot: string) =>
   ProjectId.make(`cli-import-project-${hashHex(workspaceRoot)}`);
 const importCommandId = (driver: ProviderDriverKind, sessionId: string, facet: string) =>
-  CommandId.make(`cli-import:${driver}:${sessionId}:${facet}`);
+  CommandId.make(`cli-import:e${IMPORT_EPOCH}:${driver}:${sessionId}:${facet}`);
 export const importedMessageId = (sessionId: string, sourceId: string) =>
   MessageId.make(`cli-import-${sessionId}-${sourceId}`);
 
@@ -131,6 +152,7 @@ function readImportCursor(runtimePayload: unknown): ImportCursor | undefined {
     sourceSessionId: cursor.sourceSessionId,
     sourcePath: cursor.sourcePath,
     lineCount: cursor.lineCount,
+    ...(typeof cursor.epoch === "number" ? { epoch: cursor.epoch } : {}),
   };
 }
 
@@ -198,13 +220,14 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
       readonly workspaceRoot: string;
       readonly sessionId: string;
       readonly createdAt: string;
+      readonly title?: string;
     }) {
       const existing = yield* snapshotQuery.getActiveProjectByWorkspaceRoot(input.workspaceRoot);
       if (Option.isSome(existing)) {
         return existing.value.id;
       }
 
-      const title = path.basename(input.workspaceRoot) || "project";
+      const title = input.title ?? (path.basename(input.workspaceRoot) || "project");
       const create = (projectId: ProjectId, commandId: CommandId) =>
         engine
           .dispatch({
@@ -338,6 +361,7 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
             sourceSessionId: input.sessionId,
             sourcePath: input.filePath,
             lineCount: input.parsed.lineCount,
+            epoch: IMPORT_EPOCH,
           },
         },
       });
@@ -353,12 +377,26 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
       const { driver, sessionId, parsed } = input;
       const firstMessage = parsed.messages[0];
       const lastMessage = parsed.messages[parsed.messages.length - 1];
-      if (parsed.cwd === undefined || firstMessage === undefined || lastMessage === undefined) {
+      // Codex sessions without git metadata are project-less "chats": they
+      // group into one shared Chats project instead of minting a project
+      // per throwaway cwd.
+      const isChat = driver === CODEX_DRIVER && parsed.hasProject !== true;
+      if (firstMessage === undefined || lastMessage === undefined) {
         return;
       }
-      const workspaceRoot = path.resolve(expandHomePath(parsed.cwd));
+      if (parsed.cwd === undefined && !isChat) {
+        return;
+      }
+      const workspaceRoot = isChat
+        ? input.context.chatsWorkspaceRoot
+        : path.resolve(expandHomePath(parsed.cwd ?? input.context.chatsWorkspaceRoot));
       const createdAt = parsed.startedAt ?? firstMessage.timestamp;
-      const projectId = yield* ensureProject({ workspaceRoot, sessionId, createdAt });
+      const projectId = yield* ensureProject({
+        workspaceRoot,
+        sessionId,
+        createdAt,
+        ...(isChat ? { title: CHATS_PROJECT_TITLE } : {}),
+      });
       const threadId = importedThreadId(sessionId);
       const instanceId = defaultInstanceIdForDriver(driver);
 
@@ -394,7 +432,7 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         threadId,
         parsed,
         filePath: input.filePath,
-        cwd: workspaceRoot,
+        cwd: parsed.cwd !== undefined ? path.resolve(expandHomePath(parsed.cwd)) : workspaceRoot,
       });
       // "stopped" keeps the thread settled while still giving the sidebar a
       // provider badge; "starting"/"running" would un-settle it.
@@ -461,6 +499,57 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
             provider: driver,
             sessionId,
             threadId: input.binding.threadId,
+          });
+          return;
+        }
+        // Epoch migration: a project-less codex chat imported under the old
+        // one-project-per-cwd layout moves into the shared Chats project.
+        // Delete the old thread, re-import it fresh (epoch-salted command
+        // ids bypass the old receipts), and drop the per-chat project it
+        // leaves empty. A thread the user already deleted stays dead.
+        if (driver === CODEX_DRIVER && cursor.epoch === undefined && parsed.hasProject !== true) {
+          const migrateShell = yield* snapshotQuery.getThreadShellById(input.binding.threadId);
+          if (Option.isNone(migrateShell)) {
+            return;
+          }
+          const oldProjectId = migrateShell.value.projectId;
+          yield* engine.dispatch({
+            type: "thread.delete",
+            commandId: importCommandId(driver, sessionId, "migrate-thread-delete"),
+            threadId: input.binding.threadId,
+          });
+          // Tombstone the old binding so it stops claiming this source
+          // session; the re-import below owns it under an epoch-scoped
+          // thread id (deleted thread ids cannot be re-created).
+          yield* directory.upsert({
+            threadId: input.binding.threadId,
+            provider: driver,
+            providerInstanceId:
+              input.binding.providerInstanceId ?? defaultInstanceIdForDriver(driver),
+            status: input.binding.status ?? "stopped",
+            resumeCursor: null,
+            runtimePayload: { importCursor: null },
+          });
+          yield* importFreshSession({
+            driver,
+            sessionId,
+            filePath: input.filePath,
+            parsed,
+            context: input.context,
+          });
+          const remaining = yield* snapshotQuery.getFirstActiveThreadIdByProjectId(oldProjectId);
+          if (Option.isNone(remaining)) {
+            yield* engine.dispatch({
+              type: "project.delete",
+              commandId: importCommandId(driver, sessionId, "migrate-project-delete"),
+              projectId: oldProjectId,
+            });
+          }
+          yield* Effect.logInfo("session.importer.chat-migrated", {
+            provider: driver,
+            sessionId,
+            threadId: input.binding.threadId,
+            oldProjectId,
           });
           return;
         }
@@ -612,6 +701,7 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         bindingsBySource,
         seenSessionIds: new Set<string>(),
         stats: { importedCount: 0, updatedCount: 0 },
+        chatsWorkspaceRoot: path.dirname(codexSessionsDir),
       };
 
       const sources = [

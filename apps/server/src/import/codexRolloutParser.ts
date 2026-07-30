@@ -25,6 +25,7 @@ export function parseCodexRolloutJsonl(content: string): ParsedCliSession {
   const messages: ParsedSessionMessage[] = [];
   let sessionId: string | undefined;
   let cwd: string | undefined;
+  let hasProject = false;
   let startedAt: string | undefined;
   let malformedLineCount = 0;
 
@@ -48,6 +49,7 @@ export function parseCodexRolloutJsonl(content: string): ParsedCliSession {
         sessionId ??= readString(payload.id) ?? readString(payload.session_id);
         cwd ??= readString(payload.cwd);
         startedAt ??= readString(payload.timestamp) ?? readString(entry.timestamp);
+        hasProject = isRecord(payload.git) && Object.keys(payload.git).length > 0;
       }
       continue;
     }
@@ -91,5 +93,6 @@ export function parseCodexRolloutJsonl(content: string): ParsedCliSession {
     messages,
     lineCount: lines.length,
     malformedLineCount,
+    hasProject,
   };
 }

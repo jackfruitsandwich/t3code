@@ -1,5 +1,11 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { defaultInstanceIdForDriver, ProviderDriverKind, ThreadId } from "@t3tools/contracts";
+import {
+  CommandId,
+  defaultInstanceIdForDriver,
+  ProjectId,
+  ProviderDriverKind,
+  ThreadId,
+} from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -227,6 +233,7 @@ it.live(
                 id: CODEX_SESSION_ID,
                 cwd: codexWorkspaceDir,
                 timestamp: "2026-07-02T08:00:00.000Z",
+                git: { repository_url: "https://example.com/repo.git", branch: "main" },
               },
             },
             { timestamp: "2026-07-02T08:00:00.500Z", type: "turn_context", payload: {} },
@@ -303,6 +310,7 @@ it.live(
             sourceSessionId: CLAUDE_SESSION_ID,
             sourcePath: claudeSessionPath,
             lineCount: 5,
+            epoch: 2,
           },
         });
 
@@ -432,6 +440,7 @@ it.live(
             sourceSessionId: CLAUDE_SESSION_ID,
             sourcePath: claudeSessionPath,
             lineCount: 7,
+            epoch: 2,
           },
         });
 
@@ -511,6 +520,151 @@ it.live(
         const eventCountAfterAdoption = yield* countPersistedEvents(harness);
         yield* importer.sweepNow();
         assert.equal(yield* countPersistedEvents(harness), eventCountAfterAdoption);
+
+        // Project-less codex chats (no git metadata) group into one shared
+        // "Chats" project rooted at the codex home.
+        const chatSessionId = "eeeeeeee-3333-4333-8333-333333333333";
+        yield* fileSystem.writeFileString(
+          path.join(codexDayDir, "rollout-2026-07-29T09-00-00-chat.jsonl"),
+          jsonl([
+            {
+              timestamp: "2026-07-03T09:00:00.000Z",
+              type: "session_meta",
+              payload: {
+                id: chatSessionId,
+                cwd: path.join(harness.rootDir, "some-throwaway-cwd"),
+                timestamp: "2026-07-03T09:00:00.000Z",
+              },
+            },
+            codexEventMsg({
+              type: "user_message",
+              text: "Quick question",
+              timestamp: "2026-07-03T09:00:01.000Z",
+            }),
+            codexEventMsg({
+              type: "agent_message",
+              text: "Quick answer.",
+              timestamp: "2026-07-03T09:00:05.000Z",
+            }),
+          ]),
+        );
+        yield* importer.sweepNow();
+        const chatsRoot = path.dirname(codexSessionsDir);
+        const chatsProject = Option.getOrThrowWith(
+          yield* harness.snapshotQuery.getActiveProjectByWorkspaceRoot(chatsRoot),
+          () => new Error("expected shared Chats project"),
+        );
+        const chatShell = Option.getOrThrowWith(
+          yield* harness.snapshotQuery.getThreadShellById(importedThreadId(chatSessionId)),
+          () => new Error("expected chat thread"),
+        );
+        assert.equal(chatShell.projectId, chatsProject.id);
+
+        // Epoch migration: a chat imported under the old one-project-per-cwd
+        // layout is moved into Chats and its per-chat project is deleted.
+        const legacySessionId = "ffffffff-4444-4444-8444-444444444444";
+        // Hand-rolled epoch-1 id: the legacy layout predates epoch scoping.
+        const legacyThreadId = ThreadId.make(`cli-import-${legacySessionId}`);
+        const legacyCwd = path.join(harness.rootDir, "legacy-chat-cwd");
+        yield* fileSystem.makeDirectory(legacyCwd, { recursive: true });
+        const legacyProjectId = ProjectId.make("cli-import-project-legacy-junk");
+        yield* harness.engine.dispatch({
+          type: "project.create",
+          commandId: CommandId.make("test-legacy-project-create"),
+          projectId: legacyProjectId,
+          title: "legacy-chat-cwd",
+          workspaceRoot: legacyCwd,
+          createdAt: "2026-07-04T10:00:00.000Z",
+        });
+        yield* harness.engine.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make("test-legacy-thread-create"),
+          threadId: legacyThreadId,
+          projectId: legacyProjectId,
+          title: "Legacy chat",
+          modelSelection: {
+            instanceId: defaultInstanceIdForDriver(CODEX_PROVIDER),
+            model: "gpt-5.6-sol",
+          },
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+          createdAt: "2026-07-04T10:00:00.000Z",
+        });
+        const legacyPath = path.join(codexDayDir, "rollout-2026-07-29T10-00-00-legacy.jsonl");
+        const legacyContent = jsonl([
+          {
+            timestamp: "2026-07-04T10:00:00.000Z",
+            type: "session_meta",
+            payload: {
+              id: legacySessionId,
+              cwd: legacyCwd,
+              timestamp: "2026-07-04T10:00:00.000Z",
+            },
+          },
+          codexEventMsg({
+            type: "user_message",
+            text: "Legacy chat question",
+            timestamp: "2026-07-04T10:00:01.000Z",
+          }),
+          codexEventMsg({
+            type: "agent_message",
+            text: "Legacy chat answer.",
+            timestamp: "2026-07-04T10:00:05.000Z",
+          }),
+        ]);
+        yield* fileSystem.writeFileString(legacyPath, legacyContent);
+        yield* harness.sessionDirectory.upsert({
+          threadId: legacyThreadId,
+          provider: CODEX_PROVIDER,
+          providerInstanceId: defaultInstanceIdForDriver(CODEX_PROVIDER),
+          status: "stopped",
+          runtimeMode: "full-access",
+          resumeCursor: { threadId: legacySessionId },
+          runtimePayload: {
+            cwd: legacyCwd,
+            // Epoch field deliberately absent: legacy layout marker.
+            importCursor: {
+              sourceSessionId: legacySessionId,
+              sourcePath: legacyPath,
+              lineCount: legacyContent.split("\n").length - 1,
+            },
+          },
+        });
+        yield* importer.sweepNow();
+        // The migrated thread lives under a fresh epoch-scoped id; the old
+        // thread is deleted and its binding tombstoned.
+        const migratedThreadId = importedThreadId(legacySessionId);
+        const migratedShell = Option.getOrThrowWith(
+          yield* harness.snapshotQuery.getThreadShellById(migratedThreadId),
+          () => new Error("expected migrated chat thread"),
+        );
+        assert.equal(migratedShell.projectId, chatsProject.id);
+        assert.isTrue(
+          Option.isNone(yield* harness.snapshotQuery.getThreadShellById(legacyThreadId)),
+          "legacy thread should be deleted after migration",
+        );
+        assert.isTrue(
+          Option.isNone(yield* harness.snapshotQuery.getActiveProjectByWorkspaceRoot(legacyCwd)),
+          "per-chat legacy project should be deleted after migration",
+        );
+        const migratedThread = Option.getOrThrowWith(
+          yield* harness.snapshotQuery.getThreadDetailById(migratedThreadId),
+          () => new Error("expected migrated thread detail"),
+        );
+        assert.deepEqual(
+          migratedThread.messages.map((message) => message.text),
+          ["Legacy chat question", "Legacy chat answer."],
+        );
+        const migratedBinding = Option.getOrThrowWith(
+          yield* harness.sessionDirectory.getBinding(migratedThreadId),
+          () => new Error("expected migrated binding"),
+        );
+        const migratedPayload = migratedBinding.runtimePayload as {
+          importCursor?: { epoch?: number };
+        };
+        assert.equal(migratedPayload.importCursor?.epoch, 2);
       }),
     ),
 );

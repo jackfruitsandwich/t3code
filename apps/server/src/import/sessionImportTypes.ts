@@ -38,6 +38,13 @@ export interface ParsedCliSession {
   readonly lineCount: number;
   /** Lines that failed to parse as JSON (excluding an in-flight tail). */
   readonly malformedLineCount: number;
+  /**
+   * Whether the source session belongs to a project. Codex rollouts carry
+   * git metadata in `session_meta` only for repository-backed sessions;
+   * project-less "chats" omit it and group into one shared Chats project.
+   * Undefined for providers without the distinction (Claude).
+   */
+  readonly hasProject?: boolean;
 }
 
 const MAX_TITLE_LENGTH = 60;
