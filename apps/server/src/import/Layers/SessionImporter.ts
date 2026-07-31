@@ -91,7 +91,14 @@ export interface SessionImporterLiveOptions {
   readonly sweepIntervalMs?: number;
   /** Whether `start()` forks the background loop; `sweepNow` always works. */
   readonly enabled?: boolean;
+  /**
+   * Files larger than this are skipped (whole-file reads would blow memory
+   * on small hosts). Oversized sessions simply don't import.
+   */
+  readonly maxFileBytes?: number;
 }
+
+const DEFAULT_MAX_FILE_BYTES = 32 * 1024 * 1024;
 
 interface ImportCursor {
   readonly sourceSessionId: string;
@@ -184,6 +191,7 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
 
     const enabled = options?.enabled ?? true;
     const sweepIntervalMs = Math.max(1, options?.sweepIntervalMs ?? DEFAULT_SWEEP_INTERVAL_MS);
+    const maxFileBytes = Math.max(1, options?.maxFileBytes ?? DEFAULT_MAX_FILE_BYTES);
 
     // Cheap change detection between sweeps; per spec a stale entry only
     // delays a file until it changes again, so process-local state is fine.
@@ -620,6 +628,15 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
       // Recorded before importing: a failed import is retried when the file
       // changes again rather than re-attempted (and re-logged) every sweep.
       fileFingerprints.set(filePath, { size, mtimeMs });
+
+      if (size > maxFileBytes) {
+        yield* Effect.logInfo("session.importer.file-too-large", {
+          filePath,
+          size,
+          maxFileBytes,
+        });
+        return;
+      }
 
       const content = yield* fs.readFileString(filePath);
       const parsed =
