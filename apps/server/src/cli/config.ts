@@ -131,6 +131,14 @@ const EnvServerConfig = Config.all({
     Config.option,
     Config.map(Option.getOrUndefined),
   ),
+  importSweepIntervalMs: Config.number("T3CODE_IMPORT_SWEEP_MS").pipe(
+    Config.option,
+    Config.map(Option.getOrUndefined),
+  ),
+  importSettleMs: Config.number("T3CODE_IMPORT_SETTLE_MS").pipe(
+    Config.option,
+    Config.map(Option.getOrUndefined),
+  ),
   logWebSocketEvents: Config.boolean("T3CODE_LOG_WS_EVENTS").pipe(
     Config.option,
     Config.map(Option.getOrUndefined),
@@ -383,6 +391,8 @@ export const resolveServerConfig = (
       autoBootstrapProjectFromCwd,
       // Default ON: this fork mirrors on-disk CLI sessions into the sidebar.
       importCliSessions: env.importCliSessions ?? true,
+      importSweepIntervalMs: env.importSweepIntervalMs,
+      importSettleMs: env.importSettleMs,
       logWebSocketEvents,
       tailscaleServeEnabled,
       tailscaleServePort,

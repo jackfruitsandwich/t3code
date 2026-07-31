@@ -388,6 +388,8 @@ const buildAppUnderTest = (options?: {
       desktopBootstrapToken: defaultDesktopBootstrapToken,
       autoBootstrapProjectFromCwd: false,
       importCliSessions: false,
+      importSweepIntervalMs: undefined,
+      importSettleMs: undefined,
       logWebSocketEvents: false,
       tailscaleServeEnabled: false,
       tailscaleServePort: 443,

@@ -36,6 +36,8 @@ const makeServerConfig = Effect.fn(function* (baseDir: string) {
     mode: "web",
     autoBootstrapProjectFromCwd: false,
     importCliSessions: false,
+    importSweepIntervalMs: undefined,
+    importSettleMs: undefined,
     logWebSocketEvents: false,
     tailscaleServeEnabled: false,
     tailscaleServePort: 443,

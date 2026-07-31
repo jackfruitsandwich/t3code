@@ -36,6 +36,7 @@ import {
   ThreadId,
   type ServerSettings,
 } from "@t3tools/contracts";
+import * as Clock from "effect/Clock";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -96,9 +97,17 @@ export interface SessionImporterLiveOptions {
    * on small hosts). Oversized sessions simply don't import.
    */
   readonly maxFileBytes?: number;
+  /**
+   * A file is only processed once it has been quiet for this long. Active
+   * agent sessions rewrite their transcript continuously; re-parsing a
+   * multi-MB file on every sweep pegs small hosts. Imports land at turn
+   * boundaries, which is when they're readable anyway. 0 disables.
+   */
+  readonly settleMs?: number;
 }
 
 const DEFAULT_MAX_FILE_BYTES = 32 * 1024 * 1024;
+const DEFAULT_SETTLE_MS = 20 * 1000;
 
 interface ImportCursor {
   readonly sourceSessionId: string;
@@ -192,6 +201,7 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
     const enabled = options?.enabled ?? true;
     const sweepIntervalMs = Math.max(1, options?.sweepIntervalMs ?? DEFAULT_SWEEP_INTERVAL_MS);
     const maxFileBytes = Math.max(1, options?.maxFileBytes ?? DEFAULT_MAX_FILE_BYTES);
+    const settleMs = Math.max(0, options?.settleMs ?? DEFAULT_SETTLE_MS);
 
     // Cheap change detection between sweeps; per spec a stale entry only
     // delays a file until it changes again, so process-local state is fine.
@@ -625,6 +635,14 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
       ) {
         return;
       }
+      // Still being written to: skip without recording the fingerprint so
+      // the file is picked up on the first sweep after it settles.
+      if (settleMs > 0) {
+        const nowMs = yield* Clock.currentTimeMillis;
+        if (nowMs - mtimeMs < settleMs) {
+          return;
+        }
+      }
       // Recorded before importing: a failed import is retried when the file
       // changes again rather than re-attempted (and re-logged) every sweep.
       fileFingerprints.set(filePath, { size, mtimeMs });
@@ -844,6 +862,12 @@ export const makeSessionImporterLive = (options?: SessionImporterLiveOptions) =>
       const serverConfig = yield* ServerConfig;
       return yield* makeSessionImporter({
         enabled: serverConfig.importCliSessions,
+        ...(serverConfig.importSweepIntervalMs !== undefined
+          ? { sweepIntervalMs: serverConfig.importSweepIntervalMs }
+          : {}),
+        ...(serverConfig.importSettleMs !== undefined
+          ? { settleMs: serverConfig.importSettleMs }
+          : {}),
         ...options,
       });
     }),

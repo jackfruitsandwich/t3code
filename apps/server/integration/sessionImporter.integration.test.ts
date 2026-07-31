@@ -109,6 +109,8 @@ const makeImporter = (input: {
   makeSessionImporter({
     claudeProjectsDir: input.claudeProjectsDir,
     codexSessionsDir: input.codexSessionsDir,
+    // Fixtures are written immediately before sweeping.
+    settleMs: 0,
   }).pipe(
     Effect.provide(
       Layer.mergeAll(
