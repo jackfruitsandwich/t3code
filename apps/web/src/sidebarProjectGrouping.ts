@@ -216,7 +216,23 @@ export function buildSidebarProjectSnapshots(input: {
     });
   }
 
-  return result;
+  // Distinct directories sharing a folder name (four "work" checkouts, two
+  // "context-surgeon" clones) get their parent folder appended so the rows
+  // stay tellable-apart.
+  const nameCounts = new Map<string, number>();
+  for (const group of result) {
+    nameCounts.set(group.displayName, (nameCounts.get(group.displayName) ?? 0) + 1);
+  }
+  return result.map((group) => {
+    if ((nameCounts.get(group.displayName) ?? 0) < 2) {
+      return group;
+    }
+    const segments = group.workspaceRoot.split(/[\\/]/).filter((segment) => segment.length > 0);
+    const parent = segments.length > 1 ? segments[segments.length - 2] : undefined;
+    return parent === undefined
+      ? group
+      : { ...group, displayName: `${group.displayName} · ${parent}` };
+  });
 }
 
 export function buildSidebarProjectPickerEntries(input: {

@@ -5,6 +5,7 @@ import {
   CloudIcon,
   ContainerIcon,
   FolderPlusIcon,
+  GitForkIcon,
   Globe2Icon,
   LoaderIcon,
   SearchIcon,
@@ -56,6 +57,10 @@ import {
   scopeProjectRef,
   scopeThreadRef,
 } from "@t3tools/client-runtime/environment";
+import {
+  foldForkFamilies,
+  type ForkFamilyRowMeta,
+} from "@t3tools/client-runtime/state/thread-fork-family";
 import { safeErrorLogAttributes } from "@t3tools/client-runtime/errors";
 import {
   isAtomCommandInterrupted,
@@ -304,6 +309,9 @@ function buildThreadJumpLabelMap(input: {
 interface SidebarThreadRowProps {
   thread: SidebarThreadSummary;
   projectCwd: string | null;
+  /** Fork-family fold role for this row; null for plain rows. */
+  forkFamily: ForkFamilyRowMeta | null;
+  toggleForkFamily: (familyId: string) => void;
   orderedProjectThreadKeys: readonly string[];
   isActive: boolean;
   jumpLabel: string | null;
@@ -364,6 +372,8 @@ export const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThr
     attemptArchiveThread,
     openPrLink,
     thread,
+    forkFamily,
+    toggleForkFamily,
   } = props;
   const threadRef = scopeThreadRef(thread.environmentId, thread.id);
   const threadKey = scopedThreadKey(threadRef);
@@ -626,6 +636,16 @@ export const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThr
     },
     [],
   );
+  const handleToggleForkFamily = useCallback(
+    (event: React.MouseEvent<HTMLButtonElement>) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (forkFamily !== null) {
+        toggleForkFamily(forkFamily.familyId);
+      }
+    },
+    [forkFamily, toggleForkFamily],
+  );
   const handleConfirmArchiveClick = useCallback(
     (event: React.MouseEvent<HTMLButtonElement>) => {
       event.preventDefault();
@@ -671,13 +691,18 @@ export const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThr
         className={`${resolveThreadRowClassName({
           isActive,
           isSelected,
-        })} relative isolate`}
+        })} relative isolate${
+          forkFamily?.role === "branch" ? " ml-3 w-auto border-l border-sidebar-border/70 pl-2" : ""
+        }`}
         onClick={handleRowClick}
         onDoubleClick={handleRowDoubleClick}
         onKeyDown={handleRowKeyDown}
         onContextMenu={handleRowContextMenu}
       >
         <div className="flex min-w-0 flex-1 items-center gap-1.5 text-left">
+          {forkFamily?.role === "branch" && (
+            <GitForkIcon className="size-3 shrink-0 text-sidebar-muted-foreground/60" />
+          )}
           {prStatus && (
             <Tooltip>
               <TooltipTrigger
@@ -728,6 +753,33 @@ export const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThr
           )}
         </div>
         <div className="ml-auto flex shrink-0 items-center gap-1.5">
+          {forkFamily?.role === "head" && (
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <button
+                    type="button"
+                    aria-expanded={forkFamily.expanded}
+                    aria-label={`${forkFamily.memberCount} branches`}
+                    data-testid={`thread-fork-badge-${thread.id}`}
+                    className="inline-flex cursor-pointer items-center gap-0.5 rounded-sm px-1 text-[10px] text-sidebar-muted-foreground outline-hidden hover:text-foreground focus-visible:ring-1 focus-visible:ring-ring"
+                    onPointerDown={stopPropagationOnPointerDown}
+                    onClick={handleToggleForkFamily}
+                  >
+                    <GitForkIcon className="size-3" />
+                    {forkFamily.memberCount}
+                    <ChevronRightIcon
+                      className={`size-3 transition-transform ${forkFamily.expanded ? "rotate-90" : ""}`}
+                    />
+                  </button>
+                }
+              />
+              <TooltipPopup side="top">
+                {forkFamily.expanded ? "Collapse" : "Show"} {forkFamily.memberCount} branches of
+                this conversation
+              </TooltipPopup>
+            </Tooltip>
+          )}
           {discoveredPorts.length > 0 && (
             <Tooltip>
               <TooltipTrigger
@@ -883,6 +935,8 @@ interface SidebarProjectThreadListProps {
   hiddenThreadStatus: ThreadStatusPill | null;
   orderedProjectThreadKeys: readonly string[];
   renderedThreads: readonly SidebarThreadSummary[];
+  forkFamilyMetaByThreadId: ReadonlyMap<string, ForkFamilyRowMeta>;
+  toggleForkFamily: (familyId: string) => void;
   showEmptyThreadState: boolean;
   shouldShowThreadPanel: boolean;
   isThreadListExpanded: boolean;
@@ -934,6 +988,8 @@ const SidebarProjectThreadList = memo(function SidebarProjectThreadList(
     hiddenThreadStatus,
     orderedProjectThreadKeys,
     renderedThreads,
+    forkFamilyMetaByThreadId,
+    toggleForkFamily,
     showEmptyThreadState,
     shouldShowThreadPanel,
     isThreadListExpanded,
@@ -989,6 +1045,8 @@ const SidebarProjectThreadList = memo(function SidebarProjectThreadList(
               key={threadKey}
               thread={thread}
               projectCwd={projectCwd}
+              forkFamily={forkFamilyMetaByThreadId.get(thread.id) ?? null}
+              toggleForkFamily={toggleForkFamily}
               orderedProjectThreadKeys={orderedProjectThreadKeys}
               isActive={activeRouteThreadKey === threadKey}
               jumpLabel={threadJumpLabelByKey.get(threadKey) ?? null}
@@ -1093,6 +1151,20 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
   const threadSortOrder = useClientSettings<SidebarThreadSortOrder>(
     (settings) => settings.sidebarThreadSortOrder,
   );
+  const [expandedForkFamilies, setExpandedForkFamilies] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
+  const toggleForkFamily = useCallback((familyId: string) => {
+    setExpandedForkFamilies((current) => {
+      const next = new Set(current);
+      if (next.has(familyId)) {
+        next.delete(familyId);
+      } else {
+        next.add(familyId);
+      }
+      return next;
+    });
+  }, []);
   const appSettingsConfirmThreadDelete = useClientSettings<boolean>(
     (settings) => settings.confirmThreadDelete,
   );
@@ -1235,7 +1307,12 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
     return counts;
   }, [memberProjectByScopedKey, project.memberProjects, projectThreads]);
 
-  const { projectStatus, visibleProjectThreads, orderedProjectThreadKeys } = useMemo(() => {
+  const {
+    projectStatus,
+    visibleProjectThreads,
+    orderedProjectThreadKeys,
+    forkFamilyMetaByThreadId,
+  } = useMemo(() => {
     const lastVisitedAtByThreadKey = new Map(
       projectThreads.map((thread, index) => [
         scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id)),
@@ -1253,10 +1330,16 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
         },
       });
     };
-    const visibleProjectThreads = sortThreads(
-      projectThreads.filter((thread) => thread.archivedAt === null),
-      threadSortOrder,
+    // Fork families collapse to one row (expanding in place), so preview
+    // slicing and shift-selection both see the folded list.
+    const folded = foldForkFamilies(
+      sortThreads(
+        projectThreads.filter((thread) => thread.archivedAt === null),
+        threadSortOrder,
+      ),
+      expandedForkFamilies,
     );
+    const visibleProjectThreads = folded.rows;
     const projectStatus = resolveProjectStatusIndicator(
       visibleProjectThreads.map((thread) => resolveProjectThreadStatus(thread)),
     );
@@ -1266,8 +1349,9 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
       ),
       projectStatus,
       visibleProjectThreads,
+      forkFamilyMetaByThreadId: folded.metaByThreadId,
     };
-  }, [projectThreads, threadLastVisitedAts, threadSortOrder]);
+  }, [expandedForkFamilies, projectThreads, threadLastVisitedAts, threadSortOrder]);
   const pinnedCollapsedThread = useMemo(() => {
     const activeThreadKey = activeRouteThreadKey ?? undefined;
     if (!activeThreadKey || projectExpanded) {
@@ -2327,6 +2411,8 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
         hiddenThreadStatus={hiddenThreadStatus}
         orderedProjectThreadKeys={orderedProjectThreadKeys}
         renderedThreads={renderedThreads}
+        forkFamilyMetaByThreadId={forkFamilyMetaByThreadId}
+        toggleForkFamily={toggleForkFamily}
         showEmptyThreadState={showEmptyThreadState}
         shouldShowThreadPanel={shouldShowThreadPanel}
         isThreadListExpanded={isThreadListExpanded}

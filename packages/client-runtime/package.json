@@ -127,6 +127,10 @@
       "types": "./src/state/threadSort.ts",
       "default": "./src/state/threadSort.ts"
     },
+    "./state/thread-fork-family": {
+      "types": "./src/state/threadForkFamily.ts",
+      "default": "./src/state/threadForkFamily.ts"
+    },
     "./state/thread-settled": {
       "types": "./src/state/threadSettled.ts",
       "default": "./src/state/threadSettled.ts"
