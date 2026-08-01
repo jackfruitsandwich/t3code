@@ -139,6 +139,13 @@ const EnvServerConfig = Config.all({
     Config.option,
     Config.map(Option.getOrUndefined),
   ),
+  // Comma-separated path prefixes whose sessions route to the Automations
+  // project regardless of launch markers — for agent-driven interactive CLIs
+  // (tmux harnesses) that provider files cannot distinguish from a human.
+  importAutomationRoots: Config.string("T3CODE_IMPORT_AUTOMATION_ROOTS").pipe(
+    Config.option,
+    Config.map(Option.getOrUndefined),
+  ),
   logWebSocketEvents: Config.boolean("T3CODE_LOG_WS_EVENTS").pipe(
     Config.option,
     Config.map(Option.getOrUndefined),
@@ -393,6 +400,11 @@ export const resolveServerConfig = (
       importCliSessions: env.importCliSessions ?? true,
       importSweepIntervalMs: env.importSweepIntervalMs,
       importSettleMs: env.importSettleMs,
+      importAutomationRoots:
+        env.importAutomationRoots
+          ?.split(",")
+          .map((root) => root.trim())
+          .filter((root) => root.length > 0) ?? [],
       logWebSocketEvents,
       tailscaleServeEnabled,
       tailscaleServePort,

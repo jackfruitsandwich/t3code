@@ -111,6 +111,13 @@ export interface SessionImporterLiveOptions {
    * boundaries, which is when they're readable anyway. 0 disables.
    */
   readonly settleMs?: number;
+  /**
+   * Path prefixes whose sessions route to the Automations project regardless
+   * of launch markers. Agent harnesses that drive real interactive CLIs
+   * (tmux) produce files indistinguishable from a human's; the directories
+   * they run in are the one clean signal. Kin detection still applies.
+   */
+  readonly automationRoots?: ReadonlyArray<string>;
 }
 
 const DEFAULT_MAX_FILE_BYTES = 32 * 1024 * 1024;
@@ -261,6 +268,22 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
     const sweepIntervalMs = Math.max(1, options?.sweepIntervalMs ?? DEFAULT_SWEEP_INTERVAL_MS);
     const maxFileBytes = Math.max(1, options?.maxFileBytes ?? DEFAULT_MAX_FILE_BYTES);
     const settleMs = Math.max(0, options?.settleMs ?? DEFAULT_SETTLE_MS);
+    const automationRoots = (options?.automationRoots ?? []).map((root) =>
+      path.resolve(expandHomePath(root)),
+    );
+
+    /** Machine-marked by the provider, or living under a configured
+     * automation root (tmux-driven harness sessions carry human markers). */
+    const isAutomationSession = (parsed: ParsedCliSession) => {
+      if (parsed.launch === "machine") {
+        return true;
+      }
+      if (parsed.cwd === undefined || automationRoots.length === 0) {
+        return false;
+      }
+      const cwd = path.resolve(expandHomePath(parsed.cwd));
+      return automationRoots.some((root) => cwd.startsWith(root));
+    };
 
     // Cheap change detection between sweeps; per spec a stale entry only
     // delays a file until it changes again, so process-local state is fine.
@@ -663,7 +686,7 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         // conversation stays put, everything else moves to Automations. The
         // decision is recorded on the binding so it runs once.
         if (
-          parsed.launch === "machine" &&
+          isAutomationSession(parsed) &&
           input.skipMachineDecision !== true &&
           readLaunchClass(input.binding.runtimePayload) === undefined
         ) {
@@ -735,26 +758,6 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
           // The imported thread was deleted in T3; leave the source alone
           // instead of resurrecting it.
           return;
-        }
-        // Repair XML-noise titles left by first-message titling on sessions
-        // that open with a slash command. Only noise-prefixed titles are
-        // touched, so a user rename is never clobbered.
-        if (
-          parsed.title !== undefined &&
-          parsed.title !== shell.value.title &&
-          isCommandNoiseText(shell.value.title)
-        ) {
-          yield* engine.dispatch({
-            type: "thread.meta.update",
-            commandId: importCommandId(driver, sessionId, `retitle:${hashHex(parsed.title)}`),
-            threadId,
-            title: parsed.title,
-          });
-          yield* Effect.logInfo("session.importer.retitled", {
-            provider: driver,
-            sessionId,
-            threadId,
-          });
         }
         if (parsed.lineCount <= cursor.lineCount) {
           return;
@@ -855,7 +858,7 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
       // Human-side sessions register their fork signature so the sweep-end
       // machine placement pass can recognize machine-launched forks of them.
       if (
-        parsed.launch !== "machine" &&
+        !isAutomationSession(parsed) &&
         parsed.launch !== "subagent" &&
         parsed.forkSignature !== undefined
       ) {
@@ -868,6 +871,33 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
 
       const binding = context.bindingsBySource.get(key);
       if (binding !== undefined) {
+        // Repair XML-noise titles left by first-message titling on sessions
+        // that open with a slash command. Runs for adopted threads too — the
+        // noise-prefix guard is what keeps user renames safe, not ownership.
+        if (
+          parsed.title !== undefined &&
+          !isCommandNoiseText(parsed.title) &&
+          binding.threadId.startsWith("cli-import")
+        ) {
+          const titleShell = yield* snapshotQuery.getThreadShellById(binding.threadId);
+          if (
+            Option.isSome(titleShell) &&
+            isCommandNoiseText(titleShell.value.title) &&
+            titleShell.value.title !== parsed.title
+          ) {
+            yield* engine.dispatch({
+              type: "thread.meta.update",
+              commandId: importCommandId(driver, sessionId, `retitle:${hashHex(parsed.title)}`),
+              threadId: binding.threadId,
+              title: parsed.title,
+            });
+            yield* Effect.logInfo("session.importer.retitled", {
+              provider: driver,
+              sessionId,
+              threadId: binding.threadId,
+            });
+          }
+        }
         // Backfill fork signatures onto bindings imported before signatures
         // existed (including adopted/native ones), so their threads can join
         // fork families.
@@ -950,7 +980,7 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
       if (parsed.launch === "subagent") {
         return;
       }
-      if (parsed.launch === "machine") {
+      if (isAutomationSession(parsed)) {
         context.deferredMachine.push({ kind: "fresh", driver, sessionId, filePath, parsed });
         return;
       }
@@ -1346,6 +1376,9 @@ export const makeSessionImporterLive = (options?: SessionImporterLiveOptions) =>
           : {}),
         ...(serverConfig.importSettleMs !== undefined
           ? { settleMs: serverConfig.importSettleMs }
+          : {}),
+        ...(serverConfig.importAutomationRoots.length > 0
+          ? { automationRoots: serverConfig.importAutomationRoots }
           : {}),
         ...options,
       });

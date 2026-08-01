@@ -80,6 +80,7 @@ export class ServerConfig extends Context.Service<
     readonly importCliSessions: boolean;
     readonly importSweepIntervalMs: number | undefined;
     readonly importSettleMs: number | undefined;
+    readonly importAutomationRoots: ReadonlyArray<string>;
     readonly logWebSocketEvents: boolean;
     readonly tailscaleServeEnabled: boolean;
     readonly tailscaleServePort: number;
@@ -187,6 +188,7 @@ const makeTest = Effect.fn("ServerConfig.makeTest")(function* (
     importCliSessions: false,
     importSweepIntervalMs: undefined,
     importSettleMs: undefined,
+    importAutomationRoots: [],
     logWebSocketEvents: false,
     tailscaleServeEnabled: false,
     tailscaleServePort: 443,

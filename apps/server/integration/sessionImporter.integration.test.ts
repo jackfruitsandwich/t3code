@@ -1112,6 +1112,57 @@ it.live(
           "Rename the widget everywhere",
           "noise titles are repaired from the first real prompt",
         );
+
+        // Automation roots: a session with human markers (tmux-driven
+        // harness) living under a configured root still routes to
+        // Automations.
+        const rootedId = "66666666-1111-4111-8111-999999999992";
+        const agentFarmCwd = path.join(harness.rootDir, "agent-farm", "work-r9");
+        yield* fileSystem.makeDirectory(agentFarmCwd, { recursive: true });
+        yield* fileSystem.writeFileString(
+          path.join(claudeProjectDir, `${rootedId}.jsonl`),
+          jsonl([
+            claudeUserEntry({
+              uuid: "rooted-user-1",
+              text: "walkthrough step one",
+              timestamp: "2026-07-11T03:00:00.000Z",
+              cwd: agentFarmCwd,
+              sessionId: rootedId,
+            }),
+            claudeAssistantEntry({
+              uuid: "rooted-assistant-1",
+              text: "done",
+              timestamp: "2026-07-11T03:00:30.000Z",
+              cwd: agentFarmCwd,
+              sessionId: rootedId,
+            }),
+          ]),
+        );
+        const rootedImporter = yield* makeSessionImporter({
+          claudeProjectsDir,
+          codexSessionsDir,
+          settleMs: 0,
+          automationRoots: [path.join(harness.rootDir, "agent-farm")],
+        }).pipe(
+          Effect.provide(
+            Layer.mergeAll(
+              Layer.succeed(OrchestrationEngineService, harness.engine),
+              Layer.succeed(ProjectionSnapshotQuery, harness.snapshotQuery),
+              Layer.succeed(ProviderSessionDirectory, harness.sessionDirectory),
+              ServerSettingsService.layerTest(),
+            ),
+          ),
+        );
+        yield* rootedImporter.sweepNow();
+        const rootedShell = Option.getOrThrowWith(
+          yield* harness.snapshotQuery.getThreadShellById(importedThreadId(rootedId)),
+          () => new Error("expected rooted automation thread"),
+        );
+        assert.equal(
+          rootedShell.projectId,
+          automationsProject.id,
+          "sessions under an automation root land in Automations despite human markers",
+        );
       }),
     ),
 );

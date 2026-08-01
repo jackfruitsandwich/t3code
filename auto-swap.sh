@@ -10,7 +10,7 @@ for i in $(seq 1 4320); do
     sleep 3
     if pgrep -f "T3 Code .Alpha..app/Contents/MacOS" >/dev/null 2>&1; then continue; fi
     [ -f "$ZIP" ] || { echo "$(date) zip missing, aborting" >>"$LOG"; exit 1; }
-    mv "$APP" "$HOME/.Trash/T3 Code (Alpha)-pre-chats-fix-$(date +%H%M%S).app" 2>>"$LOG"
+    mv "$APP" "$HOME/.Trash/T3 Code (Alpha)-pre-forks-ui-$(date +%H%M%S).app" 2>>"$LOG"
     ditto -x -k "$ZIP" /Applications/ >>"$LOG" 2>&1
     sleep 2
     open -a "T3 Code (Alpha)" >>"$LOG" 2>&1 || { sleep 3; open -a "T3 Code (Alpha)" >>"$LOG" 2>&1; }

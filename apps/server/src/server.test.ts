@@ -390,6 +390,7 @@ const buildAppUnderTest = (options?: {
       importCliSessions: false,
       importSweepIntervalMs: undefined,
       importSettleMs: undefined,
+      importAutomationRoots: [],
       logWebSocketEvents: false,
       tailscaleServeEnabled: false,
       tailscaleServePort: 443,
