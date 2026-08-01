@@ -37,6 +37,7 @@ import {
   type ServerSettings,
 } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
+import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -58,7 +59,12 @@ import {
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { parseClaudeSessionJsonl } from "../claudeSessionParser.ts";
 import { parseCodexRolloutJsonl } from "../codexRolloutParser.ts";
-import { isEligibleCliSession, isRecord, type ParsedCliSession } from "../sessionImportTypes.ts";
+import {
+  isCommandNoiseText,
+  isEligibleCliSession,
+  isRecord,
+  type ParsedCliSession,
+} from "../sessionImportTypes.ts";
 import { SessionImporter, type SessionImporterShape } from "../Services/SessionImporter.ts";
 
 const DEFAULT_SWEEP_INTERVAL_MS = 30 * 1000;
@@ -76,6 +82,7 @@ const CLAUDE_DRIVER = ProviderDriverKind.make("claudeAgent");
 const CODEX_DRIVER = ProviderDriverKind.make("codex");
 
 const CHATS_PROJECT_TITLE = "Chats";
+const AUTOMATIONS_PROJECT_TITLE = "Automations";
 
 class SessionImportError extends Schema.TaggedErrorClass<SessionImportError>()(
   "SessionImportError",
@@ -122,12 +129,34 @@ interface SweepStats {
   updatedCount: number;
 }
 
+/**
+ * A machine-launched session whose placement decision is postponed to the end
+ * of the sweep, when every human session's fork signature is registered: a
+ * machine session sharing early history with a human one is a fork of that
+ * conversation (e.g. a `/branch` of a T3-driven thread) and belongs beside
+ * it, not in Automations.
+ */
+interface DeferredMachineSession {
+  readonly kind: "fresh" | "existing";
+  readonly driver: ProviderDriverKind;
+  readonly sessionId: string;
+  readonly filePath: string;
+  readonly parsed: ParsedCliSession;
+  readonly binding?: ProviderRuntimeBindingWithMetadata;
+  readonly cursor?: ImportCursor;
+}
+
 interface SweepContext {
   readonly bindingsBySource: ReadonlyMap<string, ProviderRuntimeBindingWithMetadata>;
   readonly seenSessionIds: Set<string>;
   readonly stats: SweepStats;
   /** Workspace root of the shared project holding project-less codex chats. */
   readonly chatsWorkspaceRoot: string;
+  /** Workspace root of the shared project holding machine-launched sessions. */
+  readonly automationsWorkspaceRoot: string;
+  /** Fork-signature id -> owning human-side source key, for kinship checks. */
+  readonly sigOwners: Map<string, string>;
+  readonly deferredMachine: DeferredMachineSession[];
 }
 
 const sourceKey = (driver: ProviderDriverKind, sessionId: string) => `${driver}:${sessionId}`;
@@ -141,12 +170,16 @@ const hashHex = (value: string) =>
  * read model retains them), so a layout migration re-imports under a fresh
  * id and tombstones the old binding.
  */
-export const importedThreadId = (sessionId: string) =>
-  ThreadId.make(`cli-import-e${IMPORT_EPOCH}-${sessionId}`);
+export const importedThreadId = (sessionId: string, idVariant = "") =>
+  ThreadId.make(`cli-import-e${IMPORT_EPOCH}${idVariant}-${sessionId}`);
 export const importedProjectId = (workspaceRoot: string) =>
   ProjectId.make(`cli-import-project-${hashHex(workspaceRoot)}`);
-const importCommandId = (driver: ProviderDriverKind, sessionId: string, facet: string) =>
-  CommandId.make(`cli-import:e${IMPORT_EPOCH}:${driver}:${sessionId}:${facet}`);
+const importCommandId = (
+  driver: ProviderDriverKind,
+  sessionId: string,
+  facet: string,
+  idVariant = "",
+) => CommandId.make(`cli-import:e${IMPORT_EPOCH}${idVariant}:${driver}:${sessionId}:${facet}`);
 export const importedMessageId = (sessionId: string, sourceId: string) =>
   MessageId.make(`cli-import-${sessionId}-${sourceId}`);
 
@@ -170,6 +203,32 @@ function readImportCursor(runtimePayload: unknown): ImportCursor | undefined {
     lineCount: cursor.lineCount,
     ...(typeof cursor.epoch === "number" ? { epoch: cursor.epoch } : {}),
   };
+}
+
+function readForkSignature(runtimePayload: unknown): ReadonlyArray<string> | undefined {
+  if (!isRecord(runtimePayload) || !Array.isArray(runtimePayload.importForkSig)) {
+    return undefined;
+  }
+  const ids = runtimePayload.importForkSig.filter(
+    (value): value is string => typeof value === "string" && value.length > 0,
+  );
+  return ids.length > 0 ? ids : undefined;
+}
+
+/** Sweep-end placement decision recorded on the binding: a machine-launched
+ * session is either kin of a human conversation or an automation. */
+function readLaunchClass(runtimePayload: unknown): string | undefined {
+  if (!isRecord(runtimePayload) || typeof runtimePayload.importLaunch !== "string") {
+    return undefined;
+  }
+  return runtimePayload.importLaunch;
+}
+
+function readStampedForkFamily(runtimePayload: unknown): string | undefined {
+  if (!isRecord(runtimePayload) || typeof runtimePayload.forkFamilyStamped !== "string") {
+    return undefined;
+  }
+  return runtimePayload.forkFamilyStamped;
 }
 
 function readResumeSessionId(binding: ProviderRuntimeBindingWithMetadata): string | undefined {
@@ -298,7 +357,9 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
       readonly threadId: ThreadId;
       readonly parsed: ParsedCliSession;
       readonly fromLineIndex: number;
+      readonly idVariant?: string;
     }) {
+      const idVariant = input.idVariant ?? "";
       let dispatchedCount = 0;
       for (const message of input.parsed.messages) {
         if (message.lineIndex < input.fromLineIndex) {
@@ -308,7 +369,12 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         if (message.role === "user") {
           yield* engine.dispatch({
             type: "thread.message.user.record",
-            commandId: importCommandId(input.driver, input.sessionId, `msg:${message.sourceId}`),
+            commandId: importCommandId(
+              input.driver,
+              input.sessionId,
+              `msg:${message.sourceId}`,
+              idVariant,
+            ),
             threadId: input.threadId,
             messageId,
             text: message.text,
@@ -323,6 +389,7 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
               input.driver,
               input.sessionId,
               `msg:${message.sourceId}:delta`,
+              idVariant,
             ),
             threadId: input.threadId,
             messageId,
@@ -335,6 +402,7 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
               input.driver,
               input.sessionId,
               `msg:${message.sourceId}:complete`,
+              idVariant,
             ),
             threadId: input.threadId,
             messageId,
@@ -354,6 +422,8 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
       readonly filePath: string;
       /** Omitted on incremental updates so the shallow merge keeps `cwd`. */
       readonly cwd?: string;
+      /** Sweep-end machine placement decision; omitted keeps the stored one. */
+      readonly launchClass?: "human" | "kin" | "automation";
     }) => {
       const userTurnCount = input.parsed.messages.filter(
         (message) => message.role === "user",
@@ -375,6 +445,10 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         resumeCursor,
         runtimePayload: {
           ...(input.cwd !== undefined ? { cwd: input.cwd } : {}),
+          ...(input.parsed.forkSignature !== undefined && input.parsed.forkSignature.length > 0
+            ? { importForkSig: input.parsed.forkSignature }
+            : {}),
+          ...(input.launchClass !== undefined ? { importLaunch: input.launchClass } : {}),
           importCursor: {
             sourceSessionId: input.sessionId,
             sourcePath: input.filePath,
@@ -391,36 +465,50 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
       readonly filePath: string;
       readonly parsed: ParsedCliSession;
       readonly context: SweepContext;
+      /** Overrides normal project placement (machine sessions -> Automations). */
+      readonly placement?: {
+        readonly workspaceRoot: string;
+        readonly projectTitle: string;
+        /** Salts thread/command ids when re-importing over a deleted thread. */
+        readonly idVariant?: string;
+      };
+      readonly launchClass?: "human" | "kin" | "automation";
     }) {
       const { driver, sessionId, parsed } = input;
+      const idVariant = input.placement?.idVariant ?? "";
       const firstMessage = parsed.messages[0];
       const lastMessage = parsed.messages[parsed.messages.length - 1];
       // Codex sessions without git metadata are project-less "chats": they
       // group into one shared Chats project instead of minting a project
       // per throwaway cwd.
-      const isChat = driver === CODEX_DRIVER && parsed.hasProject !== true;
+      const isChat =
+        input.placement === undefined && driver === CODEX_DRIVER && parsed.hasProject !== true;
       if (firstMessage === undefined || lastMessage === undefined) {
         return;
       }
-      if (parsed.cwd === undefined && !isChat) {
+      if (parsed.cwd === undefined && !isChat && input.placement === undefined) {
         return;
       }
-      const workspaceRoot = isChat
-        ? input.context.chatsWorkspaceRoot
-        : path.resolve(expandHomePath(parsed.cwd ?? input.context.chatsWorkspaceRoot));
+      const workspaceRoot =
+        input.placement?.workspaceRoot ??
+        (isChat
+          ? input.context.chatsWorkspaceRoot
+          : path.resolve(expandHomePath(parsed.cwd ?? input.context.chatsWorkspaceRoot)));
       const createdAt = parsed.startedAt ?? firstMessage.timestamp;
+      const projectTitle =
+        input.placement?.projectTitle ?? (isChat ? CHATS_PROJECT_TITLE : undefined);
       const projectId = yield* ensureProject({
         workspaceRoot,
         sessionId,
         createdAt,
-        ...(isChat ? { title: CHATS_PROJECT_TITLE } : {}),
+        ...(projectTitle !== undefined ? { title: projectTitle } : {}),
       });
-      const threadId = importedThreadId(sessionId);
+      const threadId = importedThreadId(sessionId, idVariant);
       const instanceId = defaultInstanceIdForDriver(driver);
 
       yield* engine.dispatch({
         type: "thread.create",
-        commandId: importCommandId(driver, sessionId, "thread.create"),
+        commandId: importCommandId(driver, sessionId, "thread.create", idVariant),
         threadId,
         projectId,
         title: parsed.title ?? "Imported session",
@@ -443,6 +531,7 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         threadId,
         parsed,
         fromLineIndex: 0,
+        idVariant,
       });
       yield* upsertImportBinding({
         driver,
@@ -451,12 +540,13 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         parsed,
         filePath: input.filePath,
         cwd: parsed.cwd !== undefined ? path.resolve(expandHomePath(parsed.cwd)) : workspaceRoot,
+        ...(input.launchClass !== undefined ? { launchClass: input.launchClass } : {}),
       });
       // "stopped" keeps the thread settled while still giving the sidebar a
       // provider badge; "starting"/"running" would un-settle it.
       yield* engine.dispatch({
         type: "thread.session.set",
-        commandId: importCommandId(driver, sessionId, "session"),
+        commandId: importCommandId(driver, sessionId, "session", idVariant),
         threadId,
         session: {
           threadId,
@@ -490,6 +580,8 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         readonly binding: ProviderRuntimeBindingWithMetadata;
         readonly cursor: ImportCursor;
         readonly context: SweepContext;
+        /** Set when re-entered from the sweep-end machine placement pass. */
+        readonly skipMachineDecision?: boolean;
       }) {
         const { driver, sessionId, parsed, cursor } = input;
         // A native T3 session has run on this thread since import: the
@@ -524,6 +616,65 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
             provider: driver,
             sessionId,
             threadId: input.binding.threadId,
+          });
+          return;
+        }
+        // Agent-spawned subagent sessions are provider plumbing — Codex's own
+        // UI never shows them. Drop the imported thread and tombstone the
+        // binding; the fresh-import path skips these files from now on.
+        if (parsed.launch === "subagent") {
+          const subagentShell = yield* snapshotQuery.getThreadShellById(input.binding.threadId);
+          if (Option.isNone(subagentShell)) {
+            return;
+          }
+          const subagentProjectId = subagentShell.value.projectId;
+          yield* engine.dispatch({
+            type: "thread.delete",
+            commandId: importCommandId(driver, sessionId, "subagent-thread-delete"),
+            threadId: input.binding.threadId,
+          });
+          yield* directory.upsert({
+            threadId: input.binding.threadId,
+            provider: driver,
+            providerInstanceId:
+              input.binding.providerInstanceId ?? defaultInstanceIdForDriver(driver),
+            status: input.binding.status ?? "stopped",
+            resumeCursor: null,
+            runtimePayload: { importCursor: null },
+          });
+          const subagentRemaining =
+            yield* snapshotQuery.getFirstActiveThreadIdByProjectId(subagentProjectId);
+          if (Option.isNone(subagentRemaining)) {
+            yield* engine.dispatch({
+              type: "project.delete",
+              commandId: importCommandId(driver, sessionId, "subagent-project-delete"),
+              projectId: subagentProjectId,
+            });
+          }
+          yield* Effect.logInfo("session.importer.subagent-removed", {
+            provider: driver,
+            sessionId,
+            threadId: input.binding.threadId,
+          });
+          return;
+        }
+        // Machine-launched sessions wait for the sweep-end placement pass,
+        // which knows every human session's fork signature: kin of a human
+        // conversation stays put, everything else moves to Automations. The
+        // decision is recorded on the binding so it runs once.
+        if (
+          parsed.launch === "machine" &&
+          input.skipMachineDecision !== true &&
+          readLaunchClass(input.binding.runtimePayload) === undefined
+        ) {
+          input.context.deferredMachine.push({
+            kind: "existing",
+            driver,
+            sessionId,
+            filePath: input.filePath,
+            parsed,
+            binding: input.binding,
+            cursor,
           });
           return;
         }
@@ -578,14 +729,34 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
           });
           return;
         }
-        if (parsed.lineCount <= cursor.lineCount) {
-          return;
-        }
         const threadId = input.binding.threadId;
         const shell = yield* snapshotQuery.getThreadShellById(threadId);
         if (Option.isNone(shell)) {
           // The imported thread was deleted in T3; leave the source alone
           // instead of resurrecting it.
+          return;
+        }
+        // Repair XML-noise titles left by first-message titling on sessions
+        // that open with a slash command. Only noise-prefixed titles are
+        // touched, so a user rename is never clobbered.
+        if (
+          parsed.title !== undefined &&
+          parsed.title !== shell.value.title &&
+          isCommandNoiseText(shell.value.title)
+        ) {
+          yield* engine.dispatch({
+            type: "thread.meta.update",
+            commandId: importCommandId(driver, sessionId, `retitle:${hashHex(parsed.title)}`),
+            threadId,
+            title: parsed.title,
+          });
+          yield* Effect.logInfo("session.importer.retitled", {
+            provider: driver,
+            sessionId,
+            threadId,
+          });
+        }
+        if (parsed.lineCount <= cursor.lineCount) {
           return;
         }
 
@@ -681,8 +852,38 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
       }
       context.seenSessionIds.add(key);
 
+      // Human-side sessions register their fork signature so the sweep-end
+      // machine placement pass can recognize machine-launched forks of them.
+      if (
+        parsed.launch !== "machine" &&
+        parsed.launch !== "subagent" &&
+        parsed.forkSignature !== undefined
+      ) {
+        for (const sigId of parsed.forkSignature) {
+          if (!context.sigOwners.has(sigId)) {
+            context.sigOwners.set(sigId, key);
+          }
+        }
+      }
+
       const binding = context.bindingsBySource.get(key);
       if (binding !== undefined) {
+        // Backfill fork signatures onto bindings imported before signatures
+        // existed (including adopted/native ones), so their threads can join
+        // fork families.
+        if (
+          readForkSignature(binding.runtimePayload) === undefined &&
+          parsed.forkSignature !== undefined &&
+          parsed.forkSignature.length > 0
+        ) {
+          yield* directory.upsert({
+            threadId: binding.threadId,
+            provider: driver,
+            providerInstanceId: binding.providerInstanceId ?? defaultInstanceIdForDriver(driver),
+            status: binding.status ?? "stopped",
+            runtimePayload: { importForkSig: parsed.forkSignature },
+          });
+        }
         let cursor = readImportCursor(binding.runtimePayload);
         // Self-heal: repair cursors falsely stripped by the key-presence
         // adoption bug. An importer-created thread (cli-import- prefix)
@@ -744,7 +945,248 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
       if (!isEligibleCliSession(parsed)) {
         return;
       }
+      // Agent-spawned subagent sessions never import: Codex's own UI hides
+      // them, and they are conversation plumbing, not conversations.
+      if (parsed.launch === "subagent") {
+        return;
+      }
+      if (parsed.launch === "machine") {
+        context.deferredMachine.push({ kind: "fresh", driver, sessionId, filePath, parsed });
+        return;
+      }
       yield* importFreshSession({ driver, sessionId, filePath, parsed, context });
+    });
+
+    /** Whether a machine-launched session shares early history with any
+     * human-side session — i.e. it is a fork of a real conversation. */
+    const hasHumanKin = (context: SweepContext, parsed: ParsedCliSession, selfKey: string) =>
+      parsed.forkSignature?.some((sigId) => {
+        const owner = context.sigOwners.get(sigId);
+        return owner !== undefined && owner !== selfKey;
+      }) ?? false;
+
+    const processDeferredMachine = Effect.fn("SessionImporter.processDeferredMachine")(function* (
+      context: SweepContext,
+    ) {
+      for (const deferred of context.deferredMachine) {
+        const { driver, sessionId, filePath, parsed } = deferred;
+        const key = sourceKey(driver, sessionId);
+        const kin = hasHumanKin(context, parsed, key);
+        if (deferred.kind === "fresh") {
+          yield* importFreshSession({
+            driver,
+            sessionId,
+            filePath,
+            parsed,
+            context,
+            ...(kin
+              ? { launchClass: "kin" as const }
+              : {
+                  placement: {
+                    workspaceRoot: context.automationsWorkspaceRoot,
+                    projectTitle: AUTOMATIONS_PROJECT_TITLE,
+                  },
+                  launchClass: "automation" as const,
+                }),
+          });
+          continue;
+        }
+        const binding = deferred.binding;
+        const cursor = deferred.cursor;
+        if (binding === undefined || cursor === undefined) {
+          continue;
+        }
+        if (kin) {
+          // A fork of a human conversation: record the decision and resume
+          // normal incremental handling in place.
+          yield* directory.upsert({
+            threadId: binding.threadId,
+            provider: driver,
+            providerInstanceId: binding.providerInstanceId ?? defaultInstanceIdForDriver(driver),
+            status: binding.status ?? "stopped",
+            runtimePayload: { importLaunch: "kin" },
+          });
+          yield* importSessionIncrement({
+            driver,
+            sessionId,
+            filePath,
+            parsed,
+            binding,
+            cursor,
+            context,
+            skipMachineDecision: true,
+          });
+          continue;
+        }
+        const shell = yield* snapshotQuery.getThreadShellById(binding.threadId);
+        if (Option.isNone(shell)) {
+          continue;
+        }
+        const automationsProject = yield* snapshotQuery.getActiveProjectByWorkspaceRoot(
+          context.automationsWorkspaceRoot,
+        );
+        if (
+          Option.isSome(automationsProject) &&
+          shell.value.projectId === automationsProject.value.id
+        ) {
+          // Already placed; just record the decision.
+          yield* directory.upsert({
+            threadId: binding.threadId,
+            provider: driver,
+            providerInstanceId: binding.providerInstanceId ?? defaultInstanceIdForDriver(driver),
+            status: binding.status ?? "stopped",
+            runtimePayload: { importLaunch: "automation" },
+          });
+          continue;
+        }
+        // Move to Automations: delete the old thread, tombstone its
+        // binding, and re-import under a variant-salted id (deleted thread
+        // ids can never be re-created).
+        const oldProjectId = shell.value.projectId;
+        yield* engine.dispatch({
+          type: "thread.delete",
+          commandId: importCommandId(driver, sessionId, "automation-thread-delete"),
+          threadId: binding.threadId,
+        });
+        yield* directory.upsert({
+          threadId: binding.threadId,
+          provider: driver,
+          providerInstanceId: binding.providerInstanceId ?? defaultInstanceIdForDriver(driver),
+          status: binding.status ?? "stopped",
+          resumeCursor: null,
+          runtimePayload: { importCursor: null },
+        });
+        yield* importFreshSession({
+          driver,
+          sessionId,
+          filePath,
+          parsed,
+          context,
+          placement: {
+            workspaceRoot: context.automationsWorkspaceRoot,
+            projectTitle: AUTOMATIONS_PROJECT_TITLE,
+            idVariant: "a",
+          },
+          launchClass: "automation",
+        });
+        const remaining = yield* snapshotQuery.getFirstActiveThreadIdByProjectId(oldProjectId);
+        if (Option.isNone(remaining)) {
+          yield* engine.dispatch({
+            type: "project.delete",
+            commandId: importCommandId(driver, sessionId, "automation-project-delete"),
+            projectId: oldProjectId,
+          });
+        }
+        yield* Effect.logInfo("session.importer.automation-migrated", {
+          provider: driver,
+          sessionId,
+          oldThreadId: binding.threadId,
+        });
+      }
+    });
+
+    /**
+     * Group imported threads into fork families: sessions sharing any early
+     * history id are branches of one conversation. The family id is the
+     * lexicographically smallest member session id (Codex uuidv7 ids sort by
+     * creation time, so that is the original session). Only families with two
+     * or more members are stamped; the marker on the binding keeps re-stamps
+     * from dispatching every sweep.
+     */
+    const stampForkFamilies = Effect.fn("SessionImporter.stampForkFamilies")(function* () {
+      const bindings = yield* directory.listBindings();
+      interface FamilyNode {
+        readonly binding: ProviderRuntimeBindingWithMetadata;
+        readonly sessionId: string;
+        readonly sig: ReadonlyArray<string>;
+      }
+      const nodes: FamilyNode[] = [];
+      for (const binding of bindings) {
+        const sig = readForkSignature(binding.runtimePayload);
+        if (sig === undefined) {
+          continue;
+        }
+        const sessionId =
+          readImportCursor(binding.runtimePayload)?.sourceSessionId ?? readResumeSessionId(binding);
+        if (sessionId === undefined) {
+          continue;
+        }
+        nodes.push({ binding, sessionId, sig });
+      }
+
+      const parent = new Map<number, number>();
+      const find = (index: number): number => {
+        let root = index;
+        while ((parent.get(root) ?? root) !== root) {
+          root = parent.get(root) ?? root;
+        }
+        parent.set(index, root);
+        return root;
+      };
+      const sigOwner = new Map<string, number>();
+      for (let index = 0; index < nodes.length; index += 1) {
+        parent.set(index, index);
+        for (const sigId of nodes[index]?.sig ?? []) {
+          const owner = sigOwner.get(sigId);
+          if (owner === undefined) {
+            sigOwner.set(sigId, index);
+          } else {
+            parent.set(find(index), find(owner));
+          }
+        }
+      }
+      const components = new Map<number, FamilyNode[]>();
+      for (let index = 0; index < nodes.length; index += 1) {
+        const node = nodes[index];
+        if (node === undefined) {
+          continue;
+        }
+        const root = find(index);
+        components.set(root, [...(components.get(root) ?? []), node]);
+      }
+
+      const nowIso = yield* Effect.map(DateTime.now, DateTime.formatIso);
+      let stampedCount = 0;
+      for (const members of components.values()) {
+        if (members.length < 2) {
+          continue;
+        }
+        const familyId = members
+          .map((member) => member.sessionId)
+          .sort((left, right) => (left < right ? -1 : 1))[0];
+        if (familyId === undefined) {
+          continue;
+        }
+        for (const member of members) {
+          if (readStampedForkFamily(member.binding.runtimePayload) === familyId) {
+            continue;
+          }
+          const shell = yield* snapshotQuery.getThreadShellById(member.binding.threadId);
+          if (Option.isNone(shell)) {
+            continue;
+          }
+          yield* engine.dispatch({
+            type: "thread.fork-family.set",
+            commandId: CommandId.make(`cli-import:family:${member.sessionId}:${hashHex(familyId)}`),
+            threadId: member.binding.threadId,
+            forkFamilyId: familyId,
+            createdAt: nowIso,
+          });
+          yield* directory.upsert({
+            threadId: member.binding.threadId,
+            provider: member.binding.provider,
+            providerInstanceId:
+              member.binding.providerInstanceId ??
+              defaultInstanceIdForDriver(member.binding.provider),
+            status: member.binding.status ?? "stopped",
+            runtimePayload: { forkFamilyStamped: familyId },
+          });
+          stampedCount += 1;
+        }
+      }
+      if (stampedCount > 0) {
+        yield* Effect.logInfo("session.importer.families-stamped", { stampedCount });
+      }
     });
 
     const sweep = Effect.gen(function* () {
@@ -761,6 +1203,7 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
 
       const bindings = yield* directory.listBindings();
       const bindingsBySource = new Map<string, ProviderRuntimeBindingWithMetadata>();
+      const sigOwners = new Map<string, string>();
       for (const binding of bindings) {
         const cursor = readImportCursor(binding.runtimePayload);
         if (cursor !== undefined) {
@@ -773,6 +1216,22 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
             bindingsBySource.set(key, binding);
           }
         }
+        // Signatures from prior sweeps seed the kinship registry; automation
+        // bindings are excluded so automations never claim kinship.
+        const sig = readForkSignature(binding.runtimePayload);
+        const sessionId = cursor?.sourceSessionId ?? resumeSessionId;
+        if (
+          sig !== undefined &&
+          sessionId !== undefined &&
+          readLaunchClass(binding.runtimePayload) !== "automation"
+        ) {
+          const key = sourceKey(binding.provider, sessionId);
+          for (const sigId of sig) {
+            if (!sigOwners.has(sigId)) {
+              sigOwners.set(sigId, key);
+            }
+          }
+        }
       }
 
       const context: SweepContext = {
@@ -780,6 +1239,9 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         seenSessionIds: new Set<string>(),
         stats: { importedCount: 0, updatedCount: 0 },
         chatsWorkspaceRoot: path.dirname(codexSessionsDir),
+        automationsWorkspaceRoot: path.dirname(claudeProjectsDir),
+        sigOwners,
+        deferredMachine: [],
       };
 
       const sources = [
@@ -807,6 +1269,23 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
           );
         }
       }
+
+      yield* processDeferredMachine(context).pipe(
+        Effect.catch((error) =>
+          Effect.logWarning("session.importer.machine-pass-failed", { error }),
+        ),
+        Effect.catchDefect((defect) =>
+          Effect.logWarning("session.importer.machine-pass-defect", { defect }),
+        ),
+      );
+      yield* stampForkFamilies().pipe(
+        Effect.catch((error) =>
+          Effect.logWarning("session.importer.family-pass-failed", { error }),
+        ),
+        Effect.catchDefect((defect) =>
+          Effect.logWarning("session.importer.family-pass-defect", { defect }),
+        ),
+      );
 
       if (context.stats.importedCount > 0 || context.stats.updatedCount > 0) {
         yield* Effect.logInfo("session.importer.sweep-complete", {

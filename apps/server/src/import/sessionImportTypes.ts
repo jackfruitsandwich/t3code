@@ -45,6 +45,21 @@ export interface ParsedCliSession {
    * Undefined for providers without the distinction (Claude).
    */
   readonly hasProject?: boolean;
+  /**
+   * How the session was launched, from markers the provider writes itself:
+   * Claude stamps every entry with an `entrypoint` ("cli" for the interactive
+   * TUI, "sdk-*" for programmatic runs); Codex marks `exec`/`codex_exec`
+   * automation and agent-spawned `subagent` sessions in `session_meta`.
+   * Absent marker means human.
+   */
+  readonly launch?: "human" | "machine" | "subagent";
+  /**
+   * Stable ids from the session's earliest history. Forks copy history, so
+   * two sessions sharing any of these ids are branches of one conversation;
+   * used to group fork families and to keep machine-launched forks of a
+   * human session out of the Automations project.
+   */
+  readonly forkSignature?: ReadonlyArray<string>;
 }
 
 const MAX_TITLE_LENGTH = 60;
@@ -53,6 +68,15 @@ const MAX_TITLE_LENGTH = 60;
 export function truncateSessionTitle(text: string): string | undefined {
   const trimmed = text.trim().slice(0, MAX_TITLE_LENGTH).trim();
   return trimmed.length > 0 ? trimmed : undefined;
+}
+
+/**
+ * Whether a message is CLI slash-command plumbing (`<command-name>/model...`,
+ * `<local-command-stdout>`...) rather than something the user said. Sessions
+ * that open with one would otherwise all get the same XML-noise title.
+ */
+export function isCommandNoiseText(text: string): boolean {
+  return text.startsWith("<command-") || text.startsWith("<local-command-");
 }
 
 /**

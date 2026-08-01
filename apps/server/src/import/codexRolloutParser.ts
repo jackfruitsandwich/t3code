@@ -11,6 +11,7 @@
  * @module import/codexRolloutParser
  */
 import {
+  isCommandNoiseText,
   isRecord,
   parseJsonlLine,
   readString,
@@ -20,6 +21,8 @@ import {
   type ParsedSessionMessage,
 } from "./sessionImportTypes.ts";
 
+const FORK_SIGNATURE_LENGTH = 8;
+
 export function parseCodexRolloutJsonl(content: string): ParsedCliSession {
   const lines = splitCompleteJsonlLines(content);
   const messages: ParsedSessionMessage[] = [];
@@ -27,6 +30,8 @@ export function parseCodexRolloutJsonl(content: string): ParsedCliSession {
   let cwd: string | undefined;
   let hasProject = false;
   let startedAt: string | undefined;
+  let launch: "human" | "machine" | "subagent" = "human";
+  const forkSignature: string[] = [];
   let malformedLineCount = 0;
 
   for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
@@ -50,8 +55,25 @@ export function parseCodexRolloutJsonl(content: string): ParsedCliSession {
         cwd ??= readString(payload.cwd);
         startedAt ??= readString(payload.timestamp) ?? readString(entry.timestamp);
         hasProject = isRecord(payload.git) && Object.keys(payload.git).length > 0;
+        if (
+          payload.thread_source === "subagent" ||
+          (isRecord(payload.source) && "subagent" in payload.source)
+        ) {
+          launch = "subagent";
+        } else if (payload.source === "exec" || payload.originator === "codex_exec") {
+          launch = "machine";
+        }
       }
       continue;
+    }
+
+    // Provider item ids are copied verbatim when Codex forks a session, so
+    // the earliest ones identify the conversation across all its branches.
+    if (entry.type === "response_item" && forkSignature.length < FORK_SIGNATURE_LENGTH) {
+      const itemId = payload === undefined ? undefined : readString(payload.id);
+      if (itemId !== undefined) {
+        forkSignature.push(itemId);
+      }
     }
 
     if (entry.type !== "event_msg" || payload === undefined) {
@@ -82,7 +104,9 @@ export function parseCodexRolloutJsonl(content: string): ParsedCliSession {
     });
   }
 
-  const firstUserText = messages.find((message) => message.role === "user")?.text;
+  const firstUserText =
+    messages.find((message) => message.role === "user" && !isCommandNoiseText(message.text))
+      ?.text ?? messages.find((message) => message.role === "user")?.text;
   const title = firstUserText !== undefined ? truncateSessionTitle(firstUserText) : undefined;
 
   return {
@@ -94,5 +118,7 @@ export function parseCodexRolloutJsonl(content: string): ParsedCliSession {
     lineCount: lines.length,
     malformedLineCount,
     hasProject,
+    launch,
+    forkSignature,
   };
 }

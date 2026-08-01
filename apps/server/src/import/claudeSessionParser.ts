@@ -12,6 +12,7 @@
  * @module import/claudeSessionParser
  */
 import {
+  isCommandNoiseText,
   isRecord,
   parseJsonlLine,
   readString,
@@ -20,6 +21,8 @@ import {
   type ParsedCliSession,
   type ParsedSessionMessage,
 } from "./sessionImportTypes.ts";
+
+const FORK_SIGNATURE_LENGTH = 5;
 
 /**
  * Extract the concatenated text-block content from a Claude message
@@ -50,6 +53,7 @@ export function parseClaudeSessionJsonl(content: string): ParsedCliSession {
   let cwd: string | undefined;
   let aiTitle: string | undefined;
   let startedAt: string | undefined;
+  let entrypoint: string | undefined;
   let malformedLineCount = 0;
 
   for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
@@ -83,6 +87,7 @@ export function parseClaudeSessionJsonl(content: string): ParsedCliSession {
 
     sessionId ??= readString(entry.sessionId);
     cwd ??= readString(entry.cwd);
+    entrypoint ??= readString(entry.entrypoint);
 
     const timestamp = readString(entry.timestamp);
     const message = isRecord(entry.message) ? entry.message : undefined;
@@ -104,10 +109,18 @@ export function parseClaudeSessionJsonl(content: string): ParsedCliSession {
     });
   }
 
-  const firstUserText = messages.find((message) => message.role === "user")?.text;
+  const firstUserText =
+    messages.find((message) => message.role === "user" && !isCommandNoiseText(message.text))
+      ?.text ?? messages.find((message) => message.role === "user")?.text;
   const title =
     (aiTitle !== undefined ? truncateSessionTitle(aiTitle) : undefined) ??
     (firstUserText !== undefined ? truncateSessionTitle(firstUserText) : undefined);
+  // Entry uuids are copied verbatim when Claude forks a session, so the
+  // earliest ones identify the conversation across all its branches.
+  const forkSignature = messages
+    .slice(0, FORK_SIGNATURE_LENGTH)
+    .map((message) => message.sourceId)
+    .filter((sourceId) => !sourceId.startsWith("line-"));
 
   return {
     sessionId,
@@ -117,5 +130,7 @@ export function parseClaudeSessionJsonl(content: string): ParsedCliSession {
     messages,
     lineCount: lines.length,
     malformedLineCount,
+    launch: entrypoint === undefined || entrypoint === "cli" ? "human" : "machine",
+    forkSignature,
   };
 }
