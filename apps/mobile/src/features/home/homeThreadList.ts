@@ -109,15 +109,42 @@ export function buildHomeProjectScopes(input: {
     else projectRefsByGroup.set(key, [projectRef]);
   }
 
-  return Array.from(groups, ([key, projects]) => {
+  const scopes = Array.from(groups, ([key, projects]) => {
     const representative = projects[0]!;
     return {
       key,
-      title: deriveProjectGroupLabel({ representative, members: projects }),
+      // Single-directory scopes keep their folder title (matching the web
+      // sidebar); only true multi-checkout groups take the repo label.
+      title:
+        projects.length > 1
+          ? deriveProjectGroupLabel({ representative, members: projects })
+          : representative.title,
       representative,
       projects,
       projectRefs: projectRefsByGroup.get(key) ?? [],
     };
+  });
+  return disambiguateHomeTitles(scopes, (scope) => scope.representative.workspaceRoot);
+}
+
+/** Distinct directories sharing a folder name get their parent folder
+ * appended so the rows stay tellable-apart (mirrors the web sidebar). */
+function disambiguateHomeTitles<T extends { readonly title: string }>(
+  entries: ReadonlyArray<T>,
+  workspaceRootOf: (entry: T) => string | undefined,
+): T[] {
+  const titleCounts = new Map<string, number>();
+  for (const entry of entries) {
+    titleCounts.set(entry.title, (titleCounts.get(entry.title) ?? 0) + 1);
+  }
+  return entries.map((entry) => {
+    if ((titleCounts.get(entry.title) ?? 0) < 2) {
+      return entry;
+    }
+    const root = workspaceRootOf(entry);
+    const segments = root?.split(/[\\/]/).filter((segment) => segment.length > 0) ?? [];
+    const parent = segments.length > 1 ? segments[segments.length - 2] : undefined;
+    return parent === undefined ? entry : { ...entry, title: `${entry.title} · ${parent}` };
   });
 }
 
@@ -343,7 +370,10 @@ export function buildHomeThreadGroups(input: {
       continue;
     }
 
-    const title = deriveProjectGroupLabel({ representative, members: group.projects });
+    const title =
+      group.projects.length > 1
+        ? deriveProjectGroupLabel({ representative, members: group.projects })
+        : representative.title;
     const groupMatches =
       query.length === 0 ||
       title.toLocaleLowerCase().includes(query) ||
@@ -404,7 +434,7 @@ export function buildHomeThreadGroups(input: {
   }
 
   return Arr.sort(
-    result,
+    disambiguateHomeTitles(result, (group) => group.representative.workspaceRoot),
     Order.mapInput(
       Order.Struct({
         timestamp: Order.flip(Order.Number),

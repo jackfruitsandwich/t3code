@@ -7,6 +7,9 @@ import { memo, useCallback, useEffect, useMemo, type ComponentProps } from "reac
 import { Platform, Pressable, useWindowDimensions, View } from "react-native";
 import type { SwipeableMethods } from "react-native-gesture-handler/ReanimatedSwipeable";
 
+import type { ForkFamilyRowMeta } from "@t3tools/client-runtime/state/thread-fork-family";
+
+import { SymbolView } from "../../components/AppSymbol";
 import { AppText as Text } from "../../components/AppText";
 import { ControlPillMenu } from "../../components/ControlPill";
 import { ProjectFavicon } from "../../components/ProjectFavicon";
@@ -243,6 +246,9 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
     state: "open" | "closed" | "merged" | null,
   ) => void;
   readonly projectCwd?: string | null;
+  /** Fork-family fold role for this row; null for plain rows. */
+  readonly forkFamily?: ForkFamilyRowMeta | null;
+  readonly onToggleForkFamily?: (familyId: string) => void;
   readonly simultaneousSwipeGesture?: ComponentProps<
     typeof ThreadSwipeable
   >["simultaneousWithExternalGesture"];
@@ -270,8 +276,42 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
   const drawerColor = useThemeColor("--color-drawer");
   const pressedBackgroundColor = useThemeColor("--color-subtle");
   const selectedBackgroundColor = useThemeColor("--color-user-bubble");
+  const iconColor = useThemeColor("--color-icon");
   const sidebarPane = props.pane === "sidebar";
   const selected = props.selected === true;
+
+  const forkFamily = props.forkFamily ?? null;
+  const isForkBranch = forkFamily?.role === "branch";
+  const onToggleForkFamily = props.onToggleForkFamily;
+  const handleToggleForkFamily = useCallback(() => {
+    if (forkFamily !== null) {
+      onToggleForkFamily?.(forkFamily.familyId);
+    }
+  }, [forkFamily, onToggleForkFamily]);
+  const forkBadge =
+    forkFamily?.role === "head" ? (
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel={`${forkFamily.expanded ? "Collapse" : "Show"} ${forkFamily.memberCount} branches`}
+        hitSlop={8}
+        onPress={handleToggleForkFamily}
+        className="flex-row items-center gap-1 rounded-md bg-subtle px-1.5 py-0.5"
+      >
+        <SymbolView
+          name="arrow.triangle.branch"
+          size={10}
+          tintColor={iconColor}
+          type="monochrome"
+        />
+        <Text className="text-xs tabular-nums text-foreground-muted">{forkFamily.memberCount}</Text>
+        <SymbolView
+          name={forkFamily.expanded ? "chevron.down" : "chevron.right"}
+          size={8}
+          tintColor={iconColor}
+          type="monochrome"
+        />
+      </Pressable>
+    ) : null;
 
   const status = resolveThreadListV2Status(thread);
   const statusLabel = STATUS_LABEL_BY_STATUS[status];
@@ -433,6 +473,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
             <ProviderIcon provider={props.providerDriver} size={14} />
           </View>
         ) : null}
+        {forkBadge}
       </View>
     </>
   );
@@ -505,8 +546,18 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
           className={cn(
             "min-h-[44px] flex-row items-center gap-2.5 py-2",
             sidebarPane ? "px-3" : "px-5",
+            isForkBranch && "border-l border-border-subtle",
+            isForkBranch && (sidebarPane ? "ml-3" : "ml-5"),
           )}
         >
+          {isForkBranch ? (
+            <SymbolView
+              name="arrow.turn.down.right"
+              size={11}
+              tintColor={iconColor}
+              type="monochrome"
+            />
+          ) : null}
           {props.project ? (
             <View className="opacity-40">
               <ProjectFavicon
@@ -526,6 +577,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
           >
             {thread.title}
           </Text>
+          {forkBadge}
           <Text
             className={cn(
               "text-sm tabular-nums",

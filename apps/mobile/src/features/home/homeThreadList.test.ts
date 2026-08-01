@@ -374,7 +374,7 @@ describe("buildHomeThreadGroups", () => {
     ).toHaveLength(2);
   });
 
-  it("uses the repository label for a singleton repository scope", () => {
+  it("keeps the folder title for a singleton repository scope", () => {
     const project = makeProject({
       environmentId: EnvironmentId.make("environment-1"),
       id: ProjectId.make("project-1"),
@@ -407,8 +407,10 @@ describe("buildHomeThreadGroups", () => {
       ],
     );
 
-    expect(scopes[0]?.title).toBe("codething-mvp");
-    expect(groups[0]?.title).toBe("codething-mvp");
+    // A lone checkout keeps its directory name (the CLI tools' mental model);
+    // the repo label is reserved for true multi-checkout groups.
+    expect(scopes[0]?.title).toBe("local-worktree-name");
+    expect(groups[0]?.title).toBe("local-worktree-name");
   });
 
   it("sorts the newest thread first regardless of snapshot order", () => {

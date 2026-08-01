@@ -15,7 +15,14 @@ import type {
 import { useAtomSet, useAtomValue } from "@effect/atom-react";
 import { AsyncResult } from "effect/unstable/reactivity";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ActivityIndicator, FlatList, Platform, Pressable, View } from "react-native";
+import {
+  ActivityIndicator,
+  FlatList,
+  LayoutAnimation,
+  Platform,
+  Pressable,
+  View,
+} from "react-native";
 import type { SwipeableMethods } from "react-native-gesture-handler/ReanimatedSwipeable";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useThemeColor } from "../../lib/useThemeColor";
@@ -506,6 +513,21 @@ export function HomeScreen(props: HomeScreenProps) {
     }
     return supported;
   }, [serverConfigs]);
+  const [expandedForkFamilies, setExpandedForkFamilies] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
+  const toggleForkFamily = useCallback((familyId: string) => {
+    LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
+    setExpandedForkFamilies((current) => {
+      const next = new Set(current);
+      if (next.has(familyId)) {
+        next.delete(familyId);
+      } else {
+        next.add(familyId);
+      }
+      return next;
+    });
+  }, []);
   const threadListV2Layout = useMemo(() => {
     if (!threadListV2Enabled)
       return { items: [], hiddenSettledCount: 0, snoozedCount: 0, nextSnoozeWakeAt: null };
@@ -522,9 +544,11 @@ export function HomeScreen(props: HomeScreenProps) {
       settledLimit: settledVisibleCount,
       now: `${nowMinute}:00.000Z`,
       snoozeNow: new Date().toISOString(),
+      expandedForkFamilyIds: expandedForkFamilies,
     });
   }, [
     changeRequestStateByKey,
+    expandedForkFamilies,
     nowMinute,
     snoozeWakeTick,
     settledVisibleCount,
@@ -639,6 +663,8 @@ export function HomeScreen(props: HomeScreenProps) {
           projectCwd={
             projectCwdByKey.get(scopedProjectKey(thread.environmentId, thread.projectId)) ?? null
           }
+          forkFamily={item.item.forkFamily ?? null}
+          onToggleForkFamily={toggleForkFamily}
           onSwipeableClose={handleSwipeableClose}
           onSwipeableWillOpen={handleSwipeableWillOpen}
         />
@@ -653,6 +679,7 @@ export function HomeScreen(props: HomeScreenProps) {
       handleUnsettleThread,
       projectByKey,
       projectCwdByKey,
+      toggleForkFamily,
       props.onArchiveThread,
       props.onDeletePendingTask,
       props.onSelectPendingTask,

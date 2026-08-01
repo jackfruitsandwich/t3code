@@ -1,5 +1,9 @@
 import { effectiveSettled, effectiveSnoozed } from "@t3tools/client-runtime/state/thread-settled";
 import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/shell";
+import {
+  foldForkFamilies,
+  type ForkFamilyRowMeta,
+} from "@t3tools/client-runtime/state/thread-fork-family";
 import type { EnvironmentId, ProjectId } from "@t3tools/contracts";
 
 import type { PendingNewTask } from "../../state/use-pending-new-tasks";
@@ -100,6 +104,8 @@ export interface ThreadListV2Item {
   /** First settled row after the card block draws the SETTLED divider. */
   readonly showSettledDivider: boolean;
   readonly isLast: boolean;
+  /** Fork-family fold role for this row; null/absent for plain rows. */
+  readonly forkFamily?: ForkFamilyRowMeta | null;
 }
 
 export interface ThreadListV2Layout {
@@ -202,6 +208,8 @@ export function buildThreadListV2Items(input: {
       second-precise, so classifying with the floored minute would hold a
       woken thread hidden for up to a minute. Defaults to `now`. */
   readonly snoozeNow?: string;
+  /** Fork families whose branches are revealed; others collapse to one row. */
+  readonly expandedForkFamilyIds?: ReadonlySet<string>;
 }): ThreadListV2Layout {
   const now = input.now ?? new Date().toISOString();
   const snoozeNow = input.snoozeNow ?? now;
@@ -251,19 +259,33 @@ export function buildThreadListV2Items(input: {
     }
   }
 
-  const orderedActive = sortThreadsForListV2(active);
-  const orderedSettled = [...settled].sort(
-    (left, right) =>
-      firstValidTimestampMs(right.latestUserMessageAt, right.updatedAt) -
-      firstValidTimestampMs(left.latestUserMessageAt, left.updatedAt),
+  // Fork families fold to one row per block (expanding in place), so the
+  // settled limit and hidden count both operate on folded rows.
+  const expandedForkFamilyIds = input.expandedForkFamilyIds ?? new Set<string>();
+  const foldedActive = foldForkFamilies(sortThreadsForListV2(active), expandedForkFamilyIds);
+  const foldedSettled = foldForkFamilies(
+    [...settled].sort(
+      (left, right) =>
+        firstValidTimestampMs(right.latestUserMessageAt, right.updatedAt) -
+        firstValidTimestampMs(left.latestUserMessageAt, left.updatedAt),
+    ),
+    expandedForkFamilyIds,
   );
   const settledLimit = input.settledLimit ?? Number.POSITIVE_INFINITY;
   const visibleSettled =
-    orderedSettled.length > settledLimit ? orderedSettled.slice(0, settledLimit) : orderedSettled;
+    foldedSettled.rows.length > settledLimit
+      ? foldedSettled.rows.slice(0, settledLimit)
+      : foldedSettled.rows;
 
   const items: ThreadListV2Item[] = [];
-  for (const thread of orderedActive) {
-    items.push({ thread, variant: "card", showSettledDivider: false, isLast: false });
+  for (const thread of foldedActive.rows) {
+    items.push({
+      thread,
+      variant: "card",
+      showSettledDivider: false,
+      isLast: false,
+      forkFamily: foldedActive.metaByThreadId.get(thread.id) ?? null,
+    });
   }
   for (const [index, thread] of visibleSettled.entries()) {
     items.push({
@@ -271,6 +293,7 @@ export function buildThreadListV2Items(input: {
       variant: "slim",
       showSettledDivider: index === 0,
       isLast: false,
+      forkFamily: foldedSettled.metaByThreadId.get(thread.id) ?? null,
     });
   }
   const last = items.at(-1);
@@ -279,7 +302,7 @@ export function buildThreadListV2Items(input: {
   }
   return {
     items,
-    hiddenSettledCount: orderedSettled.length - visibleSettled.length,
+    hiddenSettledCount: foldedSettled.rows.length - visibleSettled.length,
     snoozedCount,
     nextSnoozeWakeAt,
   };

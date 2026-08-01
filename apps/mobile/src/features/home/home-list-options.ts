@@ -34,7 +34,10 @@ export interface ResolvedHomeListOptions extends HomeListOptions {
 export function resolveProjectGroupingMode(
   projectGroupingEnabled: boolean | undefined,
 ): SidebarProjectGroupingMode {
-  return projectGroupingEnabled === false ? "separate" : "repository";
+  // Default matches the web sidebar: one row per directory, the mental model
+  // of the CLI tools whose sessions the fork imports. Repository grouping is
+  // the explicit opt-in.
+  return projectGroupingEnabled === true ? "repository" : "separate";
 }
 
 export const PROJECT_SORT_OPTIONS: ReadonlyArray<{

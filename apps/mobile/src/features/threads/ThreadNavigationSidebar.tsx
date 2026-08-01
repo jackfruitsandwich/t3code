@@ -9,7 +9,15 @@ import { useAtomValue } from "@effect/atom-react";
 import type { EnvironmentId } from "@t3tools/contracts";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type { LayoutChangeEvent, NativeScrollEvent, NativeSyntheticEvent } from "react-native";
-import { Platform, Pressable, StyleSheet, TextInput, View, useColorScheme } from "react-native";
+import {
+  LayoutAnimation,
+  Platform,
+  Pressable,
+  StyleSheet,
+  TextInput,
+  View,
+  useColorScheme,
+} from "react-native";
 import { Gesture, GestureDetector } from "react-native-gesture-handler";
 import type { SwipeableMethods } from "react-native-gesture-handler/ReanimatedSwipeable";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
@@ -424,6 +432,21 @@ function ThreadNavigationSidebarPane(
     }
     return supported;
   }, [serverConfigs]);
+  const [expandedForkFamilies, setExpandedForkFamilies] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
+  const toggleForkFamily = useCallback((familyId: string) => {
+    LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
+    setExpandedForkFamilies((current) => {
+      const next = new Set(current);
+      if (next.has(familyId)) {
+        next.delete(familyId);
+      } else {
+        next.add(familyId);
+      }
+      return next;
+    });
+  }, []);
   const threadListV2Layout = useMemo(() => {
     if (!threadListV2Enabled)
       return { items: [], hiddenSettledCount: 0, snoozedCount: 0, nextSnoozeWakeAt: null };
@@ -438,9 +461,11 @@ function ThreadNavigationSidebarPane(
       settledLimit: settledVisibleCount,
       now: `${nowMinute}:00.000Z`,
       snoozeNow: new Date().toISOString(),
+      expandedForkFamilyIds: expandedForkFamilies,
     });
   }, [
     changeRequestStateByKey,
+    expandedForkFamilies,
     nowMinute,
     snoozeWakeTick,
     options.selectedEnvironmentId,
@@ -704,7 +729,10 @@ function ThreadNavigationSidebarPane(
           previous.key === item.key &&
           previous.item.thread === item.item.thread &&
           previous.item.variant === item.item.variant &&
-          previous.item.showSettledDivider === item.item.showSettledDivider
+          previous.item.showSettledDivider === item.item.showSettledDivider &&
+          previous.item.forkFamily?.role === item.item.forkFamily?.role &&
+          previous.item.forkFamily?.expanded === item.item.forkFamily?.expanded &&
+          previous.item.forkFamily?.memberCount === item.item.forkFamily?.memberCount
         );
       }
       if (previous.type === "v2-show-more" && item.type === "v2-show-more") {
@@ -810,6 +838,8 @@ function ThreadNavigationSidebarPane(
               onUnsettleThread={unsettleThread}
               onChangeRequestState={handleChangeRequestState}
               projectCwd={projectCwdByKey.get(scopeKey) ?? null}
+              forkFamily={item.item.forkFamily ?? null}
+              onToggleForkFamily={toggleForkFamily}
               onSwipeableClose={handleSwipeableClose}
               onSwipeableWillOpen={handleSwipeableWillOpen}
               simultaneousSwipeGesture={sidebarScrollGesture}
