@@ -35,6 +35,16 @@ const agentMessage = (text: string, timestamp = "2026-07-02T08:00:09.000Z") =>
     payload: { type: "agent_message", message: text },
   });
 
+const completedMessage = (type: "UserMessage" | "AgentMessage", text: string, timestamp: string) =>
+  line({
+    timestamp,
+    type: "event_msg",
+    payload: {
+      type: "item_completed",
+      item: { type, content: [{ type: "text", text }] },
+    },
+  });
+
 describe("parseCodexRolloutJsonl", () => {
   it("reads session meta and user/agent messages with line timestamps", () => {
     const parsed = parseCodexRolloutJsonl(
@@ -83,6 +93,23 @@ describe("parseCodexRolloutJsonl", () => {
 
     assert.equal(parsed.sessionId, SESSION_ID);
     assert.equal(parsed.title, "y".repeat(60));
+  });
+
+  it("reads Codex Desktop completed message items", () => {
+    const parsed = parseCodexRolloutJsonl(
+      sessionMeta({ source: "vscode", originator: "Codex Desktop" }) +
+        completedMessage("UserMessage", "Import this session", "2026-07-02T08:00:01.000Z") +
+        completedMessage("AgentMessage", "Imported.", "2026-07-02T08:00:09.000Z"),
+    );
+
+    assert.deepEqual(
+      parsed.messages.map(({ role, text }) => ({ role, text })),
+      [
+        { role: "user", text: "Import this session" },
+        { role: "assistant", text: "Imported." },
+      ],
+    );
+    assert.isTrue(isEligibleCliSession(parsed));
   });
 
   it("never throws on malformed lines and does not consume a partial tail", () => {
