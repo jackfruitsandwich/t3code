@@ -4,6 +4,7 @@ import {
   defaultInstanceIdForDriver,
   ProjectId,
   ProviderDriverKind,
+  ProviderInstanceId,
   ThreadId,
 } from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
@@ -256,6 +257,19 @@ it.live(
           ]),
         );
 
+        // Configured provider accounts have their own transcript namespaces.
+        // An equal session ID in another account must not suppress a local import.
+        const otherAccountThreadId = ThreadId.make("other-account-same-session");
+        yield* harness.sessionDirectory.upsert({
+          threadId: otherAccountThreadId,
+          provider: CODEX_PROVIDER,
+          providerInstanceId: ProviderInstanceId.make("codex-other-account"),
+          status: "stopped",
+          resumeCursor: { threadId: CODEX_SESSION_ID },
+          runtimePayload: { importForkSig: ["user-1"], marker: "untouched-other-account" },
+        });
+        const otherAccountBefore = yield* harness.sessionDirectory.getBinding(otherAccountThreadId);
+
         const importer = yield* makeImporter({ harness, claudeProjectsDir, codexSessionsDir });
         yield* importer.sweepNow();
 
@@ -343,6 +357,10 @@ it.live(
         const codexBinding = Option.getOrThrowWith(
           yield* harness.sessionDirectory.getBinding(codexThreadId),
           () => new Error("expected imported codex binding"),
+        );
+        assert.deepEqual(
+          yield* harness.sessionDirectory.getBinding(otherAccountThreadId),
+          otherAccountBefore,
         );
         assert.equal(codexBinding.provider, CODEX_PROVIDER);
         assert.deepEqual(codexBinding.resumeCursor, { threadId: CODEX_SESSION_ID });

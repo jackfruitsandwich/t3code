@@ -82,6 +82,12 @@ const IMPORT_EPOCH = 2;
 const CLAUDE_DRIVER = ProviderDriverKind.make("claudeAgent");
 const CODEX_DRIVER = ProviderDriverKind.make("codex");
 
+// This sweeper reads only the default Claude/Codex homes. Other configured
+// accounts may legitimately contain the same native session or message IDs.
+const belongsToScannedProviderHome = (binding: ProviderRuntimeBindingWithMetadata) =>
+  (binding.provider === CLAUDE_DRIVER || binding.provider === CODEX_DRIVER) &&
+  binding.providerInstanceId === defaultInstanceIdForDriver(binding.provider);
+
 const CHATS_PROJECT_TITLE = "Chats";
 const AUTOMATIONS_PROJECT_TITLE = "Automations";
 
@@ -1131,6 +1137,7 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
       }
       const nodes: FamilyNode[] = [];
       for (const binding of bindings) {
+        if (!belongsToScannedProviderHome(binding)) continue;
         const sig = readForkSignature(binding.runtimePayload);
         if (sig === undefined) {
           continue;
@@ -1234,6 +1241,7 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
       const bindingsBySource = new Map<string, ProviderRuntimeBindingWithMetadata>();
       const sigOwners = new Map<string, string>();
       for (const binding of bindings) {
+        if (!belongsToScannedProviderHome(binding)) continue;
         const cursor = readImportCursor(binding.runtimePayload);
         if (cursor !== undefined) {
           bindingsBySource.set(sourceKey(binding.provider, cursor.sourceSessionId), binding);
