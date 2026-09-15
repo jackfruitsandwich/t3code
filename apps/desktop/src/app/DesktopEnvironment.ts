@@ -13,7 +13,10 @@ import * as Path from "effect/Path";
 
 import * as DesktopAppSettings from "../settings/DesktopAppSettings.ts";
 import * as DesktopConfig from "./DesktopConfig.ts";
+import { resolveLinuxDesktopEntryName } from "./DesktopEarlyElectronStartup.ts";
+import { resolveDesktopBaseDir, resolveDesktopStateDir } from "./DesktopStatePaths.ts";
 import { isNightlyDesktopVersion } from "../updates/updateChannels.ts";
+import type { OtlpProtocol } from "@t3tools/shared/observability";
 
 export interface MakeDesktopEnvironmentInput {
   readonly dirname: string;
@@ -51,7 +54,16 @@ export class DesktopEnvironment extends Context.Service<
     readonly browserArtifactsDir: string;
     readonly rootDir: string;
     readonly appRoot: string;
+    // Root of the tree containing apps/server/dist and node_modules for the
+    // backend. Equals appRoot everywhere except packaged Windows, where the
+    // server tree ships as the resources/server.asar sidecar (see
+    // scripts/build-desktop-artifact.ts) that the asar-aware
+    // ELECTRON_RUN_AS_NODE primary reads in place and the WSL backend
+    // extracts on demand (see DesktopWslServerTree).
+    readonly serverRoot: string;
     readonly backendEntryPath: string;
+    // Built web client the packaged renderer is served from over t3code://app.
+    readonly clientAssetsDir: string;
     readonly backendCwd: string;
     readonly preloadPath: string;
     readonly appUpdateYmlPath: string;
@@ -61,18 +73,21 @@ export class DesktopEnvironment extends Context.Service<
     readonly commitHashOverride: Option.Option<string>;
     readonly otlpTracesUrl: Option.Option<string>;
     readonly otlpExportIntervalMs: number;
+    readonly otlpHeaders: Option.Option<Record<string, string>>;
+    readonly otlpProtocol: OtlpProtocol;
     readonly branding: DesktopAppBranding;
     readonly displayName: string;
     readonly appUserModelId: string;
     readonly linuxDesktopEntryName: string;
     readonly linuxWmClass: string;
+    readonly linuxApplicationsDir: string;
+    readonly appImagePath: Option.Option<string>;
     readonly userDataDirName: string;
     readonly legacyUserDataDirName: string;
     readonly defaultDesktopSettings: DesktopAppSettings.DesktopSettings;
     readonly runtimeInfo: DesktopRuntimeInfo;
     readonly resolvePickFolderDefaultPath: (rawOptions: unknown) => Option.Option<string>;
     readonly resolveResourcePathCandidates: (fileName: string) => readonly string[];
-    readonly developmentDockIconPath: string;
   }
 >()("@t3tools/desktop/app/DesktopEnvironment") {}
 
@@ -89,7 +104,7 @@ function resolveDesktopAppStageLabel(input: {
   return isNightlyDesktopVersion(input.appVersion) ? "Nightly" : "Alpha";
 }
 
-function resolveDesktopAppBranding(input: {
+export function resolveDesktopAppBranding(input: {
   readonly isDevelopment: boolean;
   readonly appVersion: string;
 }): DesktopAppBranding {
@@ -147,21 +162,34 @@ const make = Effect.fn("desktop.environment.make")(function* (
       : input.platform === "darwin"
         ? path.join(homeDirectory, "Library", "Application Support")
         : Option.getOrElse(config.xdgConfigHome, () => path.join(homeDirectory, ".config"));
-  const configuredBaseDir = config.t3Home;
-  const baseDir = Option.getOrElse(configuredBaseDir, () => path.join(homeDirectory, ".t3"));
+  const baseDir = resolveDesktopBaseDir({
+    homeDirectory,
+    joinPath: path.join,
+    t3Home: config.t3Home,
+  });
   const rootDir = path.resolve(input.dirname, "../../..");
   const appRoot = input.isPackaged ? input.appPath : rootDir;
+  const serverRoot =
+    input.isPackaged && input.platform === "win32"
+      ? path.join(input.resourcesPath, "server.asar")
+      : appRoot;
   const branding = resolveDesktopAppBranding({
     isDevelopment,
     appVersion: input.appVersion,
   });
   const displayName = branding.displayName;
-  const stateDir = path.join(
+  const stateDir = resolveDesktopStateDir({
     baseDir,
-    isDevelopment && Option.isNone(configuredBaseDir) ? "dev" : "userdata",
-  );
+    isDevelopment,
+    joinPath: path.join,
+    t3Home: config.t3Home,
+  });
   const userDataDirName = isDevelopment ? "t3code-dev" : "t3code";
   const legacyUserDataDirName = isDevelopment ? "T3 Code (Dev)" : "T3 Code (Alpha)";
+  const linuxApplicationsDir = path.join(
+    Option.getOrElse(config.xdgDataHome, () => path.join(homeDirectory, ".local", "share")),
+    "applications",
+  );
   const resourcesPath = input.resourcesPath;
 
   return DesktopEnvironment.of({
@@ -186,7 +214,9 @@ const make = Effect.fn("desktop.environment.make")(function* (
     browserArtifactsDir: path.join(stateDir, "browser-artifacts"),
     rootDir,
     appRoot,
-    backendEntryPath: path.join(appRoot, "apps/server/dist/bin.mjs"),
+    serverRoot,
+    backendEntryPath: path.join(serverRoot, "apps/server/dist/bin.mjs"),
+    clientAssetsDir: path.join(serverRoot, "apps/server/dist/client"),
     backendCwd: input.isPackaged ? homeDirectory : appRoot,
     preloadPath: path.join(input.dirname, "preload.cjs"),
     appUpdateYmlPath: input.isPackaged
@@ -198,13 +228,17 @@ const make = Effect.fn("desktop.environment.make")(function* (
     commitHashOverride: config.commitHashOverride,
     otlpTracesUrl: config.otlpTracesUrl,
     otlpExportIntervalMs: config.otlpExportIntervalMs,
+    otlpHeaders: config.otlpHeaders,
+    otlpProtocol: config.otlpProtocol,
     branding,
     displayName,
     appUserModelId: Option.getOrElse(config.appUserModelIdOverride, () =>
       isDevelopment ? "com.t3tools.t3code.dev" : "com.t3tools.t3code",
     ),
-    linuxDesktopEntryName: isDevelopment ? "t3code-dev.desktop" : "t3code.desktop",
+    linuxDesktopEntryName: resolveLinuxDesktopEntryName(isDevelopment),
     linuxWmClass: isDevelopment ? "t3code-dev" : "t3code",
+    linuxApplicationsDir,
+    appImagePath: config.appImagePath,
     userDataDirName,
     legacyUserDataDirName,
     defaultDesktopSettings: DesktopAppSettings.resolveDefaultDesktopSettings(input.appVersion),
@@ -244,7 +278,6 @@ const make = Effect.fn("desktop.environment.make")(function* (
       path.join(resourcesPath, "resources", fileName),
       path.join(resourcesPath, fileName),
     ],
-    developmentDockIconPath: path.join(rootDir, "assets", "dev", "blueprint-macos-1024.png"),
   });
 });
 

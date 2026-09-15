@@ -1,3 +1,4 @@
+import { forkParked } from "../../serverActivation.ts";
 /**
  * SessionImporter - Background import of provider-native CLI sessions.
  *
@@ -84,12 +85,9 @@ const CODEX_DRIVER = ProviderDriverKind.make("codex");
 const CHATS_PROJECT_TITLE = "Chats";
 const AUTOMATIONS_PROJECT_TITLE = "Automations";
 
-class SessionImportError extends Schema.TaggedErrorClass<SessionImportError>()(
-  "SessionImportError",
-  {
-    detail: Schema.String,
-  },
-) {}
+class SessionImportError extends Schema.TaggedError<SessionImportError>()("SessionImportError", {
+  detail: Schema.String,
+}) {}
 
 export interface SessionImporterLiveOptions {
   /** Directory containing Claude Code `<project>/<session uuid>.jsonl` files. */
@@ -535,6 +533,7 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         threadId,
         projectId,
         title: parsed.title ?? "Imported session",
+        historyImport: true,
         modelSelection: {
           instanceId,
           model: DEFAULT_MODEL_BY_PROVIDER[driver] ?? DEFAULT_MODEL,
@@ -565,8 +564,8 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         cwd: parsed.cwd !== undefined ? path.resolve(expandHomePath(parsed.cwd)) : workspaceRoot,
         ...(input.launchClass !== undefined ? { launchClass: input.launchClass } : {}),
       });
-      // "stopped" keeps the thread settled while still giving the sidebar a
-      // provider badge; "starting"/"running" would un-settle it.
+      // Keep a provider badge without waking a session. The server's
+      // settlement reactor handles age-based placement under the user's settings.
       yield* engine.dispatch({
         type: "thread.session.set",
         commandId: importCommandId(driver, sessionId, "session", idVariant),
@@ -1347,7 +1346,7 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
           return;
         }
 
-        yield* Effect.forkScoped(
+        yield* forkParked(
           guardedSweep.pipe(Effect.repeat(Schedule.spaced(Duration.millis(sweepIntervalMs)))),
         );
 

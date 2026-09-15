@@ -13,6 +13,7 @@ import {
   RelayEnvironmentMintResponse,
   RelayEnvironmentMintResponseProofPayload,
   RelayCloudMintCredentialProofPayload,
+  RelayEnvironmentConnectNotAuthorizedReason,
   type RelayEnvironmentConnectResponse,
   type RelayEnvironmentStatusResponse,
 } from "@t3tools/contracts/relay";
@@ -44,21 +45,8 @@ import * as ManagedEndpointAllocations from "./ManagedEndpointAllocations.ts";
 import * as RelayConfiguration from "../Config.ts";
 import { isManagedEndpointHostname } from "../deploymentConfig.ts";
 
-export const EnvironmentConnectNotAuthorizedReason = Schema.Literals([
-  "client_proof_key_thumbprint_missing",
-  "environment_link_not_found",
-  "endpoint_provider_not_managed",
-  "managed_endpoint_allocation_not_found",
-  "managed_endpoint_base_domain_not_configured",
-  "managed_endpoint_allocation_not_ready",
-  "managed_endpoint_hostname_invalid",
-  "managed_endpoint_mismatch",
-]);
-export type EnvironmentConnectNotAuthorizedReason =
-  typeof EnvironmentConnectNotAuthorizedReason.Type;
-
 function environmentConnectNotAuthorizedReasonMessage(
-  reason: EnvironmentConnectNotAuthorizedReason,
+  reason: RelayEnvironmentConnectNotAuthorizedReason,
 ): string {
   switch (reason) {
     case "client_proof_key_thumbprint_missing":
@@ -80,12 +68,12 @@ function environmentConnectNotAuthorizedReasonMessage(
   }
 }
 
-export class EnvironmentConnectNotAuthorized extends Schema.TaggedErrorClass<EnvironmentConnectNotAuthorized>()(
+export class EnvironmentConnectNotAuthorized extends Schema.TaggedError<EnvironmentConnectNotAuthorized>()(
   "EnvironmentConnectNotAuthorized",
   {
     environmentId: Schema.String,
     operation: Schema.Literals(["connect", "status"]),
-    reason: EnvironmentConnectNotAuthorizedReason,
+    reason: RelayEnvironmentConnectNotAuthorizedReason,
   },
 ) {
   override get message(): string {
@@ -93,7 +81,7 @@ export class EnvironmentConnectNotAuthorized extends Schema.TaggedErrorClass<Env
   }
 }
 
-export class EnvironmentMintRequestFailed extends Schema.TaggedErrorClass<EnvironmentMintRequestFailed>()(
+export class EnvironmentMintRequestFailed extends Schema.TaggedError<EnvironmentMintRequestFailed>()(
   "EnvironmentMintRequestFailed",
   {
     environmentId: Schema.String,
@@ -106,7 +94,7 @@ export class EnvironmentMintRequestFailed extends Schema.TaggedErrorClass<Enviro
   }
 }
 
-export class EnvironmentMintRequestTimedOut extends Schema.TaggedErrorClass<EnvironmentMintRequestTimedOut>()(
+export class EnvironmentMintRequestTimedOut extends Schema.TaggedError<EnvironmentMintRequestTimedOut>()(
   "EnvironmentMintRequestTimedOut",
   {
     environmentId: Schema.String,
@@ -118,7 +106,7 @@ export class EnvironmentMintRequestTimedOut extends Schema.TaggedErrorClass<Envi
   }
 }
 
-export class EnvironmentMintResponseInvalid extends Schema.TaggedErrorClass<EnvironmentMintResponseInvalid>()(
+export class EnvironmentMintResponseInvalid extends Schema.TaggedError<EnvironmentMintResponseInvalid>()(
   "EnvironmentMintResponseInvalid",
   {
     environmentId: Schema.String,

@@ -2,6 +2,7 @@ import type {
   EnvironmentProject,
   EnvironmentThreadShell,
 } from "@t3tools/client-runtime/state/shell";
+import { threadSearchMatchKey } from "@t3tools/client-runtime/state/thread-search";
 import { EnvironmentId, ProjectId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
@@ -35,6 +36,7 @@ function makeThread(
     interactionMode: "default",
     branch: null,
     worktreePath: null,
+    pullRequests: [],
     latestTurn: null,
     createdAt: "2026-06-01T00:00:00.000Z",
     updatedAt: "2026-06-01T00:00:00.000Z",
@@ -374,7 +376,7 @@ describe("buildHomeThreadGroups", () => {
     ).toHaveLength(2);
   });
 
-  it("keeps the folder title for a singleton repository scope", () => {
+  it("uses the physical project title for a singleton scope", () => {
     const project = makeProject({
       environmentId: EnvironmentId.make("environment-1"),
       id: ProjectId.make("project-1"),
@@ -407,8 +409,6 @@ describe("buildHomeThreadGroups", () => {
       ],
     );
 
-    // A lone checkout keeps its directory name (the CLI tools' mental model);
-    // the repo label is reserved for true multi-checkout groups.
     expect(scopes[0]?.title).toBe("local-worktree-name");
     expect(groups[0]?.title).toBe("local-worktree-name");
   });
@@ -566,10 +566,16 @@ describe("buildHomeThreadGroups", () => {
     );
 
     expect(buildGroups(projects, threads, { projectGroupingMode: "repository" })).toHaveLength(1);
-    expect(buildGroups(projects, threads, { projectGroupingMode: "repository_path" })).toHaveLength(
-      2,
-    );
-    expect(buildGroups(projects, threads, { projectGroupingMode: "separate" })).toHaveLength(2);
+    expect(
+      buildGroups(projects, threads, { projectGroupingMode: "repository_path" }).map(
+        (group) => group.title,
+      ),
+    ).toEqual(["Mobile", "Web"]);
+    expect(
+      buildGroups(projects, threads, { projectGroupingMode: "separate" }).map(
+        (group) => group.title,
+      ),
+    ).toEqual(["Mobile", "Web"]);
   });
 
   it("default view shows only threads from the last 5 days", () => {
@@ -608,6 +614,43 @@ describe("buildHomeThreadGroups", () => {
     expect(group?.recentThreads.map((thread) => thread.id)).toEqual(["recent-1", "recent-2"]);
     // ...while full history stays available for the expanded view.
     expect(group?.threads.map((thread) => thread.id)).toEqual(["recent-1", "recent-2", "old"]);
+  });
+
+  it("keeps an old thread in the default view while a message waits in its outbox", () => {
+    const environmentId = EnvironmentId.make("environment-1");
+    const project = makeProject({
+      environmentId,
+      id: ProjectId.make("project-1"),
+      title: "T3 Code",
+    });
+    const threads = [
+      makeThread({
+        environmentId,
+        id: ThreadId.make("recent"),
+        projectId: project.id,
+        title: "Today",
+        updatedAt: "2026-06-28T00:00:00.000Z",
+      }),
+      makeThread({
+        environmentId,
+        id: ThreadId.make("old-queued"),
+        projectId: project.id,
+        title: "Two weeks ago, follow-up queued offline",
+        updatedAt: "2026-06-14T00:00:00.000Z",
+      }),
+      makeThread({
+        environmentId,
+        id: ThreadId.make("old"),
+        projectId: project.id,
+        title: "Two weeks ago",
+        updatedAt: "2026-06-13T00:00:00.000Z",
+      }),
+    ];
+
+    const group = buildGroups([project], threads, {
+      queuedThreadKeys: new Set([`${environmentId}:old-queued`]),
+    })[0];
+    expect(group?.recentThreads.map((thread) => thread.id)).toEqual(["recent", "old-queued"]);
   });
 
   it("falls back to the most recent 3 threads when none are within 5 days", () => {
@@ -661,6 +704,33 @@ describe("buildHomeThreadGroups", () => {
     expect(group?.recentThreads.map((thread) => thread.id)).toEqual(
       group?.threads.map((thread) => thread.id),
     );
+  });
+
+  it("includes a thread matched by message content", () => {
+    const environmentId = EnvironmentId.make("environment-1");
+    const project = makeProject({
+      environmentId,
+      id: ProjectId.make("project-1"),
+      title: "T3 Code",
+    });
+    const thread = makeThread({
+      environmentId,
+      id: ThreadId.make("thread-content"),
+      projectId: project.id,
+      title: "Unrelated title",
+    });
+
+    const groups = buildGroups([project], [thread], {
+      searchQuery: "relay reconnect",
+      matchedThreadKeys: new Set([
+        threadSearchMatchKey({
+          environmentId,
+          threadId: thread.id,
+        }),
+      ]),
+    });
+
+    expect(groups[0]?.threads.map((candidate) => candidate.id)).toEqual(["thread-content"]);
   });
 
   it("targets quick new threads at the group member with the newest thread", () => {

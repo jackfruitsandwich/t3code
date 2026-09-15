@@ -15,6 +15,7 @@ import * as AzureDevOpsSourceControlProvider from "./AzureDevOpsSourceControlPro
 import * as BitbucketSourceControlProvider from "./BitbucketSourceControlProvider.ts";
 import * as GitHubSourceControlProvider from "./GitHubSourceControlProvider.ts";
 import * as GitLabSourceControlProvider from "./GitLabSourceControlProvider.ts";
+import * as ForgejoSourceControlProvider from "./ForgejoSourceControlProvider.ts";
 import * as SourceControlProvider from "./SourceControlProvider.ts";
 import {
   probeSourceControlProvider,
@@ -50,6 +51,7 @@ export class SourceControlProviderRegistry extends Context.Service<
     >;
     readonly resolveHandle: (input: {
       readonly cwd: string;
+      readonly context?: SourceControlProvider.SourceControlProviderContext;
     }) => Effect.Effect<SourceControlProviderHandle, SourceControlProviderError>;
     readonly resolve: (input: {
       readonly cwd: string;
@@ -193,6 +195,7 @@ function bindProviderContext(
   });
 }
 
+/** @public Service construction is part of the canonical Effect module API. */
 export const makeWithProviders = Effect.fn("makeSourceControlProviderRegistryWithProviders")(
   function* (registrations: ReadonlyArray<SourceControlProviderRegistration>) {
     const config = yield* ServerConfig;
@@ -254,7 +257,15 @@ export const makeWithProviders = Effect.fn("makeSourceControlProviderRegistryWit
     });
 
     const resolveHandle: SourceControlProviderRegistry["Service"]["resolveHandle"] = (input) =>
-      Cache.get(providerContextCache, input.cwd).pipe(
+      (input.context === undefined
+        ? Cache.get(providerContextCache, input.cwd)
+        : refineUnknownRemoteProvider({
+            specs: discoverySpecs,
+            process,
+            cwd: input.cwd,
+            context: input.context,
+          })
+      ).pipe(
         Effect.map((context) => {
           const kind = context?.provider.kind ?? "unknown";
           const provider = providers.get(kind) ?? unsupportedProvider(kind);
@@ -286,6 +297,8 @@ export const makeWithProviders = Effect.fn("makeSourceControlProviderRegistryWit
 export const make = Effect.gen(function* () {
   const github = yield* GitHubSourceControlProvider.make;
   const gitlab = yield* GitLabSourceControlProvider.make;
+  const forgejo = yield* ForgejoSourceControlProvider.make;
+  const forgejoDiscovery = yield* ForgejoSourceControlProvider.makeDiscovery;
   const bitbucket = yield* BitbucketSourceControlProvider.make;
   const bitbucketDiscovery = yield* BitbucketSourceControlProvider.makeDiscovery;
   const azureDevOps = yield* AzureDevOpsSourceControlProvider.make;
@@ -310,6 +323,7 @@ export const make = Effect.gen(function* () {
       provider: bitbucket,
       discovery: bitbucketDiscovery,
     },
+    { kind: "forgejo", provider: forgejo, discovery: forgejoDiscovery },
   ]);
 });
 

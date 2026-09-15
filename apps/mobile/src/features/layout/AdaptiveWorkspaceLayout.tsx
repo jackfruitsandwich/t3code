@@ -22,7 +22,12 @@ import {
   type ReactNode,
 } from "react";
 import { useWindowDimensions, View } from "react-native";
-import Animated, { useAnimatedStyle, useSharedValue, withTiming } from "react-native-reanimated";
+import Animated, {
+  useAnimatedStyle,
+  useDerivedValue,
+  useSharedValue,
+  withTiming,
+} from "react-native-reanimated";
 import { AsyncResult } from "effect/unstable/reactivity";
 
 import {
@@ -38,13 +43,20 @@ import { resolveThreadSelectionNavigationAction } from "../../lib/adaptive-navig
 import { scopedThreadKey } from "../../lib/scopedEntities";
 import { mobilePreferencesAtom } from "../../state/preferences";
 import {
+  DEFAULT_MOBILE_PROJECT_GROUPING_SETTINGS,
+  resolveMobileProjectGroupingSettings,
+} from "../../state/project-grouping";
+import {
   parseActiveThreadPath,
   useHardwareKeyboardCommand,
 } from "../keyboard/hardwareKeyboardCommands";
-import { HomeListOptionsProvider, resolveProjectGroupingMode } from "../home/home-list-options";
+import { AndroidHomeFabLayout } from "../home/AndroidHomeFab";
+import { HomeListOptionsProvider } from "../home/home-list-options";
+import { useAppearancePreferences } from "../settings/appearance/AppearancePreferencesProvider";
 import { ThreadNavigationSidebar } from "../threads/ThreadNavigationSidebar";
 import { WORKSPACE_PANE_TIMING } from "./workspace-pane-animation";
 import { WorkspaceInspectorPane } from "./workspace-inspector-pane";
+import { WorkspaceContentWidthContext } from "./workspace-content-width";
 
 interface AdaptiveWorkspaceContextValue {
   readonly layout: Layout;
@@ -190,15 +202,17 @@ export function AdaptiveWorkspaceLayout(props: {
   const preferencesResult = useAtomValue(mobilePreferencesAtom);
   if (!AsyncResult.isSuccess(preferencesResult)) {
     return AsyncResult.isFailure(preferencesResult) ? (
-      <AdaptiveWorkspaceLayoutContent {...props} projectGroupingMode="repository" />
+      <AdaptiveWorkspaceLayoutContent
+        {...props}
+        projectGroupingMode={DEFAULT_MOBILE_PROJECT_GROUPING_SETTINGS.sidebarProjectGroupingMode}
+      />
     ) : null;
   }
+  const groupingSettings = resolveMobileProjectGroupingSettings(preferencesResult.value);
   return (
     <AdaptiveWorkspaceLayoutContent
       {...props}
-      projectGroupingMode={resolveProjectGroupingMode(
-        preferencesResult.value.projectGroupingEnabled,
-      )}
+      projectGroupingMode={groupingSettings.sidebarProjectGroupingMode}
     />
   );
 }
@@ -212,6 +226,7 @@ function AdaptiveWorkspaceLayoutContent(
   },
 ) {
   const projectGroupingMode = props.projectGroupingMode;
+  const { materialYouStyleLayoutActive } = useAppearancePreferences();
   const { width, height } = useWindowDimensions();
   const pathname = props.pathname;
   const navigation = useNavigation();
@@ -423,14 +438,39 @@ function AdaptiveWorkspaceLayoutContent(
   );
 
   const handleOpenSettings = useCallback(() => {
-    navigation.navigate("SettingsSheet", { screen: "Settings" });
+    navigation.navigate("SettingsSheet", {
+      screen: "SettingsContent",
+      params: { screen: "Settings" },
+    });
+  }, [navigation]);
+
+  const handleStartNewTask = useCallback(() => {
+    navigation.navigate("NewTaskSheet", { screen: "NewTask" });
   }, [navigation]);
 
   // Minted here (root stack navigation) so the sidebar pane stays free of
   // navigation hooks — on iOS it renders inside an independent nav tree.
   const handleOpenEnvironmentSettings = useCallback(() => {
-    navigation.navigate("SettingsSheet", { screen: "SettingsEnvironments" });
+    navigation.navigate("SettingsSheet", {
+      screen: "SettingsContent",
+      params: { screen: "SettingsEnvironments" },
+    });
   }, [navigation]);
+
+  const handleNewThreadOnBranch = useCallback(
+    (thread: EnvironmentThreadShell) => {
+      navigation.navigate("NewTaskSheet", {
+        screen: "NewTaskDraft",
+        params: {
+          environmentId: String(thread.environmentId),
+          projectId: String(thread.projectId),
+          branch: thread.branch,
+          worktreePath: thread.worktreePath,
+        },
+      });
+    },
+    [navigation],
+  );
 
   const handleNewThreadInProject = useCallback(
     (project: EnvironmentProject) => {
@@ -471,6 +511,10 @@ function AdaptiveWorkspaceLayoutContent(
   const contentSettledWidth = layout.usesSplitView
     ? Math.max(0, panes.contentPaneWidth - inspectorColumnTargetWidth)
     : null;
+  const renderedInspectorWidth = useSharedValue(inspectorColumnTargetWidth);
+  const renderedContentWidth = useDerivedValue(() =>
+    Math.max(0, width - renderedSidebarWidth.value - renderedInspectorWidth.value),
+  );
 
   const handleSelectThread = useCallback(
     (thread: EnvironmentThreadShell) => {
@@ -516,31 +560,48 @@ function AdaptiveWorkspaceLayoutContent(
               pointerEvents={panes.primarySidebarVisible ? "auto" : "none"}
               style={sidebarAnimatedStyle}
             >
-              <ThreadNavigationSidebar
-                width={layout.listPaneWidth}
-                visible={panes.primarySidebarVisible}
-                onRequestVisibility={revealPrimarySidebar}
-                selectedThreadKey={selectedThreadKey}
-                onOpenSettings={handleOpenSettings}
-                onOpenEnvironmentSettings={handleOpenEnvironmentSettings}
-                onNewThreadInProject={handleNewThreadInProject}
-                onSelectThread={handleSelectThread}
-                onSearchQueryChange={setPrimarySidebarSearchQuery}
-                searchQuery={primarySidebarSearchQuery}
-              />
+              <View className="flex-1" style={{ width: layout.listPaneWidth }}>
+                <AndroidHomeFabLayout onStartNewTask={handleStartNewTask}>
+                  <ThreadNavigationSidebar
+                    width={layout.listPaneWidth}
+                    visible={panes.primarySidebarVisible}
+                    onRequestVisibility={revealPrimarySidebar}
+                    selectedThreadKey={selectedThreadKey}
+                    onOpenSettings={handleOpenSettings}
+                    onOpenEnvironmentSettings={handleOpenEnvironmentSettings}
+                    onNewThreadInProject={handleNewThreadInProject}
+                    onNewThreadOnBranch={handleNewThreadOnBranch}
+                    onSelectThread={handleSelectThread}
+                    onSearchQueryChange={setPrimarySidebarSearchQuery}
+                    searchQuery={primarySidebarSearchQuery}
+                  />
+                </AndroidHomeFabLayout>
+              </View>
             </Animated.View>
           ) : null}
-          <View className="flex-1 overflow-hidden bg-screen" collapsable={false}>
+          <View
+            className={
+              materialYouStyleLayoutActive
+                ? "flex-1 overflow-hidden bg-header"
+                : "flex-1 overflow-hidden bg-screen"
+            }
+            collapsable={false}
+          >
             <View
               collapsable={false}
               style={
                 contentSettledWidth !== null ? { flex: 1, width: contentSettledWidth } : { flex: 1 }
               }
             >
-              {props.children}
+              <WorkspaceContentWidthContext
+                value={layout.usesSplitView ? renderedContentWidth : null}
+              >
+                {props.children}
+              </WorkspaceContentWidthContext>
             </View>
           </View>
           <WorkspaceInspectorPane
+            renderedInspectorWidth={renderedInspectorWidth}
             active={workspaceInspector?.active ?? false}
             panes={panes}
             renderInspector={workspaceInspector?.render}

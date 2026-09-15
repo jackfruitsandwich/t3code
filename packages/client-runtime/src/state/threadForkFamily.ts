@@ -28,8 +28,20 @@ export interface FoldedForkFamilies<T> {
 
 interface ForkFamilyThread {
   readonly id: string;
+  readonly environmentId?: string | undefined;
   readonly forkFamilyId?: string | null | undefined;
 }
+
+/** Thread IDs and imported family IDs are local to their environment. */
+export const forkFamilyThreadKey = (thread: ForkFamilyThread): string =>
+  thread.environmentId === undefined ? thread.id : `${thread.environmentId}:${thread.id}`;
+
+const familyKey = (thread: ForkFamilyThread): string | null =>
+  thread.forkFamilyId == null
+    ? null
+    : thread.environmentId === undefined
+      ? thread.forkFamilyId
+      : `${thread.environmentId}:${thread.forkFamilyId}`;
 
 /**
  * Fold `threads` (already in display order) so each multi-member fork family
@@ -39,21 +51,24 @@ interface ForkFamilyThread {
 export function foldForkFamilies<T extends ForkFamilyThread>(
   threads: ReadonlyArray<T>,
   expandedFamilyIds: ReadonlySet<string>,
+  selectedThreadKey?: string | null,
 ): FoldedForkFamilies<T> {
   const membersByFamily = new Map<string, T[]>();
   for (const thread of threads) {
-    const familyId = thread.forkFamilyId;
+    const familyId = familyKey(thread);
     if (familyId === undefined || familyId === null) {
       continue;
     }
-    membersByFamily.set(familyId, [...(membersByFamily.get(familyId) ?? []), thread]);
+    const members = membersByFamily.get(familyId);
+    if (members === undefined) membersByFamily.set(familyId, [thread]);
+    else members.push(thread);
   }
 
   const rows: T[] = [];
   const metaByThreadId = new Map<string, ForkFamilyRowMeta>();
   const foldedFamilies = new Set<string>();
   for (const thread of threads) {
-    const familyId = thread.forkFamilyId;
+    const familyId = familyKey(thread);
     const members =
       familyId === undefined || familyId === null ? undefined : membersByFamily.get(familyId);
     if (
@@ -69,9 +84,11 @@ export function foldForkFamilies<T extends ForkFamilyThread>(
       continue;
     }
     foldedFamilies.add(familyId);
-    const expanded = expandedFamilyIds.has(familyId);
+    const expanded =
+      expandedFamilyIds.has(familyId) ||
+      members.slice(1).some((member) => forkFamilyThreadKey(member) === selectedThreadKey);
     rows.push(thread);
-    metaByThreadId.set(thread.id, {
+    metaByThreadId.set(forkFamilyThreadKey(thread), {
       familyId,
       memberCount: members.length,
       role: "head",
@@ -79,11 +96,11 @@ export function foldForkFamilies<T extends ForkFamilyThread>(
     });
     if (expanded) {
       for (const member of members) {
-        if (member.id === thread.id) {
+        if (forkFamilyThreadKey(member) === forkFamilyThreadKey(thread)) {
           continue;
         }
         rows.push(member);
-        metaByThreadId.set(member.id, {
+        metaByThreadId.set(forkFamilyThreadKey(member), {
           familyId,
           memberCount: members.length,
           role: "branch",
@@ -93,4 +110,30 @@ export function foldForkFamilies<T extends ForkFamilyThread>(
     }
   }
   return { rows, metaByThreadId };
+}
+
+/** Page by conversations, keeping an expanded family and the selected family intact. */
+export function paginateForkFamilies<T extends ForkFamilyThread>(
+  folded: FoldedForkFamilies<T>,
+  limit: number,
+  selectedThreadKey?: string | null,
+): T[] {
+  const visibleKeys = new Set<string>();
+  const visibleFamilies = new Set<string>();
+  let roots = 0;
+  for (const thread of folded.rows) {
+    const key = forkFamilyThreadKey(thread);
+    const meta = folded.metaByThreadId.get(key);
+    const root = meta?.role !== "branch";
+    if ((root && roots < limit) || key === selectedThreadKey) {
+      visibleKeys.add(key);
+      if (meta) visibleFamilies.add(meta.familyId);
+    }
+    if (root) roots += 1;
+  }
+  return folded.rows.filter((thread) => {
+    const key = forkFamilyThreadKey(thread);
+    const meta = folded.metaByThreadId.get(key);
+    return visibleKeys.has(key) || (meta !== undefined && visibleFamilies.has(meta.familyId));
+  });
 }

@@ -15,6 +15,7 @@ import * as AzureDevOpsCli from "./AzureDevOpsCli.ts";
 import * as BitbucketApi from "./BitbucketApi.ts";
 import * as GitHubCli from "./GitHubCli.ts";
 import * as GitLabCli from "./GitLabCli.ts";
+import * as ForgejoCli from "./ForgejoCli.ts";
 import * as SourceControlProviderRegistry from "./SourceControlProviderRegistry.ts";
 
 const TEST_EPOCH = DateTime.makeUnsafe("1970-01-01T00:00:00.000Z");
@@ -86,12 +87,14 @@ function makeRegistry(input: {
   return SourceControlProviderRegistry.make.pipe(
     Effect.provide(
       Layer.mergeAll(
+        NodeServices.layer,
         registryLayer,
         processLayer,
         Layer.mock(AzureDevOpsCli.AzureDevOpsCli)({}),
         Layer.mock(BitbucketApi.BitbucketApi)({}),
         Layer.mock(GitHubCli.GitHubCli)({}),
         Layer.mock(GitLabCli.GitLabCli)({}),
+        Layer.mock(ForgejoCli.ForgejoCli)({ listLogins: () => Effect.succeed([]) }),
         ServerConfig.layerTest(process.cwd(), {
           prefix: "t3-source-control-registry-test-",
         }).pipe(Layer.provide(NodeServices.layer)),
@@ -200,6 +203,38 @@ self-hosted.example.test
     const provider = yield* registry.resolve({ cwd: "/repo" });
 
     assert.strictEqual(provider.kind, "gitlab");
+  }),
+);
+
+it.effect("refines the caller-selected remote instead of choosing another configured remote", () =>
+  Effect.gen(function* () {
+    const registry = yield* makeRegistry({
+      remotes: [{ name: "origin", url: "git@github.com:fork/project.git" }],
+      process: {
+        run: () =>
+          Effect.succeed(
+            processOutput(`self-hosted.example.test
+  ✓ Logged in to self-hosted.example.test as gitlab-user
+`),
+          ),
+      },
+    });
+
+    const handle = yield* registry.resolveHandle({
+      cwd: "/repo",
+      context: {
+        provider: {
+          kind: "unknown",
+          name: "self-hosted.example.test",
+          baseUrl: "https://self-hosted.example.test",
+        },
+        remoteName: "upstream",
+        remoteUrl: "https://self-hosted.example.test/group/project.git",
+      },
+    });
+
+    assert.strictEqual(handle.context?.provider.kind, "gitlab");
+    assert.strictEqual(handle.context?.remoteName, "upstream");
   }),
 );
 

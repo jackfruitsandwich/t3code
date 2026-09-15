@@ -2,7 +2,6 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
-  SidebarMenuAction,
   SidebarMenuButton,
   SidebarMenuSubButton,
   SidebarProvider,
@@ -55,12 +54,15 @@ describe("sidebar interactive cursors", () => {
 
     expect(html).toContain('data-slot="sidebar-menu-button"');
     expect(html).toContain("h-8");
-    expect(html).toContain("rounded-md");
-    expect(html).toContain("px-2");
+    expect(html).toContain("rounded-[var(--control-radius)]");
+    expect(html).toContain("px-[var(--sidebar-row-content-inset)]");
     expect(html).toContain("py-1.5");
     expect(html).toContain("]:size-4");
     expect(html).toContain("]:shrink-0");
     expect(html).toContain("cursor-pointer");
+    expect(html).toContain("gap-[var(--sidebar-control-gap)]");
+    expect(html).toContain("text-[var(--sidebar-icon-color)]");
+    expect(html).not.toContain("[&amp;&gt;svg]:opacity-60");
   });
 
   it("applies the shared default treatment to icon-only menu buttons", () => {
@@ -84,17 +86,6 @@ describe("sidebar interactive cursors", () => {
 
     expect(html).toContain("cursor-grab");
     expect(html).not.toContain("cursor-pointer");
-  });
-
-  it("uses a pointer cursor for menu actions", () => {
-    const html = renderToStaticMarkup(
-      <SidebarMenuAction aria-label="Create thread">
-        <span>+</span>
-      </SidebarMenuAction>,
-    );
-
-    expect(html).toContain('data-slot="sidebar-menu-action"');
-    expect(html).toContain("cursor-pointer");
   });
 
   it("uses a pointer cursor for submenu buttons", () => {

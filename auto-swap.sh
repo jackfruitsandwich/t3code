@@ -1,8 +1,12 @@
 #!/bin/bash
 # Waits for T3 Code (Alpha) to quit, then swaps in the freshly built app and relaunches.
 # Lives outside release/ so rebuilds don't delete it. Gives up after 6 hours.
-LOG="$HOME/hack/t3code/auto-swap.log"
-ZIP="$HOME/hack/t3code/release/T3-Code-0.0.30-arm64.zip"
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)" || exit 1
+LOG="$ROOT/auto-swap.log"
+# An explicit artifact wins; otherwise use this checkout's build version.
+VERSION="$(node -e 'process.stdout.write(require(process.argv[1]).version)' "$ROOT/apps/desktop/package.json")" || exit 1
+ZIP="${1:-$ROOT/release/T3-Code-$VERSION-arm64.zip}"
+[ -f "$ZIP" ] || { echo "Artifact missing: $ZIP" >&2; exit 1; }
 APP="/Applications/T3 Code (Alpha).app"
 echo "$(date) armed, waiting for app to quit" >>"$LOG"
 for i in $(seq 1 4320); do

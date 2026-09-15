@@ -10,11 +10,17 @@ Object.assign(process.env, repoEnv);
 
 const APP_VARIANT = resolveAppVariant(repoEnv.APP_VARIANT);
 const isIosPersonalTeamBuild = repoEnv.T3CODE_IOS_PERSONAL_TEAM === "1";
+const runtimeVersionPolicy =
+  process.env.MOBILE_VERSION_POLICY ??
+  (APP_VARIANT === "development" ? "appVersion" : "fingerprint");
 
 const personalTeamBundleIdentifier = repoEnv.T3CODE_IOS_PERSONAL_TEAM_BUNDLE_ID?.trim();
 const IOS_BUNDLE_IDENTIFIER_PATTERN = /^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$/;
 
 const fromRepoRoot = (relativePath: string) => `../../${relativePath}`;
+// Android layers are rendered by scripts/export-android-icons.ts from the Icon Composer sources.
+// The wordmark sits inside the adaptive safe zone; the variant artwork is a full-bleed background.
+const androidAdaptiveForeground = "./assets/android-icon-foreground.png";
 
 if (
   isIosPersonalTeamBuild &&
@@ -30,8 +36,10 @@ const DEVELOPMENT_ASSETS = {
   appIcon: fromRepoRoot(BRAND_ASSET_PATHS.developmentIosIconPng),
   iosIcon: fromRepoRoot(BRAND_ASSET_PATHS.developmentIconComposerProject),
   splashIcon: fromRepoRoot(BRAND_ASSET_PATHS.developmentIosIconPng),
-  androidAdaptiveForeground: fromRepoRoot(BRAND_ASSET_PATHS.developmentUniversalIconPng),
-  androidAdaptiveBackgroundColor: "#00639B",
+  androidAdaptiveForeground,
+  androidAdaptiveBackgroundColor: "#347FF8",
+  androidAdaptiveBackgroundImage: "./assets/android-icon-background-dev.png",
+  androidSplashIcon: "./assets/android-splash-icon-dev.png",
   androidMonochromeIcon: "./assets/android-icon-mark.png",
   androidNotificationIcon: "./assets/android-notification-icon.png",
   androidNotificationColor: "#00639B",
@@ -41,8 +49,10 @@ const PREVIEW_ASSETS = {
   appIcon: fromRepoRoot(BRAND_ASSET_PATHS.nightlyIosIconPng),
   iosIcon: fromRepoRoot(BRAND_ASSET_PATHS.nightlyIconComposerProject),
   splashIcon: fromRepoRoot(BRAND_ASSET_PATHS.nightlyIosIconPng),
-  androidAdaptiveForeground: fromRepoRoot(BRAND_ASSET_PATHS.nightlyLinuxIconPng),
+  androidAdaptiveForeground,
   androidAdaptiveBackgroundColor: "#111533",
+  androidAdaptiveBackgroundImage: "./assets/android-icon-background-nightly.png",
+  androidSplashIcon: "./assets/android-splash-icon-nightly.png",
   androidMonochromeIcon: "./assets/android-icon-mark.png",
   androidNotificationIcon: "./assets/android-notification-icon.png",
   androidNotificationColor: "#7565C7",
@@ -52,8 +62,10 @@ const RELEASE_ASSETS = {
   appIcon: fromRepoRoot(BRAND_ASSET_PATHS.productionIosIconPng),
   iosIcon: fromRepoRoot(BRAND_ASSET_PATHS.productionIconComposerProject),
   splashIcon: fromRepoRoot(BRAND_ASSET_PATHS.productionIosIconPng),
-  androidAdaptiveForeground: "./assets/android-icon-mark.png",
+  androidAdaptiveForeground,
   androidAdaptiveBackgroundColor: "#000000",
+  androidAdaptiveBackgroundImage: undefined,
+  androidSplashIcon: "./assets/android-splash-icon-prod.png",
   androidMonochromeIcon: "./assets/android-icon-mark.png",
   androidNotificationIcon: "./assets/android-notification-icon.png",
   androidNotificationColor: "#FFFFFF",
@@ -119,6 +131,45 @@ const widgetsPlugin: NonNullable<ExpoConfig["plugins"]>[number] = [
     frequentUpdates: true,
     widgets: [
       {
+        name: "SubscriptionUsage",
+        displayName: "Subscription usage",
+        description: "Subscription quotas from your connected T3 Code environments.",
+        configuration: {
+          title: "Subscription usage",
+          description:
+            "Both shows Session and Weekly when available. The Lock Screen shows the tightest selected limit.",
+          parameters: {
+            codexPeriod: {
+              title: "Codex limits",
+              type: "enum",
+              default: "auto",
+              values: [
+                { name: "Both", value: "auto" },
+                { name: "Session", value: "session" },
+                { name: "Weekly", value: "weekly" },
+              ],
+            },
+            claudePeriod: {
+              title: "Claude limits",
+              type: "enum",
+              default: "auto",
+              values: [
+                { name: "Both", value: "auto" },
+                { name: "Session", value: "session" },
+                { name: "Weekly", value: "weekly" },
+              ],
+            },
+          },
+        },
+        supportedFamilies: [
+          "systemSmall",
+          "systemMedium",
+          "systemLarge",
+          "systemExtraLarge",
+          "accessoryRectangular",
+        ],
+      },
+      {
         name: "AgentActivity",
         displayName: "Agent Activity",
         description: "Shows the current state of active T3 Code agents.",
@@ -142,12 +193,14 @@ const sharingPlugin: NonNullable<ExpoConfig["plugins"]>[number] = [
         supportsText: true,
         supportsWebUrlWithMaxCount: 1,
         supportsImageWithMaxCount: 8,
+        supportsMovieWithMaxCount: 8,
+        supportsFileWithMaxCount: 8,
       },
     },
     android: {
       enabled: true,
-      singleShareMimeTypes: ["text/plain", "image/*"],
-      multipleShareMimeTypes: ["image/*"],
+      singleShareMimeTypes: ["*/*"],
+      multipleShareMimeTypes: ["*/*"],
     },
   },
 ];
@@ -161,19 +214,18 @@ const config: ExpoConfig = {
   slug: "t3-code",
   platforms: ["ios", "android"],
   scheme: variant.scheme,
-  version: "0.1.0",
+  version: "1.2.0",
   runtimeVersion: {
-    // Fingerprint (not appVersion) so an OTA only reaches binaries whose native
-    // project — native deps, config plugins, AND patches/ — matches the update.
-    // With appVersion, every 0.1.0 build shares a runtime version, so a JS update
-    // could land on a binary missing the native changes it needs and crash.
-    policy: process.env.MOBILE_VERSION_POLICY ?? "fingerprint",
+    // Development manifests resolve on every launch, so avoid fingerprint's
+    // expensive native-project calculation there. Preview and production stay
+    // fingerprinted so OTAs only reach binaries with matching native projects.
+    policy: runtimeVersionPolicy,
   },
   orientation: "portrait",
   icon: variant.assets.appIcon,
   userInterfaceStyle: "automatic",
   updates: {
-    enabled: true,
+    enabled: repoEnv.T3CODE_MOBILE_UPDATES_ENABLED !== "0",
     url: "https://u.expo.dev/d763fcb8-d37c-41ea-a773-b54a0ab4a454",
     checkAutomatically: "ON_LOAD",
     fallbackToCacheTimeout: 0,
@@ -181,29 +233,56 @@ const config: ExpoConfig = {
   ios: {
     icon: variant.assets.iosIcon,
     supportsTablet: true,
+    // Multitasking-capable iPad apps cannot rotate programmatically, so the
+    // showcase capture build requires full screen (see infoPlist below).
+    requireFullScreen: process.env.T3_SHOWCASE_CAPTURE_BUILD === "1",
     bundleIdentifier: iosBundleIdentifier,
-    // Pin code signing to the T3 Tools team so non-interactive `expo run:ios`
-    // does not fall back to a personal team (which cannot sign app groups,
-    // Sign in with Apple, or push notification entitlements).
-    appleTeamId: "ARK85ZXQ4Z",
+    // Official builds keep the T3 Tools team; local forks can retain their
+    // existing signing identity across native prebuilds.
+    appleTeamId: repoEnv.T3CODE_IOS_TEAM_ID?.trim() || "ARK85ZXQ4Z",
     associatedDomains: [
       `applinks:${variant.relyingParty}`,
       `webcredentials:${variant.relyingParty}`,
     ],
+    entitlements: {
+      "keychain-access-groups": [`$(AppIdentifierPrefix)${iosBundleIdentifier}`],
+    },
     infoPlist: {
       NSAppTransportSecurity: {
         NSAllowsArbitraryLoads: true,
       },
       NSLocalNetworkUsageDescription:
         "Allow T3 Code to connect to T3 Code servers on your local network or tailnet.",
+      NSPhotoLibraryAddUsageDescription: "Allow T3 Code to save images to your photo library.",
       ITSAppUsesNonExemptEncryption: false,
+      // The App Store screenshot harness rotates the iPad interface from
+      // inside the app (CI denies osascript the Accessibility access that
+      // Simulator menu scripting needs), and iPadOS ignores programmatic
+      // orientation requests for multitasking-capable apps — so the capture
+      // build opts out of multitasking and declares landscape support.
+      ...(process.env.T3_SHOWCASE_CAPTURE_BUILD === "1"
+        ? {
+            "UISupportedInterfaceOrientations~ipad": [
+              "UIInterfaceOrientationPortrait",
+              "UIInterfaceOrientationPortraitUpsideDown",
+              "UIInterfaceOrientationLandscapeLeft",
+              "UIInterfaceOrientationLandscapeRight",
+            ],
+          }
+        : {}),
     },
   },
   android: {
     icon: variant.assets.appIcon,
     package: variant.androidPackage,
+    ...(repoEnv.T3CODE_ANDROID_GOOGLE_SERVICES_FILE
+      ? { googleServicesFile: repoEnv.T3CODE_ANDROID_GOOGLE_SERVICES_FILE }
+      : {}),
     adaptiveIcon: {
       backgroundColor: variant.assets.androidAdaptiveBackgroundColor,
+      ...(variant.assets.androidAdaptiveBackgroundImage
+        ? { backgroundImage: variant.assets.androidAdaptiveBackgroundImage }
+        : {}),
       foregroundImage: variant.assets.androidAdaptiveForeground,
       monochromeImage: variant.assets.androidMonochromeIcon,
     },
@@ -267,18 +346,32 @@ const config: ExpoConfig = {
           shortcut_icon: {
             foregroundImage: variant.assets.androidAdaptiveForeground,
             backgroundColor: variant.assets.androidAdaptiveBackgroundColor,
+            ...(variant.assets.androidAdaptiveBackgroundImage
+              ? { backgroundImage: variant.assets.androidAdaptiveBackgroundImage }
+              : {}),
           },
         },
+      },
+    ],
+    [
+      "expo-audio",
+      {
+        microphonePermission: "Allow T3 Code to use your microphone for voice input.",
+        recordAudioAndroid: false,
+        enableBackgroundPlayback: false,
+        enableBackgroundRecording: false,
       },
     ],
     [
       "expo-camera",
       {
         cameraPermission: "Allow T3 Code to access your camera so you can scan pairing QR codes.",
+        microphonePermission: false,
         barcodeScannerEnabled: true,
         recordAudioAndroid: false,
       },
     ],
+    ["expo-image-picker", { photosPermission: false, microphonePermission: false }],
     [
       "expo-splash-screen",
       {
@@ -290,11 +383,24 @@ const config: ExpoConfig = {
           image: variant.assets.splashIcon,
           backgroundColor: "#0a0a0a",
         },
+        android: {
+          // Android 12+ masks the splash icon to a circle over the central two thirds of
+          // its 288dp canvas, so the iOS export's corners get cut. A full-canvas image of
+          // the composed adaptive layers puts the wordmark in the same frame the launcher
+          // icon uses.
+          image: variant.assets.androidSplashIcon,
+          imageWidth: 288,
+          dark: { image: variant.assets.androidSplashIcon },
+        },
       },
     ],
     [
       "expo-build-properties",
       {
+        android: {
+          // Keep the supported floor explicit and covered by native notification tests.
+          minSdkVersion: 24,
+        },
         ios: {
           deploymentTarget: "18.0",
           // AppCheckCore 11.3+ includes Swift and needs module maps for these Objective-C dependencies.
@@ -318,6 +424,7 @@ const config: ExpoConfig = {
     "./plugins/withAndroidModernPopupMenu.cjs",
     "./plugins/withAndroidModernAlertDialog.cjs",
     "./plugins/withAndroidPredictiveBackCompat.cjs",
+    "./plugins/withAndroidTabletOrientation.cjs",
     ...(isIosPersonalTeamBuild ? ["./plugins/withoutIosPersonalTeamCapabilities.cjs"] : []),
   ],
   extra: {

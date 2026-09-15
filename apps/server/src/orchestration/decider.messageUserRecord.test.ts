@@ -36,6 +36,7 @@ function makeReadModel(): OrchestrationReadModel {
         settledOverride: null,
         settledAt: null,
         deletedAt: null,
+        pullRequests: [],
         messages: [],
         proposedPlans: [],
         activities: [],
@@ -66,6 +67,7 @@ it.layer(NodeServices.layer)("thread.message.user.record decider", (it) => {
       const single = Array.isArray(event) ? event[0]! : event;
       assert.equal(single.type, "thread.message-sent");
       assert.equal(single.occurredAt, HISTORICAL_AT);
+      expect(single.metadata).toMatchObject({ historyImport: true });
       expect(single.payload).toEqual({
         threadId: ThreadId.make("thread-1"),
         messageId: MessageId.make("msg-user-1"),
