@@ -3,6 +3,7 @@
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 import tailwindColors from "tailwindcss/colors";
+import clerkTheme from "../clerk-theme.json" with { type: "json" };
 import { BUILT_IN_THEME_IDS, type BuiltInThemeId } from "@t3tools/shared/themePalettes";
 
 import {
@@ -149,9 +150,26 @@ const adaptiveVariablesFor = (appearance: MobileThemeAppearance) =>
     ]),
   );
 
+// Clerk's native chrome keeps its fixed appearance palette even when the
+// app uses a custom theme. Uniwind still needs these tokens in every theme.
+const clerkVariablesFor = (appearance: MobileThemeAppearance) => {
+  const colors = appearance === "light" ? clerkTheme.colors : clerkTheme.darkColors;
+  const borderRgb = [1, 3, 5].map((start) =>
+    Number.parseInt(colors.border.slice(start, start + 2), 16),
+  );
+  return {
+    "--color-clerk-page": colors.background,
+    "--color-clerk-foreground": colors.foreground,
+    "--color-clerk-foreground-muted": colors.mutedForeground,
+    "--color-clerk-border": `rgba(${borderRgb.join(", ")}, 0.06)`,
+    "--color-clerk-danger": colors.danger,
+  };
+};
+
 const variablesFor = (themeId: BuiltInThemeId, appearance: MobileThemeAppearance) => ({
   ...getMobileThemeVariables(themeId, appearance),
   ...adaptiveVariablesFor(appearance),
+  ...clerkVariablesFor(appearance),
 });
 
 const renderVariant = (name: string, variables: Readonly<Record<string, string>>) => {
@@ -163,8 +181,8 @@ const renderVariant = (name: string, variables: Readonly<Record<string, string>>
 
 export const renderUniwindThemesCSS = () => {
   const variants = [
-    renderVariant("light", adaptiveVariablesFor("light")),
-    renderVariant("dark", adaptiveVariablesFor("dark")),
+    renderVariant("light", { ...adaptiveVariablesFor("light"), ...clerkVariablesFor("light") }),
+    renderVariant("dark", { ...adaptiveVariablesFor("dark"), ...clerkVariablesFor("dark") }),
     ...BUILT_IN_THEME_IDS.flatMap((themeId) =>
       APPEARANCES.map((appearance) =>
         renderVariant(`${themeId}-${appearance}`, variablesFor(themeId, appearance)),

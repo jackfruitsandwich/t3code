@@ -44,6 +44,24 @@ describe("generate mobile Uniwind themes", () => {
     }
   });
 
+  it("gives every custom theme the complete default token set required by Uniwind", () => {
+    const authored = NodeFS.readFileSync(
+      NodePath.resolve(import.meta.dirname, "../global.css"),
+      "utf8",
+    );
+    const generated = renderUniwindThemesCSS();
+    const variablesFor = (css: string, variant: string) =>
+      [...css.matchAll(new RegExp(`@variant ${variant} \\{([^}]+)\\}`, "gu"))].flatMap((match) =>
+        [...match[1]!.matchAll(/(--[\w-]+):/gu)].map((variable) => variable[1]!),
+      );
+    for (const name of customThemeNames) {
+      const appearance = name.endsWith("-dark") ? "dark" : "light";
+      expect(new Set(variablesFor(generated, name))).toEqual(
+        new Set(variablesFor(authored + generated, appearance)),
+      );
+    }
+  });
+
   it("generates the default runtime bridge from the authored CSS", () => {
     const css = NodeFS.readFileSync(NodePath.resolve(import.meta.dirname, "../global.css"), "utf8");
     const variables = readDefaultThemeVariables(css);
