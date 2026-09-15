@@ -25,6 +25,7 @@ import { CSS } from "@dnd-kit/utilities";
 import {
   canSnooze,
   effectiveSnoozed,
+  hasQueuedTurnStart,
   threadWokeAt,
 } from "@t3tools/client-runtime/state/thread-settled";
 import { resolveSettledThreadTimestamp } from "@t3tools/client-runtime/state/thread-sort";
@@ -255,6 +256,7 @@ import {
 // stays behind an explicit Show more.
 const SETTLED_TAIL_INITIAL_COUNT = 10;
 const SETTLED_TAIL_PAGE_COUNT = 25;
+const ACTIVE_PAGE_COUNT = 50;
 // Fresh keys deliberately reset both shelves to collapsed for existing users.
 const SETTLED_SHELF_EXPANDED_KEY = "t3code:sidebar:settled-expanded";
 const SNOOZED_SHELF_EXPANDED_KEY = "t3code:sidebar:snoozed-expanded";
@@ -2708,11 +2710,14 @@ export default function Sidebar() {
   // filter context changes so a scope/search flip never inherits a deep
   // page state.
   const [settledVisibleCount, setSettledVisibleCount] = useState(SETTLED_TAIL_INITIAL_COUNT);
+  const [activeVisibleCount, setActiveVisibleCount] = useState(ACTIVE_PAGE_COUNT);
+  const [renamingThreadKey, setRenamingThreadKey] = useState<string | null>(null);
   const settledResetKey = projectScopeKey ?? "all";
   const lastSettledResetKeyRef = useRef(settledResetKey);
   if (lastSettledResetKeyRef.current !== settledResetKey) {
     lastSettledResetKeyRef.current = settledResetKey;
     setSettledVisibleCount(SETTLED_TAIL_INITIAL_COUNT);
+    setActiveVisibleCount(ACTIVE_PAGE_COUNT);
   }
   const [expandedForkFamilies, setExpandedForkFamilies] = useState<ReadonlySet<string>>(
     () => new Set(),
@@ -2783,9 +2788,38 @@ export default function Sidebar() {
     return routeThread === undefined ? EMPTY_THREADS : [routeThread];
   }, [routeThreadKey, snoozedShelfExpanded, snoozedThreads]);
 
+  // Imported CLI history can leave thousands of threads explicitly active.
+  // Page the cards without settling them or hiding work that needs attention.
+  const keepActiveThreadVisible = useCallback(
+    (thread: EnvironmentThreadShell) =>
+      resolveSidebarThreadStatus(thread) !== "ready" ||
+      hasQueuedTurnStart(thread, { now: snoozeNow }) ||
+      thread.hasActionableProposedPlan ||
+      forkFamilyThreadKey(thread) === renamingThreadKey ||
+      forkFamilyThreadKey(thread) === optimisticDrop?.key,
+    [snoozeNow, renamingThreadKey, optimisticDrop?.key],
+  );
+  const showMoreActive = useCallback(
+    () => setActiveVisibleCount((count) => count + ACTIVE_PAGE_COUNT),
+    [],
+  );
   const foldedSections = useMemo(() => {
     const pinned = foldForkFamilies(pinnedThreads, expandedForkFamilies, routeThreadKey);
-    const active = foldForkFamilies(activeThreads, expandedForkFamilies, routeThreadKey);
+    const foldedActive = foldForkFamilies(
+      activeThreads,
+      expandedForkFamilies,
+      routeThreadKey,
+      keepActiveThreadVisible,
+    );
+    const active = {
+      rows: paginateForkFamilies(
+        foldedActive,
+        activeVisibleCount,
+        routeThreadKey,
+        keepActiveThreadVisible,
+      ),
+      metaByThreadId: foldedActive.metaByThreadId,
+    };
     const snoozed = foldForkFamilies(visibleSnoozedThreads, expandedForkFamilies, routeThreadKey);
     const settled = {
       rows: renderedSettledThreads,
@@ -2794,6 +2828,7 @@ export default function Sidebar() {
     return {
       pinned,
       active,
+      hasMoreActive: active.rows.length < foldedActive.rows.length,
       snoozed,
       settled,
       meta: new Map([
@@ -2811,6 +2846,8 @@ export default function Sidebar() {
     expandedForkFamilies,
     routeThreadKey,
     foldedSettledThreads,
+    activeVisibleCount,
+    keepActiveThreadVisible,
   ]);
 
   const orderedThreads = useMemo(
@@ -3016,7 +3053,6 @@ export default function Sidebar() {
     ],
   );
 
-  const [renamingThreadKey, setRenamingThreadKey] = useState<string | null>(null);
   const [renamingTitle, setRenamingTitle] = useState("");
   const startThreadRename = useCallback((threadRef: ScopedThreadRef, title: string) => {
     setRenamingThreadKey(scopedThreadKey(threadRef));
@@ -4923,6 +4959,18 @@ export default function Sidebar() {
                       }
                       return items;
                     })()}
+                    {foldedSections.hasMoreActive ? (
+                      <li data-thread-selection-safe className="list-none">
+                        <button
+                          type="button"
+                          onClick={showMoreActive}
+                          className="flex h-9 w-full cursor-pointer items-center gap-2.5 rounded-md px-2.5 text-left text-sm text-sidebar-muted-foreground/55 hover:bg-sidebar-row-hover hover:text-sidebar-foreground"
+                        >
+                          <PlusIcon aria-hidden className="size-4 shrink-0" />
+                          Show more active conversations
+                        </button>
+                      </li>
+                    ) : null}
                     {settledShelfExpanded && hiddenSettledCount > 0 ? (
                       <li className="list-none">
                         <button

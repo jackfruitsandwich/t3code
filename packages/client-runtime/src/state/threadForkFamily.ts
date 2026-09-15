@@ -46,12 +46,14 @@ const familyKey = (thread: ForkFamilyThread): string | null =>
 /**
  * Fold `threads` (already in display order) so each multi-member fork family
  * occupies one row, expanding in place to head-then-branches when its family
- * id is in `expandedFamilyIds`.
+ * id is in `expandedFamilyIds`. `keepVisible` also reveals branches that need
+ * attention; pass the same predicate to pagination to retain their families.
  */
 export function foldForkFamilies<T extends ForkFamilyThread>(
   threads: ReadonlyArray<T>,
   expandedFamilyIds: ReadonlySet<string>,
   selectedThreadKey?: string | null,
+  keepVisible?: (thread: T) => boolean,
 ): FoldedForkFamilies<T> {
   const membersByFamily = new Map<string, T[]>();
   for (const thread of threads) {
@@ -86,7 +88,11 @@ export function foldForkFamilies<T extends ForkFamilyThread>(
     foldedFamilies.add(familyId);
     const expanded =
       expandedFamilyIds.has(familyId) ||
-      members.slice(1).some((member) => forkFamilyThreadKey(member) === selectedThreadKey);
+      members
+        .slice(1)
+        .some(
+          (member) => forkFamilyThreadKey(member) === selectedThreadKey || keepVisible?.(member),
+        );
     rows.push(thread);
     metaByThreadId.set(forkFamilyThreadKey(thread), {
       familyId,
@@ -112,11 +118,12 @@ export function foldForkFamilies<T extends ForkFamilyThread>(
   return { rows, metaByThreadId };
 }
 
-/** Page by conversations, keeping an expanded family and the selected family intact. */
+/** Page by conversations, keeping selected and attention-worthy families intact. */
 export function paginateForkFamilies<T extends ForkFamilyThread>(
   folded: FoldedForkFamilies<T>,
   limit: number,
   selectedThreadKey?: string | null,
+  keepVisible?: (thread: T) => boolean,
 ): T[] {
   const visibleKeys = new Set<string>();
   const visibleFamilies = new Set<string>();
@@ -125,7 +132,7 @@ export function paginateForkFamilies<T extends ForkFamilyThread>(
     const key = forkFamilyThreadKey(thread);
     const meta = folded.metaByThreadId.get(key);
     const root = meta?.role !== "branch";
-    if ((root && roots < limit) || key === selectedThreadKey) {
+    if ((root && roots < limit) || key === selectedThreadKey || keepVisible?.(thread)) {
       visibleKeys.add(key);
       if (meta) visibleFamilies.add(meta.familyId);
     }

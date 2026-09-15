@@ -121,4 +121,34 @@ describe("paginateForkFamilies", () => {
       "next-branch",
     ]);
   });
+
+  it("keeps attention-worthy branches visible with their family beyond the page", () => {
+    const needsAttention = (thread: Row) => thread.id === "next-branch";
+    const folded = foldForkFamilies(threads, new Set(), null, needsAttention);
+    expect(
+      paginateForkFamilies(folded, 1, null, needsAttention).map((thread) => thread.id),
+    ).toEqual(["head", "next-head", "next-branch"]);
+    expect(folded.metaByThreadId.get("next-head")?.expanded).toBe(true);
+    const idle = foldForkFamilies(threads, new Set());
+    expect(paginateForkFamilies(idle, 1).map((thread) => thread.id)).toEqual(["head"]);
+  });
+
+  it("pages a large imported history while retaining deep navigation and live work", () => {
+    const history = Array.from({ length: 14_361 }, (_, index) => ({
+      id: `thread-${index}`,
+      environmentId: "mac",
+    }));
+    const selected = "mac:thread-14000";
+    const needsAttention = (thread: Row) => thread.id === "thread-12000";
+    const folded = foldForkFamilies(history, new Set(), selected, needsAttention);
+    const firstPage = paginateForkFamilies(folded, 50, selected, needsAttention);
+    expect(firstPage).toEqual([...history.slice(0, 50), history[12000], history[14000]]);
+    expect(paginateForkFamilies(folded, 100, selected, needsAttention)).toEqual([
+      ...history.slice(0, 100),
+      history[12000],
+      history[14000],
+    ]);
+    expect(paginateForkFamilies(folded, history.length, selected, needsAttention)).toEqual(history);
+    expect(history).toHaveLength(14_361);
+  });
 });
