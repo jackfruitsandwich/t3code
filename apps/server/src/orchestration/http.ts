@@ -8,6 +8,7 @@ import * as Option from "effect/Option";
 import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder";
 
 import { projectThreadDetailSnapshot } from "./ActivityPayloadProjection.ts";
+import { limitShellForMobile } from "./mobileShell.ts";
 import { cleanupFailedUploadedAttachments, normalizeDispatchCommand } from "./Normalizer.ts";
 import {
   annotateEnvironmentRequest,
@@ -16,6 +17,7 @@ import {
   failEnvironmentNotFound,
   requireEnvironmentScope,
 } from "../auth/http.ts";
+import * as EnvironmentAuth from "../auth/EnvironmentAuth.ts";
 import * as ProjectCloneTracker from "../project/ProjectCloneTracker.ts";
 import { OrchestrationEngineService } from "./Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "./Services/ProjectionSnapshotQuery.ts";
@@ -27,6 +29,18 @@ export const orchestrationHttpApiLayer = HttpApiBuilder.group(
     const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
     const orchestrationEngine = yield* OrchestrationEngineService;
     const projectCloneTracker = yield* ProjectCloneTracker.ProjectCloneTracker;
+    const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
+    // The phone announces itself on its WebSocket upgrade, which the session
+    // remembers; over HTTP that record is the only way to tell it apart.
+    const isMobileSession = (sessionId: string) =>
+      serverAuth.listSessions().pipe(
+        Effect.map((sessions) =>
+          sessions.some(
+            (session) => session.sessionId === sessionId && session.client.deviceType === "mobile",
+          ),
+        ),
+        Effect.orElseSucceed(() => false),
+      );
 
     return handlers
       .handle(
@@ -52,14 +66,18 @@ export const orchestrationHttpApiLayer = HttpApiBuilder.group(
         "shellSnapshot",
         Effect.fn("environment.orchestration.shellSnapshot")(function* (args) {
           yield* annotateEnvironmentRequest(args.endpoint.name);
-          yield* requireEnvironmentScope(AuthOrchestrationReadScope);
-          return yield* projectionSnapshotQuery
+          const principal = yield* requireEnvironmentScope(AuthOrchestrationReadScope);
+          const snapshot = yield* projectionSnapshotQuery
             .getShellSnapshot()
             .pipe(
               Effect.catch((cause) =>
                 failEnvironmentInternal("orchestration_snapshot_failed", cause),
               ),
             );
+          // The phone gets a capped thread list; see mobileShell.ts.
+          return (yield* isMobileSession(principal.sessionId))
+            ? limitShellForMobile(snapshot)
+            : snapshot;
         }),
       )
       .handle(

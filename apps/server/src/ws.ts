@@ -92,6 +92,7 @@ import {
 } from "./orchestration/ActivityPayloadProjection.ts";
 import { makeThreadLiveEventCoalescer } from "./orchestration/ThreadLiveEventCoalescer.ts";
 import { makeLiveStreamBudget, type RetainedLiveItem } from "./orchestration/LiveStreamBudget.ts";
+import { limitShellForMobile } from "./orchestration/mobileShell.ts";
 import {
   cleanupFailedUploadedAttachments,
   normalizeDispatchCommand,
@@ -1854,7 +1855,11 @@ const makeWsRpcLayer = (
                 Stream.flatMap((items) => Stream.fromIterable(items)),
               );
 
+              // The phone gets a capped thread list; see mobileShell.ts.
               const loadSnapshot = projectionSnapshotQuery.getShellSnapshot().pipe(
+                Effect.map((snapshot) =>
+                  clientOrigin.surface === "mobile" ? limitShellForMobile(snapshot) : snapshot,
+                ),
                 Effect.tapError((cause) =>
                   Effect.logError("orchestration shell snapshot load failed", { cause }),
                 ),
