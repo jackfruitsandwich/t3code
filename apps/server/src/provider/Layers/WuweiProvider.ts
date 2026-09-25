@@ -5,7 +5,12 @@
  *
  * @module provider/Layers/WuweiProvider
  */
-import type { ModelCapabilities, ServerProviderModel, WuweiSettings } from "@t3tools/contracts";
+import type {
+  ModelCapabilities,
+  ServerProviderModel,
+  ServerProviderSlashCommand,
+  WuweiSettings,
+} from "@t3tools/contracts";
 import { createModelCapabilities } from "@t3tools/shared/model";
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
 import * as DateTime from "effect/DateTime";
@@ -56,9 +61,35 @@ interface WuweiCatalogModel {
   readonly reasoningEfforts: ReadonlyArray<string>;
 }
 
+interface WuweiCatalogCommand {
+  readonly name: string;
+  readonly description?: string;
+  readonly hint?: string;
+}
+
 interface WuweiCatalog {
   readonly models: ReadonlyArray<WuweiCatalogModel>;
+  readonly commands?: ReadonlyArray<WuweiCatalogCommand>;
   readonly warnings: ReadonlyArray<string>;
+}
+
+/** wuwei runs these itself when a message is exactly "/name args"; the model never sees them. */
+function slashCommandsFromCatalog(
+  commands: ReadonlyArray<WuweiCatalogCommand> | undefined,
+): ReadonlyArray<ServerProviderSlashCommand> {
+  return (commands ?? []).flatMap((command) => {
+    const name = typeof command.name === "string" ? command.name.trim() : "";
+    if (!name) return [];
+    const description = command.description?.trim();
+    const hint = command.hint?.trim();
+    return [
+      {
+        name,
+        ...(description ? { description } : {}),
+        ...(hint ? { input: { hint } } : {}),
+      },
+    ];
+  });
 }
 
 export function wuweiModelCapabilities(efforts: ReadonlyArray<string>): ModelCapabilities {
@@ -238,6 +269,7 @@ export const checkWuweiProviderStatus = Effect.fn("checkWuweiProviderStatus")(fu
     enabled: true,
     checkedAt,
     models: modelsFromCatalog(catalog.models, settings),
+    slashCommands: slashCommandsFromCatalog(catalog.commands),
     probe: {
       installed: true,
       version: null,
