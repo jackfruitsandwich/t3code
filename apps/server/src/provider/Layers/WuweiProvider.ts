@@ -29,6 +29,8 @@ const CATALOG_TIMEOUT_MS = 30_000;
 
 export const WUWEI_PRESENTATION: ServerProviderPresentation = {
   displayName: "wuwei",
+  // wuwei has no plan mode; /plan and the Plan/Build toggle would do nothing.
+  showInteractionModeToggle: false,
   reportsContextWindow: true,
   supportsConversationRollback: false,
 };
