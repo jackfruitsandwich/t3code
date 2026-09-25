@@ -100,4 +100,19 @@ describe("mobile slash commands", () => {
       }),
     ).toEqual({ text: "/plan ", cursor: 6, interactionMode: null });
   });
+
+  it("shows only the provider's commands when it owns the slash menu", () => {
+    const items = buildComposerSlashCommandItems({
+      query: "",
+      atMessageStart: true,
+      hasThread: true,
+      allowInteractionMode: true,
+      selectedProviderStatus: {
+        driver: ProviderDriverKind.make("wuwei"),
+        slashCommands: [{ name: "memory", description: "toggle memory" }],
+        ownsSlashMenu: true,
+      },
+    });
+    expect(items.map((item) => item.label)).toEqual(["/memory"]);
+  });
 });

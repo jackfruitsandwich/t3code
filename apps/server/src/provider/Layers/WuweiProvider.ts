@@ -36,6 +36,8 @@ export const WUWEI_PRESENTATION: ServerProviderPresentation = {
   displayName: "wuwei",
   // wuwei has no plan mode; /plan and the Plan/Build toggle would do nothing.
   showInteractionModeToggle: false,
+  // wuwei runs its own slash commands (src/acp/main.ts); T3's /model is the picker button.
+  ownsSlashMenu: true,
   reportsContextWindow: true,
   supportsConversationRollback: false,
 };

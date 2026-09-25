@@ -2291,33 +2291,38 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       }));
     }
     if (composerTrigger.kind === "slash-command") {
-      const builtInSlashCommandItems = [
-        {
-          id: "slash:model",
-          type: "slash-command",
-          command: "model",
-          label: "/model",
-          description: "Switch response model for this thread",
-        },
-        ...(planModeUiEnabled
-          ? ([
-              {
-                id: "slash:plan",
-                type: "slash-command",
-                command: "plan",
-                label: "/plan",
-                description: "Switch this thread into plan mode",
-              },
-              {
-                id: "slash:default",
-                type: "slash-command",
-                command: "default",
-                label: "/default",
-                description: "Switch this thread back to normal build mode",
-              },
-            ] as const)
-          : []),
-      ] satisfies ReadonlyArray<Extract<ComposerCommandItem, { type: "slash-command" }>>;
+      // A provider that owns "/" (wuwei) answers every command itself; T3's
+      // built-ins and skills stay out of its menu.
+      const providerOwnsSlashMenu = selectedProviderStatus?.ownsSlashMenu === true;
+      const builtInSlashCommandItems = providerOwnsSlashMenu
+        ? []
+        : ([
+            {
+              id: "slash:model",
+              type: "slash-command",
+              command: "model",
+              label: "/model",
+              description: "Switch response model for this thread",
+            },
+            ...(planModeUiEnabled
+              ? ([
+                  {
+                    id: "slash:plan",
+                    type: "slash-command",
+                    command: "plan",
+                    label: "/plan",
+                    description: "Switch this thread into plan mode",
+                  },
+                  {
+                    id: "slash:default",
+                    type: "slash-command",
+                    command: "default",
+                    label: "/default",
+                    description: "Switch this thread back to normal build mode",
+                  },
+                ] as const)
+              : []),
+          ] satisfies ReadonlyArray<Extract<ComposerCommandItem, { type: "slash-command" }>>);
       const slashMenuSkills = getProviderSkillsForSlashMenu(
         selectedProviderSkills,
         settings.showSkillsInSlashMenu,
@@ -2349,7 +2354,11 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         (item) => item.command.name !== "compact" || compactSlashCommandAvailable,
       );
       const slashCommandItems = slashCommandItemsForPromptPosition(
-        [...builtInSlashCommandItems, ...visibleProviderSlashCommandItems, ...skillItems],
+        [
+          ...builtInSlashCommandItems,
+          ...visibleProviderSlashCommandItems,
+          ...(providerOwnsSlashMenu ? [] : skillItems),
+        ],
         composerTrigger.rangeStart === 0,
       );
       return searchSlashCommandItems(slashCommandItems, query);

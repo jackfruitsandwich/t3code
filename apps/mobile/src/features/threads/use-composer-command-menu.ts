@@ -57,7 +57,7 @@ export function buildComposerSlashCommandItems(input: {
   readonly allowInteractionMode: boolean;
   readonly selectedProviderStatus: Pick<
     ServerProvider,
-    "driver" | "slashCommands" | "showInteractionModeToggle"
+    "driver" | "slashCommands" | "showInteractionModeToggle" | "ownsSlashMenu"
   > | null;
 }): ComposerCommandItem[] {
   const query = input.query.toLowerCase();
@@ -86,9 +86,15 @@ export function buildComposerSlashCommandItems(input: {
       description: "Switch to default mode",
     },
   ] satisfies ComposerCommandItem[];
-  const items: ComposerCommandItem[] = builtIn.filter(
-    (item) => item.command.includes(query) && (item.command === "model" || allowInteractionMode),
-  );
+  // A provider that owns "/" (wuwei) answers every command itself; T3's
+  // built-ins stay out of its menu.
+  const providerOwnsSlashMenu = input.selectedProviderStatus?.ownsSlashMenu === true;
+  const items: ComposerCommandItem[] = providerOwnsSlashMenu
+    ? []
+    : builtIn.filter(
+        (item) =>
+          item.command.includes(query) && (item.command === "model" || allowInteractionMode),
+      );
 
   // Providers expand commands only at the start of a message. T3 commands
   // change local state and do not have this restriction.
@@ -349,7 +355,9 @@ export function useComposerCommandMenu({
           description: skill.shortDescription ?? skill.description ?? "",
         }));
 
-      return [...commandItems, ...skillItems];
+      return selectedProviderStatus?.ownsSlashMenu
+        ? commandItems
+        : [...commandItems, ...skillItems];
     }
 
     if (trigger.kind === "skill") {
