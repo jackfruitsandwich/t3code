@@ -15,6 +15,7 @@ import {
   type ProviderSession,
   ProviderDriverKind,
   ProviderInstanceId,
+  RuntimeTaskId,
   type ThreadId,
   type ThreadTokenUsageSnapshot,
   TurnId,
@@ -83,6 +84,9 @@ interface WuweiSessionContext {
   readonly turns: Array<{ id: TurnId; items: Array<unknown> }>;
   activeTurnId: TurnId | undefined;
   readonly totals: TokenTotals;
+  /** Thinking text of the block in progress; flushed as rows when the block ends. */
+  thinking: string;
+  thinkingRows: number;
   stopped: boolean;
 }
 
@@ -95,6 +99,14 @@ function parseWuweiResume(raw: unknown): { sessionId: string } | undefined {
   if (raw.schemaVersion !== WUWEI_RESUME_VERSION) return undefined;
   if (typeof raw.sessionId !== "string" || !raw.sessionId.trim()) return undefined;
   return { sessionId: raw.sessionId.trim() };
+}
+
+/** Paragraphs of one thinking block, each shown as its own thinking row. */
+export function thinkingParagraphs(text: string): ReadonlyArray<string> {
+  return text
+    .split(/\n\s*\n/)
+    .map((paragraph) => paragraph.replace(/\s+/g, " ").trim())
+    .filter((paragraph) => paragraph.length > 0);
 }
 
 function count(value: unknown): number {
@@ -151,6 +163,33 @@ export function makeWuweiAdapter(wuweiSettings: WuweiSettings, options?: WuweiAd
       });
     const offerRuntimeEvent = (event: ProviderRuntimeEvent) =>
       PubSub.publish(runtimeEventPubSub, event).pipe(Effect.asVoid);
+
+    // T3 does not persist reasoning deltas, so a finished thinking block becomes
+    // task.progress rows (the work log's "thinking" style). The inert "dream"
+    // task type keeps them out of the Agents roster and out of thread liveness.
+    const flushThinking = (ctx: WuweiSessionContext) =>
+      Effect.gen(function* () {
+        const paragraphs = thinkingParagraphs(ctx.thinking);
+        ctx.thinking = "";
+        for (const paragraph of paragraphs) {
+          ctx.thinkingRows += 1;
+          yield* offerRuntimeEvent({
+            type: "task.progress",
+            ...(yield* makeEventStamp()),
+            provider: PROVIDER,
+            threadId: ctx.threadId,
+            turnId: ctx.activeTurnId,
+            payload: {
+              taskId: RuntimeTaskId.make(
+                `wuwei-thinking:${ctx.activeTurnId ?? "turn"}:${ctx.thinkingRows}`,
+              ),
+              description: "Thinking",
+              summary: paragraph,
+              taskType: "dream",
+            },
+          });
+        }
+      });
 
     const withThreadLock = <A, E, R>(threadId: string, effect: Effect.Effect<A, E, R>) =>
       SynchronizedRef.modifyEffect(threadLocksRef, (current) => {
@@ -220,6 +259,8 @@ export function makeWuweiAdapter(wuweiSettings: WuweiSettings, options?: WuweiAd
             return;
           case "ContentDelta":
           case "ThoughtDelta":
+            if (event._tag === "ThoughtDelta") ctx.thinking += event.text;
+            else yield* flushThinking(ctx);
             yield* offerRuntimeEvent(
               makeAcpContentDeltaEvent({
                 stamp,
@@ -234,6 +275,7 @@ export function makeWuweiAdapter(wuweiSettings: WuweiSettings, options?: WuweiAd
             );
             return;
           case "ToolCallUpdated":
+            yield* flushThinking(ctx);
             yield* offerRuntimeEvent(
               makeAcpToolCallEvent({
                 stamp,
@@ -366,6 +408,8 @@ export function makeWuweiAdapter(wuweiSettings: WuweiSettings, options?: WuweiAd
             turns: [],
             activeTurnId: undefined,
             totals: { input: 0, cachedInput: 0, output: 0, reasoning: 0 },
+            thinking: "",
+            thinkingRows: 0,
             stopped: false,
           };
 
@@ -481,6 +525,7 @@ export function makeWuweiAdapter(wuweiSettings: WuweiSettings, options?: WuweiAd
             Effect.tapError((error) =>
               Effect.gen(function* () {
                 yield* ctx.acp.drainEvents;
+                yield* flushThinking(ctx);
                 yield* offerRuntimeEvent({
                   type: "turn.completed",
                   ...(yield* makeEventStamp()),
@@ -493,6 +538,7 @@ export function makeWuweiAdapter(wuweiSettings: WuweiSettings, options?: WuweiAd
             ),
           );
         yield* ctx.acp.drainEvents;
+        yield* flushThinking(ctx);
 
         const turnRecord = ctx.turns.find((turn) => turn.id === turnId);
         if (turnRecord) turnRecord.items.push({ prompt: promptParts, result });

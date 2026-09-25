@@ -149,6 +149,17 @@ wuweiAdapterTestLayer("WuweiAdapter", (it) => {
         ["assistant_text", "It is /tmp/project."],
       ]);
 
+      // Thinking reaches the work log as an inert task row once its block ends.
+      const thinking = collected.find((event) => event.type === "task.progress");
+      assert.isDefined(thinking);
+      if (thinking?.type === "task.progress") {
+        assert.deepInclude(thinking.payload, {
+          description: "Thinking",
+          summary: "checking the folder",
+          taskType: "dream",
+        });
+      }
+
       const tool = collected.find(
         (event) =>
           event.type === "item.completed" && event.payload.itemType === "command_execution",
