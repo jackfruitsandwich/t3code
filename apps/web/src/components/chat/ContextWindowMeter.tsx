@@ -30,6 +30,10 @@ export function ContextWindowMeter(props: {
   const dashOffset = circumference * (1 - normalizedPercentage / 100);
   const totalProcessedTokens = usage.totalProcessedTokens ?? null;
   const showTotalProcessed = totalProcessedTokens !== null && totalProcessedTokens > 0;
+  const lastInputTokens = usage.lastInputTokens ?? null;
+  const lastCachedInputTokens = usage.lastCachedInputTokens ?? null;
+  const showLastCache =
+    lastInputTokens !== null && lastInputTokens > 0 && lastCachedInputTokens !== null;
   const isOverloaded = normalizedPercentage > 90;
   const usageColor = isOverloaded
     ? "var(--color-error)"
@@ -129,6 +133,17 @@ export function ContextWindowMeter(props: {
               <span className="text-secondary-label">Total processed</span>
               <span className="font-medium tabular-nums text-secondary-label">
                 {formatContextWindowTokens(totalProcessedTokens)}
+              </span>
+            </div>
+          ) : null}
+          {showLastCache ? (
+            <div className="flex items-center justify-between gap-3 text-[11px] leading-4">
+              <span className="text-secondary-label">Cached, last request</span>
+              <span className="font-medium tabular-nums text-secondary-label">
+                {formatContextWindowTokens(lastCachedInputTokens)}/
+                {formatContextWindowTokens(lastInputTokens)}
+                <span className="mx-1">·</span>
+                {formatPercentage((lastCachedInputTokens / lastInputTokens) * 100)}
               </span>
             </div>
           ) : null}

@@ -273,6 +273,14 @@ export const GrokIcon: Icon = ({ className, ...props }) => (
   </svg>
 );
 
+/** wuwei's own mark from its TUI header: ◉ in the surrounding text color. */
+export const WuweiIcon: Icon = (props) => (
+  <svg {...props} viewBox="0 0 24 24" fill="none" stroke="currentColor">
+    <circle cx="12" cy="12" r="9" strokeWidth="2" />
+    <circle cx="12" cy="12" r="4.5" fill="currentColor" stroke="none" />
+  </svg>
+);
+
 export const TraeIcon: Icon = (props) => (
   <svg {...props} viewBox="0 0 24 24" fill="currentColor">
     {/* Back rectangle: left strip + bottom strip drawn separately — empty bottom-left corner is the gap between them */}
