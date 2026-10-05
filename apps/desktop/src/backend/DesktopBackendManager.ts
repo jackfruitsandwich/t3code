@@ -97,6 +97,12 @@ export interface DesktopBackendStartConfig extends BackendProcessContext {
   readonly httpBaseUrl: URL;
   readonly captureOutput: boolean;
   readonly preflightFailure: Option.Option<PreflightFailure>;
+  // Attach mode: do not spawn anything. Treat an already-running backend at
+  // `httpBaseUrl` as the active run: wait for readiness, then watch liveness
+  // and report an "exit" once it stops answering so the normal restart loop
+  // re-attaches when it comes back. Set by DesktopBackendConfiguration when
+  // `desktop-attach.json` is present.
+  readonly attach?: boolean;
   // Present for a WSL run after the configured/default distro has been
   // resolved to the concrete distro passed to wsl.exe.
   readonly runningDistro?: string;
@@ -437,9 +443,69 @@ const decodeDesktopTelemetryControlLine = Schema.decodeUnknownEffect(
   Schema.fromJsonString(DesktopTelemetryControlMessage),
 );
 
+// How long an attached backend may stay unreachable before the run is
+// declared dead. Generous so a quick `t3serve` restart reads as a blip.
+const ATTACHED_LIVENESS_INTERVAL = Duration.seconds(2);
+const ATTACHED_LIVENESS_FAILURES_BEFORE_EXIT = 5;
+
+const probeAttachedBackendOnce = (
+  httpBaseUrl: URL,
+): Effect.Effect<boolean, never, HttpClient.HttpClient> =>
+  waitForHttpReadyShared({
+    baseUrl: httpBaseUrl.href,
+    path: BACKEND_READINESS_PATH,
+    // One attempt only: timeoutMs < intervalMs collapses the retry policy.
+    timeoutMs: 1,
+    intervalMs: 1_000,
+    probeTimeoutMs: Duration.toMillis(DEFAULT_BACKEND_READINESS_REQUEST_TIMEOUT),
+    makeError: () => ({ _tag: "AttachedBackendProbeFailed" }) as const,
+  }).pipe(
+    Effect.as(true),
+    Effect.catchCause(() => Effect.succeed(false)),
+  );
+
+const runAttachedBackend = Effect.fn("runAttachedBackend")(function* (
+  options: RunBackendProcessOptions,
+): Effect.fn.Return<BackendProcessExit, BackendProcessError, BackendProcessRunRequirements> {
+  // pid 0: there is no child. Callers only use the pid for logging.
+  yield* options.onStarted?.(0) ?? Effect.void;
+  const probeReadiness = Effect.fn("desktop.attachedBackend.probeReadiness")(() =>
+    waitForHttpReady({
+      executablePath: options.executablePath,
+      entryPath: options.entryPath,
+      cwd: options.cwd,
+      httpBaseUrl: options.httpBaseUrl,
+      timeout: options.readinessTimeout ?? DEFAULT_BACKEND_READINESS_TIMEOUT,
+    }).pipe(
+      Effect.flatMap(() => options.onReady?.() ?? Effect.void),
+      Effect.as(true),
+      Effect.catchTags({
+        BackendReadinessTimeoutError: (error) =>
+          (options.onReadinessFailure?.(error) ?? Effect.void).pipe(Effect.as(false)),
+      }),
+    ),
+  );
+  yield* probeReadiness().pipe(Effect.repeat({ while: (ready) => !ready }));
+
+  let consecutiveFailures = 0;
+  while (consecutiveFailures < ATTACHED_LIVENESS_FAILURES_BEFORE_EXIT) {
+    yield* Effect.sleep(ATTACHED_LIVENESS_INTERVAL);
+    const alive = yield* probeAttachedBackendOnce(options.httpBaseUrl);
+    consecutiveFailures = alive ? 0 : consecutiveFailures + 1;
+  }
+  yield* options.onExitObserved?.() ?? Effect.void;
+  return {
+    code: Option.none(),
+    reason: `attached backend at ${options.httpBaseUrl.href} stopped responding`,
+  } satisfies BackendProcessExit;
+});
+
 export const runBackendProcess = Effect.fn("runBackendProcess")(function* (
   options: RunBackendProcessOptions,
 ): Effect.fn.Return<BackendProcessExit, BackendProcessError, BackendProcessRunRequirements> {
+  if (options.attach) {
+    return yield* runAttachedBackend(options);
+  }
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const bootstrapJson = yield* encodeBootstrapJson(options.bootstrap).pipe(
     Effect.mapError(

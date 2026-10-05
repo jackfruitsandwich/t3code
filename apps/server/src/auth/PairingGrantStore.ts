@@ -245,7 +245,10 @@ const DEFAULT_ONE_TIME_TOKEN_TTL_MINUTES = Duration.minutes(5);
 // gets logged anywhere by accident) means a page reload past the 5-min
 // window can still recover by re-bootstrapping rather than locking
 // the user out of the backend.
-const DESKTOP_BOOTSTRAP_TTL_HOURS = Duration.hours(24);
+// Long-lived: the desktop may attach to a detached server (`t3serve`) that
+// outlives many desktop relaunches, and each relaunch re-exchanges this seed.
+// The seed never leaves the local machine (desktop-attach.json, mode 0600).
+const DESKTOP_BOOTSTRAP_TTL_HOURS = Duration.days(365);
 // A dev server's startup token is read off a log by whoever (or whatever) is
 // driving the session, often minutes later — after a `node --watch` restart, a
 // detour into another task, or a hand-off to the person actually doing the

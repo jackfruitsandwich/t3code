@@ -220,6 +220,53 @@ interface SharedBootstrapInput {
   readonly observabilitySettings: BackendObservabilitySettings;
 }
 
+// Detached-backend attach mode. When `<stateDir>/desktop-attach.json` exists,
+// the desktop does not spawn its own backend; it attaches to a server that is
+// already running (started out-of-process by `t3serve`, so the desktop app can
+// be rebuilt and relaunched without killing in-flight agent turns). The file
+// carries the URL and the desktop-bootstrap token that server was seeded with.
+export const DESKTOP_ATTACH_FILE_NAME = "desktop-attach.json";
+
+const DesktopAttachConfig = Schema.Struct({
+  httpBaseUrl: Schema.String,
+  bootstrapToken: Schema.String,
+});
+export type DesktopAttachConfig = typeof DesktopAttachConfig.Type;
+
+const decodeDesktopAttachConfig = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(DesktopAttachConfig),
+);
+
+const readDesktopAttachConfig = Effect.gen(function* () {
+  const fileSystem = yield* FileSystem.FileSystem;
+  const environment = yield* DesktopEnvironment.DesktopEnvironment;
+  const attachPath = environment.path.join(environment.stateDir, DESKTOP_ATTACH_FILE_NAME);
+  const raw = yield* fileSystem.readFileString(attachPath).pipe(
+    Effect.map(Option.some),
+    Effect.catchTags({
+      PlatformError: (cause) =>
+        cause.reason._tag === "NotFound"
+          ? Effect.succeed(Option.none())
+          : Effect.logWarning("desktop attach file unreadable; spawning a local backend", {
+              path: attachPath,
+              error: cause.message,
+            }).pipe(Effect.as(Option.none())),
+    }),
+  );
+  if (Option.isNone(raw)) {
+    return Option.none<DesktopAttachConfig>();
+  }
+  return yield* decodeDesktopAttachConfig(raw.value).pipe(
+    Effect.map(Option.some),
+    Effect.catchCause((cause) =>
+      Effect.logWarning("desktop attach file invalid; spawning a local backend", {
+        path: attachPath,
+        cause: String(cause),
+      }).pipe(Effect.as(Option.none<DesktopAttachConfig>())),
+    ),
+  );
+});
+
 // What the launch runs inside the distro. The staged runtime is the release's
 // self-contained `t3` executable (Node inside); the mounted server tree is a
 // script that needs the distro's own Node.
@@ -784,15 +831,33 @@ export const make = Effect.gen(function* () {
   // invariant the renderer relies on. modifyEffect serializes the whole
   // get-or-create so the first caller wins and the rest reuse its token.
   const tokenRef = yield* SynchronizedRef.make(Option.none<string>());
+  const attachConfig = readDesktopAttachConfig.pipe(
+    Effect.provideService(FileSystem.FileSystem, fileSystem),
+    Effect.provideService(DesktopEnvironment.DesktopEnvironment, environment),
+  );
   const getOrCreateBootstrapToken = SynchronizedRef.modifyEffect(tokenRef, (current) =>
     Option.match(current, {
       onSome: (token) => Effect.succeed([token, current] as const),
       onNone: () =>
-        crypto.randomBytes(24).pipe(
-          Effect.map((bytes) => {
-            const token = Encoding.encodeHex(bytes);
-            return [token, Option.some(token)] as const;
-          }),
+        attachConfig.pipe(
+          Effect.flatMap((attach) =>
+            Option.match(attach, {
+              // Attach mode: the renderer must exchange the token the detached
+              // server was seeded with, not a fresh one.
+              onSome: (config) =>
+                Effect.succeed([
+                  config.bootstrapToken,
+                  Option.some(config.bootstrapToken),
+                ] as const),
+              onNone: () =>
+                crypto.randomBytes(24).pipe(
+                  Effect.map((bytes) => {
+                    const token = Encoding.encodeHex(bytes);
+                    return [token, Option.some(token)] as const;
+                  }),
+                ),
+            }),
+          ),
         ),
     }),
   );
@@ -840,10 +905,30 @@ export const make = Effect.gen(function* () {
       Effect.provideService(FileSystem.FileSystem, fileSystem),
       Effect.provideService(DesktopEnvironment.DesktopEnvironment, environment),
     );
-    return yield* resolvePrimaryStartConfig({ ...shared, resourceMonitorPath }).pipe(
+    const config = yield* resolvePrimaryStartConfig({ ...shared, resourceMonitorPath }).pipe(
       Effect.provideService(DesktopEnvironment.DesktopEnvironment, environment),
       Effect.provideService(DesktopServerExposure.DesktopServerExposure, serverExposure),
     );
+    const attach = yield* attachConfig;
+    if (Option.isNone(attach)) {
+      return config;
+    }
+    const httpBaseUrl = new URL(attach.value.httpBaseUrl);
+    yield* Effect.logInfo("attaching to detached backend instead of spawning one", {
+      httpBaseUrl: httpBaseUrl.href,
+    });
+    return {
+      ...config,
+      attach: true,
+      httpBaseUrl,
+      captureOutput: false,
+      bootstrap: {
+        ...config.bootstrap,
+        desktopBootstrapToken: attach.value.bootstrapToken,
+        port: Number(httpBaseUrl.port) || config.bootstrap.port,
+        host: httpBaseUrl.hostname,
+      },
+    } satisfies DesktopBackendManager.DesktopBackendStartConfig;
   });
 
   // Single source of truth for what the primary actually runs as. Both
