@@ -1431,6 +1431,17 @@ export const claudePromptUuid = Effect.fn("claudePromptUuid")(function* (attempt
   return uuid;
 });
 
+// Fork: a v1-imported thread can be migrated more than once (rehearsal copies,
+// rollback then re-migration), which restarts its attempt ids. Claude silently
+// drops a prompt whose uuid is already in the session file, so those prompts
+// are also keyed by the message's own random id.
+export const claudePromptKey = (
+  input: Pick<ProviderAdapter.ProviderAdapterV2TurnInput, "attemptId" | "appThread" | "message">,
+): string =>
+  input.appThread.historyOrigin === "v1_import"
+    ? `${input.attemptId}:${input.message.messageId}`
+    : input.attemptId;
+
 type ClaudeAssistantContentBlock = SDKAssistantMessage["message"]["content"][number];
 type ClaudeToolUseContentBlock = Extract<
   ClaudeAssistantContentBlock,
@@ -7250,7 +7261,7 @@ export function makeClaudeAdapterV2(
             const nativeTurnId = `turn:${turnInput.attemptId}`;
             const promptUuid = isClaudeProviderContinuationTurn(turnInput)
               ? null
-              : yield* claudePromptUuid(turnInput.attemptId).pipe(
+              : yield* claudePromptUuid(claudePromptKey(turnInput)).pipe(
                   Effect.provideService(Crypto.Crypto, crypto),
                 );
             const providerTurnId = idAllocator.derive.providerTurn({
