@@ -1,42 +1,37 @@
 /**
- * WuweiDriver — `ProviderDriver` for wuwei, run by Bun from its own repo and
- * spoken to over ACP. The model catalog comes from wuwei's `--catalog` probe.
- * Text generation (titles, commit messages) is not offered.
+ * WuweiDriver — `ProviderDriver` for wuwei, Jack's own agent harness. wuwei
+ * runs inside this server (orchestration-v2/Adapters/WuweiAdapterV2.ts); its
+ * models, commands and login state come from its in-process host
+ * (WuweiProvider.ts). Text generation (titles, commit messages) is not
+ * offered.
  *
  * @module provider/Drivers/WuweiDriver
  */
 import { ProviderDriverKind, TextGenerationError, WuweiSettings } from "@t3tools/contracts";
-import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
-import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
-import { ChildProcessSpawner } from "effect/unstable/process";
 
 import * as BackgroundPolicy from "../../background/BackgroundPolicy.ts";
-import { ServerConfig } from "../../config.ts";
+import * as ServerConfig from "../../config.ts";
+import * as IdAllocator from "../../orchestration-v2/IdAllocator.ts";
+import { WuweiAdapterV2Driver } from "../../orchestration-v2/Adapters/WuweiAdapterV2.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import type { TextGeneration } from "../../textGeneration/TextGeneration.ts";
 import { ProviderDriverError } from "../Errors.ts";
-import { ProviderEventLoggers } from "../Layers/ProviderEventLoggers.ts";
-import { makeWuweiAdapter } from "../Layers/WuweiAdapter.ts";
-import {
-  buildInitialWuweiProviderSnapshot,
-  checkWuweiProviderStatus,
-} from "../Layers/WuweiProvider.ts";
 import { makeManagedServerProvider } from "../makeManagedServerProvider.ts";
 import {
   defaultProviderContinuationIdentity,
   type ProviderDriver,
   type ProviderInstance,
 } from "../ProviderDriver.ts";
-import { mergeProviderInstanceEnvironment } from "../ProviderInstanceEnvironment.ts";
 import { makeManualOnlyProviderMaintenanceCapabilities } from "../providerMaintenance.ts";
 import {
   haveProviderSnapshotSettingsChanged,
   makeProviderSnapshotSettingsSource,
   type ProviderSnapshotSettings,
 } from "../providerUpdateSettings.ts";
+import { buildInitialWuweiProviderSnapshot, checkWuweiProviderStatus } from "../WuweiProvider.ts";
 import { withInstanceIdentity } from "./instanceIdentity.ts";
 
 const decodeWuweiSettings = Schema.decodeSync(WuweiSettings);
@@ -62,12 +57,9 @@ const wuweiTextGeneration: TextGeneration["Service"] = {
 
 export type WuweiDriverEnv =
   | BackgroundPolicy.BackgroundPolicy
-  | ChildProcessSpawner.ChildProcessSpawner
-  | Crypto.Crypto
   | FileSystem.FileSystem
-  | Path.Path
-  | ProviderEventLoggers
-  | ServerConfig
+  | IdAllocator.IdAllocatorV2
+  | ServerConfig.ServerConfig
   | ServerSettingsService;
 
 export const WuweiDriver: ProviderDriver<WuweiSettings, WuweiDriverEnv> = {
@@ -80,10 +72,7 @@ export const WuweiDriver: ProviderDriver<WuweiSettings, WuweiDriverEnv> = {
   defaultConfig: (): WuweiSettings => decodeWuweiSettings({}),
   create: ({ instanceId, displayName, accentColor, environment, enabled, config }) =>
     Effect.gen(function* () {
-      const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
       const serverSettings = yield* ServerSettingsService;
-      const eventLoggers = yield* ProviderEventLoggers;
-      const processEnv = mergeProviderInstanceEnvironment(environment);
       const continuationIdentity = defaultProviderContinuationIdentity({
         driverKind: DRIVER_KIND,
         instanceId,
@@ -101,11 +90,24 @@ export const WuweiDriver: ProviderDriver<WuweiSettings, WuweiDriverEnv> = {
         packageName: null,
       });
 
-      const adapter = yield* makeWuweiAdapter(effectiveConfig, {
-        environment: processEnv,
-        ...(eventLoggers.native ? { nativeEventLogger: eventLoggers.native } : {}),
+      const orchestrationAdapter = yield* WuweiAdapterV2Driver.create({
         instanceId,
-      });
+        displayName,
+        accentColor,
+        environment,
+        enabled,
+        config,
+      }).pipe(
+        Effect.mapError(
+          (cause) =>
+            new ProviderDriverError({
+              driver: DRIVER_KIND,
+              instanceId,
+              detail: "Failed to build wuwei orchestration adapter.",
+              cause,
+            }),
+        ),
+      );
 
       const snapshotSettings = makeProviderSnapshotSettingsSource(effectiveConfig, serverSettings);
       const snapshot = yield* makeManagedServerProvider<ProviderSnapshotSettings<WuweiSettings>>({
@@ -115,17 +117,14 @@ export const WuweiDriver: ProviderDriver<WuweiSettings, WuweiDriverEnv> = {
         haveSettingsChanged: haveProviderSnapshotSettingsChanged,
         initialSnapshot: (settings) =>
           buildInitialWuweiProviderSnapshot(settings.provider).pipe(Effect.map(stampIdentity)),
-        checkProvider: checkWuweiProviderStatus(effectiveConfig, processEnv).pipe(
-          Effect.map(stampIdentity),
-          Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
-        ),
+        checkProvider: checkWuweiProviderStatus(effectiveConfig).pipe(Effect.map(stampIdentity)),
       }).pipe(
         Effect.mapError(
           (cause) =>
             new ProviderDriverError({
               driver: DRIVER_KIND,
               instanceId,
-              detail: `Failed to build wuwei snapshot: ${cause.message ?? String(cause)}`,
+              detail: "Failed to build wuwei snapshot.",
               cause,
             }),
         ),
@@ -139,7 +138,7 @@ export const WuweiDriver: ProviderDriver<WuweiSettings, WuweiDriverEnv> = {
         accentColor,
         enabled,
         snapshot,
-        adapter,
+        orchestrationAdapter,
         textGeneration: wuweiTextGeneration,
       } satisfies ProviderInstance;
     }),

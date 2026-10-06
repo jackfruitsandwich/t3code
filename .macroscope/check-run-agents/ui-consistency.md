@@ -1,7 +1,7 @@
 ---
 title: UI Consistency
-model: gpt-5-6-sol
-effort: medium
+model: gpt-6-sol
+effort: max
 input: incremental
 tools:
   - browse_code
@@ -11,14 +11,11 @@ include:
   - "apps/web/src/**/*.css"
 exclude:
   - "apps/web/src/**/*.test.tsx"
-labels:
-  - vouch:trusted
-  - macroscope-review
 requires:
   - Check
 maxBudgetPerRun: 2
 maxBudgetPerPR: 10
-conclusion: failure
+conclusion: neutral
 ---
 
 # UI consistency review

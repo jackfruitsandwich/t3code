@@ -5,6 +5,10 @@ import {
   type AuthPairingLink,
   type ServerAuthBootstrapMethod,
 } from "@t3tools/contracts";
+import {
+  DESKTOP_BOOTSTRAP_TOKEN_WINDOW_MS,
+  isValidDesktopBootstrapToken,
+} from "@t3tools/shared/desktopBootstrapToken";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
@@ -245,10 +249,7 @@ const DEFAULT_ONE_TIME_TOKEN_TTL_MINUTES = Duration.minutes(5);
 // gets logged anywhere by accident) means a page reload past the 5-min
 // window can still recover by re-bootstrapping rather than locking
 // the user out of the backend.
-// Long-lived: the desktop may attach to a detached server (`t3serve`) that
-// outlives many desktop relaunches, and each relaunch re-exchanges this seed.
-// The seed never leaves the local machine (desktop-attach.json, mode 0600).
-const DESKTOP_BOOTSTRAP_TTL_HOURS = Duration.days(365);
+const DESKTOP_BOOTSTRAP_TTL_HOURS = Duration.hours(24);
 // A dev server's startup token is read off a log by whoever (or whatever) is
 // driving the session, often minutes later — after a `node --watch` restart, a
 // detour into another task, or a hand-off to the person actually doing the
@@ -312,7 +313,15 @@ export const make = Effect.gen(function* () {
       id,
     }).pipe(Effect.asVoid);
 
-  if (config.desktopBootstrapToken) {
+  // A desktop that sends its secret rotates the renderer's token, so accept
+  // whichever token the secret derives for the current window instead of
+  // seeding one fixed token. Older desktops only send the token.
+  const desktopBootstrapSecret = config.desktopBootstrapSecret;
+  const consumeRotatingDesktopToken = (credential: string, nowMs: number) =>
+    desktopBootstrapSecret !== undefined &&
+    isValidDesktopBootstrapToken(desktopBootstrapSecret, credential, nowMs);
+
+  if (config.desktopBootstrapToken && desktopBootstrapSecret === undefined) {
     const now = yield* DateTime.now;
     yield* seedGrant(config.desktopBootstrapToken, {
       method: "desktop-bootstrap",
@@ -435,6 +444,16 @@ export const make = Effect.gen(function* () {
   const consume: PairingGrantStore["Service"]["consume"] = Effect.fn("PairingGrantStore.consume")(
     function* (credential, input) {
       const now = yield* DateTime.now;
+      if (consumeRotatingDesktopToken(credential, now.epochMilliseconds)) {
+        return {
+          method: "desktop-bootstrap",
+          scopes: AuthAdministrativeScopes,
+          subject: "desktop-bootstrap",
+          expiresAt: DateTime.add(now, {
+            milliseconds: DESKTOP_BOOTSTRAP_TOKEN_WINDOW_MS,
+          }),
+        } satisfies BootstrapGrant;
+      }
       const seededResult: ConsumeResult = yield* Ref.modify(
         seededGrantsRef,
         (current): readonly [ConsumeResult, Map<string, StoredBootstrapGrant>] => {

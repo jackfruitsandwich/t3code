@@ -5,19 +5,21 @@ import { forkParked } from "../../serverActivation.ts";
  * Sweeps the Claude Code (`<config dir>/projects`) and Codex
  * (`<codex home>/sessions`) transcript directories and materializes each
  * eligible session as a T3 project/thread with its message history and a
- * resume binding, so chatting into the thread continues the real provider
- * session. Source files are read-only; every write goes through
- * `OrchestrationEngineService.dispatch` with commandIds derived
- * deterministically from the source session, so re-runs dedupe via command
- * receipts. The importer NEVER dispatches `thread.turn.start` — importing
- * history must not wake a live agent.
+ * native resume ref, so chatting into the thread continues the real provider
+ * session. Source files are read-only. Threads are written straight to the
+ * v2 event log the way upstream's `AgentSessionImporter` writes them
+ * (`historyOrigin: "v1_import"`, a provider thread whose `nativeThreadRef` is
+ * the source session), with deterministic event ids. The importer NEVER
+ * starts a turn — importing history must not wake a live agent.
  *
- * Ownership: bindings written by the importer carry
- * `runtimePayload.importCursor` ({ sourceSessionId, sourcePath, lineCount }).
- * A binding without that marker belongs to a T3-native session and is never
- * touched; a discovered file is only imported incrementally when both the
- * session id and path match the marker, so a session adopted (forked) by
- * live T3 chat stops being appended to.
+ * Ownership: bindings in `provider_session_runtime` written by the importer
+ * carry `runtimePayload.importCursor` ({ sourceSessionId, sourcePath,
+ * lineCount }). A binding without that marker belongs to a T3-native session
+ * and is never touched; a discovered file is only imported incrementally when
+ * both the session id and path match the marker. Once a T3 run has happened
+ * on an imported thread, T3 owns it: the cursor is dropped and the file is no
+ * longer tailed. Sessions T3 itself drives (v2 provider threads) are never
+ * imported.
  *
  * @module import/Layers/SessionImporter
  */
@@ -31,10 +33,16 @@ import {
   DEFAULT_MODEL_BY_PROVIDER,
   DEFAULT_PROVIDER_INTERACTION_MODE,
   defaultInstanceIdForDriver,
+  EventId,
   MessageId,
   ProjectId,
   ProviderDriverKind,
+  ProviderInstanceId,
   ThreadId,
+  TurnItemId,
+  type OrchestrationV2AppThread,
+  type OrchestrationV2DomainEvent,
+  type OrchestrationV2ProviderThread,
   type ServerSettings,
 } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
@@ -47,16 +55,20 @@ import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
+import * as SqlClient from "effect/sql/SqlClient";
 
 import { ServerConfig } from "../../config.ts";
-import { OrchestrationEngineService } from "../../orchestration/Services/OrchestrationEngine.ts";
-import { ProjectionSnapshotQuery } from "../../orchestration/Services/ProjectionSnapshotQuery.ts";
+import * as EventSink from "../../orchestration-v2/EventSink.ts";
+import { deriveProviderThread } from "../../orchestration-v2/IdAllocator.ts";
+import * as ProjectStore from "../../orchestration-v2/ProjectStore.ts";
+import * as ThreadManagementService from "../../orchestration-v2/ThreadManagementService.ts";
 import { expandHomePath } from "../../pathExpansion.ts";
-import { resolveCodexHomeLayout } from "../../provider/Drivers/CodexHomeLayout.ts";
 import {
-  ProviderSessionDirectory,
-  type ProviderRuntimeBindingWithMetadata,
-} from "../../provider/Services/ProviderSessionDirectory.ts";
+  ProviderSessionRuntimeRepository,
+  type ProviderSessionRuntime,
+} from "../../persistence/ProviderSessionRuntime.ts";
+import { ProjectService } from "../../project/ProjectService.ts";
+import { resolveCodexHomeLayout } from "../../provider/Drivers/CodexHomeLayout.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { parseClaudeSessionJsonl } from "../claudeSessionParser.ts";
 import { parseCodexRolloutJsonl } from "../codexRolloutParser.ts";
@@ -65,6 +77,7 @@ import {
   isEligibleCliSession,
   isRecord,
   type ParsedCliSession,
+  type ParsedSessionMessage,
 } from "../sessionImportTypes.ts";
 import { SessionImporter, type SessionImporterShape } from "../Services/SessionImporter.ts";
 
@@ -72,8 +85,7 @@ const DEFAULT_SWEEP_INTERVAL_MS = 30 * 1000;
 
 /**
  * Import layout epoch. Bumped when the project-placement rules change so
- * that migrated sessions can be re-dispatched under fresh command ids
- * (epoch-1 receipts would otherwise shadow the re-import). Epoch 2: codex
+ * that migrated sessions can be re-imported under fresh ids. Epoch 2: codex
  * sessions without git metadata group into one shared "Chats" project
  * instead of one project per cwd.
  */
@@ -82,9 +94,19 @@ const IMPORT_EPOCH = 2;
 const CLAUDE_DRIVER = ProviderDriverKind.make("claudeAgent");
 const CODEX_DRIVER = ProviderDriverKind.make("codex");
 
+/** A `provider_session_runtime` row, as the importer reads and merges it. */
+interface ImportBinding {
+  readonly threadId: ThreadId;
+  readonly provider: ProviderDriverKind;
+  readonly providerInstanceId: ProviderInstanceId | undefined;
+  readonly status: ProviderSessionRuntime["status"];
+  readonly resumeCursor: unknown;
+  readonly runtimePayload: unknown;
+}
+
 // This sweeper reads only the default Claude/Codex homes. Other configured
 // accounts may legitimately contain the same native session or message IDs.
-const belongsToScannedProviderHome = (binding: ProviderRuntimeBindingWithMetadata) =>
+const belongsToScannedProviderHome = (binding: ImportBinding) =>
   (binding.provider === CLAUDE_DRIVER || binding.provider === CODEX_DRIVER) &&
   binding.providerInstanceId === defaultInstanceIdForDriver(binding.provider);
 
@@ -153,12 +175,14 @@ interface DeferredMachineSession {
   readonly sessionId: string;
   readonly filePath: string;
   readonly parsed: ParsedCliSession;
-  readonly binding?: ProviderRuntimeBindingWithMetadata;
+  readonly binding?: ImportBinding;
   readonly cursor?: ImportCursor;
 }
 
 interface SweepContext {
-  readonly bindingsBySource: ReadonlyMap<string, ProviderRuntimeBindingWithMetadata>;
+  readonly bindingsBySource: ReadonlyMap<string, ImportBinding>;
+  /** Native sessions T3 itself drives; their transcripts are never imported. */
+  readonly t3NativeSessions: ReadonlySet<string>;
   readonly seenSessionIds: Set<string>;
   readonly stats: SweepStats;
   /** Workspace root of the shared project holding project-less codex chats. */
@@ -177,9 +201,8 @@ const hashHex = (value: string) =>
 
 /**
  * Deterministic T3 ids derived from the source session/workspace. Thread ids
- * are epoch-scoped because deleted thread ids can never be re-created (the
- * read model retains them), so a layout migration re-imports under a fresh
- * id and tombstones the old binding.
+ * are epoch-scoped because deleted thread ids can never be re-created, so a
+ * layout migration re-imports under a fresh id and tombstones the old binding.
  */
 export const importedThreadId = (sessionId: string, idVariant = "") =>
   ThreadId.make(`cli-import-e${IMPORT_EPOCH}${idVariant}-${sessionId}`);
@@ -193,6 +216,8 @@ const importCommandId = (
 ) => CommandId.make(`cli-import:e${IMPORT_EPOCH}${idVariant}:${driver}:${sessionId}:${facet}`);
 export const importedMessageId = (sessionId: string, sourceId: string) =>
   MessageId.make(`cli-import-${sessionId}-${sourceId}`);
+const importEventId = (threadId: ThreadId, facet: string) =>
+  EventId.make(`cli-import:v2:${threadId}:${facet}`);
 
 function readImportCursor(runtimePayload: unknown): ImportCursor | undefined {
   if (!isRecord(runtimePayload) || !isRecord(runtimePayload.importCursor)) {
@@ -235,14 +260,7 @@ function readLaunchClass(runtimePayload: unknown): string | undefined {
   return runtimePayload.importLaunch;
 }
 
-function readStampedForkFamily(runtimePayload: unknown): string | undefined {
-  if (!isRecord(runtimePayload) || typeof runtimePayload.forkFamilyStamped !== "string") {
-    return undefined;
-  }
-  return runtimePayload.forkFamilyStamped;
-}
-
-function readResumeSessionId(binding: ProviderRuntimeBindingWithMetadata): string | undefined {
+function readResumeSessionId(binding: ImportBinding): string | undefined {
   if (!isRecord(binding.resumeCursor)) {
     return undefined;
   }
@@ -259,12 +277,102 @@ function readResumeSessionId(binding: ProviderRuntimeBindingWithMetadata): strin
   return undefined;
 }
 
+const toBinding = (row: ProviderSessionRuntime): ImportBinding => ({
+  threadId: row.threadId,
+  provider: ProviderDriverKind.make(row.providerName),
+  providerInstanceId: row.providerInstanceId ?? undefined,
+  status: row.status,
+  resumeCursor: row.resumeCursor,
+  runtimePayload: row.runtimePayload,
+});
+
+const dateTime = (iso: string) => DateTime.makeUnsafe(iso);
+
+/** Message + timeline events for imported text, as upstream's AgentSessionImporter writes them. */
+function messageEvents(input: {
+  readonly threadId: ThreadId;
+  readonly sessionId: string;
+  readonly message: ParsedSessionMessage;
+}): ReadonlyArray<OrchestrationV2DomainEvent> {
+  const { threadId, message } = input;
+  const messageId = importedMessageId(input.sessionId, message.sourceId);
+  const at = dateTime(message.timestamp);
+  const turnItemId = TurnItemId.make(`cli-import:v2:${threadId}:${message.sourceId}`);
+  const base = {
+    id: turnItemId,
+    threadId,
+    runId: null,
+    nodeId: null,
+    providerThreadId: null,
+    providerTurnId: null,
+    nativeItemRef: null,
+    parentItemId: null,
+    // EventSink assigns the real position (next in the thread's runless band).
+    ordinal: 0,
+    status: "completed" as const,
+    title: null,
+    startedAt: at,
+    completedAt: at,
+    updatedAt: at,
+  };
+  return [
+    {
+      id: importEventId(threadId, `message:${message.sourceId}`),
+      type: "message.updated",
+      threadId,
+      occurredAt: at,
+      payload: {
+        createdBy: message.role === "user" ? "user" : "agent",
+        creationSource: "server",
+        id: messageId,
+        threadId,
+        runId: null,
+        nodeId: null,
+        role: message.role,
+        text: message.text,
+        attachments: [],
+        streaming: false,
+        createdAt: at,
+        updatedAt: at,
+      },
+    },
+    {
+      id: importEventId(threadId, `turn-item:${message.sourceId}`),
+      type: "turn-item.updated",
+      threadId,
+      occurredAt: at,
+      payload:
+        message.role === "user"
+          ? {
+              ...base,
+              createdBy: "user",
+              creationSource: "server",
+              type: "user_message",
+              messageId,
+              inputIntent: "turn_start",
+              text: message.text,
+              attachments: [],
+            }
+          : {
+              ...base,
+              type: "assistant_message",
+              messageId,
+              text: message.text,
+              streaming: false,
+            },
+    },
+  ];
+}
+
 const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
   Effect.gen(function* () {
-    const engine = yield* OrchestrationEngineService;
-    const snapshotQuery = yield* ProjectionSnapshotQuery;
-    const directory = yield* ProviderSessionDirectory;
+    const eventSink = yield* EventSink.EventSinkV2;
+    const projectStore = yield* ProjectStore.ProjectStoreV2;
+    const projects = yield* ProjectService;
+    const threads = yield* ThreadManagementService.ThreadManagementService;
+    const runtimes = yield* ProviderSessionRuntimeRepository;
     const serverSettings = yield* ServerSettingsService;
+    const sql = yield* SqlClient.SqlClient;
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
 
@@ -275,6 +383,91 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
     const automationRoots = (options?.automationRoots ?? []).map((root) =>
       path.resolve(expandHomePath(root)),
     );
+
+    // --- Store: the importer's whole view of T3 state -------------------------
+
+    const listBindings = runtimes.list().pipe(Effect.map((rows) => rows.map(toBinding)));
+
+    /**
+     * Shallow-merges `runtimePayload` into the thread's binding (the
+     * repository replaces the payload, so read-merge-write), keeping the
+     * resume cursor unless one is given.
+     */
+    const mergeBinding = Effect.fn("SessionImporter.mergeBinding")(function* (input: {
+      readonly threadId: ThreadId;
+      readonly provider: ProviderDriverKind;
+      readonly resumeCursor?: unknown;
+      readonly runtimePayload: Record<string, unknown>;
+    }) {
+      const current = yield* runtimes.getByThreadId({ threadId: input.threadId });
+      const previous = Option.getOrUndefined(current);
+      const payload = isRecord(previous?.runtimePayload) ? previous.runtimePayload : {};
+      const lastSeenAt = DateTime.formatIso(yield* DateTime.now);
+      yield* runtimes.upsert({
+        threadId: input.threadId,
+        providerName: input.provider,
+        providerInstanceId:
+          previous?.providerInstanceId ?? defaultInstanceIdForDriver(input.provider),
+        adapterKey: previous?.adapterKey ?? input.provider,
+        runtimeMode: previous?.runtimeMode ?? "full-access",
+        status: previous?.status ?? "stopped",
+        lastSeenAt,
+        resumeCursor:
+          input.resumeCursor === undefined ? (previous?.resumeCursor ?? null) : input.resumeCursor,
+        runtimePayload: { ...payload, ...input.runtimePayload },
+      });
+    });
+
+    /** The live (not deleted) thread, or none. */
+    const getThread = (threadId: ThreadId) =>
+      threads
+        .getThreadShell(threadId)
+        .pipe(
+          Effect.map((shell) =>
+            shell === null || shell.deletedAt !== null ? Option.none() : Option.some(shell),
+          ),
+        );
+
+    /** A T3 run on an imported thread means T3 owns its native session now. */
+    const hasT3Runs = (threadId: ThreadId) =>
+      threads
+        .getThreadRecords(threadId, ["runs"])
+        .pipe(Effect.map((records) => records.runs.length > 0));
+
+    const deleteThread = (threadId: ThreadId, commandId: CommandId) =>
+      threads.dispatch({ type: "thread.delete", commandId, threadId }).pipe(Effect.asVoid);
+
+    /** Deletes a project the importer emptied; a project with threads stays. */
+    const deleteProjectIfEmpty = (projectId: ProjectId, commandId: CommandId) =>
+      Effect.gen(function* () {
+        const remaining = yield* threads.listProjectThreads({ projectId, includeSubagents: true });
+        if (remaining.some((thread) => thread.deletedAt === null)) return;
+        yield* projects.delete({ commandId, projectId }).pipe(Effect.asVoid);
+      });
+
+    /** Sessions T3 itself drives: every v2 provider thread's native id. */
+    const listT3NativeSessions = sql<{
+      readonly driver: string | null;
+      readonly native_id: string | null;
+    }>`
+      SELECT
+        json_extract(provider_thread.payload_json, '$.driver') AS driver,
+        json_extract(provider_thread.payload_json, '$.nativeThreadRef.nativeId') AS native_id
+      FROM orchestration_v2_projection_provider_threads AS provider_thread
+    `.pipe(
+      Effect.map(
+        (rows) =>
+          new Set(
+            rows.flatMap((row) =>
+              row.driver === null || row.native_id === null
+                ? []
+                : [sourceKey(ProviderDriverKind.make(row.driver), row.native_id)],
+            ),
+          ),
+      ),
+    );
+
+    // --------------------------------------------------------------------------
 
     /** Machine-marked by the provider, or living under a configured
      * automation root (tmux-driven harness sessions carry human markers). */
@@ -323,122 +516,97 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
     const ensureProject = Effect.fn("SessionImporter.ensureProject")(function* (input: {
       readonly workspaceRoot: string;
       readonly sessionId: string;
-      readonly createdAt: string;
       readonly title?: string;
     }) {
-      const existing = yield* snapshotQuery.getActiveProjectByWorkspaceRoot(input.workspaceRoot);
+      const existing = yield* projectStore.findActiveByWorkspaceRoot(input.workspaceRoot);
       if (Option.isSome(existing)) {
-        return existing.value.id;
+        return existing.value.projectId;
       }
 
       const title = input.title ?? (path.basename(input.workspaceRoot) || "project");
       const create = (projectId: ProjectId, commandId: CommandId) =>
-        engine
-          .dispatch({
-            type: "project.create",
-            commandId,
-            projectId,
-            title,
-            workspaceRoot: input.workspaceRoot,
-            createdAt: input.createdAt,
-          })
-          .pipe(
-            // A concurrent create for the same root loses the invariant
-            // race; the requery below picks up whichever project won.
-            Effect.catch((error) =>
-              Effect.logDebug("session.importer.project-create-skipped", {
-                workspaceRoot: input.workspaceRoot,
-                error,
-              }),
-            ),
-          );
+        projects.create({ commandId, projectId, title, workspaceRoot: input.workspaceRoot }).pipe(
+          Effect.map((project) => Option.some(project.id)),
+          // A concurrent create for the same root loses the race; take the winner.
+          Effect.catchTag("ProjectConflictError", (error) =>
+            Effect.succeed(Option.some(error.conflictingProjectId)),
+          ),
+          Effect.catch((error) =>
+            Effect.logDebug("session.importer.project-create-skipped", {
+              workspaceRoot: input.workspaceRoot,
+              error,
+            }).pipe(Effect.as(Option.none<ProjectId>())),
+          ),
+        );
 
-      yield* create(
+      const created = yield* create(
         importedProjectId(input.workspaceRoot),
         CommandId.make(`cli-import:project:${hashHex(input.workspaceRoot)}`),
       );
-      const requeried = yield* snapshotQuery.getActiveProjectByWorkspaceRoot(input.workspaceRoot);
-      if (Option.isSome(requeried)) {
-        return requeried.value.id;
+      if (Option.isSome(created)) {
+        return created.value;
       }
 
       // The deterministic create was receipt-shadowed: an earlier import
       // created this project and the user has since deleted it. Salt the ids
       // with the session so the workspace gets a fresh project.
-      yield* create(
+      const salted = yield* create(
         ProjectId.make(`cli-import-project-${hashHex(input.workspaceRoot)}-${input.sessionId}`),
         CommandId.make(`cli-import:project:${hashHex(input.workspaceRoot)}:${input.sessionId}`),
       );
-      const salted = yield* snapshotQuery.getActiveProjectByWorkspaceRoot(input.workspaceRoot);
       if (Option.isSome(salted)) {
-        return salted.value.id;
+        return salted.value;
       }
       return yield* new SessionImportError({
         detail: `Unable to create or find a project for workspace root '${input.workspaceRoot}'.`,
       });
     });
 
-    const dispatchMessages = Effect.fn("SessionImporter.dispatchMessages")(function* (input: {
-      readonly driver: ProviderDriverKind;
+    /**
+     * Appends source messages past `fromLineIndex` to an existing thread and
+     * moves the thread's recency to its newest message. Messages the thread
+     * already holds (an interrupted earlier append) are skipped.
+     */
+    const appendMessages = Effect.fn("SessionImporter.appendMessages")(function* (input: {
       readonly sessionId: string;
       readonly threadId: ThreadId;
       readonly parsed: ParsedCliSession;
       readonly fromLineIndex: number;
-      readonly idVariant?: string;
     }) {
-      const idVariant = input.idVariant ?? "";
-      let dispatchedCount = 0;
-      for (const message of input.parsed.messages) {
-        if (message.lineIndex < input.fromLineIndex) {
-          continue;
-        }
-        const messageId = importedMessageId(input.sessionId, message.sourceId);
-        if (message.role === "user") {
-          yield* engine.dispatch({
-            type: "thread.message.user.record",
-            commandId: importCommandId(
-              input.driver,
-              input.sessionId,
-              `msg:${message.sourceId}`,
-              idVariant,
-            ),
-            threadId: input.threadId,
-            messageId,
-            text: message.text,
-            createdAt: message.timestamp,
-          });
-        } else {
-          // Mirrors ProviderRuntimeIngestion.finalizeAssistantMessage: the
-          // full text as one delta, then the finalizing complete.
-          yield* engine.dispatch({
-            type: "thread.message.assistant.delta",
-            commandId: importCommandId(
-              input.driver,
-              input.sessionId,
-              `msg:${message.sourceId}:delta`,
-              idVariant,
-            ),
-            threadId: input.threadId,
-            messageId,
-            delta: message.text,
-            createdAt: message.timestamp,
-          });
-          yield* engine.dispatch({
-            type: "thread.message.assistant.complete",
-            commandId: importCommandId(
-              input.driver,
-              input.sessionId,
-              `msg:${message.sourceId}:complete`,
-              idVariant,
-            ),
-            threadId: input.threadId,
-            messageId,
-            createdAt: message.timestamp,
-          });
-        }
-        dispatchedCount += 1;
+      const candidates = input.parsed.messages.filter(
+        (message) => message.lineIndex >= input.fromLineIndex,
+      );
+      if (candidates.length === 0) return 0;
+      // Migrated threads hydrate their v1 transcript lazily; finish that first
+      // so appended messages take positions after it.
+      yield* threads.ensureLegacyTranscript(input.threadId);
+      const existing = yield* sql<{ readonly message_id: string }>`
+        SELECT message_id FROM orchestration_v2_projection_messages
+        WHERE thread_id = ${input.threadId}
+      `;
+      const known = new Set(existing.map((row) => row.message_id));
+      const fresh = candidates.filter(
+        (message) => !known.has(importedMessageId(input.sessionId, message.sourceId)),
+      );
+      if (fresh.length === 0) return 0;
+      const records = yield* threads.getThreadRecords(input.threadId, []);
+      const thread = records.thread;
+      const newest = dateTime(fresh[fresh.length - 1]!.timestamp);
+      const events: Array<OrchestrationV2DomainEvent> = fresh.flatMap((message) =>
+        messageEvents({ threadId: input.threadId, sessionId: input.sessionId, message }),
+      );
+      if (DateTime.toEpochMillis(newest) > DateTime.toEpochMillis(thread.updatedAt)) {
+        events.push({
+          id: importEventId(input.threadId, `recency:${fresh[fresh.length - 1]!.sourceId}`),
+          type: "thread.metadata-updated",
+          threadId: input.threadId,
+          providerInstanceId: thread.providerInstanceId,
+          occurredAt: newest,
+          payload: { ...thread, updatedAt: newest },
+        });
       }
-      return dispatchedCount;
+      yield* eventSink.write({ events });
+      return fresh.length;
     });
 
     const upsertImportBinding = (input: {
@@ -447,7 +615,7 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
       readonly threadId: ThreadId;
       readonly parsed: ParsedCliSession;
       readonly filePath: string;
-      /** Omitted on incremental updates so the shallow merge keeps `cwd`. */
+      /** Omitted on incremental updates so the merge keeps `cwd`. */
       readonly cwd?: string;
       /** Sweep-end machine placement decision; omitted keeps the stored one. */
       readonly launchClass?: "human" | "kin" | "automation";
@@ -463,12 +631,9 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
               turnCount: userTurnCount,
             }
           : { threadId: input.sessionId };
-      return directory.upsert({
+      return mergeBinding({
         threadId: input.threadId,
         provider: input.driver,
-        providerInstanceId: defaultInstanceIdForDriver(input.driver),
-        status: "stopped",
-        runtimeMode: "full-access",
         resumeCursor,
         runtimePayload: {
           ...(input.cwd !== undefined ? { cwd: input.cwd } : {}),
@@ -496,7 +661,7 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
       readonly placement?: {
         readonly workspaceRoot: string;
         readonly projectTitle: string;
-        /** Salts thread/command ids when re-importing over a deleted thread. */
+        /** Salts thread ids when re-importing over a deleted thread. */
         readonly idVariant?: string;
       };
       readonly launchClass?: "human" | "kin" | "automation";
@@ -521,25 +686,30 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         (isChat
           ? input.context.chatsWorkspaceRoot
           : path.resolve(expandHomePath(parsed.cwd ?? input.context.chatsWorkspaceRoot)));
-      const createdAt = parsed.startedAt ?? firstMessage.timestamp;
       const projectTitle =
         input.placement?.projectTitle ?? (isChat ? CHATS_PROJECT_TITLE : undefined);
       const projectId = yield* ensureProject({
         workspaceRoot,
         sessionId,
-        createdAt,
         ...(projectTitle !== undefined ? { title: projectTitle } : {}),
       });
       const threadId = importedThreadId(sessionId, idVariant);
+      const existing = yield* threads.getThreadShell(threadId);
+      if (existing !== null) {
+        // Already imported (or deleted by the user): never re-create it.
+        return;
+      }
       const instanceId = defaultInstanceIdForDriver(driver);
-
-      yield* engine.dispatch({
-        type: "thread.create",
-        commandId: importCommandId(driver, sessionId, "thread.create", idVariant),
-        threadId,
+      const createdAt = dateTime(parsed.startedAt ?? firstMessage.timestamp);
+      const updatedAt = dateTime(lastMessage.timestamp);
+      const providerThreadId = deriveProviderThread({ driver, nativeThreadId: sessionId });
+      const thread: OrchestrationV2AppThread = {
+        createdBy: "system",
+        creationSource: "server",
+        id: threadId,
         projectId,
         title: parsed.title ?? "Imported session",
-        historyImport: true,
+        providerInstanceId: instanceId,
         modelSelection: {
           instanceId,
           model: DEFAULT_MODEL_BY_PROVIDER[driver] ?? DEFAULT_MODEL,
@@ -550,16 +720,66 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         // Deliberately null: the imported session ran in the workspace root
         // itself, and provider cwd resolution falls back to it.
         worktreePath: null,
+        linkedPullRequest: null,
+        branchPullRequest: null,
+        activeProviderThreadId: providerThreadId,
+        historyOrigin: "v1_import",
+        lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+        forkedFrom: null,
         createdAt,
-      });
-
-      yield* dispatchMessages({
+        updatedAt,
+        archivedAt: null,
+        // Left to the settlement sweep: age-based placement under the user's settings.
+        settledOverride: null,
+        settledAt: null,
+        unsettledAt: null,
+        snoozedUntil: null,
+        snoozedAt: null,
+        pinnedAt: null,
+        pinOrderKey: null,
+        activeOrderKey: null,
+        lastVisitedAt: null,
+        deletedAt: null,
+      };
+      const providerThread: OrchestrationV2ProviderThread = {
+        id: providerThreadId,
         driver,
-        sessionId,
-        threadId,
-        parsed,
-        fromLineIndex: 0,
-        idVariant,
+        providerInstanceId: instanceId,
+        providerSessionId: null,
+        appThreadId: threadId,
+        ownerNodeId: null,
+        nativeThreadRef: { driver, nativeId: sessionId, strength: "strong" },
+        nativeConversationHeadRef: null,
+        status: "idle",
+        firstRunOrdinal: null,
+        lastRunOrdinal: null,
+        handoffIds: [],
+        forkedFrom: null,
+        pendingBackgroundTasks: [],
+        createdAt,
+        updatedAt,
+      };
+      yield* eventSink.write({
+        events: [
+          {
+            id: importEventId(threadId, "created"),
+            type: "thread.created",
+            threadId,
+            providerInstanceId: instanceId,
+            occurredAt: createdAt,
+            payload: thread,
+          },
+          ...parsed.messages.flatMap((message) => messageEvents({ threadId, sessionId, message })),
+          {
+            id: importEventId(threadId, "provider-thread"),
+            type: "provider-thread.updated",
+            threadId,
+            driver,
+            providerInstanceId: instanceId,
+            occurredAt: updatedAt,
+            payload: providerThread,
+          },
+        ],
       });
       yield* upsertImportBinding({
         driver,
@@ -569,24 +789,6 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         filePath: input.filePath,
         cwd: parsed.cwd !== undefined ? path.resolve(expandHomePath(parsed.cwd)) : workspaceRoot,
         ...(input.launchClass !== undefined ? { launchClass: input.launchClass } : {}),
-      });
-      // Keep a provider badge without waking a session. The server's
-      // settlement reactor handles age-based placement under the user's settings.
-      yield* engine.dispatch({
-        type: "thread.session.set",
-        commandId: importCommandId(driver, sessionId, "session", idVariant),
-        threadId,
-        session: {
-          threadId,
-          status: "stopped",
-          providerName: driver,
-          providerInstanceId: instanceId,
-          runtimeMode: "full-access",
-          activeTurnId: null,
-          lastError: null,
-          updatedAt: lastMessage.timestamp,
-        },
-        createdAt: lastMessage.timestamp,
       });
 
       input.context.stats.importedCount += 1;
@@ -605,39 +807,23 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         readonly sessionId: string;
         readonly filePath: string;
         readonly parsed: ParsedCliSession;
-        readonly binding: ProviderRuntimeBindingWithMetadata;
+        readonly binding: ImportBinding;
         readonly cursor: ImportCursor;
         readonly context: SweepContext;
         /** Set when re-entered from the sweep-end machine placement pass. */
         readonly skipMachineDecision?: boolean;
       }) {
         const { driver, sessionId, parsed, cursor } = input;
-        // A native T3 session has run on this thread since import: the
-        // adapter owns the binding now (it flips status away from "stopped"
-        // and merges a real model/activeTurnId into runtimePayload). Hand
-        // the thread over permanently — strip the import cursor so this
-        // source file is never tailed again and native turns aren't
-        // re-imported as duplicates. A terminal continuation of the source
-        // session forks to a new session id and imports as a fresh thread.
-        //
-        // The signals must be NON-NULL values, not key presence: provider
-        // lifecycle sweeps (e.g. stopAll on app quit) merge
-        // `activeTurnId: null` into every binding's runtimePayload, which a
-        // key-presence check misread as adoption and mass-stripped all
-        // import cursors.
-        const runtimePayload = input.binding.runtimePayload;
-        const payloadRecord = isRecord(runtimePayload) ? runtimePayload : undefined;
-        const nativelyOwned =
-          (input.binding.status !== undefined && input.binding.status !== "stopped") ||
-          (payloadRecord !== undefined &&
-            (Boolean(payloadRecord.activeTurnId) || Boolean(payloadRecord.model)));
-        if (nativelyOwned) {
-          yield* directory.upsert({
+        // A T3 run has happened on this thread since import: T3 drives its
+        // native session now. Hand the thread over permanently — drop the
+        // import cursor so this source file is never tailed again and T3's
+        // own turns aren't re-imported as duplicates. A terminal continuation
+        // of the source session forks to a new session id and imports as a
+        // fresh thread.
+        if (yield* hasT3Runs(input.binding.threadId)) {
+          yield* mergeBinding({
             threadId: input.binding.threadId,
             provider: driver,
-            providerInstanceId:
-              input.binding.providerInstanceId ?? defaultInstanceIdForDriver(driver),
-            status: input.binding.status ?? "stopped",
             runtimePayload: { importCursor: null },
           });
           yield* Effect.logInfo("session.importer.thread-adopted", {
@@ -651,34 +837,24 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         // UI never shows them. Drop the imported thread and tombstone the
         // binding; the fresh-import path skips these files from now on.
         if (parsed.launch === "subagent") {
-          const subagentShell = yield* snapshotQuery.getThreadShellById(input.binding.threadId);
+          const subagentShell = yield* getThread(input.binding.threadId);
           if (Option.isNone(subagentShell)) {
             return;
           }
-          const subagentProjectId = subagentShell.value.projectId;
-          yield* engine.dispatch({
-            type: "thread.delete",
-            commandId: importCommandId(driver, sessionId, "subagent-thread-delete"),
-            threadId: input.binding.threadId,
-          });
-          yield* directory.upsert({
+          yield* deleteThread(
+            input.binding.threadId,
+            importCommandId(driver, sessionId, "subagent-thread-delete"),
+          );
+          yield* mergeBinding({
             threadId: input.binding.threadId,
             provider: driver,
-            providerInstanceId:
-              input.binding.providerInstanceId ?? defaultInstanceIdForDriver(driver),
-            status: input.binding.status ?? "stopped",
             resumeCursor: null,
             runtimePayload: { importCursor: null },
           });
-          const subagentRemaining =
-            yield* snapshotQuery.getFirstActiveThreadIdByProjectId(subagentProjectId);
-          if (Option.isNone(subagentRemaining)) {
-            yield* engine.dispatch({
-              type: "project.delete",
-              commandId: importCommandId(driver, sessionId, "subagent-project-delete"),
-              projectId: subagentProjectId,
-            });
-          }
+          yield* deleteProjectIfEmpty(
+            subagentShell.value.projectId,
+            importCommandId(driver, sessionId, "subagent-project-delete"),
+          );
           yield* Effect.logInfo("session.importer.subagent-removed", {
             provider: driver,
             sessionId,
@@ -708,29 +884,24 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         }
         // Epoch migration: a project-less codex chat imported under the old
         // one-project-per-cwd layout moves into the shared Chats project.
-        // Delete the old thread, re-import it fresh (epoch-salted command
-        // ids bypass the old receipts), and drop the per-chat project it
-        // leaves empty. A thread the user already deleted stays dead.
+        // Delete the old thread, re-import it fresh under an epoch-scoped id,
+        // and drop the per-chat project it leaves empty. A thread the user
+        // already deleted stays dead.
         if (driver === CODEX_DRIVER && cursor.epoch === undefined && parsed.hasProject !== true) {
-          const migrateShell = yield* snapshotQuery.getThreadShellById(input.binding.threadId);
+          const migrateShell = yield* getThread(input.binding.threadId);
           if (Option.isNone(migrateShell)) {
             return;
           }
-          const oldProjectId = migrateShell.value.projectId;
-          yield* engine.dispatch({
-            type: "thread.delete",
-            commandId: importCommandId(driver, sessionId, "migrate-thread-delete"),
-            threadId: input.binding.threadId,
-          });
+          yield* deleteThread(
+            input.binding.threadId,
+            importCommandId(driver, sessionId, "migrate-thread-delete"),
+          );
           // Tombstone the old binding so it stops claiming this source
           // session; the re-import below owns it under an epoch-scoped
           // thread id (deleted thread ids cannot be re-created).
-          yield* directory.upsert({
+          yield* mergeBinding({
             threadId: input.binding.threadId,
             provider: driver,
-            providerInstanceId:
-              input.binding.providerInstanceId ?? defaultInstanceIdForDriver(driver),
-            status: input.binding.status ?? "stopped",
             resumeCursor: null,
             runtimePayload: { importCursor: null },
           });
@@ -741,24 +912,20 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
             parsed,
             context: input.context,
           });
-          const remaining = yield* snapshotQuery.getFirstActiveThreadIdByProjectId(oldProjectId);
-          if (Option.isNone(remaining)) {
-            yield* engine.dispatch({
-              type: "project.delete",
-              commandId: importCommandId(driver, sessionId, "migrate-project-delete"),
-              projectId: oldProjectId,
-            });
-          }
+          yield* deleteProjectIfEmpty(
+            migrateShell.value.projectId,
+            importCommandId(driver, sessionId, "migrate-project-delete"),
+          );
           yield* Effect.logInfo("session.importer.chat-migrated", {
             provider: driver,
             sessionId,
             threadId: input.binding.threadId,
-            oldProjectId,
+            oldProjectId: migrateShell.value.projectId,
           });
           return;
         }
         const threadId = input.binding.threadId;
-        const shell = yield* snapshotQuery.getThreadShellById(threadId);
+        const shell = yield* getThread(threadId);
         if (Option.isNone(shell)) {
           // The imported thread was deleted in T3; leave the source alone
           // instead of resurrecting it.
@@ -768,8 +935,7 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
           return;
         }
 
-        const dispatchedCount = yield* dispatchMessages({
-          driver,
+        const appendedCount = yield* appendMessages({
           sessionId,
           threadId,
           parsed,
@@ -782,13 +948,13 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
           parsed,
           filePath: input.filePath,
         });
-        if (dispatchedCount > 0) {
+        if (appendedCount > 0) {
           input.context.stats.updatedCount += 1;
           yield* Effect.logDebug("session.importer.updated", {
             provider: driver,
             sessionId,
             threadId,
-            dispatchedCount,
+            appendedCount,
           });
         }
       },
@@ -884,14 +1050,14 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
           !isCommandNoiseText(parsed.title) &&
           binding.threadId.startsWith("cli-import")
         ) {
-          const titleShell = yield* snapshotQuery.getThreadShellById(binding.threadId);
+          const titleShell = yield* getThread(binding.threadId);
           if (
             Option.isSome(titleShell) &&
             isCommandNoiseText(titleShell.value.title) &&
             titleShell.value.title !== parsed.title
           ) {
-            yield* engine.dispatch({
-              type: "thread.meta.update",
+            yield* threads.dispatch({
+              type: "thread.metadata.update",
               commandId: importCommandId(driver, sessionId, `retitle:${hashHex(parsed.title)}`),
               threadId: binding.threadId,
               title: parsed.title,
@@ -911,50 +1077,42 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
           parsed.forkSignature !== undefined &&
           parsed.forkSignature.length > 0
         ) {
-          yield* directory.upsert({
+          yield* mergeBinding({
             threadId: binding.threadId,
             provider: driver,
-            providerInstanceId: binding.providerInstanceId ?? defaultInstanceIdForDriver(driver),
-            status: binding.status ?? "stopped",
             runtimePayload: { importForkSig: parsed.forkSignature },
           });
         }
         let cursor = readImportCursor(binding.runtimePayload);
-        // Self-heal: repair cursors falsely stripped by the key-presence
-        // adoption bug. An importer-created thread (cli-import- prefix)
-        // whose binding shows no real native activity (no truthy
-        // model/activeTurnId, not running) but lost its cursor gets it
-        // reconstructed at the current file position; a genuinely adopted
-        // thread keeps its handoff.
-        if (cursor === undefined && binding.threadId.startsWith("cli-import-")) {
-          const payload = isRecord(binding.runtimePayload) ? binding.runtimePayload : undefined;
-          const genuinelyAdopted =
-            (binding.status !== undefined && binding.status !== "stopped") ||
-            (payload !== undefined && (Boolean(payload.activeTurnId) || Boolean(payload.model)));
-          if (!genuinelyAdopted) {
-            cursor = {
-              sourceSessionId: sessionId,
-              sourcePath: filePath,
-              lineCount: parsed.lineCount,
-              // Chats keep the legacy epoch so the migration below still
-              // runs for them; everything else is stamped current.
-              ...(driver === CODEX_DRIVER && parsed.hasProject !== true
-                ? {}
-                : { epoch: IMPORT_EPOCH }),
-            };
-            yield* directory.upsert({
-              threadId: binding.threadId,
-              provider: driver,
-              providerInstanceId: binding.providerInstanceId ?? defaultInstanceIdForDriver(driver),
-              status: binding.status ?? "stopped",
-              runtimePayload: { importCursor: cursor },
-            });
-            yield* Effect.logInfo("session.importer.cursor-repaired", {
-              provider: driver,
-              sessionId,
-              threadId: binding.threadId,
-            });
-          }
+        // Self-heal: an importer-created thread (cli-import- prefix) that
+        // lost its cursor without any T3 run gets it reconstructed at the
+        // current file position; a thread T3 has run keeps its handoff.
+        if (
+          cursor === undefined &&
+          binding.threadId.startsWith("cli-import-") &&
+          Option.isSome(yield* getThread(binding.threadId)) &&
+          !(yield* hasT3Runs(binding.threadId))
+        ) {
+          cursor = {
+            sourceSessionId: sessionId,
+            sourcePath: filePath,
+            lineCount: parsed.lineCount,
+            // Chats keep the legacy epoch so the migration below still
+            // runs for them; everything else is stamped current.
+            ...(driver === CODEX_DRIVER && parsed.hasProject !== true
+              ? {}
+              : { epoch: IMPORT_EPOCH }),
+          };
+          yield* mergeBinding({
+            threadId: binding.threadId,
+            provider: driver,
+            runtimePayload: { importCursor: cursor },
+          });
+          yield* Effect.logInfo("session.importer.cursor-repaired", {
+            provider: driver,
+            sessionId,
+            threadId: binding.threadId,
+          });
         }
         if (
           cursor === undefined ||
@@ -977,6 +1135,10 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         return;
       }
 
+      // A session T3 itself started or resumed: it already has its thread.
+      if (context.t3NativeSessions.has(key)) {
+        return;
+      }
       if (!isEligibleCliSession(parsed)) {
         return;
       }
@@ -1034,11 +1196,9 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         if (kin) {
           // A fork of a human conversation: record the decision and resume
           // normal incremental handling in place.
-          yield* directory.upsert({
+          yield* mergeBinding({
             threadId: binding.threadId,
             provider: driver,
-            providerInstanceId: binding.providerInstanceId ?? defaultInstanceIdForDriver(driver),
-            status: binding.status ?? "stopped",
             runtimePayload: { importLaunch: "kin" },
           });
           yield* importSessionIncrement({
@@ -1053,23 +1213,21 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
           });
           continue;
         }
-        const shell = yield* snapshotQuery.getThreadShellById(binding.threadId);
+        const shell = yield* getThread(binding.threadId);
         if (Option.isNone(shell)) {
           continue;
         }
-        const automationsProject = yield* snapshotQuery.getActiveProjectByWorkspaceRoot(
+        const automationsProject = yield* projectStore.findActiveByWorkspaceRoot(
           context.automationsWorkspaceRoot,
         );
         if (
           Option.isSome(automationsProject) &&
-          shell.value.projectId === automationsProject.value.id
+          shell.value.projectId === automationsProject.value.projectId
         ) {
           // Already placed; just record the decision.
-          yield* directory.upsert({
+          yield* mergeBinding({
             threadId: binding.threadId,
             provider: driver,
-            providerInstanceId: binding.providerInstanceId ?? defaultInstanceIdForDriver(driver),
-            status: binding.status ?? "stopped",
             runtimePayload: { importLaunch: "automation" },
           });
           continue;
@@ -1078,16 +1236,13 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         // binding, and re-import under a variant-salted id (deleted thread
         // ids can never be re-created).
         const oldProjectId = shell.value.projectId;
-        yield* engine.dispatch({
-          type: "thread.delete",
-          commandId: importCommandId(driver, sessionId, "automation-thread-delete"),
-          threadId: binding.threadId,
-        });
-        yield* directory.upsert({
+        yield* deleteThread(
+          binding.threadId,
+          importCommandId(driver, sessionId, "automation-thread-delete"),
+        );
+        yield* mergeBinding({
           threadId: binding.threadId,
           provider: driver,
-          providerInstanceId: binding.providerInstanceId ?? defaultInstanceIdForDriver(driver),
-          status: binding.status ?? "stopped",
           resumeCursor: null,
           runtimePayload: { importCursor: null },
         });
@@ -1104,14 +1259,10 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
           },
           launchClass: "automation",
         });
-        const remaining = yield* snapshotQuery.getFirstActiveThreadIdByProjectId(oldProjectId);
-        if (Option.isNone(remaining)) {
-          yield* engine.dispatch({
-            type: "project.delete",
-            commandId: importCommandId(driver, sessionId, "automation-project-delete"),
-            projectId: oldProjectId,
-          });
-        }
+        yield* deleteProjectIfEmpty(
+          oldProjectId,
+          importCommandId(driver, sessionId, "automation-project-delete"),
+        );
         yield* Effect.logInfo("session.importer.automation-migrated", {
           provider: driver,
           sessionId,
@@ -1125,13 +1276,13 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
      * history id are branches of one conversation. The family id is the
      * lexicographically smallest member session id (Codex uuidv7 ids sort by
      * creation time, so that is the original session). Only families with two
-     * or more members are stamped; the marker on the binding keeps re-stamps
-     * from dispatching every sweep.
+     * or more members are stamped, and only threads whose `forkFamilyId`
+     * differs, without touching their recency.
      */
     const stampForkFamilies = Effect.fn("SessionImporter.stampForkFamilies")(function* () {
-      const bindings = yield* directory.listBindings();
+      const bindings = yield* listBindings;
       interface FamilyNode {
-        readonly binding: ProviderRuntimeBindingWithMetadata;
+        readonly binding: ImportBinding;
         readonly sessionId: string;
         readonly sig: ReadonlyArray<string>;
       }
@@ -1181,7 +1332,6 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         components.set(root, [...(components.get(root) ?? []), node]);
       }
 
-      const nowIso = yield* Effect.map(DateTime.now, DateTime.formatIso);
       let stampedCount = 0;
       for (const members of components.values()) {
         if (members.length < 2) {
@@ -1194,28 +1344,23 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
           continue;
         }
         for (const member of members) {
-          if (readStampedForkFamily(member.binding.runtimePayload) === familyId) {
+          const live = yield* getThread(member.binding.threadId);
+          if (Option.isNone(live) || live.value.forkFamilyId === familyId) {
             continue;
           }
-          const shell = yield* snapshotQuery.getThreadShellById(member.binding.threadId);
-          if (Option.isNone(shell)) {
-            continue;
-          }
-          yield* engine.dispatch({
-            type: "thread.fork-family.set",
-            commandId: CommandId.make(`cli-import:family:${member.sessionId}:${hashHex(familyId)}`),
-            threadId: member.binding.threadId,
-            forkFamilyId: familyId,
-            createdAt: nowIso,
-          });
-          yield* directory.upsert({
-            threadId: member.binding.threadId,
-            provider: member.binding.provider,
-            providerInstanceId:
-              member.binding.providerInstanceId ??
-              defaultInstanceIdForDriver(member.binding.provider),
-            status: member.binding.status ?? "stopped",
-            runtimePayload: { forkFamilyStamped: familyId },
+          const records = yield* threads.getThreadRecords(member.binding.threadId, []);
+          const thread = records.thread;
+          yield* eventSink.write({
+            events: [
+              {
+                id: importEventId(thread.id, `family:${hashHex(familyId)}`),
+                type: "thread.metadata-updated",
+                threadId: thread.id,
+                providerInstanceId: thread.providerInstanceId,
+                occurredAt: thread.updatedAt,
+                payload: { ...thread, forkFamilyId: familyId },
+              },
+            ],
           });
           stampedCount += 1;
         }
@@ -1237,8 +1382,8 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
           "sessions",
         );
 
-      const bindings = yield* directory.listBindings();
-      const bindingsBySource = new Map<string, ProviderRuntimeBindingWithMetadata>();
+      const bindings = yield* listBindings;
+      const bindingsBySource = new Map<string, ImportBinding>();
       const sigOwners = new Map<string, string>();
       for (const binding of bindings) {
         if (!belongsToScannedProviderHome(binding)) continue;
@@ -1273,6 +1418,7 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
 
       const context: SweepContext = {
         bindingsBySource,
+        t3NativeSessions: yield* listT3NativeSessions,
         seenSessionIds: new Set<string>(),
         stats: { importedCount: 0, updatedCount: 0 },
         chatsWorkspaceRoot: path.dirname(codexSessionsDir),
@@ -1377,14 +1523,15 @@ export const makeSessionImporterLive = (options?: SessionImporterLiveOptions) =>
     Effect.gen(function* () {
       const serverConfig = yield* ServerConfig;
       return yield* makeSessionImporter({
-        enabled: serverConfig.importCliSessions,
+        enabled: serverConfig.importCliSessions ?? false,
         ...(serverConfig.importSweepIntervalMs !== undefined
           ? { sweepIntervalMs: serverConfig.importSweepIntervalMs }
           : {}),
         ...(serverConfig.importSettleMs !== undefined
           ? { settleMs: serverConfig.importSettleMs }
           : {}),
-        ...(serverConfig.importAutomationRoots.length > 0
+        ...(serverConfig.importAutomationRoots !== undefined &&
+        serverConfig.importAutomationRoots.length > 0
           ? { automationRoots: serverConfig.importAutomationRoots }
           : {}),
         ...options,

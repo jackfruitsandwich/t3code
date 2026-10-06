@@ -1,5 +1,8 @@
+import { EnvironmentId, ThreadId } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
+import { presentThreadShell } from "./models.ts";
+import { v2ThreadShell } from "./orchestrationV2TestFixtures.ts";
 import { foldForkFamilies, paginateForkFamilies } from "./threadForkFamily.ts";
 
 interface Row {
@@ -150,5 +153,28 @@ describe("paginateForkFamilies", () => {
     ]);
     expect(paginateForkFamilies(folded, history.length, selected, needsAttention)).toEqual(history);
     expect(history).toHaveLength(14_361);
+  });
+});
+
+describe("fork families from v2 shells", () => {
+  it("folds imported siblings once the shell carries their family id", () => {
+    const environmentId = EnvironmentId.make("mac");
+    const shell = (id: string, forkFamilyId?: string) =>
+      presentThreadShell(environmentId, {
+        ...v2ThreadShell,
+        id: ThreadId.make(id),
+        ...(forkFamilyId === undefined ? {} : { forkFamilyId }),
+      });
+    const folded = foldForkFamilies(
+      [shell("head", "family"), shell("plain"), shell("branch", "family")],
+      new Set(),
+    );
+    expect(folded.rows.map((thread) => thread.id)).toEqual(["head", "plain"]);
+    expect(folded.metaByThreadId.get("mac:head")).toEqual({
+      familyId: "mac:family",
+      memberCount: 2,
+      role: "head",
+      expanded: false,
+    });
   });
 });
