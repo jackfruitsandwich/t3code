@@ -38,6 +38,19 @@ const MAX_CARRIED_OUTPUT_CHARS = 100_000;
 const MAX_FAILURE_MESSAGE_CHARS = 4_096;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+/**
+ * Shell status for a thread with no v2 run. An imported thread keeps its native
+ * provider thread so it can resume, and upstream reads "provider thread, no run"
+ * as an open session ("Waiting"). Until its first v2 turn it is a finished
+ * conversation, so present it as completed.
+ */
+export function importedShellStatus<Status extends string>(
+  status: Status,
+  thread: Pick<OrchestrationV2AppThread, "historyOrigin">,
+): Status | "completed" {
+  return status === "idle" && thread.historyOrigin === "v1_import" ? "completed" : status;
+}
+
 export interface LegacyRuntimeColumns {
   readonly runtime_provider_name: string | null;
   readonly runtime_provider_instance_id: string | null;

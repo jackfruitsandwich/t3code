@@ -260,6 +260,8 @@ it.layer(layerTest)("LegacyV1ThreadImporter personal-fork carryover", (it) => {
       );
       assert.equal(shell?.activeProviderThreadId, claudeProviderThreadId);
       assert.deepEqual(shell?.updatedAt, v1UpdatedAt);
+      // A resumable session with no v2 turn yet is a finished chat, not "Waiting".
+      assert.equal(shell?.status, "completed");
       assert.include(
         yield* threadEventIds("thread:resume:claude"),
         "migration:v1:thread:thread:resume:claude:provider-thread",

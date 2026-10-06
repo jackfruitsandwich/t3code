@@ -15,6 +15,7 @@ import { deriveProviderThread } from "../IdAllocator.ts";
 import {
   activityTimeline,
   contextUsageFromActivities,
+  importedShellStatus,
   legacyProviderThread,
   nativeThreadIdFromCursor,
   orderTimeline,
@@ -1182,5 +1183,16 @@ describe("orderTimeline", () => {
         "assistant-2",
       ],
     );
+  });
+});
+
+describe("importedShellStatus", () => {
+  it("presents an imported thread with no v2 run as completed", () => {
+    assert.equal(importedShellStatus("idle", { historyOrigin: "v1_import" }), "completed");
+  });
+
+  it("leaves native threads and real run statuses alone", () => {
+    assert.equal(importedShellStatus("idle", { historyOrigin: undefined }), "idle");
+    assert.equal(importedShellStatus("running", { historyOrigin: "v1_import" }), "running");
   });
 });
