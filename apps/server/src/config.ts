@@ -104,6 +104,7 @@ export class ServerConfig extends Context.Service<
     readonly importCliSessions?: boolean | undefined;
     readonly importSweepIntervalMs?: number | undefined;
     readonly importSettleMs?: number | undefined;
+    readonly importMaxFileBytes?: number | undefined;
     readonly importAutomationRoots?: ReadonlyArray<string> | undefined;
     readonly logWebSocketEvents: boolean;
     readonly tailscaleServeEnabled: boolean;

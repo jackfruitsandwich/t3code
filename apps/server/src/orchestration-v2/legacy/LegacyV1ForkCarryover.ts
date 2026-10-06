@@ -269,8 +269,14 @@ function toolItem(
   const detail = text(payload.detail);
   const toolName = text(data?.toolName) ?? text(item?.tool) ?? detailToolName(detail);
   const output = toolOutput(data);
+  // v1 marks a failure on different rows per provider: Claude on a
+  // tool.updated row or as result.is_error, Codex on the item itself.
+  const failed =
+    rows.some((entry) => entry.payload.status === "failed") ||
+    record(data?.result)?.is_error === true ||
+    item?.status === "failed";
   const status: OrchestrationV2TurnItem["status"] =
-    completed === undefined ? "interrupted" : payload.status === "failed" ? "failed" : "completed";
+    completed === undefined ? "interrupted" : failed ? "failed" : "completed";
   const title = text(payload.title) ?? text(last.row.summary) ?? null;
   const id = TurnItemId.make(`${ITEM_PREFIX}:${first.row.activity_id}`);
   const startedAt = first.row.created_at;
@@ -285,7 +291,8 @@ function toolItem(
     ...base(ordinal),
     status,
     type: "dynamic_tool",
-    toolName: toolName ?? text(payload.itemType) ?? "tool",
+    toolName:
+      toolName ?? text(payload.title) ?? text(data?.kind) ?? text(payload.itemType) ?? "tool",
     input: input ?? (detail === undefined ? null : stripName(detail)),
     ...(output === undefined ? {} : { output }),
   });
@@ -527,7 +534,10 @@ export function activityTimeline(
         continue;
       }
       const taskId = text(payload.taskId);
-      if (taskId === undefined || payload.taskType === "dream") continue;
+      // Codex's turn-level "default" task only repeats the turn's own reply.
+      if (taskId === undefined || payload.taskType === "dream" || payload.taskType === "default") {
+        continue;
+      }
       const group = taskGroups.get(taskId) ?? [];
       group.push(entry);
       taskGroups.set(taskId, group);
@@ -595,7 +605,10 @@ export function wuweiTimeline(
       turn.userImageCount > 0
         ? `\n\n[${turn.userImageCount} image${turn.userImageCount === 1 ? "" : "s"}]`
         : "";
-    entries.push(message(turn.userItemId, "user", `${turn.userText}${images}`, turn.at));
+    // A chat that opens on an assistant message (a duet or a /fork) has no user turn start.
+    if (turn.userText.trim() !== "" || turn.userImageCount > 0) {
+      entries.push(message(turn.userItemId, "user", `${turn.userText}${images}`, turn.at));
+    }
     turn.entries.forEach((entry, index) => {
       const key = `${entry.id}:${index}`;
       switch (entry.kind) {

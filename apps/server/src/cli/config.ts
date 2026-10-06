@@ -164,6 +164,10 @@ const EnvServerConfig = Config.all({
     Config.option,
     Config.map(Option.getOrUndefined),
   ),
+  importMaxFileBytes: Config.Number("T3CODE_IMPORT_MAX_FILE_BYTES").pipe(
+    Config.option,
+    Config.map(Option.getOrUndefined),
+  ),
   // Comma-separated path prefixes whose sessions route to the Automations
   // project regardless of launch markers — for agent-driven interactive CLIs
   // (tmux harnesses) that provider files cannot distinguish from a human.
@@ -497,6 +501,7 @@ export const resolveServerConfig = (
       importCliSessions: env.importCliSessions ?? true,
       importSweepIntervalMs: env.importSweepIntervalMs,
       importSettleMs: env.importSettleMs,
+      importMaxFileBytes: env.importMaxFileBytes,
       importAutomationRoots:
         env.importAutomationRoots
           ?.split(",")

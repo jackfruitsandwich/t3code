@@ -146,7 +146,9 @@ export interface SessionImporterLiveOptions {
   readonly automationRoots?: ReadonlyArray<string>;
 }
 
-const DEFAULT_MAX_FILE_BYTES = 32 * 1024 * 1024;
+// Whole-file reads: generous on a desktop, lowered on small hosts with
+// T3CODE_IMPORT_MAX_FILE_BYTES (the box keeps 32 MiB).
+const DEFAULT_MAX_FILE_BYTES = 256 * 1024 * 1024;
 const DEFAULT_SETTLE_MS = 20 * 1000;
 
 interface ImportCursor {
@@ -206,6 +208,9 @@ const hashHex = (value: string) =>
  */
 export const importedThreadId = (sessionId: string, idVariant = "") =>
   ThreadId.make(`cli-import-e${IMPORT_EPOCH}${idVariant}-${sessionId}`);
+/** Imported under the current layout epoch (any id variant). */
+const isCurrentEpochThread = (threadId: string) =>
+  threadId.startsWith(`cli-import-e${IMPORT_EPOCH}`);
 export const importedProjectId = (workspaceRoot: string) =>
   ProjectId.make(`cli-import-project-${hashHex(workspaceRoot)}`);
 const importCommandId = (
@@ -428,6 +433,28 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
           ),
         );
 
+    /** Any thread with this id ever existed: deleted ids are never re-created. */
+    const threadEverExisted = (threadId: ThreadId) =>
+      sql<{ readonly found: number }>`
+        SELECT 1 AS found FROM orchestration_events
+        WHERE application_event_version = 2
+          AND aggregate_kind = 'thread'
+          AND stream_id = ${threadId}
+          AND event_type = 'thread.created'
+        LIMIT 1
+      `.pipe(Effect.map((rows) => rows.length > 0));
+
+    /**
+     * Whether the thread holds messages the importer didn't write: T3 itself
+     * ran turns on it (before or after the v2 migration), so T3 owns it.
+     */
+    const hasT3Messages = (threadId: ThreadId) =>
+      sql<{ readonly found: number }>`
+        SELECT 1 AS found FROM orchestration_v2_projection_messages
+        WHERE thread_id = ${threadId} AND message_id NOT LIKE 'cli-import-%'
+        LIMIT 1
+      `.pipe(Effect.map((rows) => rows.length > 0));
+
     /** A T3 run on an imported thread means T3 owns its native session now. */
     const hasT3Runs = (threadId: ThreadId) =>
       threads
@@ -526,7 +553,12 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
       const title = input.title ?? (path.basename(input.workspaceRoot) || "project");
       const create = (projectId: ProjectId, commandId: CommandId) =>
         projects.create({ commandId, projectId, title, workspaceRoot: input.workspaceRoot }).pipe(
-          Effect.map((project) => Option.some(project.id)),
+          // A replayed receipt hands back the project the user (or a placement
+          // move) later deleted; treat that as "not created" so the salted
+          // retry below makes a fresh one.
+          Effect.map((project) =>
+            project.deletedAt === null ? Option.some(project.id) : Option.none<ProjectId>(),
+          ),
           // A concurrent create for the same root loses the race; take the winner.
           Effect.catchTag("ProjectConflictError", (error) =>
             Effect.succeed(Option.some(error.conflictingProjectId)),
@@ -688,14 +720,22 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
           : path.resolve(expandHomePath(parsed.cwd ?? input.context.chatsWorkspaceRoot)));
       const projectTitle =
         input.placement?.projectTitle ?? (isChat ? CHATS_PROJECT_TITLE : undefined);
-      const projectId = yield* ensureProject({
-        workspaceRoot,
-        sessionId,
-        ...(projectTitle !== undefined ? { title: projectTitle } : {}),
-      });
+      // T3 projects need an existing folder. A session whose folder is gone
+      // still imports, into the shared Chats project.
+      const folderExists = yield* fs.exists(workspaceRoot).pipe(Effect.orElseSucceed(() => false));
+      const projectId = folderExists
+        ? yield* ensureProject({
+            workspaceRoot,
+            sessionId,
+            ...(projectTitle !== undefined ? { title: projectTitle } : {}),
+          })
+        : yield* ensureProject({
+            workspaceRoot: input.context.chatsWorkspaceRoot,
+            sessionId,
+            title: CHATS_PROJECT_TITLE,
+          });
       const threadId = importedThreadId(sessionId, idVariant);
-      const existing = yield* threads.getThreadShell(threadId);
-      if (existing !== null) {
+      if (yield* threadEverExisted(threadId)) {
         // Already imported (or deleted by the user): never re-create it.
         return;
       }
@@ -887,7 +927,12 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         // Delete the old thread, re-import it fresh under an epoch-scoped id,
         // and drop the per-chat project it leaves empty. A thread the user
         // already deleted stays dead.
-        if (driver === CODEX_DRIVER && cursor.epoch === undefined && parsed.hasProject !== true) {
+        if (
+          driver === CODEX_DRIVER &&
+          cursor.epoch === undefined &&
+          parsed.hasProject !== true &&
+          !isCurrentEpochThread(input.binding.threadId)
+        ) {
           const migrateShell = yield* getThread(input.binding.threadId);
           if (Option.isNone(migrateShell)) {
             return;
@@ -1085,21 +1130,30 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         }
         let cursor = readImportCursor(binding.runtimePayload);
         // Self-heal: an importer-created thread (cli-import- prefix) that
-        // lost its cursor without any T3 run gets it reconstructed at the
-        // current file position; a thread T3 has run keeps its handoff.
+        // lost its cursor although T3 never ran it gets the cursor rebuilt
+        // at the current file position. A thread T3 ran — native messages,
+        // a v2 run, or v1's adoption markers on the binding — keeps its
+        // handoff and is never tailed again.
+        const payload = isRecord(binding.runtimePayload) ? binding.runtimePayload : undefined;
+        const adoptedBeforeV2 =
+          binding.status !== "stopped" || Boolean(payload?.activeTurnId) || Boolean(payload?.model);
         if (
           cursor === undefined &&
           binding.threadId.startsWith("cli-import-") &&
+          !adoptedBeforeV2 &&
           Option.isSome(yield* getThread(binding.threadId)) &&
-          !(yield* hasT3Runs(binding.threadId))
+          !(yield* hasT3Runs(binding.threadId)) &&
+          !(yield* hasT3Messages(binding.threadId))
         ) {
           cursor = {
             sourceSessionId: sessionId,
             sourcePath: filePath,
             lineCount: parsed.lineCount,
-            // Chats keep the legacy epoch so the migration below still
-            // runs for them; everything else is stamped current.
-            ...(driver === CODEX_DRIVER && parsed.hasProject !== true
+            // Epoch-1 chats keep the legacy epoch so the Chats migration
+            // below still runs for them; everything else is stamped current.
+            ...(driver === CODEX_DRIVER &&
+            parsed.hasProject !== true &&
+            !isCurrentEpochThread(binding.threadId)
               ? {}
               : { epoch: IMPORT_EPOCH }),
           };
@@ -1529,6 +1583,9 @@ export const makeSessionImporterLive = (options?: SessionImporterLiveOptions) =>
           : {}),
         ...(serverConfig.importSettleMs !== undefined
           ? { settleMs: serverConfig.importSettleMs }
+          : {}),
+        ...(serverConfig.importMaxFileBytes !== undefined
+          ? { maxFileBytes: serverConfig.importMaxFileBytes }
           : {}),
         ...(serverConfig.importAutomationRoots !== undefined &&
         serverConfig.importAutomationRoots.length > 0

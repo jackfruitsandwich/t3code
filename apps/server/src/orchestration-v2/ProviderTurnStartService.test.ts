@@ -171,6 +171,13 @@ function makeLocalCommandHarness(input: {
   readonly writeFailure?: unknown;
   /** Loads the thread and starts the run, then fails every later state read. */
   readonly failReadsAfterRunning?: boolean;
+  /**
+   * The run's provider thread already names a native session, as the v1
+   * import gives it (LegacyV1ForkCarryover.ts), and the provider resumes it.
+   */
+  readonly resumesNativeSession?: {
+    readonly historyOrigin?: OrchestrationV2ThreadProjection["thread"]["historyOrigin"];
+  };
 }) {
   const now = DateTime.makeUnsafe("2026-09-04T12:00:00Z");
   const threadId = ThreadId.make("thread-native-account-command");
@@ -355,6 +362,28 @@ function makeLocalCommandHarness(input: {
       ),
     };
   }
+  if (input.resumesNativeSession !== undefined) {
+    const { historyOrigin } = input.resumesNativeSession;
+    projection = {
+      ...projection,
+      thread: {
+        ...projection.thread,
+        ...(historyOrigin === undefined ? {} : { historyOrigin }),
+      },
+      providerThreads: projection.providerThreads.map((candidate) =>
+        candidate.id === providerThreadId
+          ? {
+              ...candidate,
+              nativeThreadRef: {
+                driver: providerThread.driver,
+                nativeId: "019fac53-994e-73c3-b4f6-3226e80366cb",
+                strength: "strong" as const,
+              },
+            }
+          : candidate,
+      ),
+    };
+  }
   const events: Array<OrchestrationV2DomainEvent> = [];
   const interruptRun = () => {
     projection = {
@@ -392,6 +421,28 @@ function makeLocalCommandHarness(input: {
         }),
       ),
     ensureThread: () => Effect.succeed(providerThread),
+  };
+  const readySession = {
+    id: providerSessionId,
+    driver: providerThread.driver,
+    providerInstanceId: newInstanceId,
+    status: "ready" as const,
+    cwd: "/tmp/native-account-command",
+    model: null,
+    capabilities: CodexProviderCapabilitiesV2,
+    createdAt: now,
+    updatedAt: now,
+    lastError: null,
+  };
+  const resumingSession = {
+    driver: providerThread.driver,
+    providerSession: readySession,
+    resumeThread: ({
+      providerThread: resumed,
+    }: {
+      readonly providerThread: typeof providerThread;
+    }) => Effect.succeed(resumed),
+    ensureThread: () => Effect.die("A resumable native session must not be replaced."),
   };
   const open = vi.fn(() =>
     input.interruptOpen === true
@@ -431,12 +482,14 @@ function makeLocalCommandHarness(input: {
                   },
                   ensureThread: () => Effect.succeed(providerThread),
                 } as never)
-              : Effect.die("A local command must not open a native session."),
+              : input.resumesNativeSession !== undefined
+                ? Effect.succeed(resumingSession as never)
+                : Effect.die("A local command must not open a native session."),
   );
   const startRootRun = vi.fn<
     (input: RunExecutionService.RunExecutionServiceV2StartRootRunInput) => Effect.Effect<void>
   >(() =>
-    input.failReadsAfterRunning === true
+    input.failReadsAfterRunning === true || input.resumesNativeSession !== undefined
       ? Effect.void
       : Effect.die("A local command must not start a native turn."),
   );
@@ -753,6 +806,38 @@ effectIt.effect("does not mistake a failed state read for a superseded run", () 
     const finalizeCheck = yield* Effect.flip(controls.shouldFinalizeRun!());
     expect(startCheck._tag).toBe("ProjectionStoreReadError");
     expect(finalizeCheck._tag).toBe("ProjectionStoreReadError");
+  }),
+);
+
+// Personal fork: a migrated thread's native session already holds the v1
+// turns, so its first V2 turn must resume it instead of opening the id fresh.
+effectIt.effect("resumes a v1-imported native session as one that already has turns", () =>
+  Effect.gen(function* () {
+    const harness = makeLocalCommandHarness({
+      text: "Continue",
+      resumesNativeSession: { historyOrigin: "v1_import" },
+    });
+
+    yield* harness.start;
+
+    expect(harness.projection().runs.at(-1)?.status).toBe("running");
+    expect(harness.startRootRun).toHaveBeenCalledOnce();
+    const started = harness.startRootRun.mock.calls[0]?.[0];
+    expect(started?.providerThread.nativeThreadRef?.nativeId).toBe(
+      "019fac53-994e-73c3-b4f6-3226e80366cb",
+    );
+    expect(started?.nativeThreadHasTurns).toBe(true);
+  }),
+);
+
+effectIt.effect("treats a native session without accepted turns as new outside the v1 import", () =>
+  Effect.gen(function* () {
+    const harness = makeLocalCommandHarness({ text: "Continue", resumesNativeSession: {} });
+
+    yield* harness.start;
+
+    expect(harness.startRootRun).toHaveBeenCalledOnce();
+    expect(harness.startRootRun.mock.calls[0]?.[0].nativeThreadHasTurns).toBe(false);
   }),
 );
 

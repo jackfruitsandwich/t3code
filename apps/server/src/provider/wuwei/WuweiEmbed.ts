@@ -1,7 +1,7 @@
 // @effect-diagnostics nodeBuiltinImport:off -- Loads wuwei's bundle by file URL, once per process.
-import * as NodeOs from "node:os";
+import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
-import * as NodeUrl from "node:url";
+import * as NodeURL from "node:url";
 
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -16,7 +16,7 @@ import { EMBED_API_VERSION, type WuweiEmbedModule, type WuweiHost } from "./wuwe
  * wuwei (`bun run build:embed`) and restarting the server, without a T3 build.
  */
 export const DEFAULT_WUWEI_EMBED_PATH = NodePath.join(
-  NodeOs.homedir(),
+  NodeOS.homedir(),
   "CODEEEEEEEE",
   "wuwei",
   "dist",
@@ -36,14 +36,14 @@ export class WuweiEmbedLoadError extends Schema.TaggedError<WuweiEmbedLoadError>
 export function resolveWuweiEmbedPath(configured?: string): string {
   const explicit = configured?.trim() || process.env.T3CODE_WUWEI_EMBED?.trim();
   if (!explicit) return DEFAULT_WUWEI_EMBED_PATH;
-  return explicit.startsWith("~/") ? NodePath.join(NodeOs.homedir(), explicit.slice(2)) : explicit;
+  return explicit.startsWith("~/") ? NodePath.join(NodeOS.homedir(), explicit.slice(2)) : explicit;
 }
 
 let loaded: { readonly bundlePath: string; readonly host: Promise<WuweiHost> } | undefined;
 
 async function importHost(bundlePath: string): Promise<WuweiHost> {
   const module = (await import(
-    NodeUrl.pathToFileURL(bundlePath).href
+    NodeURL.pathToFileURL(bundlePath).href
   )) as Partial<WuweiEmbedModule>;
   if (module.EMBED_API_VERSION !== EMBED_API_VERSION || typeof module.loadWuwei !== "function") {
     throw new Error(

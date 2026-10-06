@@ -489,11 +489,14 @@ const make = Effect.gen(function* () {
       const base = importedThread(row);
       const live = row.deleted_at === null;
       const activities = live && row.activity_count > 0 ? yield* listActivities(base.id) : [];
-      let providerThread = legacyProviderThread({
-        thread: base,
-        runtime: row,
-        contextUsage: contextUsageFromActivities(activities),
-      });
+      // Only a live thread claims its native session; a deleted one never resumes.
+      let providerThread = live
+        ? legacyProviderThread({
+            thread: base,
+            runtime: row,
+            contextUsage: contextUsageFromActivities(activities),
+          })
+        : null;
       if (providerThread !== null) {
         const existing = yield* sql`
           SELECT 1 FROM orchestration_v2_projection_provider_threads

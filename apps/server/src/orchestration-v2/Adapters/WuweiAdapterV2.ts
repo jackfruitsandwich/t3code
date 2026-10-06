@@ -460,12 +460,13 @@ export function makeWuweiAdapterV2(
           item.flushScheduled = true;
           yield* Effect.sleep(Duration.millis(STREAM_FLUSH_MS)).pipe(
             Effect.andThen(
-              Effect.suspend(() => {
-                item.flushScheduled = false;
-                return item.completed ? Effect.void : emitStreamItem(turn, item, true);
-              }),
+              sessionEventPermit.withPermits(1)(
+                Effect.suspend(() => {
+                  item.flushScheduled = false;
+                  return item.completed ? Effect.void : emitStreamItem(turn, item, true);
+                }),
+              ),
             ),
-            sessionEventPermit.withPermits(1),
             Effect.forkIn(scope),
           );
         });
@@ -745,8 +746,11 @@ export function makeWuweiAdapterV2(
                   return;
                 }
                 if (item.kind === "failed") {
+                  // wuwei rejects a prompt only for setup reasons the user can act on
+                  // (chat open in the wuwei terminal, unknown model, backend switch).
                   turn.failure ??= makeProviderFailure({
                     cause: item.error,
+                    message: item.error instanceof Error ? item.error.message : String(item.error),
                     class: "provider_error",
                   });
                 } else if (item.result.stopReason === "cancelled") {

@@ -1,1186 +1,1410 @@
+/**
+ * Acceptance test for the CLI-session importer on the v2 event log.
+ *
+ * Every scenario runs the real importer against real temp-dir Claude/Codex
+ * transcript trees and a fresh in-memory v2 runtime (event sink, projections,
+ * ProjectService, ThreadManagementService, provider_session_runtime), and
+ * asserts on what the app would read back.
+ */
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import { assert, it } from "@effect/vitest";
 import {
   CommandId,
   defaultInstanceIdForDriver,
+  EventId,
+  MessageId,
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
+  ProviderThreadId,
+  RunId,
   ThreadId,
+  type OrchestrationV2AppThread,
+  type OrchestrationV2DomainEvent,
 } from "@t3tools/contracts";
-import { assert, it } from "@effect/vitest";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
 
-import { importedThreadId, makeSessionImporter } from "../src/import/Layers/SessionImporter.ts";
-import { OrchestrationEngineService } from "../src/orchestration/Services/OrchestrationEngine.ts";
-import { ProjectionSnapshotQuery } from "../src/orchestration/Services/ProjectionSnapshotQuery.ts";
-import { ProviderSessionDirectory } from "../src/provider/Services/ProviderSessionDirectory.ts";
-import { ServerSettingsService } from "../src/serverSettings.ts";
+import * as CheckpointStore from "../src/checkpointing/CheckpointStore.ts";
+import * as ServerConfig from "../src/config.ts";
+import * as GitWorkflow from "../src/git/GitWorkflowService.ts";
 import {
-  makeOrchestrationIntegrationHarness,
-  type OrchestrationIntegrationHarness,
-} from "./OrchestrationEngineHarness.integration.ts";
+  importedThreadId,
+  makeSessionImporter,
+  type SessionImporterLiveOptions,
+} from "../src/import/Layers/SessionImporter.ts";
+import * as McpSessionRegistryTestkit from "../src/mcp/McpSessionRegistry.testkit.ts";
+import * as EventSink from "../src/orchestration-v2/EventSink.ts";
+import { deriveProviderThread } from "../src/orchestration-v2/IdAllocator.ts";
+import * as ProjectStore from "../src/orchestration-v2/ProjectStore.ts";
+import * as RuntimeLayer from "../src/orchestration-v2/runtimeLayer.ts";
+import * as ThreadManagementService from "../src/orchestration-v2/ThreadManagementService.ts";
+import * as ProviderSessionRuntime from "../src/persistence/ProviderSessionRuntime.ts";
+import * as SqlitePersistence from "../src/persistence/Sqlite.ts";
+import * as ProjectEnrichmentService from "../src/project/ProjectEnrichmentService.ts";
+import * as ProjectService from "../src/project/ProjectService.ts";
+import * as ProviderInstanceRegistry from "../src/provider/ProviderInstanceRegistry.ts";
+import * as ServerSettings from "../src/serverSettings.ts";
+import * as SourceControlProviderRegistry from "../src/sourceControl/SourceControlProviderRegistry.ts";
+import * as WorkspacePaths from "../src/workspace/WorkspacePaths.ts";
 
-const CLAUDE_PROVIDER = ProviderDriverKind.make("claudeAgent");
-const CODEX_PROVIDER = ProviderDriverKind.make("codex");
+const CLAUDE = ProviderDriverKind.make("claudeAgent");
+const CODEX = ProviderDriverKind.make("codex");
 
-const CLAUDE_SESSION_ID = "aaaaaaaa-1111-4111-8111-111111111111";
-const CLAUDE_INELIGIBLE_SESSION_ID = "bbbbbbbb-1111-4111-8111-111111111111";
-const CLAUDE_FOREIGN_SESSION_ID = "dddddddd-1111-4111-8111-111111111111";
-const CODEX_SESSION_ID = "cccccccc-2222-4222-8222-222222222222";
+// --- v2 runtime ---------------------------------------------------------------
 
-function jsonl(entries: ReadonlyArray<Record<string, unknown>>): string {
-  return entries.map((entry) => JSON.stringify(entry)).join("\n") + "\n";
-}
+const noEnrichment = {
+  repositoryIdentity: null,
+  faviconPath: null,
+  repositoryIdentityResolved: true,
+};
 
-function claudeUserEntry(input: {
-  readonly uuid: string;
-  readonly text: string;
-  readonly timestamp: string;
-  readonly cwd: string;
-  readonly sessionId?: string;
-  readonly entrypoint?: string;
-}): Record<string, unknown> {
-  return {
-    type: "user",
-    uuid: input.uuid,
-    parentUuid: null,
-    sessionId: input.sessionId ?? CLAUDE_SESSION_ID,
-    cwd: input.cwd,
-    timestamp: input.timestamp,
-    isSidechain: false,
-    ...(input.entrypoint !== undefined ? { entrypoint: input.entrypoint } : {}),
-    message: { role: "user", content: input.text },
-  };
-}
-
-function claudeAssistantEntry(input: {
-  readonly uuid: string;
-  readonly text: string;
-  readonly timestamp: string;
-  readonly cwd: string;
-  readonly sessionId?: string;
-  readonly entrypoint?: string;
-}): Record<string, unknown> {
-  return {
-    type: "assistant",
-    uuid: input.uuid,
-    parentUuid: null,
-    sessionId: input.sessionId ?? CLAUDE_SESSION_ID,
-    cwd: input.cwd,
-    timestamp: input.timestamp,
-    isSidechain: false,
-    ...(input.entrypoint !== undefined ? { entrypoint: input.entrypoint } : {}),
-    message: {
-      role: "assistant",
-      content: [{ type: "text", text: input.text }],
-    },
-  };
-}
-
-function codexEventMsg(input: {
-  readonly type: "user_message" | "agent_message";
-  readonly text: string;
-  readonly timestamp: string;
-}): Record<string, unknown> {
-  return {
-    timestamp: input.timestamp,
-    type: "event_msg",
-    payload: { type: input.type, message: input.text },
-  };
-}
-
-function withHarness<A, E>(
-  use: (
-    harness: OrchestrationIntegrationHarness,
-  ) => Effect.Effect<A, E, FileSystem.FileSystem | Path.Path>,
-) {
-  return Effect.acquireUseRelease(
-    makeOrchestrationIntegrationHarness({ provider: CODEX_PROVIDER }),
-    use,
-    (harness) => harness.dispose,
-  ).pipe(Effect.provide(NodeServices.layer));
-}
-
-const makeImporter = (input: {
-  readonly harness: OrchestrationIntegrationHarness;
-  readonly claudeProjectsDir: string;
-  readonly codexSessionsDir: string;
-}) =>
-  makeSessionImporter({
-    claudeProjectsDir: input.claudeProjectsDir,
-    codexSessionsDir: input.codexSessionsDir,
-    // Fixtures are written immediately before sweeping.
-    settleMs: 0,
-  }).pipe(
-    Effect.provide(
-      Layer.mergeAll(
-        Layer.succeed(OrchestrationEngineService, input.harness.engine),
-        Layer.succeed(ProjectionSnapshotQuery, input.harness.snapshotQuery),
-        Layer.succeed(ProviderSessionDirectory, input.harness.sessionDirectory),
-        ServerSettingsService.layerTest(),
-      ),
-    ),
-  );
-
-const countPersistedEvents = (harness: OrchestrationIntegrationHarness) =>
-  Stream.runCollect(harness.engine.readEvents(0, 100_000)).pipe(
-    Effect.map((chunk) => Array.from(chunk).length),
-  );
-
-it.live(
-  "imports claude and codex CLI sessions as threads with bindings, idempotently and incrementally",
-  () =>
-    withHarness((harness) =>
-      Effect.gen(function* () {
-        const fileSystem = yield* FileSystem.FileSystem;
-        const path = yield* Path.Path;
-
-        const claudeProjectsDir = path.join(harness.rootDir, "claude-home", "projects");
-        const claudeProjectDir = path.join(claudeProjectsDir, "-repo-claude");
-        const codexSessionsDir = path.join(harness.rootDir, "codex-home", "sessions");
-        const codexDayDir = path.join(codexSessionsDir, "2026", "07", "29");
-        const codexWorkspaceDir = path.join(harness.rootDir, "codex-workspace");
-        yield* fileSystem.makeDirectory(claudeProjectDir, { recursive: true });
-        yield* fileSystem.makeDirectory(codexDayDir, { recursive: true });
-        yield* fileSystem.makeDirectory(codexWorkspaceDir, { recursive: true });
-
-        const claudeCwd = harness.workspaceDir;
-        const claudeSessionPath = path.join(claudeProjectDir, `${CLAUDE_SESSION_ID}.jsonl`);
-        yield* fileSystem.writeFileString(
-          claudeSessionPath,
-          jsonl([
-            { type: "mode", mode: "default" },
-            claudeUserEntry({
-              uuid: "user-1",
-              text: "Fix the login bug please",
-              timestamp: "2026-07-01T10:00:00.000Z",
-              cwd: claudeCwd,
-            }),
-            claudeAssistantEntry({
-              uuid: "assistant-1",
-              text: "I fixed the login bug.",
-              timestamp: "2026-07-01T10:00:05.000Z",
-              cwd: claudeCwd,
-            }),
-            {
-              ...claudeUserEntry({
-                uuid: "sidechain-1",
-                text: "sidechain noise",
-                timestamp: "2026-07-01T10:00:06.000Z",
-                cwd: claudeCwd,
-              }),
-              isSidechain: true,
-            },
-            { type: "ai-title", aiTitle: "Login bug fix" },
-          ]),
-        );
-
-        // Only a user message: not eligible, must not become a thread.
-        yield* fileSystem.writeFileString(
-          path.join(claudeProjectDir, `${CLAUDE_INELIGIBLE_SESSION_ID}.jsonl`),
-          jsonl([
-            claudeUserEntry({
-              uuid: "ineligible-user-1",
-              text: "no reply yet",
-              timestamp: "2026-07-01T11:00:00.000Z",
-              cwd: claudeCwd,
-              sessionId: CLAUDE_INELIGIBLE_SESSION_ID,
-            }),
-          ]),
-        );
-
-        // A session already bound to a T3-native thread (no importCursor):
-        // the importer must leave it alone entirely.
-        const foreignThreadId = ThreadId.make("thread-native-1");
-        yield* harness.sessionDirectory.upsert({
-          threadId: foreignThreadId,
-          provider: CLAUDE_PROVIDER,
-          providerInstanceId: defaultInstanceIdForDriver(CLAUDE_PROVIDER),
-          status: "stopped",
-          runtimeMode: "full-access",
-          resumeCursor: {
-            threadId: foreignThreadId,
-            resume: CLAUDE_FOREIGN_SESSION_ID,
-            turnCount: 3,
-          },
-        });
-        yield* fileSystem.writeFileString(
-          path.join(claudeProjectDir, `${CLAUDE_FOREIGN_SESSION_ID}.jsonl`),
-          jsonl([
-            claudeUserEntry({
-              uuid: "foreign-user-1",
-              text: "t3-owned session",
-              timestamp: "2026-07-01T12:00:00.000Z",
-              cwd: claudeCwd,
-              sessionId: CLAUDE_FOREIGN_SESSION_ID,
-            }),
-            claudeAssistantEntry({
-              uuid: "foreign-assistant-1",
-              text: "reply",
-              timestamp: "2026-07-01T12:00:05.000Z",
-              cwd: claudeCwd,
-              sessionId: CLAUDE_FOREIGN_SESSION_ID,
-            }),
-          ]),
-        );
-
-        const codexSessionPath = path.join(codexDayDir, "rollout-2026-07-29T08-00-00-codex.jsonl");
-        yield* fileSystem.writeFileString(
-          codexSessionPath,
-          jsonl([
-            {
-              timestamp: "2026-07-02T08:00:00.000Z",
-              type: "session_meta",
-              payload: {
-                id: CODEX_SESSION_ID,
-                cwd: codexWorkspaceDir,
-                timestamp: "2026-07-02T08:00:00.000Z",
-                git: { repository_url: "https://example.com/repo.git", branch: "main" },
-              },
-            },
-            { timestamp: "2026-07-02T08:00:00.500Z", type: "turn_context", payload: {} },
-            codexEventMsg({
-              type: "user_message",
-              text: "Refactor the rollout parser",
-              timestamp: "2026-07-02T08:00:01.000Z",
-            }),
-            codexEventMsg({
-              type: "agent_message",
-              text: "Parser refactored.",
-              timestamp: "2026-07-02T08:00:09.000Z",
-            }),
-          ]),
-        );
-
-        // Configured provider accounts have their own transcript namespaces.
-        // An equal session ID in another account must not suppress a local import.
-        const otherAccountThreadId = ThreadId.make("other-account-same-session");
-        yield* harness.sessionDirectory.upsert({
-          threadId: otherAccountThreadId,
-          provider: CODEX_PROVIDER,
-          providerInstanceId: ProviderInstanceId.make("codex-other-account"),
-          status: "stopped",
-          resumeCursor: { threadId: CODEX_SESSION_ID },
-          runtimePayload: { importForkSig: ["user-1"], marker: "untouched-other-account" },
-        });
-        const otherAccountBefore = yield* harness.sessionDirectory.getBinding(otherAccountThreadId);
-
-        const importer = yield* makeImporter({ harness, claudeProjectsDir, codexSessionsDir });
-        yield* importer.sweepNow();
-
-        // Claude thread: title, history with original timestamps, model binding.
-        const claudeThreadId = importedThreadId(CLAUDE_SESSION_ID);
-        const claudeThread = Option.getOrThrowWith(
-          yield* harness.snapshotQuery.getThreadDetailById(claudeThreadId),
-          () => new Error("expected imported claude thread"),
-        );
-        assert.equal(claudeThread.title, "Login bug fix");
-        assert.equal(claudeThread.modelSelection.instanceId, "claudeAgent");
-        assert.equal(claudeThread.createdAt, "2026-07-01T10:00:00.000Z");
-        assert.deepEqual(
-          claudeThread.messages.map((message) => ({
-            role: message.role,
-            text: message.text,
-            streaming: message.streaming,
-            createdAt: message.createdAt,
-          })),
-          [
-            {
-              role: "user",
-              text: "Fix the login bug please",
-              streaming: false,
-              createdAt: "2026-07-01T10:00:00.000Z",
-            },
-            {
-              role: "assistant",
-              text: "I fixed the login bug.",
-              streaming: false,
-              createdAt: "2026-07-01T10:00:05.000Z",
-            },
-          ],
-        );
-        assert.equal(claudeThread.session?.status, "stopped");
-
-        const claudeProject = Option.getOrThrowWith(
-          yield* harness.snapshotQuery.getActiveProjectByWorkspaceRoot(claudeCwd),
-          () => new Error("expected imported claude project"),
-        );
-        assert.equal(claudeThread.projectId, claudeProject.id);
-
-        const claudeBinding = Option.getOrThrowWith(
-          yield* harness.sessionDirectory.getBinding(claudeThreadId),
-          () => new Error("expected imported claude binding"),
-        );
-        assert.equal(claudeBinding.provider, CLAUDE_PROVIDER);
-        assert.equal(claudeBinding.providerInstanceId, "claudeAgent");
-        assert.equal(claudeBinding.status, "stopped");
-        assert.deepEqual(claudeBinding.resumeCursor, {
-          threadId: claudeThreadId,
-          resume: CLAUDE_SESSION_ID,
-          turnCount: 1,
-        });
-        assert.deepEqual(claudeBinding.runtimePayload, {
-          cwd: claudeCwd,
-          importForkSig: ["user-1", "assistant-1"],
-          importCursor: {
-            sourceSessionId: CLAUDE_SESSION_ID,
-            sourcePath: claudeSessionPath,
-            lineCount: 5,
-            epoch: 2,
-          },
-        });
-
-        // Codex thread and binding.
-        const codexThreadId = importedThreadId(CODEX_SESSION_ID);
-        const codexThread = Option.getOrThrowWith(
-          yield* harness.snapshotQuery.getThreadDetailById(codexThreadId),
-          () => new Error("expected imported codex thread"),
-        );
-        assert.equal(codexThread.title, "Refactor the rollout parser");
-        assert.deepEqual(
-          codexThread.messages.map((message) => ({ role: message.role, text: message.text })),
-          [
-            { role: "user", text: "Refactor the rollout parser" },
-            { role: "assistant", text: "Parser refactored." },
-          ],
-        );
-        const codexProject = Option.getOrThrowWith(
-          yield* harness.snapshotQuery.getActiveProjectByWorkspaceRoot(codexWorkspaceDir),
-          () => new Error("expected imported codex project"),
-        );
-        assert.equal(codexThread.projectId, codexProject.id);
-        const codexBinding = Option.getOrThrowWith(
-          yield* harness.sessionDirectory.getBinding(codexThreadId),
-          () => new Error("expected imported codex binding"),
-        );
-        assert.deepEqual(
-          yield* harness.sessionDirectory.getBinding(otherAccountThreadId),
-          otherAccountBefore,
-        );
-        assert.equal(codexBinding.provider, CODEX_PROVIDER);
-        assert.deepEqual(codexBinding.resumeCursor, { threadId: CODEX_SESSION_ID });
-
-        // Ineligible and T3-owned sessions produce no threads; the foreign
-        // binding is untouched.
-        assert.isTrue(
-          Option.isNone(
-            yield* harness.snapshotQuery.getThreadDetailById(
-              importedThreadId(CLAUDE_INELIGIBLE_SESSION_ID),
-            ),
-          ),
-        );
-        assert.isTrue(
-          Option.isNone(
-            yield* harness.snapshotQuery.getThreadDetailById(
-              importedThreadId(CLAUDE_FOREIGN_SESSION_ID),
-            ),
-          ),
-        );
-        const foreignBinding = Option.getOrThrowWith(
-          yield* harness.sessionDirectory.getBinding(foreignThreadId),
-          () => new Error("expected untouched foreign binding"),
-        );
-        assert.deepEqual(foreignBinding.resumeCursor, {
-          threadId: foreignThreadId,
-          resume: CLAUDE_FOREIGN_SESSION_ID,
-          turnCount: 3,
-        });
-        assert.isTrue(
-          foreignBinding.runtimePayload == null ||
-            (foreignBinding.runtimePayload as { importCursor?: unknown }).importCursor ===
-              undefined,
-        );
-
-        // Idempotency: a fresh importer (empty change cache) re-reads every
-        // file, and every command dedupes on its receipt — no new events.
-        const eventCountAfterImport = yield* countPersistedEvents(harness);
-        const secondImporter = yield* makeImporter({
-          harness,
-          claudeProjectsDir,
-          codexSessionsDir,
-        });
-        yield* secondImporter.sweepNow();
-        assert.equal(yield* countPersistedEvents(harness), eventCountAfterImport);
-
-        // Incremental: the CLI appends to both sessions; the next sweep
-        // imports only the tail.
-        const claudeAppend = jsonl([
-          claudeUserEntry({
-            uuid: "user-2",
-            text: "Now add a regression test",
-            timestamp: "2026-07-01T10:05:00.000Z",
-            cwd: claudeCwd,
-          }),
-          claudeAssistantEntry({
-            uuid: "assistant-2",
-            text: "Added a regression test.",
-            timestamp: "2026-07-01T10:05:30.000Z",
-            cwd: claudeCwd,
-          }),
-        ]);
-        const existingClaudeContent = yield* fileSystem.readFileString(claudeSessionPath);
-        yield* fileSystem.writeFileString(claudeSessionPath, existingClaudeContent + claudeAppend);
-        const codexAppend = jsonl([
-          codexEventMsg({
-            type: "agent_message",
-            text: "Anything else?",
-            timestamp: "2026-07-02T08:01:00.000Z",
-          }),
-        ]);
-        const existingCodexContent = yield* fileSystem.readFileString(codexSessionPath);
-        yield* fileSystem.writeFileString(codexSessionPath, existingCodexContent + codexAppend);
-
-        yield* importer.sweepNow();
-
-        const claudeThreadAfter = Option.getOrThrowWith(
-          yield* harness.snapshotQuery.getThreadDetailById(claudeThreadId),
-          () => new Error("expected claude thread after increment"),
-        );
-        assert.deepEqual(
-          claudeThreadAfter.messages.map((message) => message.text),
-          [
-            "Fix the login bug please",
-            "I fixed the login bug.",
-            "Now add a regression test",
-            "Added a regression test.",
-          ],
-        );
-        const claudeBindingAfter = Option.getOrThrowWith(
-          yield* harness.sessionDirectory.getBinding(claudeThreadId),
-          () => new Error("expected claude binding after increment"),
-        );
-        assert.deepEqual(claudeBindingAfter.resumeCursor, {
-          threadId: claudeThreadId,
-          resume: CLAUDE_SESSION_ID,
-          turnCount: 2,
-        });
-        assert.deepEqual(claudeBindingAfter.runtimePayload, {
-          cwd: claudeCwd,
-          importForkSig: ["user-1", "assistant-1", "user-2", "assistant-2"],
-          importCursor: {
-            sourceSessionId: CLAUDE_SESSION_ID,
-            sourcePath: claudeSessionPath,
-            lineCount: 7,
-            epoch: 2,
-          },
-        });
-
-        const codexThreadAfter = Option.getOrThrowWith(
-          yield* harness.snapshotQuery.getThreadDetailById(codexThreadId),
-          () => new Error("expected codex thread after increment"),
-        );
-        assert.deepEqual(
-          codexThreadAfter.messages.map((message) => message.text),
-          ["Refactor the rollout parser", "Parser refactored.", "Anything else?"],
-        );
-
-        // A no-change sweep after the increments stays quiet too.
-        const eventCountAfterIncrement = yield* countPersistedEvents(harness);
-        yield* importer.sweepNow();
-        assert.equal(yield* countPersistedEvents(harness), eventCountAfterIncrement);
-
-        // Adoption: once a native T3 session runs on an imported thread, the
-        // importer hands the thread over — the cursor is stripped and later
-        // source-file growth is never re-imported (native turns would
-        // otherwise appear twice).
-        yield* harness.sessionDirectory.upsert({
-          threadId: claudeThreadId,
-          provider: CLAUDE_PROVIDER,
-          providerInstanceId: defaultInstanceIdForDriver(CLAUDE_PROVIDER),
-          status: "running",
-          runtimePayload: { model: "claude-fable-5", activeTurnId: "turn-adopted" },
-        });
-        const adoptionAppend = jsonl([
-          claudeUserEntry({
-            uuid: "user-3",
-            text: "This turn came through native T3 chat",
-            timestamp: "2026-07-01T10:10:00.000Z",
-            cwd: claudeCwd,
-          }),
-          claudeAssistantEntry({
-            uuid: "assistant-3",
-            text: "Replying natively.",
-            timestamp: "2026-07-01T10:10:30.000Z",
-            cwd: claudeCwd,
-          }),
-        ]);
-        const contentBeforeAdoption = yield* fileSystem.readFileString(claudeSessionPath);
-        yield* fileSystem.writeFileString(
-          claudeSessionPath,
-          contentBeforeAdoption + adoptionAppend,
-        );
-        yield* importer.sweepNow();
-
-        const adoptedThread = Option.getOrThrowWith(
-          yield* harness.snapshotQuery.getThreadDetailById(claudeThreadId),
-          () => new Error("expected claude thread after adoption"),
-        );
-        assert.equal(adoptedThread.messages.length, 4);
-        const adoptedBinding = Option.getOrThrowWith(
-          yield* harness.sessionDirectory.getBinding(claudeThreadId),
-          () => new Error("expected claude binding after adoption"),
-        );
-        const adoptedPayload = adoptedBinding.runtimePayload as Record<string, unknown>;
-        assert.equal(adoptedPayload.importCursor, null);
-        assert.equal(adoptedBinding.status, "running");
-
-        // The handoff is permanent: further growth imports nothing.
-        const contentAfterAdoption = yield* fileSystem.readFileString(claudeSessionPath);
-        yield* fileSystem.writeFileString(
-          claudeSessionPath,
-          contentAfterAdoption +
-            jsonl([
-              claudeUserEntry({
-                uuid: "user-4",
-                text: "One more terminal message",
-                timestamp: "2026-07-01T10:15:00.000Z",
-                cwd: claudeCwd,
-              }),
-            ]),
-        );
-        const eventCountAfterAdoption = yield* countPersistedEvents(harness);
-        yield* importer.sweepNow();
-        assert.equal(yield* countPersistedEvents(harness), eventCountAfterAdoption);
-
-        // Project-less codex chats (no git metadata) group into one shared
-        // "Chats" project rooted at the codex home.
-        const chatSessionId = "eeeeeeee-3333-4333-8333-333333333333";
-        yield* fileSystem.writeFileString(
-          path.join(codexDayDir, "rollout-2026-07-29T09-00-00-chat.jsonl"),
-          jsonl([
-            {
-              timestamp: "2026-07-03T09:00:00.000Z",
-              type: "session_meta",
-              payload: {
-                id: chatSessionId,
-                cwd: path.join(harness.rootDir, "some-throwaway-cwd"),
-                timestamp: "2026-07-03T09:00:00.000Z",
-              },
-            },
-            codexEventMsg({
-              type: "user_message",
-              text: "Quick question",
-              timestamp: "2026-07-03T09:00:01.000Z",
-            }),
-            codexEventMsg({
-              type: "agent_message",
-              text: "Quick answer.",
-              timestamp: "2026-07-03T09:00:05.000Z",
-            }),
-          ]),
-        );
-        yield* importer.sweepNow();
-        const chatsRoot = path.dirname(codexSessionsDir);
-        const chatsProject = Option.getOrThrowWith(
-          yield* harness.snapshotQuery.getActiveProjectByWorkspaceRoot(chatsRoot),
-          () => new Error("expected shared Chats project"),
-        );
-        const chatShell = Option.getOrThrowWith(
-          yield* harness.snapshotQuery.getThreadShellById(importedThreadId(chatSessionId)),
-          () => new Error("expected chat thread"),
-        );
-        assert.equal(chatShell.projectId, chatsProject.id);
-
-        // Epoch migration: a chat imported under the old one-project-per-cwd
-        // layout is moved into Chats and its per-chat project is deleted.
-        const legacySessionId = "ffffffff-4444-4444-8444-444444444444";
-        // Hand-rolled epoch-1 id: the legacy layout predates epoch scoping.
-        const legacyThreadId = ThreadId.make(`cli-import-${legacySessionId}`);
-        const legacyCwd = path.join(harness.rootDir, "legacy-chat-cwd");
-        yield* fileSystem.makeDirectory(legacyCwd, { recursive: true });
-        const legacyProjectId = ProjectId.make("cli-import-project-legacy-junk");
-        yield* harness.engine.dispatch({
-          type: "project.create",
-          commandId: CommandId.make("test-legacy-project-create"),
-          projectId: legacyProjectId,
-          title: "legacy-chat-cwd",
-          workspaceRoot: legacyCwd,
-          createdAt: "2026-07-04T10:00:00.000Z",
-        });
-        yield* harness.engine.dispatch({
-          type: "thread.create",
-          commandId: CommandId.make("test-legacy-thread-create"),
-          threadId: legacyThreadId,
-          projectId: legacyProjectId,
-          title: "Legacy chat",
-          modelSelection: {
-            instanceId: defaultInstanceIdForDriver(CODEX_PROVIDER),
-            model: "gpt-5.6-sol",
-          },
-          runtimeMode: "full-access",
-          interactionMode: "default",
-          branch: null,
-          worktreePath: null,
-          createdAt: "2026-07-04T10:00:00.000Z",
-        });
-        const legacyPath = path.join(codexDayDir, "rollout-2026-07-29T10-00-00-legacy.jsonl");
-        const legacyContent = jsonl([
-          {
-            timestamp: "2026-07-04T10:00:00.000Z",
-            type: "session_meta",
-            payload: {
-              id: legacySessionId,
-              cwd: legacyCwd,
-              timestamp: "2026-07-04T10:00:00.000Z",
-            },
-          },
-          codexEventMsg({
-            type: "user_message",
-            text: "Legacy chat question",
-            timestamp: "2026-07-04T10:00:01.000Z",
-          }),
-          codexEventMsg({
-            type: "agent_message",
-            text: "Legacy chat answer.",
-            timestamp: "2026-07-04T10:00:05.000Z",
-          }),
-        ]);
-        yield* fileSystem.writeFileString(legacyPath, legacyContent);
-        yield* harness.sessionDirectory.upsert({
-          threadId: legacyThreadId,
-          provider: CODEX_PROVIDER,
-          providerInstanceId: defaultInstanceIdForDriver(CODEX_PROVIDER),
-          status: "stopped",
-          runtimeMode: "full-access",
-          resumeCursor: { threadId: legacySessionId },
-          runtimePayload: {
-            cwd: legacyCwd,
-            // Epoch field deliberately absent: legacy layout marker.
-            importCursor: {
-              sourceSessionId: legacySessionId,
-              sourcePath: legacyPath,
-              lineCount: legacyContent.split("\n").length - 1,
-            },
-          },
-        });
-        yield* importer.sweepNow();
-        // The migrated thread lives under a fresh epoch-scoped id; the old
-        // thread is deleted and its binding tombstoned.
-        const migratedThreadId = importedThreadId(legacySessionId);
-        const migratedShell = Option.getOrThrowWith(
-          yield* harness.snapshotQuery.getThreadShellById(migratedThreadId),
-          () => new Error("expected migrated chat thread"),
-        );
-        assert.equal(migratedShell.projectId, chatsProject.id);
-        assert.isTrue(
-          Option.isNone(yield* harness.snapshotQuery.getThreadShellById(legacyThreadId)),
-          "legacy thread should be deleted after migration",
-        );
-        assert.isTrue(
-          Option.isNone(yield* harness.snapshotQuery.getActiveProjectByWorkspaceRoot(legacyCwd)),
-          "per-chat legacy project should be deleted after migration",
-        );
-        const migratedThread = Option.getOrThrowWith(
-          yield* harness.snapshotQuery.getThreadDetailById(migratedThreadId),
-          () => new Error("expected migrated thread detail"),
-        );
-        assert.deepEqual(
-          migratedThread.messages.map((message) => message.text),
-          ["Legacy chat question", "Legacy chat answer."],
-        );
-        const migratedBinding = Option.getOrThrowWith(
-          yield* harness.sessionDirectory.getBinding(migratedThreadId),
-          () => new Error("expected migrated binding"),
-        );
-        const migratedPayload = migratedBinding.runtimePayload as {
-          importCursor?: { epoch?: number };
-        };
-        assert.equal(migratedPayload.importCursor?.epoch, 2);
-
-        // Provider lifecycle sweeps merge `activeTurnId: null` into every
-        // binding on app quit. That must NOT read as adoption: imports keep
-        // flowing afterwards.
-        yield* harness.sessionDirectory.upsert({
-          threadId: codexThreadId,
-          provider: CODEX_PROVIDER,
-          providerInstanceId: defaultInstanceIdForDriver(CODEX_PROVIDER),
-          status: "stopped",
-          runtimePayload: { activeTurnId: null, lastRuntimeEvent: "provider.stopAll" },
-        });
-        const codexContentBefore = yield* fileSystem.readFileString(codexSessionPath);
-        yield* fileSystem.writeFileString(
-          codexSessionPath,
-          codexContentBefore +
-            jsonl([
-              codexEventMsg({
-                type: "user_message",
-                text: "After a quit-cycle sweep",
-                timestamp: "2026-07-05T08:00:00.000Z",
-              }),
-            ]),
-        );
-        yield* importer.sweepNow();
-        const codexAfterLifecycle = Option.getOrThrowWith(
-          yield* harness.snapshotQuery.getThreadDetailById(codexThreadId),
-          () => new Error("expected codex thread after lifecycle sweep"),
-        );
-        assert.include(
-          codexAfterLifecycle.messages.map((message) => message.text),
-          "After a quit-cycle sweep",
-          "lifecycle-contaminated binding must not be treated as adopted",
-        );
-
-        // Self-heal: a cursor falsely stripped (importCursor: null) on a
-        // binding with no real native activity gets reconstructed at the
-        // current file position, and later growth imports again.
-        yield* harness.sessionDirectory.upsert({
-          threadId: codexThreadId,
-          provider: CODEX_PROVIDER,
-          providerInstanceId: defaultInstanceIdForDriver(CODEX_PROVIDER),
-          status: "stopped",
-          runtimePayload: { importCursor: null },
-        });
-        const codexContentStripped = yield* fileSystem.readFileString(codexSessionPath);
-        yield* fileSystem.writeFileString(
-          codexSessionPath,
-          codexContentStripped +
-            jsonl([
-              codexEventMsg({
-                type: "agent_message",
-                text: "Lost while cursor was stripped",
-                timestamp: "2026-07-05T09:00:00.000Z",
-              }),
-            ]),
-        );
-        yield* importer.sweepNow();
-        const repairedBinding = Option.getOrThrowWith(
-          yield* harness.sessionDirectory.getBinding(codexThreadId),
-          () => new Error("expected repaired binding"),
-        );
-        const repairedPayload = repairedBinding.runtimePayload as {
-          importCursor?: { epoch?: number; lineCount?: number };
-        };
-        assert.equal(repairedPayload.importCursor?.epoch, 2, "repaired cursor carries epoch");
-        // Growth after the repair imports again.
-        const codexContentRepaired = yield* fileSystem.readFileString(codexSessionPath);
-        yield* fileSystem.writeFileString(
-          codexSessionPath,
-          codexContentRepaired +
-            jsonl([
-              codexEventMsg({
-                type: "user_message",
-                text: "Back in business",
-                timestamp: "2026-07-05T10:00:00.000Z",
-              }),
-            ]),
-        );
-        yield* importer.sweepNow();
-        const codexAfterRepair = Option.getOrThrowWith(
-          yield* harness.snapshotQuery.getThreadDetailById(codexThreadId),
-          () => new Error("expected codex thread after repair"),
-        );
-        assert.include(
-          codexAfterRepair.messages.map((message) => message.text),
-          "Back in business",
-          "imports must resume after cursor repair",
-        );
-
-        // Fork families: two codex sessions sharing early provider item ids
-        // are branches of one conversation and get one forkFamilyId (the
-        // lexicographically smallest member session id).
-        const codexForkAId = "11111111-5555-4555-8555-555555555551";
-        const codexForkBId = "11111111-5555-4555-8555-555555555552";
-        const codexForkFile = (sessionId: string, extraText: string) =>
-          jsonl([
-            {
-              timestamp: "2026-07-06T08:00:00.000Z",
-              type: "session_meta",
-              payload: {
-                id: sessionId,
-                cwd: codexWorkspaceDir,
-                timestamp: "2026-07-06T08:00:00.000Z",
-                git: { repository_url: "https://example.com/repo.git", branch: "main" },
-              },
-            },
-            {
-              timestamp: "2026-07-06T08:00:01.000Z",
-              type: "response_item",
-              payload: { id: "rs_sharedfork001", type: "reasoning" },
-            },
-            codexEventMsg({
-              type: "user_message",
-              text: "Original fork prompt",
-              timestamp: "2026-07-06T08:00:02.000Z",
-            }),
-            codexEventMsg({
-              type: "agent_message",
-              text: extraText,
-              timestamp: "2026-07-06T08:00:05.000Z",
-            }),
-          ]);
-        yield* fileSystem.writeFileString(
-          path.join(codexDayDir, "rollout-2026-07-29T11-00-00-forka.jsonl"),
-          codexForkFile(codexForkAId, "Answer in the original."),
-        );
-        yield* fileSystem.writeFileString(
-          path.join(codexDayDir, "rollout-2026-07-29T11-01-00-forkb.jsonl"),
-          codexForkFile(codexForkBId, "Answer in the fork."),
-        );
-        yield* importer.sweepNow();
-        const forkAShell = Option.getOrThrowWith(
-          yield* harness.snapshotQuery.getThreadShellById(importedThreadId(codexForkAId)),
-          () => new Error("expected fork A thread"),
-        );
-        const forkBShell = Option.getOrThrowWith(
-          yield* harness.snapshotQuery.getThreadShellById(importedThreadId(codexForkBId)),
-          () => new Error("expected fork B thread"),
-        );
-        assert.equal(forkAShell.forkFamilyId, codexForkAId);
-        assert.equal(forkBShell.forkFamilyId, codexForkAId);
-        // Stamps are marked on the binding: a further sweep dispatches nothing.
-        const eventCountAfterFamilies = yield* countPersistedEvents(harness);
-        yield* importer.sweepNow();
-        assert.equal(yield* countPersistedEvents(harness), eventCountAfterFamilies);
-
-        // Subagent sessions never import fresh...
-        const subagentFreshId = "22222222-6666-4666-8666-666666666661";
-        yield* fileSystem.writeFileString(
-          path.join(codexDayDir, "rollout-2026-07-29T12-00-00-subfresh.jsonl"),
-          jsonl([
-            {
-              timestamp: "2026-07-07T08:00:00.000Z",
-              type: "session_meta",
-              payload: {
-                id: subagentFreshId,
-                cwd: codexWorkspaceDir,
-                timestamp: "2026-07-07T08:00:00.000Z",
-                thread_source: "subagent",
-                git: { repository_url: "https://example.com/repo.git", branch: "main" },
-              },
-            },
-            codexEventMsg({
-              type: "user_message",
-              text: "subagent task",
-              timestamp: "2026-07-07T08:00:01.000Z",
-            }),
-            codexEventMsg({
-              type: "agent_message",
-              text: "subagent result",
-              timestamp: "2026-07-07T08:00:05.000Z",
-            }),
-          ]),
-        );
-        yield* importer.sweepNow();
-        assert.isTrue(
-          Option.isNone(
-            yield* harness.snapshotQuery.getThreadShellById(importedThreadId(subagentFreshId)),
-          ),
-          "subagent sessions must not import",
-        );
-
-        // ...and one imported before the marker was understood is removed.
-        const subagentLegacyId = "22222222-6666-4666-8666-666666666662";
-        const subagentLegacyPath = path.join(
-          codexDayDir,
-          "rollout-2026-07-29T12-01-00-sublegacy.jsonl",
-        );
-        const subagentBody = (marked: boolean) =>
-          jsonl([
-            {
-              timestamp: "2026-07-07T09:00:00.000Z",
-              type: "session_meta",
-              payload: {
-                id: subagentLegacyId,
-                cwd: codexWorkspaceDir,
-                timestamp: "2026-07-07T09:00:00.000Z",
-                ...(marked ? { thread_source: "subagent" } : {}),
-                git: { repository_url: "https://example.com/repo.git", branch: "main" },
-              },
-            },
-            codexEventMsg({
-              type: "user_message",
-              text: "was imported as a normal thread",
-              timestamp: "2026-07-07T09:00:01.000Z",
-            }),
-            codexEventMsg({
-              type: "agent_message",
-              text: "done",
-              timestamp: "2026-07-07T09:00:05.000Z",
-            }),
-          ]);
-        yield* fileSystem.writeFileString(subagentLegacyPath, subagentBody(false));
-        yield* importer.sweepNow();
-        assert.isTrue(
-          Option.isSome(
-            yield* harness.snapshotQuery.getThreadShellById(importedThreadId(subagentLegacyId)),
-          ),
-        );
-        yield* fileSystem.writeFileString(subagentLegacyPath, subagentBody(true));
-        yield* importer.sweepNow();
-        assert.isTrue(
-          Option.isNone(
-            yield* harness.snapshotQuery.getThreadShellById(importedThreadId(subagentLegacyId)),
-          ),
-          "previously imported subagent thread must be removed",
-        );
-
-        // Machine-launched sessions without human kin land in Automations.
-        const automationId = "33333333-7777-4777-8777-777777777771";
-        yield* fileSystem.writeFileString(
-          path.join(claudeProjectDir, `${automationId}.jsonl`),
-          jsonl([
-            claudeUserEntry({
-              uuid: "auto-user-1",
-              text: "# nightly pipeline run",
-              timestamp: "2026-07-08T03:00:00.000Z",
-              cwd: claudeCwd,
-              sessionId: automationId,
-              entrypoint: "sdk-cli",
-            }),
-            claudeAssistantEntry({
-              uuid: "auto-assistant-1",
-              text: "pipeline output",
-              timestamp: "2026-07-08T03:00:30.000Z",
-              cwd: claudeCwd,
-              sessionId: automationId,
-              entrypoint: "sdk-cli",
-            }),
-          ]),
-        );
-        yield* importer.sweepNow();
-        const automationsRoot = path.dirname(claudeProjectsDir);
-        const automationsProject = Option.getOrThrowWith(
-          yield* harness.snapshotQuery.getActiveProjectByWorkspaceRoot(automationsRoot),
-          () => new Error("expected shared Automations project"),
-        );
-        assert.equal(automationsProject.title, "Automations");
-        const automationShell = Option.getOrThrowWith(
-          yield* harness.snapshotQuery.getThreadShellById(importedThreadId(automationId)),
-          () => new Error("expected automation thread"),
-        );
-        assert.equal(automationShell.projectId, automationsProject.id);
-
-        // A machine-launched fork of a human conversation is kin: it stays in
-        // the human project and joins the fork family.
-        const kinId = "33333333-7777-4777-8777-777777777772";
-        yield* fileSystem.writeFileString(
-          path.join(claudeProjectDir, `${kinId}.jsonl`),
-          jsonl([
-            claudeUserEntry({
-              uuid: "user-1",
-              text: "Fix the login bug please",
-              timestamp: "2026-07-01T10:00:00.000Z",
-              cwd: claudeCwd,
-              sessionId: kinId,
-              entrypoint: "sdk-cli",
-            }),
-            claudeAssistantEntry({
-              uuid: "assistant-1",
-              text: "I fixed the login bug.",
-              timestamp: "2026-07-01T10:00:05.000Z",
-              cwd: claudeCwd,
-              sessionId: kinId,
-              entrypoint: "sdk-cli",
-            }),
-            claudeUserEntry({
-              uuid: "kin-user-2",
-              text: "Branched follow-up",
-              timestamp: "2026-07-08T04:00:00.000Z",
-              cwd: claudeCwd,
-              sessionId: kinId,
-              entrypoint: "sdk-cli",
-            }),
-            claudeAssistantEntry({
-              uuid: "kin-assistant-2",
-              text: "Branched reply.",
-              timestamp: "2026-07-08T04:00:30.000Z",
-              cwd: claudeCwd,
-              sessionId: kinId,
-              entrypoint: "sdk-cli",
-            }),
-          ]),
-        );
-        yield* importer.sweepNow();
-        const kinShell = Option.getOrThrowWith(
-          yield* harness.snapshotQuery.getThreadShellById(importedThreadId(kinId)),
-          () => new Error("expected kin thread"),
-        );
-        assert.equal(kinShell.projectId, claudeProject.id, "kin stays in the human project");
-        const adoptedOriginalShell = Option.getOrThrowWith(
-          yield* harness.snapshotQuery.getThreadShellById(claudeThreadId),
-          () => new Error("expected original thread"),
-        );
-        assert.isDefined(kinShell.forkFamilyId);
-        assert.equal(
-          kinShell.forkFamilyId,
-          adoptedOriginalShell.forkFamilyId,
-          "fork and adopted original share one family",
-        );
-
-        // An existing normal import that turns out to be machine-launched is
-        // migrated into Automations under a variant-salted id.
-        const migrateMachineId = "44444444-8888-4888-8888-888888888881";
-        const machineCwd = path.join(harness.rootDir, "machine-cwd");
-        yield* fileSystem.makeDirectory(machineCwd, { recursive: true });
-        const machinePath = path.join(claudeProjectDir, `${migrateMachineId}.jsonl`);
-        const machineBody = (entrypoint?: string) =>
-          jsonl([
-            claudeUserEntry({
-              uuid: "mig-user-1",
-              text: "# batch job",
-              timestamp: "2026-07-09T03:00:00.000Z",
-              cwd: machineCwd,
-              sessionId: migrateMachineId,
-              ...(entrypoint !== undefined ? { entrypoint } : {}),
-            }),
-            claudeAssistantEntry({
-              uuid: "mig-assistant-1",
-              text: "batch output",
-              timestamp: "2026-07-09T03:00:30.000Z",
-              cwd: machineCwd,
-              sessionId: migrateMachineId,
-              ...(entrypoint !== undefined ? { entrypoint } : {}),
-            }),
-          ]);
-        yield* fileSystem.writeFileString(machinePath, machineBody());
-        yield* importer.sweepNow();
-        assert.isTrue(
-          Option.isSome(
-            yield* harness.snapshotQuery.getThreadShellById(importedThreadId(migrateMachineId)),
-          ),
-        );
-        yield* fileSystem.writeFileString(machinePath, machineBody("sdk-cli"));
-        yield* importer.sweepNow();
-        assert.isTrue(
-          Option.isNone(
-            yield* harness.snapshotQuery.getThreadShellById(importedThreadId(migrateMachineId)),
-          ),
-          "machine thread leaves its original id",
-        );
-        const migratedMachineShell = Option.getOrThrowWith(
-          yield* harness.snapshotQuery.getThreadShellById(importedThreadId(migrateMachineId, "a")),
-          () => new Error("expected migrated automation thread"),
-        );
-        assert.equal(migratedMachineShell.projectId, automationsProject.id);
-        assert.isTrue(
-          Option.isNone(yield* harness.snapshotQuery.getActiveProjectByWorkspaceRoot(machineCwd)),
-          "emptied machine project is deleted",
-        );
-
-        // Sessions opening with slash-command XML are titled from the first
-        // real prompt; threads already titled with the noise get repaired.
-        const titleId = "55555555-9999-4999-8999-999999999991";
-        const titlePath = path.join(claudeProjectDir, `${titleId}.jsonl`);
-        yield* fileSystem.writeFileString(
-          titlePath,
-          jsonl([
-            claudeUserEntry({
-              uuid: "title-user-1",
-              text: "<command-name>/model</command-name> output",
-              timestamp: "2026-07-10T03:00:00.000Z",
-              cwd: claudeCwd,
-              sessionId: titleId,
-            }),
-            claudeUserEntry({
-              uuid: "title-user-2",
-              text: "Rename the widget everywhere",
-              timestamp: "2026-07-10T03:01:00.000Z",
-              cwd: claudeCwd,
-              sessionId: titleId,
-            }),
-            claudeAssistantEntry({
-              uuid: "title-assistant-1",
-              text: "Renamed.",
-              timestamp: "2026-07-10T03:01:30.000Z",
-              cwd: claudeCwd,
-              sessionId: titleId,
-            }),
-          ]),
-        );
-        yield* importer.sweepNow();
-        const titleThreadId = importedThreadId(titleId);
-        const titleShell = Option.getOrThrowWith(
-          yield* harness.snapshotQuery.getThreadShellById(titleThreadId),
-          () => new Error("expected titled thread"),
-        );
-        assert.equal(titleShell.title, "Rename the widget everywhere");
-        // Simulate a thread titled by the old logic, then a file change.
-        yield* harness.engine.dispatch({
-          type: "thread.meta.update",
-          commandId: CommandId.make("test-noise-title"),
-          threadId: titleThreadId,
-          title: "<command-name>/model</command-name> output",
-        });
-        const titleContent = yield* fileSystem.readFileString(titlePath);
-        yield* fileSystem.writeFileString(
-          titlePath,
-          titleContent +
-            jsonl([
-              claudeAssistantEntry({
-                uuid: "title-assistant-2",
-                text: "Anything else?",
-                timestamp: "2026-07-10T03:02:00.000Z",
-                cwd: claudeCwd,
-                sessionId: titleId,
-              }),
-            ]),
-        );
-        yield* importer.sweepNow();
-        const repairedTitleShell = Option.getOrThrowWith(
-          yield* harness.snapshotQuery.getThreadShellById(titleThreadId),
-          () => new Error("expected repaired-title thread"),
-        );
-        assert.equal(
-          repairedTitleShell.title,
-          "Rename the widget everywhere",
-          "noise titles are repaired from the first real prompt",
-        );
-
-        // Automation roots: a session with human markers (tmux-driven
-        // harness) living under a configured root still routes to
-        // Automations.
-        const rootedId = "66666666-1111-4111-8111-999999999992";
-        const agentFarmCwd = path.join(harness.rootDir, "agent-farm", "work-r9");
-        yield* fileSystem.makeDirectory(agentFarmCwd, { recursive: true });
-        yield* fileSystem.writeFileString(
-          path.join(claudeProjectDir, `${rootedId}.jsonl`),
-          jsonl([
-            claudeUserEntry({
-              uuid: "rooted-user-1",
-              text: "walkthrough step one",
-              timestamp: "2026-07-11T03:00:00.000Z",
-              cwd: agentFarmCwd,
-              sessionId: rootedId,
-            }),
-            claudeAssistantEntry({
-              uuid: "rooted-assistant-1",
-              text: "done",
-              timestamp: "2026-07-11T03:00:30.000Z",
-              cwd: agentFarmCwd,
-              sessionId: rootedId,
-            }),
-          ]),
-        );
-        const rootedImporter = yield* makeSessionImporter({
-          claudeProjectsDir,
-          codexSessionsDir,
-          settleMs: 0,
-          automationRoots: [path.join(harness.rootDir, "agent-farm")],
-        }).pipe(
-          Effect.provide(
-            Layer.mergeAll(
-              Layer.succeed(OrchestrationEngineService, harness.engine),
-              Layer.succeed(ProjectionSnapshotQuery, harness.snapshotQuery),
-              Layer.succeed(ProviderSessionDirectory, harness.sessionDirectory),
-              ServerSettingsService.layerTest(),
-            ),
-          ),
-        );
-        yield* rootedImporter.sweepNow();
-        const rootedShell = Option.getOrThrowWith(
-          yield* harness.snapshotQuery.getThreadShellById(importedThreadId(rootedId)),
-          () => new Error("expected rooted automation thread"),
-        );
-        assert.equal(
-          rootedShell.projectId,
-          automationsProject.id,
-          "sessions under an automation root land in Automations despite human markers",
-        );
-      }),
-    ),
+/**
+ * The orchestrator, thread management, ProjectService and event sink over a
+ * fresh in-memory database, with real workspace-path validation. Provider
+ * plumbing the importer never reaches is stubbed.
+ */
+const layerRuntime = Layer.mergeAll(
+  RuntimeLayer.layer.pipe(Layer.provide(RuntimeLayer.layerProjectService)),
+  RuntimeLayer.layerProjectService,
+  RuntimeLayer.layerEventSink,
+  ProjectStore.layer,
+  ProviderSessionRuntime.layer,
+).pipe(
+  Layer.provide(
+    Layer.succeed(ProjectEnrichmentService.ProjectEnrichmentService, {
+      peek: () => Effect.succeed(noEnrichment),
+      request: () => Effect.void,
+      getAvailable: () => Effect.succeed(noEnrichment),
+      invalidate: () => Effect.void,
+      subscribeChanges: Effect.never,
+    }),
+  ),
+  Layer.provide(WorkspacePaths.layer),
+  Layer.provide(McpSessionRegistryTestkit.layer),
+  Layer.provideMerge(SqlitePersistence.layerMemory),
+  Layer.provide(Layer.mock(CheckpointStore.CheckpointStore)({})),
+  Layer.provide(ServerConfig.layerTest(process.cwd(), { prefix: "t3-session-importer-config-" })),
+  Layer.provideMerge(ServerSettings.layerTest()),
+  Layer.provide(
+    Layer.succeed(ProviderInstanceRegistry.ProviderInstanceRegistry, {
+      getInstance: () => Effect.succeed(undefined),
+      listInstances: Effect.succeed([]),
+      listUnavailable: Effect.succeed([]),
+      streamChanges: Stream.empty,
+      subscribeChanges: Effect.never,
+    }),
+  ),
+  Layer.provide(Layer.mock(GitWorkflow.GitWorkflowService)({})),
+  Layer.provide(
+    Layer.mock(SourceControlProviderRegistry.SourceControlProviderRegistry)({
+      resolveLink: () => Effect.die("unused"),
+    }),
+  ),
+  Layer.provideMerge(NodeServices.layer),
 );
+
+// --- transcript fixtures (the shapes the fork's parsers read) -------------------
+
+type Entry = Record<string, unknown>;
+const jsonl = (entries: ReadonlyArray<Entry>) =>
+  entries.map((entry) => JSON.stringify(entry)).join("\n") + "\n";
+
+/** Claude Code `<projects>/<dir>/<session>.jsonl` entries for one session. */
+const claudeSession = (input: {
+  readonly sessionId: string;
+  readonly cwd: string;
+  /** Claude stamps `cli` for the interactive TUI and `sdk-*` for programmatic runs. */
+  readonly entrypoint?: string;
+}) => {
+  const entry = (type: "user" | "assistant", uuid: string, text: string, at: string): Entry => ({
+    type,
+    uuid,
+    parentUuid: null,
+    sessionId: input.sessionId,
+    cwd: input.cwd,
+    timestamp: at,
+    isSidechain: false,
+    ...(input.entrypoint === undefined ? {} : { entrypoint: input.entrypoint }),
+    message:
+      type === "user"
+        ? { role: "user", content: text }
+        : { role: "assistant", content: [{ type: "text", text }] },
+  });
+  return {
+    user: (uuid: string, text: string, at: string) => entry("user", uuid, text, at),
+    assistant: (uuid: string, text: string, at: string) => entry("assistant", uuid, text, at),
+  };
+};
+
+const GIT = { git: { repository_url: "https://example.com/repo.git", branch: "main" } };
+
+/** Codex `sessions/YYYY/MM/DD/rollout-*.jsonl` lines. */
+const codex = {
+  meta: (id: string, cwd: string, at: string, extra: Entry = {}): Entry => ({
+    timestamp: at,
+    type: "session_meta",
+    payload: { id, cwd, timestamp: at, ...extra },
+  }),
+  user: (text: string, at: string): Entry => ({
+    timestamp: at,
+    type: "event_msg",
+    payload: { type: "user_message", message: text },
+  }),
+  assistant: (text: string, at: string): Entry => ({
+    timestamp: at,
+    type: "event_msg",
+    payload: { type: "agent_message", message: text },
+  }),
+  /** Provider item ids are copied verbatim into forks: the fork signature. */
+  item: (id: string, at: string): Entry => ({
+    timestamp: at,
+    type: "response_item",
+    payload: { id, type: "reasoning" },
+  }),
+};
+
+const iso = (value: DateTime.DateTime) => DateTime.formatIso(value);
+
+// --- harness ------------------------------------------------------------------
+
+const makeHarness = Effect.gen(function* () {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const threads = yield* ThreadManagementService.ThreadManagementService;
+  const projectStore = yield* ProjectStore.ProjectStoreV2;
+  const projects = yield* ProjectService.ProjectService;
+  const runtimes = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
+  const eventSink = yield* EventSink.EventSinkV2;
+
+  const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-session-importer-" });
+  const claudeProjectsDir = path.join(root, "claude-home", "projects");
+  const codexSessionsDir = path.join(root, "codex-home", "sessions");
+  const claudeDir = path.join(claudeProjectsDir, "-repo");
+  const codexDir = path.join(codexSessionsDir, "2026", "07", "29");
+  const workspace = path.join(root, "workspace");
+  for (const dir of [claudeDir, codexDir, workspace]) {
+    yield* fs.makeDirectory(dir, { recursive: true });
+  }
+
+  const write = (file: string, entries: ReadonlyArray<Entry>) =>
+    fs.writeFileString(file, jsonl(entries));
+  const append = (file: string, entries: ReadonlyArray<Entry>) =>
+    fs
+      .readFileString(file)
+      .pipe(Effect.flatMap((existing) => fs.writeFileString(file, existing + jsonl(entries))));
+
+  const shell = (threadId: ThreadId) => threads.getThreadShell(threadId);
+  const isLive = (threadId: ThreadId) =>
+    shell(threadId).pipe(Effect.map((found) => found !== null && found.deletedAt === null));
+  const liveShell = (threadId: ThreadId) =>
+    shell(threadId).pipe(
+      Effect.map((found) => {
+        assert.isTrue(found !== null && found.deletedAt === null, `expected live ${threadId}`);
+        return found!;
+      }),
+    );
+
+  return {
+    root,
+    workspace,
+    /** Shared project for project-less Codex chats. */
+    chatsRoot: path.dirname(codexSessionsDir),
+    /** Shared project for machine-launched sessions. */
+    automationsRoot: path.dirname(claudeProjectsDir),
+    claudeFile: (sessionId: string) => path.join(claudeDir, `${sessionId}.jsonl`),
+    codexFile: (name: string) => path.join(codexDir, `rollout-${name}.jsonl`),
+    makeDir: (...segments: ReadonlyArray<string>) => {
+      const dir = path.join(root, ...segments);
+      return fs.makeDirectory(dir, { recursive: true }).pipe(Effect.as(dir));
+    },
+    write,
+    append,
+    importer: (options: Partial<SessionImporterLiveOptions> = {}) =>
+      makeSessionImporter({ claudeProjectsDir, codexSessionsDir, settleMs: 0, ...options }),
+    shell,
+    isLive,
+    liveShell,
+    texts: (threadId: ThreadId) =>
+      threads
+        .getThreadRecords(threadId, ["messages"])
+        .pipe(Effect.map((records) => records.messages.map((message) => message.text))),
+    binding: (threadId: ThreadId) =>
+      runtimes
+        .getByThreadId({ threadId })
+        .pipe(Effect.map((row) => Option.getOrThrowWith(row, () => new Error(`no ${threadId}`)))),
+    projectAt: (workspaceRoot: string) =>
+      projectStore
+        .findActiveByWorkspaceRoot(workspaceRoot)
+        .pipe(Effect.map((row) => Option.getOrUndefined(row))),
+    /** Head of the event log: unchanged means a sweep wrote nothing. */
+    sequence: eventSink.latestSequence(),
+    threads,
+    projects,
+    runtimes,
+    eventSink,
+  };
+});
+
+type Harness = Effect.Success<typeof makeHarness>;
+
+type Scenario<E> = (h: Harness) => Effect.Effect<void, E, Layer.Success<typeof layerRuntime>>;
+const inRuntime =
+  <E>(body: Scenario<E>) =>
+  () =>
+    makeHarness.pipe(
+      Effect.flatMap((h) => body(h)),
+      Effect.provide(layerRuntime),
+    );
+
+/** One scenario: a fresh database and fresh transcript trees. */
+const runtimeTest = <E>(name: string, body: Scenario<E>) => it.effect(name, inRuntime(body));
+/** A scenario that documents a known importer bug; flips to failing once it is fixed. */
+
+/** A thread T3 itself created, optionally bound to a native provider session. */
+const seedT3Thread = (
+  h: Harness,
+  input: {
+    readonly threadId: ThreadId;
+    readonly projectId: ProjectId;
+    readonly driver: ProviderDriverKind;
+    readonly nativeSessionId?: string;
+    readonly historyOrigin?: OrchestrationV2AppThread["historyOrigin"];
+  },
+) => {
+  const at = DateTime.makeUnsafe("2026-07-20T00:00:00.000Z");
+  const instanceId = defaultInstanceIdForDriver(input.driver);
+  // Native-run provider threads keep a pending id, so it cannot be derived.
+  const providerThreadId = ProviderThreadId.make(`native-thread:pending:${input.threadId}`);
+  const events: Array<OrchestrationV2DomainEvent> = [
+    {
+      id: EventId.make(`seed:${input.threadId}:created`),
+      type: "thread.created",
+      threadId: input.threadId,
+      occurredAt: at,
+      payload: {
+        id: input.threadId,
+        projectId: input.projectId,
+        title: "T3 thread",
+        providerInstanceId: instanceId,
+        modelSelection: { instanceId, model: "test-model" },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        activeProviderThreadId: input.nativeSessionId === undefined ? null : providerThreadId,
+        ...(input.historyOrigin === undefined ? {} : { historyOrigin: input.historyOrigin }),
+        lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: input.threadId },
+        forkedFrom: null,
+        createdBy: "user",
+        creationSource: "web",
+        createdAt: at,
+        updatedAt: at,
+        archivedAt: null,
+        settledOverride: null,
+        settledAt: null,
+        lastVisitedAt: null,
+        deletedAt: null,
+      },
+    },
+  ];
+  if (input.nativeSessionId !== undefined) {
+    events.push({
+      id: EventId.make(`seed:${input.threadId}:provider-thread`),
+      type: "provider-thread.updated",
+      threadId: input.threadId,
+      driver: input.driver,
+      providerInstanceId: instanceId,
+      occurredAt: at,
+      payload: {
+        id: providerThreadId,
+        driver: input.driver,
+        providerInstanceId: instanceId,
+        providerSessionId: null,
+        appThreadId: input.threadId,
+        ownerNodeId: null,
+        nativeThreadRef: {
+          driver: input.driver,
+          nativeId: input.nativeSessionId,
+          strength: "strong",
+        },
+        nativeConversationHeadRef: null,
+        status: "idle",
+        firstRunOrdinal: 1,
+        lastRunOrdinal: 1,
+        handoffIds: [],
+        forkedFrom: null,
+        pendingBackgroundTasks: [],
+        createdAt: at,
+        updatedAt: at,
+      },
+    });
+  }
+  return h.eventSink.write({ events });
+};
+
+/** A T3 run on a thread: what chatting into an imported thread leaves behind. */
+const seedT3Run = (h: Harness, threadId: ThreadId, driver: ProviderDriverKind) => {
+  const at = DateTime.makeUnsafe("2026-07-20T00:00:00.000Z");
+  const runId = RunId.make(`seed-run:${threadId}`);
+  const instanceId = defaultInstanceIdForDriver(driver);
+  return h.eventSink.write({
+    events: [
+      {
+        id: EventId.make(`seed:${threadId}:run`),
+        type: "run.created",
+        threadId,
+        runId,
+        driver,
+        providerInstanceId: instanceId,
+        occurredAt: at,
+        payload: {
+          id: runId,
+          threadId,
+          ordinal: 1,
+          providerInstanceId: instanceId,
+          modelSelection: { instanceId, model: "test-model" },
+          providerThreadId: null,
+          userMessageId: MessageId.make(`seed-run-message:${threadId}`),
+          rootNodeId: null,
+          activeAttemptId: null,
+          status: "completed",
+          requestedAt: at,
+          startedAt: at,
+          completedAt: at,
+          checkpointId: null,
+          contextHandoffId: null,
+        },
+      },
+    ],
+  });
+};
+
+const payloadOf = (row: ProviderSessionRuntime.ProviderSessionRuntime) =>
+  row.runtimePayload as Record<string, unknown>;
+
+// --- scenarios ----------------------------------------------------------------
+
+runtimeTest("imports Claude and Codex sessions with their history and a native resume ref", (h) =>
+  Effect.gen(function* () {
+    const claudeId = "aaaaaaaa-1111-4111-8111-111111111111";
+    const ineligibleId = "bbbbbbbb-1111-4111-8111-111111111111";
+    const codexId = "cccccccc-2222-4222-8222-222222222222";
+    const codexCwd = yield* h.makeDir("codex-workspace");
+    const c = claudeSession({ sessionId: claudeId, cwd: h.workspace });
+    const claudePath = h.claudeFile(claudeId);
+    yield* h.write(claudePath, [
+      { type: "mode", mode: "default" },
+      c.user("user-1", "Fix the login bug please", "2026-07-01T10:00:00.000Z"),
+      c.assistant("assistant-1", "I fixed the login bug.", "2026-07-01T10:00:05.000Z"),
+      { ...c.user("side-1", "sidechain noise", "2026-07-01T10:00:06.000Z"), isSidechain: true },
+      { type: "ai-title", aiTitle: "Login bug fix" },
+    ]);
+    // A user message with no reply is not a conversation yet.
+    yield* h.write(h.claudeFile(ineligibleId), [
+      claudeSession({ sessionId: ineligibleId, cwd: h.workspace }).user(
+        "lonely-1",
+        "no reply yet",
+        "2026-07-01T11:00:00.000Z",
+      ),
+    ]);
+    yield* h.write(h.codexFile("codex"), [
+      codex.meta(codexId, codexCwd, "2026-07-02T08:00:00.000Z", GIT),
+      { timestamp: "2026-07-02T08:00:00.500Z", type: "turn_context", payload: {} },
+      codex.user("Refactor the rollout parser", "2026-07-02T08:00:01.000Z"),
+      codex.assistant("Parser refactored.", "2026-07-02T08:00:09.000Z"),
+    ]);
+
+    yield* (yield* h.importer()).sweepNow();
+
+    // Claude: a v1_import thread in the cwd's project, history with original
+    // timestamps, and a strong native ref to the source session.
+    const claudeThreadId = importedThreadId(claudeId);
+    const claudeRecords = yield* h.threads.getThreadRecords(claudeThreadId, [
+      "messages",
+      "providerThreads",
+    ]);
+    const claudeThread = claudeRecords.thread;
+    const workspaceProject = yield* h.projectAt(h.workspace);
+    assert.equal(claudeThread.projectId, workspaceProject?.projectId);
+    assert.equal(workspaceProject?.title, "workspace");
+    assert.equal(claudeThread.title, "Login bug fix");
+    assert.equal(claudeThread.historyOrigin, "v1_import");
+    assert.equal(claudeThread.providerInstanceId, "claudeAgent");
+    assert.equal(claudeThread.modelSelection.instanceId, "claudeAgent");
+    assert.equal(iso(claudeThread.createdAt), "2026-07-01T10:00:00.000Z");
+    assert.equal(iso(claudeThread.updatedAt), "2026-07-01T10:00:05.000Z");
+    assert.deepEqual(
+      claudeRecords.messages.map((message) => ({
+        role: message.role,
+        text: message.text,
+        streaming: message.streaming,
+        createdAt: iso(message.createdAt),
+      })),
+      [
+        {
+          role: "user",
+          text: "Fix the login bug please",
+          streaming: false,
+          createdAt: "2026-07-01T10:00:00.000Z",
+        },
+        {
+          role: "assistant",
+          text: "I fixed the login bug.",
+          streaming: false,
+          createdAt: "2026-07-01T10:00:05.000Z",
+        },
+      ],
+    );
+    assert.equal(claudeRecords.providerThreads.length, 1);
+    const claudeProviderThread = claudeRecords.providerThreads[0]!;
+    assert.equal(claudeThread.activeProviderThreadId, claudeProviderThread.id);
+    assert.equal(
+      claudeProviderThread.id,
+      deriveProviderThread({ driver: CLAUDE, nativeThreadId: claudeId }),
+    );
+    assert.equal(claudeProviderThread.appThreadId, claudeThreadId);
+    assert.deepEqual(claudeProviderThread.nativeThreadRef, {
+      driver: CLAUDE,
+      nativeId: claudeId,
+      strength: "strong",
+    });
+
+    // Its import cursor and fork signature live on the provider_session_runtime row.
+    const claudeBinding = yield* h.binding(claudeThreadId);
+    assert.equal(claudeBinding.providerName, "claudeAgent");
+    assert.equal(claudeBinding.providerInstanceId, "claudeAgent");
+    assert.equal(claudeBinding.status, "stopped");
+    assert.deepEqual(claudeBinding.resumeCursor, {
+      threadId: claudeThreadId,
+      resume: claudeId,
+      turnCount: 1,
+    });
+    assert.deepEqual(claudeBinding.runtimePayload, {
+      cwd: h.workspace,
+      importForkSig: ["user-1", "assistant-1"],
+      importCursor: {
+        sourceSessionId: claudeId,
+        sourcePath: claudePath,
+        lineCount: 5,
+        epoch: 2,
+      },
+    });
+
+    // Codex: the same shape, in its own cwd's project.
+    const codexThreadId = importedThreadId(codexId);
+    const codexRecords = yield* h.threads.getThreadRecords(codexThreadId, [
+      "messages",
+      "providerThreads",
+    ]);
+    assert.equal(codexRecords.thread.title, "Refactor the rollout parser");
+    assert.equal(codexRecords.thread.projectId, (yield* h.projectAt(codexCwd))?.projectId);
+    assert.deepEqual(
+      codexRecords.messages.map((message) => [message.role, message.text]),
+      [
+        ["user", "Refactor the rollout parser"],
+        ["assistant", "Parser refactored."],
+      ],
+    );
+    assert.deepEqual(codexRecords.providerThreads[0]?.nativeThreadRef, {
+      driver: CODEX,
+      nativeId: codexId,
+      strength: "strong",
+    });
+    assert.equal(codexRecords.thread.activeProviderThreadId, codexRecords.providerThreads[0]?.id);
+    assert.deepEqual((yield* h.binding(codexThreadId)).resumeCursor, { threadId: codexId });
+
+    assert.isNull(yield* h.shell(importedThreadId(ineligibleId)));
+
+    // A restarted importer (empty change cache) re-reads every file and writes nothing.
+    const head = yield* h.sequence;
+    yield* (yield* h.importer()).sweepNow();
+    assert.equal(yield* h.sequence, head);
+  }),
+);
+
+runtimeTest("appends new transcript lines incrementally and bumps recency", (h) =>
+  Effect.gen(function* () {
+    const claudeId = "aaaaaaaa-1111-4111-8111-111111111111";
+    const codexId = "cccccccc-2222-4222-8222-222222222222";
+    const c = claudeSession({ sessionId: claudeId, cwd: h.workspace });
+    const claudePath = h.claudeFile(claudeId);
+    const codexPath = h.codexFile("codex");
+    yield* h.write(claudePath, [
+      c.user("user-1", "Fix the login bug please", "2026-07-01T10:00:00.000Z"),
+      c.assistant("assistant-1", "I fixed the login bug.", "2026-07-01T10:00:05.000Z"),
+    ]);
+    yield* h.write(codexPath, [
+      codex.meta(codexId, h.workspace, "2026-07-02T08:00:00.000Z", GIT),
+      codex.user("Refactor the rollout parser", "2026-07-02T08:00:01.000Z"),
+      codex.assistant("Parser refactored.", "2026-07-02T08:00:09.000Z"),
+    ]);
+    const importer = yield* h.importer();
+    yield* importer.sweepNow();
+
+    yield* h.append(claudePath, [
+      c.user("user-2", "Now add a regression test", "2026-07-01T10:05:00.000Z"),
+      c.assistant("assistant-2", "Added a regression test.", "2026-07-01T10:05:30.000Z"),
+    ]);
+    yield* h.append(codexPath, [codex.assistant("Anything else?", "2026-07-02T08:01:00.000Z")]);
+    yield* importer.sweepNow();
+
+    const claudeThreadId = importedThreadId(claudeId);
+    assert.deepEqual(yield* h.texts(claudeThreadId), [
+      "Fix the login bug please",
+      "I fixed the login bug.",
+      "Now add a regression test",
+      "Added a regression test.",
+    ]);
+    // The thread's recency follows the newest imported message.
+    assert.equal(iso((yield* h.liveShell(claudeThreadId)).updatedAt), "2026-07-01T10:05:30.000Z");
+    const claudeBinding = yield* h.binding(claudeThreadId);
+    assert.deepEqual(claudeBinding.resumeCursor, {
+      threadId: claudeThreadId,
+      resume: claudeId,
+      turnCount: 2,
+    });
+    assert.deepEqual(claudeBinding.runtimePayload, {
+      cwd: h.workspace,
+      importForkSig: ["user-1", "assistant-1", "user-2", "assistant-2"],
+      importCursor: { sourceSessionId: claudeId, sourcePath: claudePath, lineCount: 4, epoch: 2 },
+    });
+
+    const codexThreadId = importedThreadId(codexId);
+    assert.deepEqual(yield* h.texts(codexThreadId), [
+      "Refactor the rollout parser",
+      "Parser refactored.",
+      "Anything else?",
+    ]);
+    assert.equal(iso((yield* h.liveShell(codexThreadId)).updatedAt), "2026-07-02T08:01:00.000Z");
+
+    // Nothing changed: nothing written, by this importer or a restarted one.
+    const head = yield* h.sequence;
+    yield* importer.sweepNow();
+    yield* (yield* h.importer()).sweepNow();
+    assert.equal(yield* h.sequence, head);
+  }),
+);
+
+runtimeTest("waits for a transcript to settle and skips files over the size cap", (h) =>
+  Effect.gen(function* () {
+    const settlingId = "dddddddd-1111-4111-8111-111111111111";
+    const c = claudeSession({ sessionId: settlingId, cwd: h.workspace });
+    const settlingPath = h.claudeFile(settlingId);
+    yield* h.write(settlingPath, [
+      c.user("settle-user-1", "Still typing", "2026-07-01T10:00:00.000Z"),
+      c.assistant("settle-assistant-1", "Still answering", "2026-07-01T10:00:05.000Z"),
+    ]);
+    const fs = yield* FileSystem.FileSystem;
+    const mtimeMs = Option.getOrThrow((yield* fs.stat(settlingPath)).mtime).getTime();
+
+    const settling = yield* h.importer({ settleMs: 20_000 });
+    yield* TestClock.setTime(mtimeMs + 19_000);
+    yield* settling.sweepNow();
+    assert.isNull(yield* h.shell(importedThreadId(settlingId)), "a busy file waits");
+    yield* TestClock.setTime(mtimeMs + 20_000);
+    yield* settling.sweepNow();
+    assert.isTrue(yield* h.isLive(importedThreadId(settlingId)), "a quiet file imports");
+
+    const largeId = "eeeeeeee-1111-4111-8111-111111111111";
+    const large = claudeSession({ sessionId: largeId, cwd: h.workspace });
+    yield* h.write(h.claudeFile(largeId), [
+      large.user("large-user-1", "x".repeat(4_000), "2026-07-01T11:00:00.000Z"),
+      large.assistant("large-assistant-1", "ok", "2026-07-01T11:00:05.000Z"),
+    ]);
+    yield* (yield* h.importer({ maxFileBytes: 2_000 })).sweepNow();
+    assert.isNull(yield* h.shell(importedThreadId(largeId)), "an oversized file is skipped");
+    yield* (yield* h.importer()).sweepNow();
+    assert.isTrue(yield* h.isLive(importedThreadId(largeId)), "only the cap kept it out");
+  }),
+);
+
+runtimeTest("places sessions in a project per cwd and project-less Codex chats in Chats", (h) =>
+  Effect.gen(function* () {
+    const otherCwd = yield* h.makeDir("other-repo");
+    const claudeA = "aaaaaaaa-0000-4000-8000-00000000000a";
+    const claudeB = "aaaaaaaa-0000-4000-8000-00000000000b";
+    const claudeOther = "aaaaaaaa-0000-4000-8000-00000000000c";
+    const repoCodex = "cccccccc-0000-4000-8000-00000000000a";
+    const chatA = "eeeeeeee-3333-4333-8333-33333333333a";
+    const chatB = "eeeeeeee-3333-4333-8333-33333333333b";
+    for (const [sessionId, cwd] of [
+      [claudeA, h.workspace],
+      [claudeB, h.workspace],
+      [claudeOther, otherCwd],
+    ] as const) {
+      const c = claudeSession({ sessionId, cwd });
+      yield* h.write(h.claudeFile(sessionId), [
+        c.user(`${sessionId}-u`, `Question ${sessionId}`, "2026-07-01T10:00:00.000Z"),
+        c.assistant(`${sessionId}-a`, "Answer", "2026-07-01T10:00:05.000Z"),
+      ]);
+    }
+    yield* h.write(h.codexFile("repo"), [
+      codex.meta(repoCodex, h.workspace, "2026-07-02T08:00:00.000Z", GIT),
+      codex.user("Repo question", "2026-07-02T08:00:01.000Z"),
+      codex.assistant("Repo answer", "2026-07-02T08:00:05.000Z"),
+    ]);
+    // No git metadata: a project-less chat, whatever throwaway cwd it ran in.
+    for (const [sessionId, cwd] of [
+      [chatA, joinPath(h.root, "throwaway-1")],
+      [chatB, joinPath(h.root, "throwaway-2")],
+    ] as const) {
+      yield* h.write(h.codexFile(sessionId), [
+        codex.meta(sessionId, cwd, "2026-07-03T09:00:00.000Z"),
+        codex.user("Quick question", "2026-07-03T09:00:01.000Z"),
+        codex.assistant("Quick answer.", "2026-07-03T09:00:05.000Z"),
+      ]);
+    }
+
+    yield* (yield* h.importer()).sweepNow();
+
+    const workspaceProject = (yield* h.projectAt(h.workspace))!;
+    const otherProject = (yield* h.projectAt(otherCwd))!;
+    assert.notEqual(workspaceProject.projectId, otherProject.projectId);
+    assert.equal(
+      (yield* h.liveShell(importedThreadId(claudeA))).projectId,
+      workspaceProject.projectId,
+    );
+    assert.equal(
+      (yield* h.liveShell(importedThreadId(claudeB))).projectId,
+      workspaceProject.projectId,
+    );
+    assert.equal(
+      (yield* h.liveShell(importedThreadId(repoCodex))).projectId,
+      workspaceProject.projectId,
+    );
+    assert.equal(
+      (yield* h.liveShell(importedThreadId(claudeOther))).projectId,
+      otherProject.projectId,
+    );
+
+    const chats = (yield* h.projectAt(h.chatsRoot))!;
+    assert.equal(chats.title, "Chats");
+    assert.equal((yield* h.liveShell(importedThreadId(chatA))).projectId, chats.projectId);
+    assert.equal((yield* h.liveShell(importedThreadId(chatB))).projectId, chats.projectId);
+    assert.isUndefined(yield* h.projectAt(joinPath(h.root, "throwaway-1")));
+  }),
+);
+
+runtimeTest("moves an epoch-1 per-cwd chat into Chats and drops its emptied project", (h) =>
+  Effect.gen(function* () {
+    const legacyId = "ffffffff-4444-4444-8444-444444444444";
+    // Hand-rolled epoch-1 id and project: the layout before epoch scoping.
+    const legacyThreadId = ThreadId.make(`cli-import-${legacyId}`);
+    const legacyCwd = yield* h.makeDir("legacy-chat-cwd");
+    const legacyProjectId = ProjectId.make("cli-import-project-legacy-chat");
+    yield* h.projects.create({
+      commandId: CommandId.make("test:legacy-project"),
+      projectId: legacyProjectId,
+      title: "legacy-chat-cwd",
+      workspaceRoot: legacyCwd,
+    });
+    yield* seedT3Thread(h, {
+      threadId: legacyThreadId,
+      projectId: legacyProjectId,
+      driver: CODEX,
+      historyOrigin: "v1_import",
+    });
+    const legacyPath = h.codexFile("legacy");
+    const legacyLines = [
+      codex.meta(legacyId, legacyCwd, "2026-07-04T10:00:00.000Z"),
+      codex.user("Legacy chat question", "2026-07-04T10:00:01.000Z"),
+      codex.assistant("Legacy chat answer.", "2026-07-04T10:00:05.000Z"),
+    ];
+    yield* h.write(legacyPath, legacyLines);
+    yield* h.runtimes.upsert({
+      threadId: legacyThreadId,
+      providerName: CODEX,
+      providerInstanceId: defaultInstanceIdForDriver(CODEX),
+      adapterKey: CODEX,
+      runtimeMode: "full-access",
+      status: "stopped",
+      lastSeenAt: "2026-07-04T10:00:05.000Z",
+      resumeCursor: { threadId: legacyId },
+      runtimePayload: {
+        cwd: legacyCwd,
+        // No epoch: the legacy layout marker.
+        importCursor: {
+          sourceSessionId: legacyId,
+          sourcePath: legacyPath,
+          lineCount: legacyLines.length,
+        },
+      },
+    });
+
+    yield* (yield* h.importer()).sweepNow();
+
+    const migratedThreadId = importedThreadId(legacyId);
+    const chats = (yield* h.projectAt(h.chatsRoot))!;
+    assert.equal((yield* h.liveShell(migratedThreadId)).projectId, chats.projectId);
+    assert.deepEqual(yield* h.texts(migratedThreadId), [
+      "Legacy chat question",
+      "Legacy chat answer.",
+    ]);
+    assert.isFalse(yield* h.isLive(legacyThreadId), "the epoch-1 thread is deleted");
+    assert.isUndefined(yield* h.projectAt(legacyCwd), "its per-chat project is deleted");
+    const legacyBinding = yield* h.binding(legacyThreadId);
+    assert.isNull(legacyBinding.resumeCursor, "the old binding is tombstoned");
+    assert.isNull(payloadOf(legacyBinding).importCursor);
+    const migratedCursor = payloadOf(yield* h.binding(migratedThreadId)).importCursor as {
+      readonly epoch?: number;
+    };
+    assert.equal(migratedCursor.epoch, 2);
+  }),
+);
+
+runtimeTest(
+  "routes machine-launched sessions to Automations unless they fork a human session",
+  (h) =>
+    Effect.gen(function* () {
+      const humanId = "aaaaaaaa-7777-4777-8777-777777777770";
+      const sdkId = "33333333-7777-4777-8777-777777777771";
+      const kinId = "33333333-7777-4777-8777-777777777772";
+      const execId = "33333333-7777-4777-8777-777777777773";
+      const execOriginatorId = "33333333-7777-4777-8777-777777777774";
+      const human = claudeSession({ sessionId: humanId, cwd: h.workspace });
+      yield* h.write(h.claudeFile(humanId), [
+        human.user("h-user-1", "Fix the login bug please", "2026-07-01T10:00:00.000Z"),
+        human.assistant("h-assistant-1", "I fixed the login bug.", "2026-07-01T10:00:05.000Z"),
+      ]);
+      const sdk = claudeSession({ sessionId: sdkId, cwd: h.workspace, entrypoint: "sdk-cli" });
+      yield* h.write(h.claudeFile(sdkId), [
+        sdk.user("auto-user-1", "# nightly pipeline run", "2026-07-08T03:00:00.000Z"),
+        sdk.assistant("auto-assistant-1", "pipeline output", "2026-07-08T03:00:30.000Z"),
+      ]);
+      // A programmatic /branch of the human conversation: its history copies the uuids.
+      const kin = claudeSession({ sessionId: kinId, cwd: h.workspace, entrypoint: "sdk-ts" });
+      yield* h.write(h.claudeFile(kinId), [
+        kin.user("h-user-1", "Fix the login bug please", "2026-07-01T10:00:00.000Z"),
+        kin.assistant("h-assistant-1", "I fixed the login bug.", "2026-07-01T10:00:05.000Z"),
+        kin.user("kin-user-2", "Branched follow-up", "2026-07-08T04:00:00.000Z"),
+        kin.assistant("kin-assistant-2", "Branched reply.", "2026-07-08T04:00:30.000Z"),
+      ]);
+      yield* h.write(h.codexFile("exec"), [
+        codex.meta(execId, h.workspace, "2026-07-08T05:00:00.000Z", { ...GIT, source: "exec" }),
+        codex.user("codex exec task", "2026-07-08T05:00:01.000Z"),
+        codex.assistant("exec result", "2026-07-08T05:00:05.000Z"),
+      ]);
+      yield* h.write(h.codexFile("exec-originator"), [
+        codex.meta(execOriginatorId, h.workspace, "2026-07-08T06:00:00.000Z", {
+          ...GIT,
+          originator: "codex_exec",
+        }),
+        codex.user("another exec task", "2026-07-08T06:00:01.000Z"),
+        codex.assistant("exec result", "2026-07-08T06:00:05.000Z"),
+      ]);
+
+      const importer = yield* h.importer();
+      yield* importer.sweepNow();
+
+      const automations = (yield* h.projectAt(h.automationsRoot))!;
+      assert.equal(automations.title, "Automations");
+      const workspaceProject = (yield* h.projectAt(h.workspace))!;
+      for (const sessionId of [sdkId, execId, execOriginatorId]) {
+        assert.equal(
+          (yield* h.liveShell(importedThreadId(sessionId))).projectId,
+          automations.projectId,
+          `${sessionId} is an automation`,
+        );
+        assert.equal(
+          payloadOf(yield* h.binding(importedThreadId(sessionId))).importLaunch,
+          "automation",
+        );
+      }
+      const kinShell = yield* h.liveShell(importedThreadId(kinId));
+      assert.equal(kinShell.projectId, workspaceProject.projectId, "kin stays beside its human");
+      assert.equal(payloadOf(yield* h.binding(importedThreadId(kinId))).importLaunch, "kin");
+      // Kin also joins the human session's fork family (smallest session id).
+      assert.equal(kinShell.forkFamilyId, kinId);
+      assert.equal((yield* h.liveShell(importedThreadId(humanId))).forkFamilyId, kinId);
+
+      // An existing normal import that turns out to be machine-launched moves to
+      // Automations under a variant id, and its emptied project goes away.
+      const lateId = "44444444-8888-4888-8888-888888888881";
+      const machineCwd = yield* h.makeDir("machine-cwd");
+      const latePath = h.claudeFile(lateId);
+      const lateBody = (entrypoint?: string) => {
+        const late = claudeSession({
+          sessionId: lateId,
+          cwd: machineCwd,
+          ...(entrypoint === undefined ? {} : { entrypoint }),
+        });
+        return [
+          late.user("mig-user-1", "# batch job", "2026-07-09T03:00:00.000Z"),
+          late.assistant("mig-assistant-1", "batch output", "2026-07-09T03:00:30.000Z"),
+        ];
+      };
+      yield* h.write(latePath, lateBody());
+      yield* importer.sweepNow();
+      assert.isTrue(yield* h.isLive(importedThreadId(lateId)));
+      assert.isDefined(yield* h.projectAt(machineCwd));
+      yield* h.write(latePath, lateBody("sdk-cli"));
+      yield* importer.sweepNow();
+      assert.isFalse(yield* h.isLive(importedThreadId(lateId)), "it leaves its original id");
+      assert.equal(
+        (yield* h.liveShell(importedThreadId(lateId, "a"))).projectId,
+        automations.projectId,
+      );
+      assert.isUndefined(yield* h.projectAt(machineCwd), "the emptied project is deleted");
+    }),
+);
+
+runtimeTest("routes human-marked sessions under an automation root to Automations", (h) =>
+  Effect.gen(function* () {
+    const rootedId = "66666666-1111-4111-8111-999999999992";
+    const farmCwd = yield* h.makeDir("agent-farm", "work-r9");
+    const c = claudeSession({ sessionId: rootedId, cwd: farmCwd });
+    yield* h.write(h.claudeFile(rootedId), [
+      c.user("rooted-user-1", "walkthrough step one", "2026-07-11T03:00:00.000Z"),
+      c.assistant("rooted-assistant-1", "done", "2026-07-11T03:00:30.000Z"),
+    ]);
+    yield* (yield* h.importer({ automationRoots: [joinPath(h.root, "agent-farm")] })).sweepNow();
+    const automations = (yield* h.projectAt(h.automationsRoot))!;
+    assert.equal((yield* h.liveShell(importedThreadId(rootedId))).projectId, automations.projectId);
+    assert.isUndefined(yield* h.projectAt(farmCwd));
+  }),
+);
+
+runtimeTest("skips Codex subagent sessions and removes ones imported earlier", (h) =>
+  Effect.gen(function* () {
+    const freshThreadSource = "22222222-6666-4666-8666-666666666661";
+    const freshSourceField = "22222222-6666-4666-8666-666666666663";
+    yield* h.write(h.codexFile("sub-thread-source"), [
+      codex.meta(freshThreadSource, h.workspace, "2026-07-07T08:00:00.000Z", {
+        ...GIT,
+        thread_source: "subagent",
+      }),
+      codex.user("subagent task", "2026-07-07T08:00:01.000Z"),
+      codex.assistant("subagent result", "2026-07-07T08:00:05.000Z"),
+    ]);
+    yield* h.write(h.codexFile("sub-source"), [
+      codex.meta(freshSourceField, h.workspace, "2026-07-07T08:10:00.000Z", {
+        ...GIT,
+        source: { subagent: { parent_thread_id: "parent" } },
+      }),
+      codex.user("subagent task", "2026-07-07T08:10:01.000Z"),
+      codex.assistant("subagent result", "2026-07-07T08:10:05.000Z"),
+    ]);
+    const importer = yield* h.importer();
+    yield* importer.sweepNow();
+    assert.isNull(yield* h.shell(importedThreadId(freshThreadSource)));
+    assert.isNull(yield* h.shell(importedThreadId(freshSourceField)));
+
+    // Imported before the marker was understood, alone in its project.
+    const legacyId = "22222222-6666-4666-8666-666666666662";
+    const subCwd = yield* h.makeDir("subagent-cwd");
+    const legacyPath = h.codexFile("sub-legacy");
+    const body = (marked: boolean) => [
+      codex.meta(legacyId, subCwd, "2026-07-07T09:00:00.000Z", {
+        ...GIT,
+        ...(marked ? { thread_source: "subagent" } : {}),
+      }),
+      codex.user("was imported as a normal thread", "2026-07-07T09:00:01.000Z"),
+      codex.assistant("done", "2026-07-07T09:00:05.000Z"),
+    ];
+    yield* h.write(legacyPath, body(false));
+    yield* importer.sweepNow();
+    assert.isTrue(yield* h.isLive(importedThreadId(legacyId)));
+    assert.isDefined(yield* h.projectAt(subCwd));
+
+    yield* h.write(legacyPath, body(true));
+    yield* importer.sweepNow();
+    assert.isFalse(yield* h.isLive(importedThreadId(legacyId)), "the subagent thread is removed");
+    assert.isUndefined(yield* h.projectAt(subCwd), "its emptied project is removed");
+    const tombstone = yield* h.binding(importedThreadId(legacyId));
+    assert.isNull(tombstone.resumeCursor);
+    assert.isNull(payloadOf(tombstone).importCursor);
+  }),
+);
+
+// The importer deletes its own emptied projects; a later session in that
+// workspace must get a live project again, not the deleted one.
+runtimeTest("gives a workspace a live project again after its import project was deleted", (h) =>
+  Effect.gen(function* () {
+    const firstId = "77777777-0000-4000-8000-000000000001";
+    const laterId = "77777777-0000-4000-8000-000000000002";
+    const cwd = yield* h.makeDir("revisited-repo");
+    const session = (sessionId: string, at: string) => [
+      codex.meta(sessionId, cwd, at, GIT),
+      codex.user(`Question in ${sessionId}`, at),
+      codex.assistant("Answer", at),
+    ];
+    yield* h.write(h.codexFile("first"), session(firstId, "2026-07-13T10:00:00.000Z"));
+    const importer = yield* h.importer();
+    yield* importer.sweepNow();
+    const first = (yield* h.projectAt(cwd))!;
+    // The user deletes the project (the importer does the same when it empties
+    // one by removing a subagent or moving a thread to Automations).
+    yield* h.projects.delete({
+      commandId: CommandId.make("test:user-project-delete"),
+      projectId: first.projectId,
+      force: true,
+    });
+    assert.isUndefined(yield* h.projectAt(cwd));
+
+    yield* h.write(h.codexFile("later"), session(laterId, "2026-07-14T10:00:00.000Z"));
+    yield* importer.sweepNow();
+    const later = yield* h.liveShell(importedThreadId(laterId));
+    assert.notEqual(later.projectId, first.projectId, "not the deleted project");
+    const project = yield* h.projectAt(cwd);
+    assert.isDefined(project, "the workspace has a live project again");
+    assert.equal(later.projectId, project?.projectId, "the new thread lives in it");
+  }),
+);
+
+runtimeTest("repairs slash-command noise titles and leaves user renames alone", (h) =>
+  Effect.gen(function* () {
+    const titleId = "55555555-9999-4999-8999-999999999991";
+    const c = claudeSession({ sessionId: titleId, cwd: h.workspace });
+    const titlePath = h.claudeFile(titleId);
+    const noise = "<command-name>/model</command-name> output";
+    yield* h.write(titlePath, [
+      c.user("title-user-1", noise, "2026-07-10T03:00:00.000Z"),
+      c.user("title-user-2", "Rename the widget everywhere", "2026-07-10T03:01:00.000Z"),
+      c.assistant("title-assistant-1", "Renamed.", "2026-07-10T03:01:30.000Z"),
+    ]);
+    const importer = yield* h.importer();
+    yield* importer.sweepNow();
+    const threadId = importedThreadId(titleId);
+    assert.equal((yield* h.liveShell(threadId)).title, "Rename the widget everywhere");
+
+    // A thread titled by the old first-message logic is repaired on the next change.
+    yield* h.threads.dispatch({
+      type: "thread.metadata.update",
+      commandId: CommandId.make("test:noise-title"),
+      threadId,
+      title: noise,
+    });
+    yield* h.append(titlePath, [
+      c.assistant("title-assistant-2", "Anything else?", "2026-07-10T03:02:00.000Z"),
+    ]);
+    yield* importer.sweepNow();
+    assert.equal((yield* h.liveShell(threadId)).title, "Rename the widget everywhere");
+
+    // Only noise is replaced: a user's own title survives later changes.
+    yield* h.threads.dispatch({
+      type: "thread.metadata.update",
+      commandId: CommandId.make("test:user-title"),
+      threadId,
+      title: "My widget work",
+    });
+    yield* h.append(titlePath, [c.user("title-user-3", "One more", "2026-07-10T03:03:00.000Z")]);
+    yield* importer.sweepNow();
+    assert.equal((yield* h.liveShell(threadId)).title, "My widget work");
+  }),
+);
+
+runtimeTest("stamps fork families on two-or-more member families without moving recency", (h) =>
+  Effect.gen(function* () {
+    const forkA = "11111111-5555-4555-8555-555555555551";
+    const forkB = "11111111-5555-4555-8555-555555555552";
+    const loner = "11111111-5555-4555-8555-555555555553";
+    const forkFile = (sessionId: string, sharedItem: string, answer: string) => [
+      codex.meta(sessionId, h.workspace, "2026-07-06T08:00:00.000Z", GIT),
+      codex.item(sharedItem, "2026-07-06T08:00:01.000Z"),
+      codex.user("Original fork prompt", "2026-07-06T08:00:02.000Z"),
+      codex.assistant(answer, "2026-07-06T08:00:05.000Z"),
+    ];
+    yield* h.write(h.codexFile("fork-a"), forkFile(forkA, "rs_shared001", "In the original."));
+    yield* h.write(h.codexFile("fork-b"), forkFile(forkB, "rs_shared001", "In the fork."));
+    yield* h.write(h.codexFile("loner"), forkFile(loner, "rs_alone001", "Unrelated."));
+
+    yield* (yield* h.importer()).sweepNow();
+
+    const shellA = yield* h.liveShell(importedThreadId(forkA));
+    const shellB = yield* h.liveShell(importedThreadId(forkB));
+    // The family id is the smallest member session id: the original.
+    assert.equal(shellA.forkFamilyId, forkA);
+    assert.equal(shellB.forkFamilyId, forkA);
+    assert.isUndefined((yield* h.liveShell(importedThreadId(loner))).forkFamilyId ?? undefined);
+    // Stamping is metadata, not activity.
+    assert.equal(iso(shellA.updatedAt), "2026-07-06T08:00:05.000Z");
+    assert.equal(iso(shellB.updatedAt), "2026-07-06T08:00:05.000Z");
+
+    // Stamped families are not re-stamped, even by a restarted importer.
+    const head = yield* h.sequence;
+    yield* (yield* h.importer()).sweepNow();
+    assert.equal(yield* h.sequence, head);
+  }),
+);
+
+runtimeTest("stops tailing an imported session once T3 has run it", (h) =>
+  Effect.gen(function* () {
+    const claudeId = "aaaaaaaa-1111-4111-8111-111111111111";
+    const c = claudeSession({ sessionId: claudeId, cwd: h.workspace });
+    const claudePath = h.claudeFile(claudeId);
+    const threadId = importedThreadId(claudeId);
+    yield* h.write(claudePath, [
+      c.user("user-1", "Fix the login bug please", "2026-07-01T10:00:00.000Z"),
+      c.assistant("assistant-1", "I fixed the login bug.", "2026-07-01T10:00:05.000Z"),
+    ]);
+    const importer = yield* h.importer();
+    yield* importer.sweepNow();
+
+    // Runtime noise on the binding (a provider stop-all merge) is not adoption.
+    const before = yield* h.binding(threadId);
+    yield* h.runtimes.upsert({
+      ...before,
+      status: "stopped",
+      runtimePayload: { ...payloadOf(before), activeTurnId: null, lastRuntimeEvent: "stopAll" },
+    });
+    yield* h.append(claudePath, [
+      c.user("user-2", "After a quit cycle", "2026-07-01T10:05:00.000Z"),
+    ]);
+    yield* importer.sweepNow();
+    assert.include(yield* h.texts(threadId), "After a quit cycle");
+
+    // Chatting into the thread in T3 hands the native session to T3: the cursor
+    // is dropped (resume ref kept) and the file is never tailed again.
+    yield* seedT3Run(h, threadId, CLAUDE);
+    yield* h.append(claudePath, [
+      c.assistant("assistant-3", "Replying natively through T3.", "2026-07-01T10:10:30.000Z"),
+    ]);
+    yield* importer.sweepNow();
+    assert.notInclude(yield* h.texts(threadId), "Replying natively through T3.");
+    const adopted = yield* h.binding(threadId);
+    assert.isNull(payloadOf(adopted).importCursor);
+    assert.deepEqual(adopted.resumeCursor, { threadId, resume: claudeId, turnCount: 2 });
+
+    const head = yield* h.sequence;
+    yield* h.append(claudePath, [
+      c.user("user-4", "One more terminal message", "2026-07-01T10:15:00.000Z"),
+    ]);
+    yield* importer.sweepNow();
+    yield* (yield* h.importer()).sweepNow();
+    assert.equal(yield* h.sequence, head);
+    assert.isNull(payloadOf(yield* h.binding(threadId)).importCursor);
+  }),
+);
+
+runtimeTest("rebuilds a lost import cursor on a thread T3 never ran", (h) =>
+  Effect.gen(function* () {
+    const codexId = "cccccccc-2222-4222-8222-222222222222";
+    const codexPath = h.codexFile("codex");
+    const threadId = importedThreadId(codexId);
+    yield* h.write(codexPath, [
+      codex.meta(codexId, h.workspace, "2026-07-02T08:00:00.000Z", GIT),
+      codex.user("Refactor the rollout parser", "2026-07-02T08:00:01.000Z"),
+      codex.assistant("Parser refactored.", "2026-07-02T08:00:09.000Z"),
+    ]);
+    const importer = yield* h.importer();
+    yield* importer.sweepNow();
+
+    const before = yield* h.binding(threadId);
+    yield* h.runtimes.upsert({
+      ...before,
+      runtimePayload: { ...payloadOf(before), importCursor: null },
+    });
+    // Lines written while the cursor was missing are skipped; the cursor is
+    // rebuilt at the current end of the file.
+    yield* h.append(codexPath, [
+      codex.assistant("Lost while stripped", "2026-07-05T09:00:00.000Z"),
+    ]);
+    yield* importer.sweepNow();
+    assert.deepEqual(payloadOf(yield* h.binding(threadId)).importCursor, {
+      sourceSessionId: codexId,
+      sourcePath: codexPath,
+      lineCount: 4,
+      epoch: 2,
+    });
+
+    yield* h.append(codexPath, [codex.user("Back in business", "2026-07-05T10:00:00.000Z")]);
+    yield* importer.sweepNow();
+    assert.include(yield* h.texts(threadId), "Back in business");
+  }),
+);
+
+runtimeTest("never re-tails a thread T3 adopted before v2, even without a cursor", (h) =>
+  Effect.gen(function* () {
+    const importer = yield* h.importer();
+    const sessions = {
+      // v1 adoption left T3's own turns in the thread and cleared the cursor.
+      withMessages: "aaaaaaaa-1111-4111-8111-1111111111a1",
+      // v1 adoption left its markers on the binding.
+      withMarkers: "aaaaaaaa-1111-4111-8111-1111111111a2",
+    };
+    for (const sessionId of Object.values(sessions)) {
+      const c = claudeSession({ sessionId, cwd: h.workspace });
+      yield* h.write(h.claudeFile(sessionId), [
+        c.user(`${sessionId}-u1`, "Fix the login bug please", "2026-07-01T10:00:00.000Z"),
+        c.assistant(`${sessionId}-a1`, "I fixed the login bug.", "2026-07-01T10:00:05.000Z"),
+      ]);
+    }
+    yield* importer.sweepNow();
+
+    const at = DateTime.makeUnsafe("2026-07-01T10:10:00.000Z");
+    const withMessagesThread = importedThreadId(sessions.withMessages);
+    yield* h.eventSink.write({
+      events: [
+        {
+          id: EventId.make("seed:migrated-native-message"),
+          type: "message.updated",
+          threadId: withMessagesThread,
+          occurredAt: at,
+          payload: {
+            createdBy: "user",
+            creationSource: "web",
+            id: MessageId.make("v1-native-message"),
+            threadId: withMessagesThread,
+            runId: null,
+            nodeId: null,
+            role: "user",
+            text: "Typed into T3 before the v2 migration",
+            attachments: [],
+            streaming: false,
+            createdAt: at,
+            updatedAt: at,
+          },
+        },
+      ],
+    });
+    const stripCursor = (threadId: ThreadId, extra: Record<string, unknown>) =>
+      Effect.gen(function* () {
+        const row = yield* h.binding(threadId);
+        yield* h.runtimes.upsert({
+          ...row,
+          runtimePayload: { ...payloadOf(row), importCursor: null, ...extra },
+        });
+      });
+    yield* stripCursor(withMessagesThread, {});
+    yield* stripCursor(importedThreadId(sessions.withMarkers), { model: "claude-fable-5" });
+
+    // The terminal (or T3's own resume) keeps writing to both transcripts. Two
+    // rounds: a wrongly rebuilt cursor would start at the end of the first.
+    const head = yield* h.sequence;
+    for (const round of [1, 2]) {
+      for (const sessionId of Object.values(sessions)) {
+        const c = claudeSession({ sessionId, cwd: h.workspace });
+        yield* h.append(h.claudeFile(sessionId), [
+          c.user(`${sessionId}-u${round}x`, "Native turn", `2026-07-01T10:1${round}:00.000Z`),
+          c.assistant(`${sessionId}-a${round}x`, "Native reply", `2026-07-01T10:1${round}:05.000Z`),
+        ]);
+      }
+      yield* importer.sweepNow();
+    }
+    yield* (yield* h.importer()).sweepNow();
+    assert.equal(yield* h.sequence, head, "neither thread is tailed again");
+    for (const sessionId of Object.values(sessions)) {
+      const threadId = importedThreadId(sessionId);
+      assert.notInclude(yield* h.texts(threadId), "Native reply");
+      assert.isNull(payloadOf(yield* h.binding(threadId)).importCursor, sessionId);
+    }
+  }),
+);
+
+runtimeTest("keeps an epoch-2 Chats thread in place when its cursor is epoch-less or lost", (h) =>
+  Effect.gen(function* () {
+    const chatId = "eeeeeeee-3333-4333-8333-3333333333c1";
+    const chatPath = h.codexFile("chat");
+    const threadId = importedThreadId(chatId);
+    yield* h.write(chatPath, [
+      codex.meta(chatId, joinPath(h.root, "throwaway"), "2026-07-03T09:00:00.000Z"),
+      codex.user("Quick question", "2026-07-03T09:00:01.000Z"),
+      codex.assistant("Quick answer.", "2026-07-03T09:00:05.000Z"),
+    ]);
+    const importer = yield* h.importer();
+    yield* importer.sweepNow();
+    const chats = (yield* h.projectAt(h.chatsRoot))!;
+    const setCursor = (cursor: unknown) =>
+      Effect.gen(function* () {
+        const row = yield* h.binding(threadId);
+        yield* h.runtimes.upsert({
+          ...row,
+          runtimePayload: { ...payloadOf(row), importCursor: cursor },
+        });
+      });
+
+    // A cursor without an epoch on an e2 thread is not an epoch-1 chat to migrate.
+    yield* setCursor({ sourceSessionId: chatId, sourcePath: chatPath, lineCount: 3 });
+    yield* h.append(chatPath, [codex.user("Follow-up one", "2026-07-03T09:01:00.000Z")]);
+    yield* importer.sweepNow();
+    assert.equal((yield* h.liveShell(threadId)).projectId, chats.projectId);
+    assert.include(yield* h.texts(threadId), "Follow-up one");
+
+    // A lost cursor is rebuilt as epoch 2 and imports carry on in place.
+    yield* setCursor(null);
+    yield* h.append(chatPath, [codex.assistant("Skipped while lost", "2026-07-03T09:02:00.000Z")]);
+    yield* importer.sweepNow();
+    assert.deepEqual(payloadOf(yield* h.binding(threadId)).importCursor, {
+      sourceSessionId: chatId,
+      sourcePath: chatPath,
+      lineCount: 5,
+      epoch: 2,
+    });
+    yield* h.append(chatPath, [codex.user("Follow-up two", "2026-07-03T09:03:00.000Z")]);
+    yield* importer.sweepNow();
+    assert.equal((yield* h.liveShell(threadId)).projectId, chats.projectId);
+    assert.deepEqual(yield* h.texts(threadId), [
+      "Quick question",
+      "Quick answer.",
+      "Follow-up one",
+      "Follow-up two",
+    ]);
+  }),
+);
+
+runtimeTest("never imports a session T3 itself drives", (h) =>
+  Effect.gen(function* () {
+    const project = yield* h.projects.create({
+      commandId: CommandId.make("test:native-project"),
+      projectId: ProjectId.make("native-project"),
+      title: "Native",
+      workspaceRoot: h.workspace,
+    });
+    // v2: T3's provider thread carries the native session id. T3's Claude
+    // adapter writes `sdk-*` transcripts, so without this guard the session
+    // would come back as a machine import.
+    const claudeNativeId = "99999999-0000-4000-8000-000000000001";
+    const codexNativeId = "99999999-0000-4000-8000-000000000002";
+    yield* seedT3Thread(h, {
+      threadId: ThreadId.make("t3-native-claude"),
+      projectId: project.id,
+      driver: CLAUDE,
+      nativeSessionId: claudeNativeId,
+    });
+    yield* seedT3Thread(h, {
+      threadId: ThreadId.make("t3-native-codex"),
+      projectId: project.id,
+      driver: CODEX,
+      nativeSessionId: codexNativeId,
+    });
+    const sdk = claudeSession({
+      sessionId: claudeNativeId,
+      cwd: h.workspace,
+      entrypoint: "sdk-ts",
+    });
+    yield* h.write(h.claudeFile(claudeNativeId), [
+      sdk.user("native-user-1", "Prompt sent from T3", "2026-07-12T10:00:00.000Z"),
+      sdk.assistant("native-assistant-1", "Reply inside T3", "2026-07-12T10:00:05.000Z"),
+    ]);
+    yield* h.write(h.codexFile("native"), [
+      codex.meta(codexNativeId, h.workspace, "2026-07-12T11:00:00.000Z", GIT),
+      codex.user("Prompt sent from T3", "2026-07-12T11:00:01.000Z"),
+      codex.assistant("Reply inside T3", "2026-07-12T11:00:05.000Z"),
+    ]);
+
+    // v1: a T3 binding without an import cursor owns its session too.
+    const boundId = "99999999-0000-4000-8000-000000000003";
+    const boundThreadId = ThreadId.make("t3-v1-bound");
+    const boundRow = {
+      threadId: boundThreadId,
+      providerName: CLAUDE,
+      providerInstanceId: defaultInstanceIdForDriver(CLAUDE),
+      adapterKey: CLAUDE,
+      runtimeMode: "full-access",
+      status: "stopped",
+      lastSeenAt: "2026-07-01T12:00:00.000Z",
+      resumeCursor: { threadId: boundThreadId, resume: boundId, turnCount: 3 },
+      runtimePayload: null,
+    } satisfies ProviderSessionRuntime.ProviderSessionRuntime;
+    yield* h.runtimes.upsert(boundRow);
+    const bound = claudeSession({ sessionId: boundId, cwd: h.workspace });
+    yield* h.write(h.claudeFile(boundId), [
+      bound.user("bound-user-1", "t3-owned session", "2026-07-01T12:00:00.000Z"),
+      bound.assistant("bound-assistant-1", "reply", "2026-07-01T12:00:05.000Z"),
+    ]);
+
+    yield* (yield* h.importer()).sweepNow();
+
+    for (const sessionId of [claudeNativeId, codexNativeId, boundId]) {
+      assert.isNull(yield* h.shell(importedThreadId(sessionId)), sessionId);
+      assert.isNull(yield* h.shell(importedThreadId(sessionId, "a")), sessionId);
+    }
+    assert.isUndefined(yield* h.projectAt(h.automationsRoot));
+    // The binding still resumes T3's session and never gains an import cursor
+    // (its fork signature is backfilled so the thread can join a family).
+    const boundAfter = yield* h.binding(boundThreadId);
+    assert.deepEqual(boundAfter.resumeCursor, boundRow.resumeCursor);
+    assert.notProperty(payloadOf(boundAfter), "importCursor");
+  }),
+);
+
+runtimeTest("never resurrects an imported thread the user deleted", (h) =>
+  Effect.gen(function* () {
+    const claudeId = "aaaaaaaa-1111-4111-8111-111111111111";
+    const c = claudeSession({ sessionId: claudeId, cwd: h.workspace });
+    const claudePath = h.claudeFile(claudeId);
+    const threadId = importedThreadId(claudeId);
+    yield* h.write(claudePath, [
+      c.user("user-1", "Fix the login bug please", "2026-07-01T10:00:00.000Z"),
+      c.assistant("assistant-1", "I fixed the login bug.", "2026-07-01T10:00:05.000Z"),
+    ]);
+    const importer = yield* h.importer();
+    yield* importer.sweepNow();
+    yield* h.threads.dispatch({
+      type: "thread.delete",
+      commandId: CommandId.make("test:user-delete"),
+      threadId,
+    });
+    assert.isFalse(yield* h.isLive(threadId));
+
+    const head = yield* h.sequence;
+    yield* h.append(claudePath, [
+      c.user("user-2", "Still talking in the terminal", "2026-07-01T10:05:00.000Z"),
+      c.assistant("assistant-2", "Still answering", "2026-07-01T10:05:05.000Z"),
+    ]);
+    yield* importer.sweepNow();
+    yield* (yield* h.importer()).sweepNow();
+    // Even with its binding gone, so the file looks brand new, the id stays dead.
+    yield* h.runtimes.deleteByThreadId({ threadId });
+    yield* (yield* h.importer()).sweepNow();
+    assert.isFalse(yield* h.isLive(threadId));
+    assert.isNull(yield* h.shell(importedThreadId(claudeId, "a")));
+    assert.equal(yield* h.sequence, head, "nothing is written for a deleted thread");
+  }),
+);
+
+runtimeTest("ignores other provider accounts' bindings for the same session ids", (h) =>
+  Effect.gen(function* () {
+    const codexId = "cccccccc-2222-4222-8222-222222222222";
+    yield* h.write(h.codexFile("codex"), [
+      codex.meta(codexId, h.workspace, "2026-07-02T08:00:00.000Z", GIT),
+      codex.item("rs_shared_with_other_account", "2026-07-02T08:00:00.500Z"),
+      codex.user("Refactor the rollout parser", "2026-07-02T08:00:01.000Z"),
+      codex.assistant("Parser refactored.", "2026-07-02T08:00:09.000Z"),
+    ]);
+    // Another configured Codex account has its own transcript namespace: an
+    // equal session id (and fork signature) there means nothing here.
+    const otherThreadId = ThreadId.make("other-account-same-session");
+    const otherRow = {
+      threadId: otherThreadId,
+      providerName: CODEX,
+      providerInstanceId: ProviderInstanceId.make("codex-other-account"),
+      adapterKey: CODEX,
+      runtimeMode: "full-access",
+      status: "stopped",
+      lastSeenAt: "2026-07-02T08:00:00.000Z",
+      resumeCursor: { threadId: codexId },
+      runtimePayload: {
+        importForkSig: ["rs_shared_with_other_account"],
+        importCursor: {
+          sourceSessionId: codexId,
+          sourcePath: h.codexFile("codex"),
+          lineCount: 1,
+          epoch: 2,
+        },
+      },
+    } satisfies ProviderSessionRuntime.ProviderSessionRuntime;
+    yield* h.runtimes.upsert(otherRow);
+
+    yield* (yield* h.importer()).sweepNow();
+
+    const local = yield* h.liveShell(importedThreadId(codexId));
+    assert.deepEqual(yield* h.texts(importedThreadId(codexId)), [
+      "Refactor the rollout parser",
+      "Parser refactored.",
+    ]);
+    assert.isUndefined(local.forkFamilyId ?? undefined, "no family across accounts");
+    assert.deepEqual(yield* h.binding(otherThreadId), otherRow);
+  }),
+);
+
+function joinPath(...segments: ReadonlyArray<string>) {
+  return segments.join("/");
+}
