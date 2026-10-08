@@ -156,6 +156,7 @@ export const layer: Layer.Layer<
 
     const openBridge = Effect.fn("ClaudeBridgeQueryRunner.open")(function* (
       input: ClaudeAdapterV2.ClaudeAgentSdkQueryOpenInput,
+      configDir: string,
     ) {
       const options = input.options;
       const sid = options.sessionId ?? options.resume;
@@ -166,7 +167,6 @@ export const layer: Layer.Layer<
           ? options.pathToClaudeCodeExecutable
           : "claude";
       const environment = options.env ?? hostEnvironment;
-      const configDir = configDirFor(options.env);
       const protocolLogger = ClaudeAdapterV2.makeClaudeAgentSdkProtocolLogger({
         nativeEventLogger,
         threadId: input.threadId,
@@ -536,13 +536,24 @@ export const layer: Layer.Layer<
         Effect.gen(function* () {
           const transport = hostEnvironment[CLAUDE_TRANSPORT_ENV]?.trim();
           if (transport === "sdk") return yield* sdkRunner.open(input);
-          const configDir = configDirFor(input.options.env);
+          const sid = input.options.sessionId ?? input.options.resume;
+          const cwd = input.options.cwd ?? hostCwd;
+          const configuredHome = configDirFor(input.options.env);
+          // An existing session resumes under the Claude home that ran it, so it
+          // keeps that home's account; Claude's own records name the home. A new
+          // session takes the provider's home.
+          const sessionHome =
+            input.options.resume === undefined
+              ? null
+              : yield* registry.findSessionHome(sid, configuredHome);
+          const configDir = sessionHome ?? configuredHome;
+          if (sessionHome !== null && sessionHome !== configuredHome) {
+            yield* Effect.logInfo("claude-bridge.session-home", { sid, configDir });
+          }
           if (!(yield* registry.isPluginInstalled(configDir))) {
             yield* Effect.logDebug("claude-bridge.plugin-missing-using-sdk", { configDir });
             return yield* sdkRunner.open(input);
           }
-          const sid = input.options.sessionId ?? input.options.resume;
-          const cwd = input.options.cwd ?? hostCwd;
           if (
             input.options.sessionId !== undefined &&
             !(yield* transcriptExists(configDir, cwd, sid))
@@ -550,7 +561,7 @@ export const layer: Layer.Layer<
             yield* Effect.logInfo("claude-bridge.first-turn-over-sdk", { sid, cwd });
             return yield* openSdkForFirstTurn(input);
           }
-          return yield* openBridge(input);
+          return yield* openBridge(input, configDir);
         }),
     });
   }),

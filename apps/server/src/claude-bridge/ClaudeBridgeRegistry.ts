@@ -128,6 +128,11 @@ export class ClaudeBridgeRegistry extends Context.Service<
       sid: string,
       input: Pick<ClaudeBridgeLaunchInput, "binaryPath" | "environment" | "cwd" | "configDir">,
     ) => Effect.Effect<string | null>;
+    /**
+     * The Claude home that last ran the session, judged by Claude's own records
+     * (`history.jsonl` prompts, `--bg` job state), or null when none shows it.
+     */
+    readonly findSessionHome: (sid: string, configDir: string) => Effect.Effect<string | null>;
   }
 >()("t3/claude-bridge/ClaudeBridgeRegistry") {}
 
@@ -196,6 +201,29 @@ export function claudeHomesToScan(
     if (!homes.includes(home)) homes.push(home);
   }
   return homes;
+}
+
+export interface ClaudeHomeEvidence {
+  readonly home: string;
+  /** Newest `history.jsonl` prompt the home recorded for the session. */
+  readonly lastPromptAt: number | null;
+  /** Whether the home keeps `--bg` job state for the session. */
+  readonly hasJob: boolean;
+}
+
+/**
+ * The home that ran a session most recently: the newest recorded prompt wins,
+ * and a home with only job state counts behind any home with prompts. A
+ * session resumed under the wrong home would run on the wrong account.
+ */
+export function pickSessionHome(evidence: ReadonlyArray<ClaudeHomeEvidence>): string | null {
+  let best: { readonly home: string; readonly at: number } | null = null;
+  for (const entry of evidence) {
+    const at = entry.lastPromptAt ?? (entry.hasJob ? 0 : null);
+    if (at === null) continue;
+    if (best === null || at > best.at) best = { home: entry.home, at };
+  }
+  return best === null ? null : best.home;
 }
 
 const make = Effect.gen(function* () {
@@ -511,6 +539,38 @@ const make = Effect.gen(function* () {
       return null;
     });
 
+  /** Newest `history.jsonl` timestamp a home recorded for the session, or null. */
+  const lastPromptAt = (home: string, sid: string) =>
+    fs.readFileString(path.join(home, "history.jsonl")).pipe(
+      Effect.map((content) => {
+        let newest: number | null = null;
+        for (const line of content.split("\n")) {
+          if (!line.includes(sid)) continue;
+          const row = parseJsonlLine(line);
+          if (!isRecord(row) || row.sessionId !== sid) continue;
+          const at = typeof row.timestamp === "number" ? row.timestamp : 0;
+          if (newest === null || at > newest) newest = at;
+        }
+        return newest;
+      }),
+      Effect.orElseSucceed((): number | null => null),
+    );
+
+  const findSessionHome = (sid: string, configDir: string) =>
+    Effect.gen(function* () {
+      const evidence: Array<ClaudeHomeEvidence> = [];
+      for (const home of claudeHomesToScan(configDir, yield* siblingClaudeHomes(configDir))) {
+        evidence.push({
+          home,
+          lastPromptAt: yield* lastPromptAt(home, sid),
+          hasJob: yield* fs
+            .exists(path.join(home, "jobs", sid.slice(0, 8), "state.json"))
+            .pipe(Effect.orElseSucceed(() => false)),
+        });
+      }
+      return pickSessionHome(evidence);
+    });
+
   /** `claude --bg` records a job's flags in `<config dir>/jobs/<first 8 of the id>/state.json`. */
   const hasSavedJobOptions = (input: ClaudeBridgeLaunchInput) =>
     fs
@@ -520,11 +580,13 @@ const make = Effect.gen(function* () {
   const launch = (input: ClaudeBridgeLaunchInput) =>
     Effect.gen(function* () {
       const hasSavedOptions = yield* hasSavedJobOptions(input);
+      // The process runs under the session's home, so it keeps that home's account.
+      const environment = { ...input.environment, CLAUDE_CONFIG_DIR: input.configDir };
       const output = yield* runClaude({
         binaryPath: input.binaryPath,
         args: claudeLaunchArgs(input, { hasSavedOptions }),
         cwd: input.cwd,
-        environment: input.environment,
+        environment,
       }).pipe(
         Effect.mapError(
           (cause) =>
@@ -546,7 +608,7 @@ const make = Effect.gen(function* () {
             binaryPath: input.binaryPath,
             args: [subcommand, copy[1]!],
             cwd: input.cwd,
-            environment: input.environment,
+            environment,
           }).pipe(Effect.ignore);
         }
         const note = /note:[^\n]*/i.exec(text)?.[0].trim() ?? "";
@@ -578,7 +640,7 @@ const make = Effect.gen(function* () {
         if (entry !== null) return entry;
         polls += 1;
         if (polls % 10 === 0) {
-          const listed = yield* isListedBackgroundJob(input.sid, input);
+          const listed = yield* isListedBackgroundJob(input.sid, { ...input, environment });
           if (wasListed && !listed) {
             return yield* new ClaudeBridgeLaunchError({
               sid: input.sid,
@@ -609,6 +671,7 @@ const make = Effect.gen(function* () {
     onUnattachedEvent,
     launch,
     findTerminalHome,
+    findSessionHome,
   });
 });
 
@@ -642,5 +705,6 @@ export const layerTest = Layer.succeed(
         new ClaudeBridgeLaunchError({ sid: input.sid, detail: "Claude bridge disabled in tests." }),
       ),
     findTerminalHome: () => Effect.succeed(null),
+    findSessionHome: () => Effect.succeed(null),
   }),
 );

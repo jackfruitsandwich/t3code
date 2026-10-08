@@ -4,6 +4,7 @@ import {
   claudeHomesToScan,
   claudeLaunchArgs,
   claudeLaunchEnvironment,
+  pickSessionHome,
   type ClaudeBridgeLaunchInput,
 } from "./ClaudeBridgeRegistry.ts";
 
@@ -75,5 +76,34 @@ describe("claudeHomesToScan", () => {
       "/home/me/.claude",
       "/home/me/.claude-ev",
     ]);
+  });
+});
+
+describe("pickSessionHome", () => {
+  it("picks the home whose prompt history saw the session most recently", () => {
+    assert.strictEqual(
+      pickSessionHome([
+        { home: "/home/me/.claude", lastPromptAt: 100, hasJob: true },
+        { home: "/home/me/.claude-ev", lastPromptAt: 200, hasJob: false },
+      ]),
+      "/home/me/.claude-ev",
+    );
+  });
+
+  it("counts a home with only job state when no home recorded a prompt", () => {
+    assert.strictEqual(
+      pickSessionHome([
+        { home: "/home/me/.claude", lastPromptAt: null, hasJob: false },
+        { home: "/home/me/.claude-ev", lastPromptAt: null, hasJob: true },
+      ]),
+      "/home/me/.claude-ev",
+    );
+  });
+
+  it("names no home when nothing recorded the session", () => {
+    assert.strictEqual(
+      pickSessionHome([{ home: "/home/me/.claude", lastPromptAt: null, hasJob: false }]),
+      null,
+    );
   });
 });
