@@ -59,17 +59,34 @@ const runnerError = (cause: unknown, method: string) =>
   new ClaudeAdapterV2.ClaudeAgentSdkQueryRunnerError({ method, cause });
 
 /** The text of a prompt as the mod can submit it: text blocks only. */
+/**
+ * The prompt as the mod can submit it: text only. Claude Code's mods API
+ * takes no image blocks from a plugin (`$.prompt.submit` refuses attachments
+ * and `$.session.append` refuses image rows), so a message with images rides
+ * on the attachment paths the adapter already writes into its text, plus one
+ * line that tells the model to open them with the Read tool.
+ */
 export function claudeBridgePromptText(message: SDKUserMessage): string | null {
   const content = message.message.content;
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return null;
   const parts: Array<string> = [];
+  let imageCount = 0;
   for (const block of content) {
-    if (isRecord(block) && block.type === "text" && typeof block.text === "string") {
+    if (!isRecord(block)) continue;
+    if (block.type === "text" && typeof block.text === "string") {
       parts.push(block.text);
+    } else if (block.type === "image") {
+      imageCount += 1;
     }
   }
+  if (imageCount > 0) parts.push(claudeBridgeImageNote(imageCount));
   return parts.length === 0 ? null : parts.join("\n\n");
+}
+
+export function claudeBridgeImageNote(imageCount: number): string {
+  const noun = imageCount === 1 ? "an image" : `${imageCount} images`;
+  return `[T3: the user attached ${noun} to this message. This Claude Code process receives only the text, so before answering open each attached image with the Read tool at its "is saved at" path above.]`;
 }
 
 export const layer: Layer.Layer<
@@ -149,6 +166,7 @@ export const layer: Layer.Layer<
           ? options.pathToClaudeCodeExecutable
           : "claude";
       const environment = options.env ?? hostEnvironment;
+      const configDir = configDirFor(options.env);
       const protocolLogger = ClaudeAdapterV2.makeClaudeAgentSdkProtocolLogger({
         nativeEventLogger,
         threadId: input.threadId,
@@ -171,6 +189,7 @@ export const layer: Layer.Layer<
           .launch({
             sid,
             cwd,
+            configDir,
             binaryPath,
             environment,
             model: options.model,
@@ -459,7 +478,7 @@ export const layer: Layer.Layer<
             const text = claudeBridgePromptText(message);
             if (text === null) {
               return yield* runnerError(
-                new Error("Only text prompts can be sent to a bridged Claude Code session."),
+                new Error("The message has no text to send to the bridged Claude Code session."),
                 "offer",
               );
             }

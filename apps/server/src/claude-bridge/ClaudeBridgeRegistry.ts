@@ -77,6 +77,8 @@ export type ClaudeBridgeEventHandler = (
 export interface ClaudeBridgeLaunchInput {
   readonly sid: string;
   readonly cwd: string;
+  /** The Claude home the process reads (`CLAUDE_CONFIG_DIR` or `~/.claude`). */
+  readonly configDir: string;
   readonly binaryPath: string;
   readonly environment: NodeJS.ProcessEnv;
   readonly model?: string;
@@ -149,8 +151,18 @@ export function claudeLaunchEnvironment(
   return { ...rest, [CLAUDE_BRIDGE_DIR_ENV]: bridgeDir };
 }
 
-export function claudeLaunchArgs(input: ClaudeBridgeLaunchInput): ReadonlyArray<string> {
+/**
+ * A background job keeps the flags of its first launch as saved options and
+ * `claude --bg --resume` with any other flags starts a COPY of the session
+ * under a new id. So the flags go only with the first launch; a relaunch of a
+ * job that already has saved options passes none and the saved ones apply.
+ */
+export function claudeLaunchArgs(
+  input: ClaudeBridgeLaunchInput,
+  options: { readonly hasSavedOptions: boolean },
+): ReadonlyArray<string> {
   const args = ["--bg", "--resume", input.sid];
+  if (options.hasSavedOptions) return args;
   if (input.model !== undefined && input.model.length > 0) {
     args.push("--model", input.model);
   }
@@ -440,11 +452,18 @@ const make = Effect.gen(function* () {
       Effect.orElseSucceed(() => false),
     );
 
+  /** `claude --bg` records a job's flags in `<config dir>/jobs/<first 8 of the id>/state.json`. */
+  const hasSavedJobOptions = (input: ClaudeBridgeLaunchInput) =>
+    fs
+      .exists(path.join(input.configDir, "jobs", input.sid.slice(0, 8), "state.json"))
+      .pipe(Effect.orElseSucceed(() => false));
+
   const launch = (input: ClaudeBridgeLaunchInput) =>
     Effect.gen(function* () {
+      const hasSavedOptions = yield* hasSavedJobOptions(input);
       const output = yield* runClaude({
         binaryPath: input.binaryPath,
-        args: claudeLaunchArgs(input),
+        args: claudeLaunchArgs(input, { hasSavedOptions }),
         cwd: input.cwd,
         environment: input.environment,
       }).pipe(
@@ -460,18 +479,22 @@ const make = Effect.gen(function* () {
       const text = `${output.stdout}\n${output.stderr}`;
       const copy = /started a copy[^\n]*? as ([0-9a-f]{8})/i.exec(text);
       if (copy !== null) {
-        // The CLI made a copy because the session already runs somewhere
-        // without the mod. The copy must not live on under a new id.
-        yield* runClaude({
-          binaryPath: input.binaryPath,
-          args: ["stop", copy[1]!],
-          cwd: input.cwd,
-          environment: input.environment,
-        }).pipe(Effect.ignore);
-        return yield* new ClaudeBridgeLaunchError({
-          sid: input.sid,
-          detail: `Session ${input.sid} is already open in a Claude Code process without the T3 bridge plugin. Close it, or install the plugin (\`claude plugin marketplace add ${plugin.marketplaceDir}\` then \`claude plugin install ${CLAUDE_BRIDGE_PLUGIN_ID}\`) and restart it.`,
-        });
+        // The CLI made a copy: the session already runs somewhere without the
+        // mod, or (unexpectedly) its saved options rejected the flags. The
+        // copy must not live on under a new id.
+        for (const subcommand of ["stop", "rm"]) {
+          yield* runClaude({
+            binaryPath: input.binaryPath,
+            args: [subcommand, copy[1]!],
+            cwd: input.cwd,
+            environment: input.environment,
+          }).pipe(Effect.ignore);
+        }
+        const note = /note:[^\n]*/i.exec(text)?.[0].trim() ?? "";
+        const detail = /saved options/i.test(note)
+          ? `Claude Code started a copy of session ${input.sid} instead of resuming it (${note}). The copy was stopped and removed; its transcript ${copy[1]} may remain under ${input.configDir}/projects.`
+          : `Session ${input.sid} is already open in a Claude Code process without the T3 bridge plugin. Close it, or install the plugin (\`claude plugin marketplace add ${plugin.marketplaceDir}\` then \`claude plugin install ${CLAUDE_BRIDGE_PLUGIN_ID}\`) and restart it.`;
+        return yield* new ClaudeBridgeLaunchError({ sid: input.sid, detail });
       }
       const untrusted = /not trusted[^\n]*/i.exec(text);
       if (untrusted !== null) {
