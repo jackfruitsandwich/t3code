@@ -20,6 +20,8 @@ import {
 import * as IdAllocator from "./IdAllocator.ts";
 import { ContextHandoffBudgetError } from "./ContextHandoffDelivery.ts";
 import { ProviderAdapterTurnStartError } from "./ProviderAdapter.ts";
+import { ClaudeAgentSdkQueryRunnerError } from "./Adapters/ClaudeAdapterV2.ts";
+import { ClaudeBridgeLaunchError } from "../claude-bridge/ClaudeBridgeRegistry.ts";
 
 it("redacts credentials and URL secrets from provider failures", () => {
   const failure = makeProviderFailure({
@@ -98,6 +100,27 @@ it("preserves actionable handoff errors wrapped by turn startup", () => {
   assert.equal(
     makeProviderFailure({ cause: Cause.fail(cause) }).message,
     new ContextHandoffBudgetError().message,
+  );
+});
+
+it("preserves the bridge's own refusal wrapped by turn startup", () => {
+  const cause = new ProviderAdapterTurnStartError({
+    driver: ProviderDriverKind.make("claudeAgent"),
+    threadId: ThreadId.make("thread:bridge-refusal"),
+    providerThreadId: ProviderThreadId.make("provider-thread:bridge-refusal"),
+    runId: RunId.make("run:bridge-refusal"),
+    cause: new ClaudeAgentSdkQueryRunnerError({
+      method: "attach",
+      cause: new ClaudeBridgeLaunchError({
+        sid: "0d7a9a6e-0e4b-4a45-9e2b-1b8d0a0f6c11",
+        detail:
+          "Session 0d7a9a6e is open in a Claude Code terminal under /home/me/.claude-ev without the T3 bridge plugin.",
+      }),
+    }),
+  });
+  assert.include(
+    makeProviderFailure({ cause: Cause.fail(cause) }).message,
+    "open in a Claude Code terminal under /home/me/.claude-ev",
   );
 });
 

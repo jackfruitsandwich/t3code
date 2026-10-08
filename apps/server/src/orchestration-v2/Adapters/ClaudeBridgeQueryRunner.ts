@@ -185,9 +185,10 @@ export const layer: Layer.Layer<
         });
         if (terminalHome !== null) {
           return yield* runnerError(
-            new Error(
-              `Session ${sid} is open in a Claude Code terminal under ${terminalHome} without the T3 bridge plugin. Install the plugin in that Claude home and restart the session, or close it.`,
-            ),
+            new ClaudeBridgeRegistry.ClaudeBridgeLaunchError({
+              sid,
+              detail: `Session ${sid} is open in a Claude Code terminal under ${terminalHome} without the T3 bridge plugin. Install the plugin in that Claude home and restart the session, or close it.`,
+            }),
             "attach",
           );
         }
