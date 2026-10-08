@@ -30,7 +30,7 @@ import type {
 import { isRecord, parseJsonlLine } from "../import/sessionImportTypes.ts";
 
 export const CLAUDE_BRIDGE_PROTOCOL_VERSION = 1;
-export const CLAUDE_BRIDGE_MOD_VERSION = "0.1.1";
+export const CLAUDE_BRIDGE_MOD_VERSION = "0.1.2";
 export const CLAUDE_BRIDGE_PLUGIN_NAME = "t3bridge";
 export const CLAUDE_BRIDGE_MARKETPLACE_NAME = "t3-bridge";
 /** `plugin@marketplace`, the key Claude's plugin registry files use. */

@@ -286,11 +286,11 @@ export function register(on) {
     return next(e)
   })
 
+  // Only the guard baseline here: whether this process bridges at all is
+  // known at session.start, which may come after this event.
   on('classic.SessionStart', async ($, e, next) => {
     transcriptPath = String(e.transcript_path || transcriptPath)
     await takeBaseline($)
-    await openSessionDir($)
-    startTimers($)
     await heartbeat($)
     return next(e)
   })
