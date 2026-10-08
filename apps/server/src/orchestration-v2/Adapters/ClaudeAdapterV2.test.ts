@@ -2085,6 +2085,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     readonly close?: (sdkMessages: Queue.Queue<SDKMessage>) => Effect.Effect<void>;
     readonly interrupt?: Effect.Effect<void>;
     readonly environment?: NodeJS.ProcessEnv;
+    readonly hasPendingWake?: Effect.Effect<boolean>;
   }) =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
@@ -2157,6 +2158,9 @@ describe("ClaudeAdapterV2 background wake turns", () => {
                   }),
                 interrupt: options?.interrupt ?? Effect.void,
                 close: options?.close?.(sdkMessages) ?? Effect.void,
+                ...(options?.hasPendingWake === undefined
+                  ? {}
+                  : { hasPendingWake: options.hasPendingWake }),
               };
             }),
           forkSession: () => Effect.die("unused forkSession"),
@@ -5736,6 +5740,87 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         yield* awaitUntil(() => harness.terminalEvents().length === 1, "spurious terminal");
         assert.equal(harness.terminalEvents()[0]?.status, "completed");
         assert.lengthOf(harness.offeredMessages, 0);
+      }).pipe(Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+    ),
+  );
+
+  // A bridged process (ClaudeBridgeQueryRunner) runs turns typed outside T3;
+  // their frames arrive live, not from the wake buffer.
+  it.effect("keeps a continuation turn open while the transport reports a pending wake", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarnessWithOptions({
+          hasPendingWake: Effect.succeed(true),
+        });
+        const now = yield* DateTime.now;
+
+        yield* harness.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now,
+            attemptId: RunAttemptId.make("attempt-claude-bridge-1"),
+            text: "fix the flaky test",
+            attachments: [],
+            messageCreatedBy: "agent",
+            messageCreationSource: "provider",
+          }),
+        );
+        let quietYields = 0;
+        yield* awaitUntil(() => quietYields++ >= 50, "pending wake quiet window");
+        assert.lengthOf(harness.terminalEvents(), 0);
+        assert.lengthOf(harness.offeredMessages, 0);
+
+        yield* Queue.offer(
+          harness.sdkMessages,
+          makeAssistantTextFrame({
+            uuid: "00000000-0000-4000-8000-000000000201",
+            text: "Fixed it.",
+          }),
+        );
+        yield* Queue.offer(
+          harness.sdkMessages,
+          makeResultFrame({ uuid: "00000000-0000-4000-8000-000000000202", result: "Fixed it." }),
+        );
+        yield* awaitUntil(() => harness.terminalEvents().length === 1, "bridged turn terminal");
+        assert.equal(harness.terminalEvents()[0]?.status, "completed");
+      }).pipe(Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+    ),
+  );
+
+  it.effect("offers a continuation whose detail is the text typed into the native process", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        const now = yield* DateTime.now;
+
+        yield* harness.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now,
+            attemptId: RunAttemptId.make("attempt-claude-bridge-2"),
+            text: "Hello.",
+            attachments: [],
+          }),
+        );
+        yield* Queue.offer(harness.sdkMessages, turnOneResult);
+        yield* awaitUntil(() => harness.terminalEvents().length === 1, "first turn terminal");
+
+        yield* Queue.offer(
+          harness.sdkMessages,
+          claudeSdkFrame({
+            type: "user",
+            message: { role: "user", content: "fix the flaky test" },
+            parent_tool_use_id: null,
+            uuid: "00000000-0000-4000-8000-000000000203",
+            session_id: WAKE_NATIVE_SESSION,
+            t3_wake_detail: "fix the flaky test",
+          }),
+        );
+        yield* Queue.offer(harness.sdkMessages, wakeTurnInit);
+        yield* awaitUntil(() => harness.continuationRequests.length === 1, "typed continuation");
+        assert.equal(harness.continuationRequests[0]?.detail, "fix the flaky test");
       }).pipe(Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
     ),
   );

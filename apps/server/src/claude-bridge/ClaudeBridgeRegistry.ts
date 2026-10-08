@@ -1,0 +1,564 @@
+/**
+ * ClaudeBridgeRegistry - the server's view of every Claude Code process that
+ * runs the t3bridge mod (ClaudeBridgePlugin.ts), through the files in the
+ * bridge directory (ClaudeBridgeProtocol.ts).
+ *
+ * It materializes the plugin on boot, pumps mod events to whoever is attached
+ * to that session (a ClaudeBridgeQueryRunner session) or to the unattached
+ * handlers (ClaudeBridgeAttachService), writes inbox commands, and launches a
+ * background `claude --bg --resume <id>` when a session has no live process.
+ */
+import { HostProcessEnvironment } from "@t3tools/shared/hostProcess";
+import * as Clock from "effect/Clock";
+import * as Context from "effect/Context";
+import * as Crypto from "effect/Crypto";
+import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
+import * as Layer from "effect/Layer";
+import * as Path from "effect/Path";
+import * as Schema from "effect/Schema";
+import type * as Scope from "effect/Scope";
+import type * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
+
+import { writeFileStringAtomically } from "../atomicWrite.ts";
+import * as ServerConfig from "../config.ts";
+import { isRecord, parseJsonlLine } from "../import/sessionImportTypes.ts";
+import * as ProcessRunner from "../processRunner.ts";
+import {
+  materializeClaudeBridgePlugin,
+  type ClaudeBridgePluginFiles,
+} from "./ClaudeBridgePlugin.ts";
+import {
+  CLAUDE_BRIDGE_DIR_ENV,
+  CLAUDE_BRIDGE_PLUGIN_ID,
+  isClaudeBridgeSessionLive,
+  parseClaudeBridgeEvent,
+  parseClaudeBridgeSessionFile,
+  type ClaudeBridgeCommand,
+  type ClaudeBridgeCommandBody,
+  type ClaudeBridgeEvent,
+  type ClaudeBridgeInbox,
+  type ClaudeBridgeSessionFile,
+} from "./ClaudeBridgeProtocol.ts";
+
+const EVENT_PUMP_INTERVAL_MS = 400;
+const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
+/** A process dir whose heartbeat is this old is removed. */
+const DEAD_PROCESS_SWEEP_MS = 120_000;
+const INBOX_HISTORY = 64;
+const LAUNCH_ATTACH_TIMEOUT_MS = 45_000;
+
+export class ClaudeBridgeLaunchError extends Schema.TaggedError<ClaudeBridgeLaunchError>()(
+  "ClaudeBridgeLaunchError",
+  {
+    sid: Schema.String,
+    detail: Schema.String,
+    cause: Schema.optional(Schema.Defect()),
+  },
+) {
+  override get message(): string {
+    return this.detail;
+  }
+}
+
+export interface ClaudeBridgeProcess {
+  readonly sid: string;
+  readonly instanceId: string;
+  /** The process directory holding the protocol files. */
+  readonly dir: string;
+  readonly session: ClaudeBridgeSessionFile;
+}
+
+export type ClaudeBridgeEventHandler = (
+  event: ClaudeBridgeEvent,
+  process: ClaudeBridgeProcess,
+) => Effect.Effect<void>;
+
+export interface ClaudeBridgeLaunchInput {
+  readonly sid: string;
+  readonly cwd: string;
+  readonly binaryPath: string;
+  readonly environment: NodeJS.ProcessEnv;
+  readonly model?: string;
+  readonly permissionMode?: string;
+  readonly extraArgs?: Record<string, string | null>;
+}
+
+export class ClaudeBridgeRegistry extends Context.Service<
+  ClaudeBridgeRegistry,
+  {
+    readonly bridgeDir: string;
+    readonly plugin: ClaudeBridgePluginFiles;
+    /** Whether the mod is installed in a Claude home, so its sessions can be bridged. */
+    readonly isPluginInstalled: (configDir: string) => Effect.Effect<boolean>;
+    readonly listLiveProcesses: Effect.Effect<ReadonlyArray<ClaudeBridgeProcess>>;
+    /** The live process of a session, the freshest heartbeat first. */
+    readonly findLiveProcess: (sid: string) => Effect.Effect<ClaudeBridgeProcess | null>;
+    readonly readSession: (
+      process: ClaudeBridgeProcess,
+    ) => Effect.Effect<ClaudeBridgeSessionFile | null>;
+    /** Appends a command to the process inbox and returns its id. */
+    readonly send: (
+      process: ClaudeBridgeProcess,
+      body: ClaudeBridgeCommandBody,
+    ) => Effect.Effect<string>;
+    /** Renews the attached marker the mod reads before holding an approval for T3. */
+    readonly heartbeat: (process: ClaudeBridgeProcess) => Effect.Effect<void>;
+    readonly clearHeartbeat: (process: ClaudeBridgeProcess) => Effect.Effect<void>;
+    /** Routes the session's events to `handler` until the scope closes. One subscriber per session. */
+    readonly subscribe: (
+      sid: string,
+      handler: ClaudeBridgeEventHandler,
+    ) => Effect.Effect<void, never, Scope.Scope>;
+    /** Receives events of sessions nobody is subscribed to. */
+    readonly onUnattachedEvent: (
+      handler: ClaudeBridgeEventHandler,
+    ) => Effect.Effect<void, never, Scope.Scope>;
+    /** Starts a background Claude Code process for the session and waits for its mod to report. */
+    readonly launch: (
+      input: ClaudeBridgeLaunchInput,
+    ) => Effect.Effect<ClaudeBridgeProcess, ClaudeBridgeLaunchError>;
+    /** Whether `claude agents` lists a live terminal process of the session (one without the mod). */
+    readonly isRunningInTerminal: (
+      sid: string,
+      input: Pick<ClaudeBridgeLaunchInput, "binaryPath" | "environment" | "cwd">,
+    ) => Effect.Effect<boolean>;
+  }
+>()("t3/claude-bridge/ClaudeBridgeRegistry") {}
+
+const isProcessAlive = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/** The spawned CLI must not believe it runs inside another Claude Code session. */
+export function claudeLaunchEnvironment(
+  environment: NodeJS.ProcessEnv,
+  bridgeDir: string,
+): NodeJS.ProcessEnv {
+  const {
+    CLAUDECODE: _claudecode,
+    CLAUDE_CODE_ENTRYPOINT: _entrypoint,
+    CLAUDE_CODE_SSE_PORT: _ssePort,
+    ...rest
+  } = environment;
+  return { ...rest, [CLAUDE_BRIDGE_DIR_ENV]: bridgeDir };
+}
+
+export function claudeLaunchArgs(input: ClaudeBridgeLaunchInput): ReadonlyArray<string> {
+  const args = ["--bg", "--resume", input.sid];
+  if (input.model !== undefined && input.model.length > 0) {
+    args.push("--model", input.model);
+  }
+  if (input.permissionMode !== undefined && input.permissionMode !== "default") {
+    args.push("--permission-mode", input.permissionMode);
+  }
+  for (const [flag, value] of Object.entries(input.extraArgs ?? {})) {
+    args.push(`--${flag}`);
+    if (value !== null) args.push(value);
+  }
+  return args;
+}
+
+const make = Effect.gen(function* () {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const serverConfig = yield* ServerConfig.ServerConfig;
+  const processRunner = yield* ProcessRunner.make();
+  const hostEnvironment = yield* HostProcessEnvironment;
+  const crypto = yield* Crypto.Crypto;
+
+  const bridgeDir =
+    hostEnvironment[CLAUDE_BRIDGE_DIR_ENV]?.trim() || path.join(serverConfig.stateDir, "bridge");
+  const claudeDir = path.join(bridgeDir, "claude");
+  // The state dir is this server's own; failing to write under it is fatal
+  // elsewhere too.
+  yield* fs.makeDirectory(claudeDir, { recursive: true }).pipe(Effect.orDie);
+  const plugin = yield* materializeClaudeBridgePlugin(
+    path.join(serverConfig.stateDir, "claude-bridge"),
+  ).pipe(Effect.orDie);
+
+  const subscribers = new Map<string, ClaudeBridgeEventHandler>();
+  const unattachedHandlers = new Set<ClaudeBridgeEventHandler>();
+
+  const readJson = (file: string) =>
+    fs.readFileString(file).pipe(
+      Effect.map((content): unknown => parseJsonlLine(content) ?? null),
+      Effect.orElseSucceed((): unknown => null),
+    );
+
+  const listDirectories = (dir: string) =>
+    fs.readDirectory(dir).pipe(
+      Effect.orElseSucceed((): ReadonlyArray<string> => []),
+      Effect.flatMap((entries) =>
+        Effect.forEach(
+          entries,
+          (entry) =>
+            fs.stat(path.join(dir, entry)).pipe(
+              Effect.map((info) => (info.type === "Directory" ? entry : null)),
+              Effect.orElseSucceed(() => null),
+            ),
+          { concurrency: 8 },
+        ),
+      ),
+      Effect.map((entries) => entries.filter((entry): entry is string => entry !== null)),
+    );
+
+  const readProcess = (sid: string, instanceId: string) =>
+    Effect.gen(function* () {
+      const dir = path.join(claudeDir, sid, instanceId);
+      const session = parseClaudeBridgeSessionFile(yield* readJson(path.join(dir, "session.json")));
+      if (session === null) return null;
+      return { sid, instanceId, dir, session } satisfies ClaudeBridgeProcess;
+    });
+
+  const listProcesses = Effect.gen(function* () {
+    const sids = yield* listDirectories(claudeDir);
+    const processes: Array<ClaudeBridgeProcess> = [];
+    for (const sid of sids) {
+      for (const instanceId of yield* listDirectories(path.join(claudeDir, sid))) {
+        const entry = yield* readProcess(sid, instanceId);
+        if (entry !== null) processes.push(entry);
+      }
+    }
+    return processes;
+  });
+
+  const listLiveProcesses = Effect.gen(function* () {
+    const processes = yield* listProcesses;
+    const now = yield* Clock.currentTimeMillis;
+    return processes
+      .filter((entry) => isClaudeBridgeSessionLive(entry.session, now))
+      .sort((a, b) => b.session.heartbeatAt - a.session.heartbeatAt);
+  });
+
+  const findLiveProcess = (sid: string) =>
+    Effect.gen(function* () {
+      const instances = yield* listDirectories(path.join(claudeDir, sid));
+      const now = yield* Clock.currentTimeMillis;
+      let best: ClaudeBridgeProcess | null = null;
+      for (const instanceId of instances) {
+        const entry = yield* readProcess(sid, instanceId);
+        if (entry === null || !isClaudeBridgeSessionLive(entry.session, now)) continue;
+        if (best === null || entry.session.heartbeatAt > best.session.heartbeatAt) best = entry;
+      }
+      return best;
+    });
+
+  const readSession = (entry: ClaudeBridgeProcess) =>
+    readJson(path.join(entry.dir, "session.json")).pipe(Effect.map(parseClaudeBridgeSessionFile));
+
+  // One writer per inbox (this server), so read-modify-write is safe; the
+  // atomic rename keeps the mod from reading a half-written file.
+  const send = (entry: ClaudeBridgeProcess, body: ClaudeBridgeCommandBody) =>
+    Effect.gen(function* () {
+      const inboxPath = path.join(entry.dir, "inbox.json");
+      const current = yield* readJson(inboxPath);
+      const existing: ClaudeBridgeInbox =
+        isRecord(current) && typeof current.seq === "number" && Array.isArray(current.commands)
+          ? { seq: current.seq, commands: current.commands as ReadonlyArray<ClaudeBridgeCommand> }
+          : { seq: 0, commands: [] };
+      const id = yield* crypto.randomUUIDv4.pipe(Effect.orDie);
+      const seq = existing.seq + 1;
+      const command: ClaudeBridgeCommand = { ...body, seq, id };
+      const next: ClaudeBridgeInbox = {
+        seq,
+        commands: [...existing.commands.slice(-(INBOX_HISTORY - 1)), command],
+      };
+      yield* writeFileStringAtomically({ filePath: inboxPath, contents: encodeJson(next) }).pipe(
+        Effect.provideService(FileSystem.FileSystem, fs),
+        Effect.provideService(Path.Path, path),
+        Effect.orDie,
+      );
+      return id;
+    });
+
+  const heartbeat = (entry: ClaudeBridgeProcess) =>
+    Clock.currentTimeMillis.pipe(
+      Effect.flatMap((now) =>
+        fs.writeFileString(
+          path.join(entry.dir, "t3.json"),
+          encodeJson({ heartbeatAt: now, pid: process.pid }),
+        ),
+      ),
+      Effect.ignore,
+    );
+
+  const clearHeartbeat = (entry: ClaudeBridgeProcess) =>
+    fs.remove(path.join(entry.dir, "t3.json")).pipe(Effect.ignore);
+
+  const dispatch = (event: ClaudeBridgeEvent, entry: ClaudeBridgeProcess) =>
+    Effect.gen(function* () {
+      const subscriber = subscribers.get(entry.sid);
+      if (subscriber !== undefined) {
+        yield* subscriber(event, entry);
+        return;
+      }
+      for (const handler of unattachedHandlers) {
+        yield* handler(event, entry);
+      }
+    }).pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("claude-bridge.event-handler-failed", {
+          sid: entry.sid,
+          type: event.type,
+          cause,
+        }),
+      ),
+    );
+
+  const pumpProcess = (entry: ClaudeBridgeProcess, live: boolean) =>
+    Effect.gen(function* () {
+      const eventsDir = path.join(entry.dir, "events");
+      const files = (yield* fs
+        .readDirectory(eventsDir)
+        .pipe(Effect.orElseSucceed((): ReadonlyArray<string> => [])))
+        .filter((name) => name.endsWith(".json"))
+        .sort();
+      for (const name of files) {
+        const file = path.join(eventsDir, name);
+        const event = parseClaudeBridgeEvent(yield* readJson(file));
+        yield* fs.remove(file).pipe(Effect.ignore);
+        if (event === null) continue;
+        // A dead process's leftovers are history the transcript already holds.
+        if (!live && event.type !== "ended") continue;
+        yield* dispatch(event, entry);
+      }
+    });
+
+  const sweepDead = (entry: ClaudeBridgeProcess) =>
+    Effect.gen(function* () {
+      yield* fs.remove(entry.dir, { recursive: true }).pipe(Effect.ignore);
+      const sidDir = path.join(claudeDir, entry.sid);
+      const remaining = yield* listDirectories(sidDir);
+      if (remaining.length === 0) {
+        yield* fs.remove(sidDir, { recursive: true }).pipe(Effect.ignore);
+      }
+    });
+
+  const pumpOnce = Effect.gen(function* () {
+    const processes = yield* listProcesses;
+    const now = yield* Clock.currentTimeMillis;
+    for (const entry of processes) {
+      const live = isClaudeBridgeSessionLive(entry.session, now);
+      yield* pumpProcess(entry, live);
+      if (!live && now - entry.session.heartbeatAt > DEAD_PROCESS_SWEEP_MS) {
+        yield* sweepDead(entry);
+      }
+    }
+  }).pipe(Effect.catchCause((cause) => Effect.logWarning("claude-bridge.pump-failed", { cause })));
+
+  yield* Effect.forkScoped(
+    pumpOnce.pipe(Effect.andThen(Effect.sleep(`${EVENT_PUMP_INTERVAL_MS} millis`)), Effect.forever),
+  );
+
+  const subscribe = (sid: string, handler: ClaudeBridgeEventHandler) =>
+    Effect.acquireRelease(
+      Effect.sync(() => {
+        subscribers.set(sid, handler);
+      }),
+      () =>
+        Effect.sync(() => {
+          if (subscribers.get(sid) === handler) subscribers.delete(sid);
+        }),
+    ).pipe(Effect.asVoid);
+
+  const onUnattachedEvent = (handler: ClaudeBridgeEventHandler) =>
+    Effect.acquireRelease(
+      Effect.sync(() => {
+        unattachedHandlers.add(handler);
+      }),
+      () =>
+        Effect.sync(() => {
+          unattachedHandlers.delete(handler);
+        }),
+    ).pipe(Effect.asVoid);
+
+  const isPluginInstalled = (configDir: string) =>
+    Effect.gen(function* () {
+      const installed = yield* readJson(path.join(configDir, "plugins", "installed_plugins.json"));
+      if (!isRecord(installed) || !isRecord(installed.plugins)) return false;
+      if (!(CLAUDE_BRIDGE_PLUGIN_ID in installed.plugins)) return false;
+      const settings = yield* readJson(path.join(configDir, "settings.json"));
+      const enabled =
+        isRecord(settings) && isRecord(settings.enabledPlugins)
+          ? settings.enabledPlugins[CLAUDE_BRIDGE_PLUGIN_ID]
+          : undefined;
+      return enabled !== false;
+    });
+
+  const runClaude = (input: {
+    readonly binaryPath: string;
+    readonly args: ReadonlyArray<string>;
+    readonly cwd: string;
+    readonly environment: NodeJS.ProcessEnv;
+  }) =>
+    processRunner.run({
+      command: input.binaryPath,
+      args: input.args,
+      cwd: input.cwd,
+      env: claudeLaunchEnvironment(input.environment, bridgeDir),
+      timeout: "90 seconds",
+    });
+
+  const isListedBackgroundJob = (
+    sid: string,
+    input: Pick<ClaudeBridgeLaunchInput, "binaryPath" | "environment" | "cwd">,
+  ) =>
+    runClaude({ ...input, args: ["agents", "--json"] }).pipe(
+      Effect.map((output) => {
+        const parsed = parseJsonlLine(output.stdout);
+        return (
+          Array.isArray(parsed) &&
+          parsed.some((agent) => isRecord(agent) && agent.sessionId === sid)
+        );
+      }),
+      Effect.orElseSucceed(() => false),
+    );
+
+  const isRunningInTerminal = (
+    sid: string,
+    input: Pick<ClaudeBridgeLaunchInput, "binaryPath" | "environment" | "cwd">,
+  ) =>
+    runClaude({ ...input, args: ["agents", "--json"] }).pipe(
+      Effect.map((output) => {
+        const parsed = parseJsonlLine(output.stdout);
+        if (!Array.isArray(parsed)) return false;
+        return parsed.some(
+          (agent) =>
+            isRecord(agent) &&
+            agent.sessionId === sid &&
+            agent.kind === "interactive" &&
+            typeof agent.pid === "number" &&
+            isProcessAlive(agent.pid),
+        );
+      }),
+      Effect.orElseSucceed(() => false),
+    );
+
+  const launch = (input: ClaudeBridgeLaunchInput) =>
+    Effect.gen(function* () {
+      const output = yield* runClaude({
+        binaryPath: input.binaryPath,
+        args: claudeLaunchArgs(input),
+        cwd: input.cwd,
+        environment: input.environment,
+      }).pipe(
+        Effect.mapError(
+          (cause) =>
+            new ClaudeBridgeLaunchError({
+              sid: input.sid,
+              detail: `Could not start \`claude --bg\` for session ${input.sid}.`,
+              cause,
+            }),
+        ),
+      );
+      const text = `${output.stdout}\n${output.stderr}`;
+      const copy = /started a copy[^\n]*? as ([0-9a-f]{8})/i.exec(text);
+      if (copy !== null) {
+        // The CLI made a copy because the session already runs somewhere
+        // without the mod. The copy must not live on under a new id.
+        yield* runClaude({
+          binaryPath: input.binaryPath,
+          args: ["stop", copy[1]!],
+          cwd: input.cwd,
+          environment: input.environment,
+        }).pipe(Effect.ignore);
+        return yield* new ClaudeBridgeLaunchError({
+          sid: input.sid,
+          detail: `Session ${input.sid} is already open in a Claude Code process without the T3 bridge plugin. Close it, or install the plugin (\`claude plugin marketplace add ${plugin.marketplaceDir}\` then \`claude plugin install ${CLAUDE_BRIDGE_PLUGIN_ID}\`) and restart it.`,
+        });
+      }
+      const untrusted = /not trusted[^\n]*/i.exec(text);
+      if (untrusted !== null) {
+        return yield* new ClaudeBridgeLaunchError({
+          sid: input.sid,
+          detail: `Claude Code refused to start in ${input.cwd}: ${untrusted[0].trim()}`,
+        });
+      }
+      if (output.code !== 0 && output.code !== null) {
+        return yield* new ClaudeBridgeLaunchError({
+          sid: input.sid,
+          detail: `\`claude --bg\` exited with code ${output.code}: ${text.trim().slice(0, 500)}`,
+        });
+      }
+      // A job the service cannot resume (no transcript under that id) is
+      // listed for a few seconds and then disappears; the mod never reports.
+      const deadline = (yield* Clock.currentTimeMillis) + LAUNCH_ATTACH_TIMEOUT_MS;
+      let wasListed = false;
+      let polls = 0;
+      while ((yield* Clock.currentTimeMillis) < deadline) {
+        const entry = yield* findLiveProcess(input.sid);
+        if (entry !== null) return entry;
+        polls += 1;
+        if (polls % 10 === 0) {
+          const listed = yield* isListedBackgroundJob(input.sid, input);
+          if (wasListed && !listed) {
+            return yield* new ClaudeBridgeLaunchError({
+              sid: input.sid,
+              detail: `Claude Code dropped the background job for session ${input.sid}: it could not resume it. The session's transcript may be missing from ${input.environment.CLAUDE_CONFIG_DIR ?? "~/.claude"}.`,
+            });
+          }
+          wasListed = wasListed || listed;
+        }
+        yield* Effect.sleep("300 millis");
+      }
+      return yield* new ClaudeBridgeLaunchError({
+        sid: input.sid,
+        detail: `Claude Code started session ${input.sid} in the background, but the T3 bridge plugin never reported in. Is the plugin installed and enabled in this Claude home?`,
+      });
+    });
+
+  return ClaudeBridgeRegistry.of({
+    bridgeDir,
+    plugin,
+    isPluginInstalled,
+    listLiveProcesses,
+    findLiveProcess,
+    readSession,
+    send,
+    heartbeat,
+    clearHeartbeat,
+    subscribe,
+    onUnattachedEvent,
+    launch,
+    isRunningInTerminal,
+  });
+});
+
+export const layer: Layer.Layer<
+  ClaudeBridgeRegistry,
+  never,
+  | ServerConfig.ServerConfig
+  | FileSystem.FileSystem
+  | Path.Path
+  | Crypto.Crypto
+  | ChildProcessSpawner.ChildProcessSpawner
+> = Layer.effect(ClaudeBridgeRegistry, make);
+
+/** A registry that sees no processes and bridges nothing, so adapters take the SDK path. */
+export const layerTest = Layer.succeed(
+  ClaudeBridgeRegistry,
+  ClaudeBridgeRegistry.of({
+    bridgeDir: "",
+    plugin: { marketplaceDir: "", pluginDir: "" },
+    isPluginInstalled: () => Effect.succeed(false),
+    listLiveProcesses: Effect.succeed([]),
+    findLiveProcess: () => Effect.succeed(null),
+    readSession: () => Effect.succeed(null),
+    send: () => Effect.succeed("unused"),
+    heartbeat: () => Effect.void,
+    clearHeartbeat: () => Effect.void,
+    subscribe: () => Effect.void,
+    onUnattachedEvent: () => Effect.void,
+    launch: (input) =>
+      Effect.fail(
+        new ClaudeBridgeLaunchError({ sid: input.sid, detail: "Claude bridge disabled in tests." }),
+      ),
+    isRunningInTerminal: () => Effect.succeed(false),
+  }),
+);

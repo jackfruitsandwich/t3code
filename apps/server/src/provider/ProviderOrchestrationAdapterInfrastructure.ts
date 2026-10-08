@@ -1,6 +1,8 @@
 import * as Layer from "effect/Layer";
 
+import * as ClaudeBridgeRegistry from "../claude-bridge/ClaudeBridgeRegistry.ts";
 import * as ClaudeAdapterV2 from "../orchestration-v2/Adapters/ClaudeAdapterV2.ts";
+import * as ClaudeBridgeQueryRunner from "../orchestration-v2/Adapters/ClaudeBridgeQueryRunner.ts";
 import * as CodexAdapterV2 from "../orchestration-v2/Adapters/CodexAdapterV2.ts";
 import * as CursorAgentSdk from "../orchestration-v2/Adapters/CursorAgentSdk.ts";
 import * as IdAllocator from "../orchestration-v2/IdAllocator.ts";
@@ -19,7 +21,11 @@ export type ProviderOrchestrationAdapterInfrastructure =
  * Effect layer memoization yields one shared queue.
  */
 export const layer = Layer.mergeAll(
-  ClaudeAdapterV2.layerQueryRunner,
+  // Claude runs over the t3bridge mod when a home has it installed, and over
+  // the Agent SDK otherwise (ClaudeBridgeQueryRunner.ts). The registry layer
+  // is the same reference the attach service provides, so memoization yields
+  // one watcher of the bridge directory.
+  ClaudeBridgeQueryRunner.layer.pipe(Layer.provide(ClaudeBridgeRegistry.layer)),
   CodexAdapterV2.layerAppServerClientFactory,
   CursorAgentSdk.layer,
   IdAllocator.layer,

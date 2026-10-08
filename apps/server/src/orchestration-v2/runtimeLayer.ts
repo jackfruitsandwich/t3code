@@ -9,6 +9,8 @@ import * as ProviderAuthService from "../provider/ProviderAuthService.ts";
 import * as AgentSessionImporter from "../project/AgentSessionImporter.ts";
 import * as AgentSessionScanner from "../project/AgentSessionScanner.ts";
 import * as SessionImporter from "../import/Layers/SessionImporter.ts";
+import * as ClaudeBridgeAttachService from "../claude-bridge/ClaudeBridgeAttachService.ts";
+import * as ClaudeBridgeRegistry from "../claude-bridge/ClaudeBridgeRegistry.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as ProjectSetupScriptRunner from "../project/ProjectSetupScriptRunner.ts";
 import * as ManagedProjectFolders from "../project/ManagedProjectFolders.ts";
@@ -286,6 +288,17 @@ const layerScheduledTaskProvided = ScheduledTaskService.layer.pipe(
     ),
   ),
 );
+// Personal fork: a turn typed into a bridged Claude Code session becomes a
+// continuation run on its thread (claude-bridge/ClaudeBridgeAttachService.ts).
+const layerClaudeBridgeAttachProvided = ClaudeBridgeAttachService.layer.pipe(
+  Layer.provide(
+    Layer.mergeAll(
+      ProviderContinuationRequests.layer,
+      ClaudeBridgeRegistry.layer,
+      layerSessionImporterProvided,
+    ),
+  ),
+);
 const layerProviderContinuationWorkerProvided = ProviderContinuationService.layer.pipe(
   Layer.provide(
     Layer.mergeAll(
@@ -352,6 +365,7 @@ export const layerProduction = Layer.mergeAll(
     Layer.provide(Layer.mergeAll(ProjectionStore.layer, layerThreadManagementProvided)),
   ),
   layerProviderContinuationWorkerProvided,
+  layerClaudeBridgeAttachProvided,
   layerAgentSessionImporterProvided,
   layerSessionImporterProvided,
   EffectOutbox.layerPruneWorker.pipe(Layer.provide(EffectOutbox.layer)),

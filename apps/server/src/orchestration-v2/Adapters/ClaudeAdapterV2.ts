@@ -90,6 +90,7 @@ import { resolveClaudeSdkExecutablePath } from "../../provider/Drivers/ClaudeExe
 import { planClaudeSkillDispatch } from "../../provider/Drivers/ClaudeSkillDispatch.ts";
 import { discoverClaudeSkills } from "../../provider/Drivers/ClaudeSkills.ts";
 import { compileClaudeModelSelection } from "../../claudeModelOptions.ts";
+import { claudeBridgeWakeDetail } from "../../claude-bridge/ClaudeBridgeProtocol.ts";
 import * as ServerConfig from "../../config.ts";
 import { expandHomePath } from "../../pathExpansion.ts";
 import {
@@ -333,6 +334,14 @@ export interface ClaudeAgentSdkQuerySession {
   ) => Effect.Effect<void, ClaudeAgentSdkQueryRunnerError>;
   readonly interrupt: Effect.Effect<void, ClaudeAgentSdkQueryRunnerError>;
   readonly close: Effect.Effect<void, ClaudeAgentSdkQueryRunnerError>;
+  /**
+   * Whether a turn is running in the native process with output still to
+   * come. A transport that attaches to a process it does not own (the Claude
+   * bridge) answers true while a terminal-typed turn is in flight, so a
+   * continuation that finds an empty wake buffer waits for the frames instead
+   * of settling. The SDK transport leaves it undefined.
+   */
+  readonly hasPendingWake?: Effect.Effect<boolean>;
 }
 
 type ClaudeQueryStreamExit = Exit.Exit<void, ClaudeAgentSdkQueryRunnerError>;
@@ -524,6 +533,15 @@ export type ClaudeAgentSdkProtocolLogEvent =
       readonly payload: {
         readonly type: "subagent.found";
         readonly toolUseId: string | null;
+      };
+    }
+  | {
+      // Claude bridge transport lifecycle and mod events (ClaudeBridgeQueryRunner.ts).
+      readonly direction: "incoming" | "outgoing";
+      readonly stage: "decoded";
+      readonly payload: {
+        readonly type: `bridge.${string}`;
+        readonly [key: string]: unknown;
       };
     }
   | {
@@ -5336,6 +5354,13 @@ export function makeClaudeAdapterV2(
             isNotification && typeof message.summary === "string" && message.summary.length > 0
               ? message.summary
               : null;
+          // A turn typed into the native process outside T3 (Claude bridge)
+          // opens with a user frame carrying the typed text; the continuation
+          // run shows it instead of a generic notice.
+          const typedPromptDetail =
+            message.type === "user" && message.parent_tool_use_id === null
+              ? claudeBridgeWakeDetail(message)
+              : null;
           if (isPendingTaskNotification) {
             yield* recordWakeReport(
               wakeInput.nativeThreadId,
@@ -5366,7 +5391,7 @@ export function makeClaudeAdapterV2(
             const updated = new Map(current);
             updated.set(wakeInput.nativeThreadId, {
               messages: [...(existing?.messages ?? []), message],
-              detail: notificationSummary ?? existing?.detail ?? null,
+              detail: notificationSummary ?? typedPromptDetail ?? existing?.detail ?? null,
             });
             return updated;
           });
@@ -7378,6 +7403,16 @@ export function makeClaudeAdapterV2(
               return updated;
             });
             if (drained.length === 0) {
+              // A bridged process may still be running the turn that caused
+              // this continuation; its frames arrive live rather than from
+              // the buffer.
+              const pendingWake =
+                querySession.query.hasPendingWake === undefined
+                  ? false
+                  : yield* querySession.query.hasPendingWake;
+              if (pendingWake) {
+                return;
+              }
               // Spurious continuation (buffer already lost with a recycled
               // session, or a duplicate request): settle immediately instead
               // of leaving a run waiting on a prompt that was never sent.
