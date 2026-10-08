@@ -5,7 +5,9 @@ import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stdio from "effect/Stdio";
 import * as Stream from "effect/Stream";
+import type * as Duration from "effect/Duration";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
+import * as Socket from "effect/socket/Socket";
 
 import * as CodexRpc from "./_generated/meta.gen.ts";
 import * as CodexSchema from "./_generated/schema.gen.ts";
@@ -17,7 +19,7 @@ import {
   encodeOptionalPayload,
   runHandler,
 } from "./_internal/shared.ts";
-import { makeChildStdio, makeTerminationError } from "./_internal/stdio.ts";
+import { makeChildStdio, makeTerminationError, makeWebSocketStdio } from "./_internal/stdio.ts";
 
 export interface CodexAppServerClientOptions {
   readonly logIncoming?: boolean;
@@ -272,4 +274,34 @@ const makeChildProcessClient = Effect.fn(
 )(function* (handle: ChildProcessSpawner.ChildProcessHandle, options: CodexAppServerClientOptions) {
   yield* Stream.runDrain(handle.stderr).pipe(Effect.ignore, Effect.forkScoped);
   return yield* make(makeChildStdio(handle), options, makeTerminationError(handle));
+});
+
+/**
+ * A client over a WebSocket to an app-server that already runs, such as the
+ * Codex daemon (`codex app-server daemon start`), which listens on
+ * `<CODEX_HOME>/app-server-control/app-server-control.sock`; a Node `ws`
+ * constructor reaches it as `ws+unix://<socket path>:/`. Other clients of the
+ * same daemon (a `codex --remote` terminal) see the same threads and turns.
+ * One JSON-RPC message per frame; the socket closing ends the client as a
+ * child process exiting would.
+ */
+export const layerWebSocket = (
+  url: string,
+  options: CodexAppServerClientOptions = {},
+  socketOptions: { readonly openTimeout?: Duration.Input | undefined } = {},
+): Layer.Layer<CodexAppServerClient, never, Socket.WebSocketConstructor> =>
+  Layer.effect(CodexAppServerClient, makeWebSocketClient(url, options, socketOptions));
+
+const makeWebSocketClient = Effect.fn(
+  "effect-codex-app-server/CodexAppServerClient.makeWebSocketClient",
+)(function* (
+  url: string,
+  options: CodexAppServerClientOptions,
+  socketOptions: { readonly openTimeout?: Duration.Input | undefined },
+) {
+  const socket = yield* Socket.makeWebSocket(url, {
+    openTimeout: socketOptions.openTimeout ?? "10 seconds",
+  });
+  const stdio = yield* makeWebSocketStdio(socket);
+  return yield* make(stdio, options);
 });

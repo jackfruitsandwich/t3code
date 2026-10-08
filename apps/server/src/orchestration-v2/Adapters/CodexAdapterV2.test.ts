@@ -725,7 +725,9 @@ describe("CodexAdapterV2 process spawning", () => {
           ProviderEventLoggers.ProviderEventLoggers,
           ProviderEventLoggers.NoOpProviderEventLoggers,
         ),
+        Effect.provide(NodeServices.layer),
       );
+      // A Codex daemon on the test machine would otherwise be joined instead of spawning.
       const open = (environment: NodeJS.ProcessEnv) =>
         factory
           .open({
@@ -745,8 +747,11 @@ describe("CodexAdapterV2 process spawning", () => {
           })
           .pipe(Effect.scoped, Effect.exit);
 
-      yield* open({});
-      yield* open({ T3CODE_CODEX_LAUNCH_ARGS: " --enable env-feature " });
+      yield* open({ [CodexAdapterV2.CODEX_TRANSPORT_ENV]: "spawn" });
+      yield* open({
+        T3CODE_CODEX_LAUNCH_ARGS: " --enable env-feature ",
+        [CodexAdapterV2.CODEX_TRANSPORT_ENV]: "spawn",
+      });
 
       assert.deepEqual(spawnedArgs, [
         ["app-server", "--strict-config", "-c", "model_reasoning_summary=detailed"],
@@ -798,6 +803,10 @@ describe("CodexAdapterV2 process spawning", () => {
     }).pipe(
       Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer)),
       Effect.provideService(HostProcessPlatform, "linux"),
+      // A Codex daemon on the test machine would otherwise be joined instead of spawning.
+      Effect.provideService(HostProcessEnvironment, {
+        [CodexAdapterV2.CODEX_TRANSPORT_ENV]: "spawn",
+      }),
     ),
   );
 });
