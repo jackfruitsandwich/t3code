@@ -1,6 +1,7 @@
 import { assert, describe, it } from "@effect/vitest";
 
 import {
+  claudeHomesToScan,
   claudeLaunchArgs,
   claudeLaunchEnvironment,
   type ClaudeBridgeLaunchInput,
@@ -58,5 +59,21 @@ describe("claudeLaunchEnvironment", () => {
       "/state/bridge",
     );
     assert.deepStrictEqual(environment, { PATH: "/bin", T3CODE_BRIDGE_DIR: "/state/bridge" });
+  });
+});
+
+describe("claudeHomesToScan", () => {
+  it("checks the configured home first and then every sibling home that keeps sessions", () => {
+    assert.deepStrictEqual(
+      claudeHomesToScan("/home/me/.claude", ["/home/me/.claude", "/home/me/.claude-ev"]),
+      ["/home/me/.claude", "/home/me/.claude-ev"],
+    );
+  });
+
+  it("keeps the configured home even before it has a sessions folder", () => {
+    assert.deepStrictEqual(claudeHomesToScan("/home/me/.claude", ["/home/me/.claude-ev"]), [
+      "/home/me/.claude",
+      "/home/me/.claude-ev",
+    ]);
   });
 });

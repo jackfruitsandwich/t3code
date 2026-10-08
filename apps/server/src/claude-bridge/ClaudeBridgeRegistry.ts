@@ -120,11 +120,14 @@ export class ClaudeBridgeRegistry extends Context.Service<
     readonly launch: (
       input: ClaudeBridgeLaunchInput,
     ) => Effect.Effect<ClaudeBridgeProcess, ClaudeBridgeLaunchError>;
-    /** Whether `claude agents` lists a live terminal process of the session (one without the mod). */
-    readonly isRunningInTerminal: (
+    /**
+     * The Claude home under which `claude agents` lists a live terminal process of
+     * the session (one without the mod), or null when no home does.
+     */
+    readonly findTerminalHome: (
       sid: string,
-      input: Pick<ClaudeBridgeLaunchInput, "binaryPath" | "environment" | "cwd">,
-    ) => Effect.Effect<boolean>;
+      input: Pick<ClaudeBridgeLaunchInput, "binaryPath" | "environment" | "cwd" | "configDir">,
+    ) => Effect.Effect<string | null>;
   }
 >()("t3/claude-bridge/ClaudeBridgeRegistry") {}
 
@@ -174,6 +177,25 @@ export function claudeLaunchArgs(
     if (value !== null) args.push(value);
   }
   return args;
+}
+
+/**
+ * Claude homes whose session records can name a terminal process holding a
+ * session. `claude agents --json` reads one home at a time, and the person runs
+ * Claude from more than one (`~/.claude`, `~/.claude-ev`), so the configured
+ * home is checked first and then every sibling `.claude*` directory that keeps
+ * a `sessions` folder. Without this a session open under another home looks
+ * absent and T3 would start a second process on the same id.
+ */
+export function claudeHomesToScan(
+  configDir: string,
+  siblingHomesWithSessions: ReadonlyArray<string>,
+): ReadonlyArray<string> {
+  const homes = [configDir];
+  for (const home of siblingHomesWithSessions) {
+    if (!homes.includes(home)) homes.push(home);
+  }
+  return homes;
 }
 
 const make = Effect.gen(function* () {
@@ -432,11 +454,36 @@ const make = Effect.gen(function* () {
       Effect.orElseSucceed(() => false),
     );
 
-  const isRunningInTerminal = (
+  /** Sibling `.claude*` directories of the configured home that keep a `sessions` folder. */
+  const siblingClaudeHomes = (configDir: string) =>
+    Effect.gen(function* () {
+      const parent = path.dirname(configDir);
+      const entries = yield* fs
+        .readDirectory(parent)
+        .pipe(Effect.orElseSucceed((): ReadonlyArray<string> => []));
+      const homes: Array<string> = [];
+      for (const entry of [...entries].sort()) {
+        if (!entry.startsWith(".claude")) continue;
+        const home = path.join(parent, entry);
+        const hasSessions = yield* fs
+          .exists(path.join(home, "sessions"))
+          .pipe(Effect.orElseSucceed(() => false));
+        if (hasSessions) homes.push(home);
+      }
+      return homes;
+    });
+
+  const listsLiveTerminalProcess = (
     sid: string,
+    home: string,
     input: Pick<ClaudeBridgeLaunchInput, "binaryPath" | "environment" | "cwd">,
   ) =>
-    runClaude({ ...input, args: ["agents", "--json"] }).pipe(
+    runClaude({
+      binaryPath: input.binaryPath,
+      cwd: input.cwd,
+      environment: { ...input.environment, CLAUDE_CONFIG_DIR: home },
+      args: ["agents", "--json"],
+    }).pipe(
       Effect.map((output) => {
         const parsed = parseJsonlLine(output.stdout);
         if (!Array.isArray(parsed)) return false;
@@ -451,6 +498,18 @@ const make = Effect.gen(function* () {
       }),
       Effect.orElseSucceed(() => false),
     );
+
+  const findTerminalHome = (
+    sid: string,
+    input: Pick<ClaudeBridgeLaunchInput, "binaryPath" | "environment" | "cwd" | "configDir">,
+  ) =>
+    Effect.gen(function* () {
+      const homes = claudeHomesToScan(input.configDir, yield* siblingClaudeHomes(input.configDir));
+      for (const home of homes) {
+        if (yield* listsLiveTerminalProcess(sid, home, input)) return home;
+      }
+      return null;
+    });
 
   /** `claude --bg` records a job's flags in `<config dir>/jobs/<first 8 of the id>/state.json`. */
   const hasSavedJobOptions = (input: ClaudeBridgeLaunchInput) =>
@@ -549,7 +608,7 @@ const make = Effect.gen(function* () {
     subscribe,
     onUnattachedEvent,
     launch,
-    isRunningInTerminal,
+    findTerminalHome,
   });
 });
 
@@ -582,6 +641,6 @@ export const layerTest = Layer.succeed(
       Effect.fail(
         new ClaudeBridgeLaunchError({ sid: input.sid, detail: "Claude bridge disabled in tests." }),
       ),
-    isRunningInTerminal: () => Effect.succeed(false),
+    findTerminalHome: () => Effect.succeed(null),
   }),
 );

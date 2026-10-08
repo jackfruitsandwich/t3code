@@ -177,10 +177,16 @@ export const layer: Layer.Layer<
 
       let entry = yield* registry.findLiveProcess(sid);
       if (entry === null) {
-        if (yield* registry.isRunningInTerminal(sid, { binaryPath, environment, cwd })) {
+        const terminalHome = yield* registry.findTerminalHome(sid, {
+          binaryPath,
+          environment,
+          cwd,
+          configDir,
+        });
+        if (terminalHome !== null) {
           return yield* runnerError(
             new Error(
-              `Session ${sid} is open in a Claude Code terminal without the T3 bridge plugin. Install the plugin in that Claude home and restart the session, or close it.`,
+              `Session ${sid} is open in a Claude Code terminal under ${terminalHome} without the T3 bridge plugin. Install the plugin in that Claude home and restart the session, or close it.`,
             ),
             "attach",
           );
