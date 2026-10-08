@@ -22,6 +22,7 @@ import {
   type OrchestrationV2AppThread,
   type OrchestrationV2DomainEvent,
 } from "@t3tools/contracts";
+import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -350,36 +351,110 @@ const seedT3Thread = (
 };
 
 /** A T3 run on a thread: what chatting into an imported thread leaves behind. */
-const seedT3Run = (h: Harness, threadId: ThreadId, driver: ProviderDriverKind) => {
+const seedRunPayload = (
+  threadId: ThreadId,
+  driver: ProviderDriverKind,
+  status: "running" | "completed",
+) => {
   const at = DateTime.makeUnsafe("2026-07-20T00:00:00.000Z");
   const runId = RunId.make(`seed-run:${threadId}`);
   const instanceId = defaultInstanceIdForDriver(driver);
+  return {
+    runId,
+    driver,
+    instanceId,
+    at,
+    payload: {
+      id: runId,
+      threadId,
+      ordinal: 1,
+      providerInstanceId: instanceId,
+      modelSelection: { instanceId, model: "test-model" },
+      providerThreadId: null,
+      userMessageId: MessageId.make(`seed-run-message:${threadId}`),
+      rootNodeId: null,
+      activeAttemptId: null,
+      status,
+      requestedAt: at,
+      startedAt: at,
+      completedAt: status === "completed" ? at : null,
+      checkpointId: null,
+      contextHandoffId: null,
+    },
+  };
+};
+
+/** A T3 run on the thread, as chatting into it from T3 leaves one. */
+const seedT3Run = (
+  h: Harness,
+  threadId: ThreadId,
+  driver: ProviderDriverKind,
+  status: "running" | "completed" = "completed",
+) => {
+  const seed = seedRunPayload(threadId, driver, status);
   return h.eventSink.write({
     events: [
       {
         id: EventId.make(`seed:${threadId}:run`),
         type: "run.created",
         threadId,
-        runId,
+        runId: seed.runId,
         driver,
-        providerInstanceId: instanceId,
+        providerInstanceId: seed.instanceId,
+        occurredAt: seed.at,
+        payload: seed.payload,
+      },
+    ],
+  });
+};
+
+const settleSeedT3Run = (h: Harness, threadId: ThreadId, driver: ProviderDriverKind) => {
+  const seed = seedRunPayload(threadId, driver, "completed");
+  return h.eventSink.write({
+    events: [
+      {
+        id: EventId.make(`seed:${threadId}:run:completed`),
+        type: "run.updated",
+        threadId,
+        runId: seed.runId,
+        driver,
+        providerInstanceId: seed.instanceId,
+        occurredAt: seed.at,
+        payload: seed.payload,
+      },
+    ],
+  });
+};
+
+/** A reply T3's own adapter wrote for a turn it drove. */
+const seedNativeReply = (
+  h: Harness,
+  threadId: ThreadId,
+  uuid: string,
+  text: string,
+  iso: string,
+) => {
+  const at = DateTime.makeUnsafe(iso);
+  return h.eventSink.write({
+    events: [
+      {
+        id: EventId.make(`seed:${threadId}:native:${uuid}`),
+        type: "message.updated",
+        threadId,
         occurredAt: at,
         payload: {
-          id: runId,
+          createdBy: "agent",
+          creationSource: "provider",
+          id: MessageId.make(`message:provider:claudeAgent:native-item:${uuid}`),
           threadId,
-          ordinal: 1,
-          providerInstanceId: instanceId,
-          modelSelection: { instanceId, model: "test-model" },
-          providerThreadId: null,
-          userMessageId: MessageId.make(`seed-run-message:${threadId}`),
-          rootNodeId: null,
-          activeAttemptId: null,
-          status: "completed",
-          requestedAt: at,
-          startedAt: at,
-          completedAt: at,
-          checkpointId: null,
-          contextHandoffId: null,
+          runId: null,
+          nodeId: null,
+          role: "assistant",
+          text,
+          attachments: [],
+          streaming: false,
+          createdAt: at,
+          updatedAt: at,
         },
       },
     ],
@@ -1034,53 +1109,131 @@ runtimeTest("stamps fork families on two-or-more member families without moving 
   }),
 );
 
-runtimeTest("stops tailing an imported session once T3 has run it", (h) =>
-  Effect.gen(function* () {
-    const claudeId = "aaaaaaaa-1111-4111-8111-111111111111";
-    const c = claudeSession({ sessionId: claudeId, cwd: h.workspace });
-    const claudePath = h.claudeFile(claudeId);
-    const threadId = importedThreadId(claudeId);
-    yield* h.write(claudePath, [
-      c.user("user-1", "Fix the login bug please", "2026-07-01T10:00:00.000Z"),
-      c.assistant("assistant-1", "I fixed the login bug.", "2026-07-01T10:00:05.000Z"),
-    ]);
-    const importer = yield* h.importer();
-    yield* importer.sweepNow();
+runtimeTest(
+  "keeps a Claude thread whole after T3 has run it: terminal rows land, T3's own turns stay out",
+  (h) =>
+    Effect.gen(function* () {
+      const claudeId = "aaaaaaaa-1111-4111-8111-111111111111";
+      const c = claudeSession({ sessionId: claudeId, cwd: h.workspace });
+      const claudePath = h.claudeFile(claudeId);
+      const threadId = importedThreadId(claudeId);
+      yield* h.write(claudePath, [
+        c.user("user-1", "Fix the login bug please", "2026-07-01T10:00:00.000Z"),
+        c.assistant("assistant-1", "I fixed the login bug.", "2026-07-01T10:00:05.000Z"),
+      ]);
+      const importer = yield* h.importer();
+      yield* importer.sweepNow();
 
-    // Runtime noise on the binding (a provider stop-all merge) is not adoption.
-    const before = yield* h.binding(threadId);
-    yield* h.runtimes.upsert({
-      ...before,
-      status: "stopped",
-      runtimePayload: { ...payloadOf(before), activeTurnId: null, lastRuntimeEvent: "stopAll" },
-    });
-    yield* h.append(claudePath, [
-      c.user("user-2", "After a quit cycle", "2026-07-01T10:05:00.000Z"),
-    ]);
-    yield* importer.sweepNow();
-    assert.include(yield* h.texts(threadId), "After a quit cycle");
+      // Runtime noise on the binding (a provider stop-all merge) is not adoption.
+      const before = yield* h.binding(threadId);
+      yield* h.runtimes.upsert({
+        ...before,
+        status: "stopped",
+        runtimePayload: { ...payloadOf(before), activeTurnId: null, lastRuntimeEvent: "stopAll" },
+      });
+      yield* h.append(claudePath, [
+        c.user("user-2", "After a quit cycle", "2026-07-01T10:05:00.000Z"),
+      ]);
+      yield* importer.sweepNow();
+      assert.include(yield* h.texts(threadId), "After a quit cycle");
 
-    // Chatting into the thread in T3 hands the native session to T3: the cursor
-    // is dropped (resume ref kept) and the file is never tailed again.
-    yield* seedT3Run(h, threadId, CLAUDE);
-    yield* h.append(claudePath, [
-      c.assistant("assistant-3", "Replying natively through T3.", "2026-07-01T10:10:30.000Z"),
-    ]);
-    yield* importer.sweepNow();
-    assert.notInclude(yield* h.texts(threadId), "Replying natively through T3.");
-    const adopted = yield* h.binding(threadId);
-    assert.isNull(payloadOf(adopted).importCursor);
-    assert.deepEqual(adopted.resumeCursor, { threadId, resume: claudeId, turnCount: 2 });
+      // Chatting into the thread in T3 makes T3 the owner. The person may still
+      // type in a terminal without the mod: those rows belong in the thread.
+      yield* seedT3Run(h, threadId, CLAUDE);
+      yield* h.append(claudePath, [
+        c.user("user-3", "Typed in the terminal after T3 ran it", "2026-07-01T10:10:00.000Z"),
+        c.assistant("assistant-3", "Replying in the terminal.", "2026-07-01T10:10:30.000Z"),
+      ]);
+      yield* importer.sweepNow();
+      assert.include(yield* h.texts(threadId), "Replying in the terminal.");
+      const adopted = yield* h.binding(threadId);
+      assert.isNotNull(payloadOf(adopted).importCursor);
+      assert.deepEqual(adopted.resumeCursor, { threadId, resume: claudeId, turnCount: 3 });
 
-    const head = yield* h.sequence;
-    yield* h.append(claudePath, [
-      c.user("user-4", "One more terminal message", "2026-07-01T10:15:00.000Z"),
-    ]);
-    yield* importer.sweepNow();
-    yield* (yield* h.importer()).sweepNow();
-    assert.equal(yield* h.sequence, head);
-    assert.isNull(payloadOf(yield* h.binding(threadId)).importCursor);
-  }),
+      // A turn T3 drove: its adapter wrote the reply, so rows up to that reply
+      // are T3's and never re-imported; what follows them in the terminal is.
+      yield* seedNativeReply(
+        h,
+        threadId,
+        "assistant-5",
+        "Replying natively through T3.",
+        "2026-07-01T10:20:00.000Z",
+      );
+      yield* h.append(claudePath, [
+        c.user("user-5", "Sent from T3", "2026-07-01T10:19:00.000Z"),
+        c.assistant("assistant-5", "Replying natively through T3.", "2026-07-01T10:19:30.000Z"),
+        c.user("user-6", "Back in the terminal", "2026-07-01T10:25:00.000Z"),
+      ]);
+      yield* importer.sweepNow();
+      const texts = yield* h.texts(threadId);
+      assert.include(texts, "Back in the terminal");
+      assert.notInclude(texts, "Sent from T3");
+      assert.equal(texts.filter((text) => text === "Replying natively through T3.").length, 1);
+
+      // A quiet transcript: a fresh sweep writes nothing.
+      const head = yield* h.sequence;
+      yield* (yield* h.importer()).sweepNow();
+      assert.equal(yield* h.sequence, head);
+    }),
+);
+
+runtimeTest(
+  "leaves an owned Claude thread alone while a T3 run is active or a mod process holds it",
+  (h) =>
+    Effect.gen(function* () {
+      const claudeId = "aaaaaaaa-1111-4111-8111-1111111111b1";
+      const c = claudeSession({ sessionId: claudeId, cwd: h.workspace });
+      const claudePath = h.claudeFile(claudeId);
+      const threadId = importedThreadId(claudeId);
+      yield* h.write(claudePath, [
+        c.user("user-1", "Fix the login bug please", "2026-07-01T10:00:00.000Z"),
+        c.assistant("assistant-1", "I fixed the login bug.", "2026-07-01T10:00:05.000Z"),
+      ]);
+      const bridgeDir = yield* h.makeDir("bridge");
+      const importer = yield* h.importer({ bridgeDir });
+      yield* importer.sweepNow();
+
+      // A T3 turn in flight writes the thread's rows itself.
+      yield* seedT3Run(h, threadId, CLAUDE, "running");
+      yield* h.append(claudePath, [
+        c.assistant("assistant-2", "Streaming through T3.", "2026-07-01T10:05:00.000Z"),
+      ]);
+      yield* importer.sweepNow();
+      assert.notInclude(yield* h.texts(threadId), "Streaming through T3.");
+
+      // The turn settles with T3's own copy of that reply. A live mod process
+      // now holds the session: the bridge adopts its terminal turns, not the importer.
+      yield* settleSeedT3Run(h, threadId, CLAUDE);
+      yield* seedNativeReply(
+        h,
+        threadId,
+        "assistant-2",
+        "Streaming through T3.",
+        "2026-07-01T10:05:00.000Z",
+      );
+      const fs = yield* FileSystem.FileSystem;
+      const instanceDir = yield* h.makeDir("bridge", "claude", claudeId, "inst-1");
+      yield* h.write(joinPath(instanceDir, "session.json"), [
+        { sid: claudeId, instanceId: "inst-1", heartbeatAt: yield* Clock.currentTimeMillis },
+      ]);
+      yield* h.append(claudePath, [
+        c.user("user-3", "Typed while bridged", "2026-07-01T10:06:00.000Z"),
+      ]);
+      yield* importer.sweepNow();
+      assert.notInclude(yield* h.texts(threadId), "Typed while bridged");
+
+      // The process is gone: the thread catches up with what T3 never wrote,
+      // and T3's own reply is not duplicated.
+      yield* fs.remove(instanceDir, { recursive: true });
+      yield* h.append(claudePath, [
+        c.assistant("assistant-3", "Reply after the process ended.", "2026-07-01T10:07:00.000Z"),
+      ]);
+      yield* importer.sweepNow();
+      const texts = yield* h.texts(threadId);
+      assert.include(texts, "Typed while bridged");
+      assert.include(texts, "Reply after the process ended.");
+      assert.equal(texts.filter((text) => text === "Streaming through T3.").length, 1);
+    }),
 );
 
 runtimeTest("rebuilds a lost import cursor on a thread T3 never ran", (h) =>
@@ -1120,82 +1273,90 @@ runtimeTest("rebuilds a lost import cursor on a thread T3 never ran", (h) =>
   }),
 );
 
-runtimeTest("never re-tails a thread T3 adopted before v2, even without a cursor", (h) =>
-  Effect.gen(function* () {
-    const importer = yield* h.importer();
-    const sessions = {
-      // v1 adoption left T3's own turns in the thread and cleared the cursor.
-      withMessages: "aaaaaaaa-1111-4111-8111-1111111111a1",
-      // v1 adoption left its markers on the binding.
-      withMarkers: "aaaaaaaa-1111-4111-8111-1111111111a2",
-    };
-    for (const sessionId of Object.values(sessions)) {
-      const c = claudeSession({ sessionId, cwd: h.workspace });
-      yield* h.write(h.claudeFile(sessionId), [
-        c.user(`${sessionId}-u1`, "Fix the login bug please", "2026-07-01T10:00:00.000Z"),
-        c.assistant(`${sessionId}-a1`, "I fixed the login bug.", "2026-07-01T10:00:05.000Z"),
-      ]);
-    }
-    yield* importer.sweepNow();
-
-    const at = DateTime.makeUnsafe("2026-07-01T10:10:00.000Z");
-    const withMessagesThread = importedThreadId(sessions.withMessages);
-    yield* h.eventSink.write({
-      events: [
-        {
-          id: EventId.make("seed:migrated-native-message"),
-          type: "message.updated",
-          threadId: withMessagesThread,
-          occurredAt: at,
-          payload: {
-            createdBy: "user",
-            creationSource: "web",
-            id: MessageId.make("v1-native-message"),
-            threadId: withMessagesThread,
-            runId: null,
-            nodeId: null,
-            role: "user",
-            text: "Typed into T3 before the v2 migration",
-            attachments: [],
-            streaming: false,
-            createdAt: at,
-            updatedAt: at,
-          },
-        },
-      ],
-    });
-    const stripCursor = (threadId: ThreadId, extra: Record<string, unknown>) =>
-      Effect.gen(function* () {
-        const row = yield* h.binding(threadId);
-        yield* h.runtimes.upsert({
-          ...row,
-          runtimePayload: { ...payloadOf(row), importCursor: null, ...extra },
-        });
-      });
-    yield* stripCursor(withMessagesThread, {});
-    yield* stripCursor(importedThreadId(sessions.withMarkers), { model: "claude-fable-5" });
-
-    // The terminal (or T3's own resume) keeps writing to both transcripts. Two
-    // rounds: a wrongly rebuilt cursor would start at the end of the first.
-    const head = yield* h.sequence;
-    for (const round of [1, 2]) {
+runtimeTest(
+  "catches up a Claude thread T3 adopted before v2 from where its record ends, once",
+  (h) =>
+    Effect.gen(function* () {
+      const importer = yield* h.importer();
+      const sessions = {
+        // v1 adoption left T3's own turns in the thread and cleared the cursor.
+        withMessages: "aaaaaaaa-1111-4111-8111-1111111111a1",
+        // v1 adoption left its markers on the binding.
+        withMarkers: "aaaaaaaa-1111-4111-8111-1111111111a2",
+      };
       for (const sessionId of Object.values(sessions)) {
         const c = claudeSession({ sessionId, cwd: h.workspace });
-        yield* h.append(h.claudeFile(sessionId), [
-          c.user(`${sessionId}-u${round}x`, "Native turn", `2026-07-01T10:1${round}:00.000Z`),
-          c.assistant(`${sessionId}-a${round}x`, "Native reply", `2026-07-01T10:1${round}:05.000Z`),
+        yield* h.write(h.claudeFile(sessionId), [
+          c.user(`${sessionId}-u1`, "Fix the login bug please", "2026-07-01T10:00:00.000Z"),
+          c.assistant(`${sessionId}-a1`, "I fixed the login bug.", "2026-07-01T10:00:05.000Z"),
         ]);
       }
       yield* importer.sweepNow();
-    }
-    yield* (yield* h.importer()).sweepNow();
-    assert.equal(yield* h.sequence, head, "neither thread is tailed again");
-    for (const sessionId of Object.values(sessions)) {
-      const threadId = importedThreadId(sessionId);
-      assert.notInclude(yield* h.texts(threadId), "Native reply");
-      assert.isNull(payloadOf(yield* h.binding(threadId)).importCursor, sessionId);
-    }
-  }),
+
+      const at = DateTime.makeUnsafe("2026-07-01T10:10:00.000Z");
+      const withMessagesThread = importedThreadId(sessions.withMessages);
+      yield* h.eventSink.write({
+        events: [
+          {
+            id: EventId.make("seed:migrated-native-message"),
+            type: "message.updated",
+            threadId: withMessagesThread,
+            occurredAt: at,
+            payload: {
+              createdBy: "user",
+              creationSource: "web",
+              id: MessageId.make("v1-native-message"),
+              threadId: withMessagesThread,
+              runId: null,
+              nodeId: null,
+              role: "user",
+              text: "Typed into T3 before the v2 migration",
+              attachments: [],
+              streaming: false,
+              createdAt: at,
+              updatedAt: at,
+            },
+          },
+        ],
+      });
+      const stripCursor = (threadId: ThreadId, extra: Record<string, unknown>) =>
+        Effect.gen(function* () {
+          const row = yield* h.binding(threadId);
+          yield* h.runtimes.upsert({
+            ...row,
+            runtimePayload: { ...payloadOf(row), importCursor: null, ...extra },
+          });
+        });
+      yield* stripCursor(withMessagesThread, {});
+      yield* stripCursor(importedThreadId(sessions.withMarkers), { model: "claude-fable-5" });
+
+      // The terminal keeps writing to both transcripts without the mod. Two
+      // rounds: each round's rows land once, and the rebuilt cursor carries on.
+      for (const round of [1, 2]) {
+        for (const sessionId of Object.values(sessions)) {
+          const c = claudeSession({ sessionId, cwd: h.workspace });
+          yield* h.append(h.claudeFile(sessionId), [
+            c.user(`${sessionId}-u${round}x`, "Native turn", `2026-07-01T10:1${round}:00.000Z`),
+            c.assistant(
+              `${sessionId}-a${round}x`,
+              "Native reply",
+              `2026-07-01T10:1${round}:05.000Z`,
+            ),
+          ]);
+        }
+        yield* importer.sweepNow();
+      }
+      for (const sessionId of Object.values(sessions)) {
+        const threadId = importedThreadId(sessionId);
+        const texts = yield* h.texts(threadId);
+        assert.equal(texts.filter((text) => text === "Native reply").length, 2, sessionId);
+        assert.equal(texts.filter((text) => text === "Native turn").length, 2, sessionId);
+        assert.isNotNull(payloadOf(yield* h.binding(threadId)).importCursor, sessionId);
+      }
+      const head = yield* h.sequence;
+      yield* (yield* h.importer()).sweepNow();
+      assert.equal(yield* h.sequence, head, "nothing new: neither thread is written again");
+    }),
 );
 
 runtimeTest("keeps an epoch-2 Chats thread in place when its cursor is epoch-less or lost", (h) =>

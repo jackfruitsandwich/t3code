@@ -46,6 +46,7 @@ import {
   type OrchestrationV2ProviderThread,
   type ServerSettings,
 } from "@t3tools/contracts";
+import { HostProcessEnvironment } from "@t3tools/shared/hostProcess";
 import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
@@ -58,6 +59,11 @@ import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 
+import {
+  CLAUDE_BRIDGE_DIR_ENV,
+  isClaudeBridgeSessionLive,
+  parseClaudeBridgeSessionFile,
+} from "../../claude-bridge/ClaudeBridgeProtocol.ts";
 import { ServerConfig } from "../../config.ts";
 import * as EventSink from "../../orchestration-v2/EventSink.ts";
 import { deriveProviderThread } from "../../orchestration-v2/IdAllocator.ts";
@@ -77,6 +83,7 @@ import {
   isCommandNoiseText,
   isEligibleCliSession,
   isRecord,
+  parseJsonlLine,
   type ParsedCliSession,
   type ParsedSessionMessage,
 } from "../sessionImportTypes.ts";
@@ -93,6 +100,13 @@ const DEFAULT_SWEEP_INTERVAL_MS = 30 * 1000;
 const IMPORT_EPOCH = 2;
 
 const CLAUDE_DRIVER = ProviderDriverKind.make("claudeAgent");
+/** Run statuses under which T3 is writing the thread's rows itself. */
+const ACTIVE_RUN_STATUSES: ReadonlySet<string> = new Set([
+  "preparing",
+  "starting",
+  "running",
+  "waiting",
+]);
 const CODEX_DRIVER = ProviderDriverKind.make("codex");
 
 /** A `provider_session_runtime` row, as the importer reads and merges it. */
@@ -138,6 +152,12 @@ export interface SessionImporterLiveOptions {
    * boundaries, which is when they're readable anyway. 0 disables.
    */
   readonly settleMs?: number;
+  /**
+   * Bridge root (`<state dir>/bridge`). A Claude session with a live mod
+   * registration under it belongs to the bridge, which adopts its terminal
+   * turns itself; the importer leaves such a session alone.
+   */
+  readonly bridgeDir?: string;
   /**
    * Path prefixes whose sessions route to the Automations project regardless
    * of launch markers. Agent harnesses that drive real interactive CLIs
@@ -393,6 +413,7 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
 
     const enabled = options?.enabled ?? true;
     const sweepIntervalMs = Math.max(1, options?.sweepIntervalMs ?? DEFAULT_SWEEP_INTERVAL_MS);
+    const bridgeDir = options?.bridgeDir;
     const maxFileBytes = Math.max(1, options?.maxFileBytes ?? DEFAULT_MAX_FILE_BYTES);
     const settleMs = Math.max(0, options?.settleMs ?? DEFAULT_SETTLE_MS);
     const automationRoots = (options?.automationRoots ?? []).map((root) =>
@@ -470,6 +491,73 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
       threads
         .getThreadRecords(threadId, ["runs"])
         .pipe(Effect.map((records) => records.runs.length > 0));
+
+    /** Whether T3 is driving a turn on the thread right now. */
+    const hasActiveRun = (threadId: ThreadId) =>
+      threads
+        .getThreadRecords(threadId, ["runs"])
+        .pipe(
+          Effect.map((records) => records.runs.some((run) => ACTIVE_RUN_STATUSES.has(run.status))),
+        );
+
+    /** Whether a Claude Code process with the T3 mod holds the session now. */
+    const hasLiveBridgeProcess = (sessionId: string) =>
+      Effect.gen(function* () {
+        if (bridgeDir === undefined) return false;
+        const dir = path.join(bridgeDir, "claude", sessionId);
+        const instances = yield* fs
+          .readDirectory(dir)
+          .pipe(Effect.orElseSucceed((): ReadonlyArray<string> => []));
+        const now = yield* Clock.currentTimeMillis;
+        for (const instanceId of instances) {
+          const raw = yield* fs
+            .readFileString(path.join(dir, instanceId, "session.json"))
+            .pipe(Effect.orElseSucceed(() => ""));
+          const session = parseClaudeBridgeSessionFile(parseJsonlLine(raw) ?? null);
+          if (session !== null && isClaudeBridgeSessionLive(session, now)) return true;
+        }
+        return false;
+      });
+
+    /**
+     * The newest moment T3's own record of a thread reaches: every reply it
+     * holds (the provider's, or imported) and the prompts of runs that
+     * completed. A prompt whose run failed never reached the native session,
+     * so it does not count.
+     */
+    const ownedWatermarkMs = (threadId: ThreadId) =>
+      sql<{ readonly at: string | null }>`
+        SELECT max(message.created_at) AS at
+        FROM orchestration_v2_projection_messages AS message
+        LEFT JOIN orchestration_v2_projection_runs AS run ON run.run_id = message.run_id
+        WHERE message.thread_id = ${threadId}
+          AND (message.role = 'assistant' OR (message.role = 'user' AND run.status = 'completed'))
+      `.pipe(
+        Effect.map((rows) => {
+          const at = rows[0]?.at;
+          return at === undefined || at === null ? undefined : DateTime.toEpochMillis(dateTime(at));
+        }),
+      );
+
+    /** The live thread whose provider thread names this native session, if any. */
+    const lookupOwnedThread = (driver: ProviderDriverKind, sessionId: string) =>
+      sql<{ readonly thread_id: string }>`
+        SELECT provider_thread.thread_id
+        FROM orchestration_v2_projection_provider_threads AS provider_thread
+        JOIN orchestration_v2_projection_threads AS thread
+          ON thread.thread_id = provider_thread.thread_id
+        WHERE json_extract(provider_thread.payload_json, '$.nativeThreadRef.nativeId') = ${sessionId}
+          AND json_extract(provider_thread.payload_json, '$.driver') = ${driver}
+          AND thread.deleted_at IS NULL
+          AND thread.archived_at IS NULL
+        ORDER BY provider_thread.updated_at DESC
+        LIMIT 1
+      `.pipe(
+        Effect.map((rows) =>
+          rows[0] === undefined ? undefined : ThreadId.make(rows[0].thread_id),
+        ),
+        Effect.orElseSucceed((): ThreadId | undefined => undefined),
+      );
 
     const deleteThread = (threadId: ThreadId, commandId: CommandId) =>
       threads.dispatch({ type: "thread.delete", commandId, threadId }).pipe(Effect.asVoid);
@@ -614,9 +702,14 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
       readonly threadId: ThreadId;
       readonly parsed: ParsedCliSession;
       readonly fromLineIndex: number;
+      /** Only rows after this instant; the rest are T3's own turns. */
+      readonly afterMs?: number;
     }) {
       const candidates = input.parsed.messages.filter(
-        (message) => message.lineIndex >= input.fromLineIndex,
+        (message) =>
+          message.lineIndex >= input.fromLineIndex &&
+          (input.afterMs === undefined ||
+            DateTime.toEpochMillis(dateTime(message.timestamp)) > input.afterMs),
       );
       if (candidates.length === 0) return 0;
       // Migrated threads hydrate their v1 transcript lazily; finish that first
@@ -703,6 +796,52 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         },
       });
     };
+
+    /**
+     * A thread T3 owns whose native session kept going without T3 (a terminal
+     * process without the mod, or from before the mod existed) gets the
+     * transcript rows T3 never saw, as imported history, so the thread reads
+     * whole from every client. Rows up to T3's own watermark are T3's turns
+     * and stay out. While a T3 run is writing the thread, or a mod process
+     * holds the session (the bridge adopts its turns), nothing is imported.
+     */
+    const catchUpOwnedThread = Effect.fn("SessionImporter.catchUpOwnedThread")(function* (input: {
+      readonly driver: ProviderDriverKind;
+      readonly sessionId: string;
+      readonly filePath: string;
+      readonly parsed: ParsedCliSession;
+      readonly threadId: ThreadId;
+      readonly fromLineIndex: number;
+      readonly context: SweepContext;
+    }) {
+      if (input.parsed.lineCount <= input.fromLineIndex) return;
+      if (yield* hasActiveRun(input.threadId)) return;
+      if (yield* hasLiveBridgeProcess(input.sessionId)) return;
+      const afterMs = yield* ownedWatermarkMs(input.threadId);
+      const appendedCount = yield* appendMessages({
+        sessionId: input.sessionId,
+        threadId: input.threadId,
+        parsed: input.parsed,
+        fromLineIndex: input.fromLineIndex,
+        ...(afterMs === undefined ? {} : { afterMs }),
+      });
+      yield* upsertImportBinding({
+        driver: input.driver,
+        sessionId: input.sessionId,
+        threadId: input.threadId,
+        parsed: input.parsed,
+        filePath: input.filePath,
+      });
+      if (appendedCount > 0) {
+        input.context.stats.updatedCount += 1;
+        yield* Effect.logInfo("session.importer.owned-thread-caught-up", {
+          provider: input.driver,
+          sessionId: input.sessionId,
+          threadId: input.threadId,
+          appendedCount,
+        });
+      }
+    });
 
     const importFreshSession = Effect.fn("SessionImporter.importFreshSession")(function* (input: {
       readonly driver: ProviderDriverKind;
@@ -878,12 +1017,24 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
       }) {
         const { driver, sessionId, parsed, cursor } = input;
         // A T3 run has happened on this thread since import: T3 drives its
-        // native session now. Hand the thread over permanently — drop the
-        // import cursor so this source file is never tailed again and T3's
-        // own turns aren't re-imported as duplicates. A terminal continuation
-        // of the source session forks to a new session id and imports as a
-        // fresh thread.
+        // native session now. A Claude session can still grow without T3 (a
+        // terminal without the mod), so its thread keeps catching up from
+        // where T3's own record ends. A Codex thread is handed over for good:
+        // drop the import cursor so this source file is never tailed again and
+        // T3's own turns aren't re-imported as duplicates.
         if (yield* hasT3Runs(input.binding.threadId)) {
+          if (driver === CLAUDE_DRIVER) {
+            yield* catchUpOwnedThread({
+              driver,
+              sessionId,
+              filePath: input.filePath,
+              parsed,
+              threadId: input.binding.threadId,
+              fromLineIndex: cursor.lineCount,
+              context: input.context,
+            });
+            return;
+          }
           yield* mergeBinding({
             threadId: input.binding.threadId,
             provider: driver,
@@ -1152,6 +1303,23 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
           });
         }
         let cursor = readImportCursor(binding.runtimePayload);
+        if (cursor === undefined && driver === CLAUDE_DRIVER) {
+          // A Claude thread T3 took over, in any era, with no cursor: catch it
+          // up from the whole transcript. The watermark keeps T3's own turns
+          // out, and the binding gets a cursor for the sweeps after.
+          if (Option.isSome(yield* getThread(binding.threadId))) {
+            yield* catchUpOwnedThread({
+              driver,
+              sessionId,
+              filePath,
+              parsed,
+              threadId: binding.threadId,
+              fromLineIndex: 0,
+              context,
+            });
+          }
+          return;
+        }
         // Self-heal: an importer-created thread (cli-import- prefix) that
         // lost its cursor although T3 never ran it gets the cursor rebuilt
         // at the current file position. A thread T3 ran — native messages,
@@ -1212,8 +1380,24 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         return;
       }
 
-      // A session T3 itself started or resumed: it already has its thread.
+      // A session T3 itself started or resumed: it already has its thread. A
+      // Claude one still catches up with rows T3 never wrote (a terminal
+      // without the mod); the binding this creates carries the cursor on.
       if (context.t3NativeSessions.has(key)) {
+        if (driver === CLAUDE_DRIVER) {
+          const owned = yield* lookupOwnedThread(driver, sessionId);
+          if (owned !== undefined) {
+            yield* catchUpOwnedThread({
+              driver,
+              sessionId,
+              filePath,
+              parsed,
+              threadId: owned,
+              fromLineIndex: 0,
+              context,
+            });
+          }
+        }
         return;
       }
       if (!isEligibleCliSession(parsed)) {
@@ -1599,8 +1783,13 @@ export const makeSessionImporterLive = (options?: SessionImporterLiveOptions) =>
     SessionImporter,
     Effect.gen(function* () {
       const serverConfig = yield* ServerConfig;
+      const hostEnvironment = yield* HostProcessEnvironment;
+      const path = yield* Path.Path;
       return yield* makeSessionImporter({
         enabled: serverConfig.importCliSessions ?? false,
+        bridgeDir:
+          hostEnvironment[CLAUDE_BRIDGE_DIR_ENV]?.trim() ||
+          path.join(serverConfig.stateDir, "bridge"),
         ...(serverConfig.importSweepIntervalMs !== undefined
           ? { sweepIntervalMs: serverConfig.importSweepIntervalMs }
           : {}),
