@@ -41,6 +41,7 @@ import {
   ThreadId,
   TurnItemId,
   type OrchestrationV2AppThread,
+  type OrchestrationV2ThreadHeldBy,
   type OrchestrationV2DomainEvent,
   type OrchestrationV2ProviderThread,
   type ServerSettings,
@@ -221,6 +222,15 @@ const importCommandId = (
 ) => CommandId.make(`cli-import:e${IMPORT_EPOCH}${idVariant}:${driver}:${sessionId}:${facet}`);
 export const importedMessageId = (sessionId: string, sourceId: string) =>
   MessageId.make(`cli-import-${sessionId}-${sourceId}`);
+/**
+ * Codex Desktop drives its sessions through a private app-server T3 cannot
+ * attach to; the thread stays Desktop's and T3 only follows the file.
+ */
+const heldByForOriginator = (
+  originator: string | undefined,
+): OrchestrationV2ThreadHeldBy | undefined =>
+  originator === "Codex Desktop" ? "codex-desktop" : undefined;
+
 const importEventId = (threadId: ThreadId, facet: string) =>
   EventId.make(`cli-import:v2:${threadId}:${facet}`);
 
@@ -627,14 +637,25 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
       const events: Array<OrchestrationV2DomainEvent> = fresh.flatMap((message) =>
         messageEvents({ threadId: input.threadId, sessionId: input.sessionId, message }),
       );
-      if (DateTime.toEpochMillis(newest) > DateTime.toEpochMillis(thread.updatedAt)) {
+      const isNewer = DateTime.toEpochMillis(newest) > DateTime.toEpochMillis(thread.updatedAt);
+      // Threads imported before the holder stamp existed pick it up on their
+      // next appended message, riding the recency bump instead of a sweep.
+      const heldBy = heldByForOriginator(input.parsed.originator);
+      const stampHeldBy = heldBy !== undefined && thread.heldBy === undefined;
+      if (isNewer || stampHeldBy) {
         events.push({
-          id: importEventId(input.threadId, `recency:${fresh[fresh.length - 1]!.sourceId}`),
+          id: isNewer
+            ? importEventId(input.threadId, `recency:${fresh[fresh.length - 1]!.sourceId}`)
+            : importEventId(input.threadId, `held-by:${heldBy}`),
           type: "thread.metadata-updated",
           threadId: input.threadId,
           providerInstanceId: thread.providerInstanceId,
-          occurredAt: newest,
-          payload: { ...thread, updatedAt: newest },
+          occurredAt: isNewer ? newest : thread.updatedAt,
+          payload: {
+            ...thread,
+            ...(isNewer ? { updatedAt: newest } : {}),
+            ...(stampHeldBy ? { heldBy } : {}),
+          },
         });
       }
       yield* eventSink.write({ events });
@@ -743,6 +764,7 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
       const createdAt = dateTime(parsed.startedAt ?? firstMessage.timestamp);
       const updatedAt = dateTime(lastMessage.timestamp);
       const providerThreadId = deriveProviderThread({ driver, nativeThreadId: sessionId });
+      const heldBy = heldByForOriginator(parsed.originator);
       const thread: OrchestrationV2AppThread = {
         createdBy: "system",
         creationSource: "server",
@@ -764,6 +786,7 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         branchPullRequest: null,
         activeProviderThreadId: providerThreadId,
         historyOrigin: "v1_import",
+        ...(heldBy === undefined ? {} : { heldBy }),
         lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
         forkedFrom: null,
         createdAt,

@@ -32,6 +32,7 @@ export function parseCodexRolloutJsonl(content: string): ParsedCliSession {
   let hasProject = false;
   let startedAt: string | undefined;
   let launch: "human" | "machine" | "subagent" = "human";
+  let originator: string | undefined;
   const forkSignature: string[] = [];
   let malformedLineCount = 0;
 
@@ -55,6 +56,7 @@ export function parseCodexRolloutJsonl(content: string): ParsedCliSession {
         sessionId ??= readString(payload.id) ?? readString(payload.session_id);
         cwd ??= readString(payload.cwd);
         startedAt ??= readString(payload.timestamp) ?? readString(entry.timestamp);
+        originator ??= readString(payload.originator);
         hasProject = isRecord(payload.git) && Object.keys(payload.git).length > 0;
         if (
           payload.thread_source === "subagent" ||
@@ -131,6 +133,7 @@ export function parseCodexRolloutJsonl(content: string): ParsedCliSession {
     malformedLineCount,
     hasProject,
     launch,
+    ...(originator === undefined ? {} : { originator }),
     forkSignature,
   };
 }

@@ -53,6 +53,7 @@ import {
   CommandId,
   DEFAULT_MODEL,
   isProviderNativeSubagentThread,
+  threadHeldByNotice,
   type ChatAttachment as ContractChatAttachment,
   type EnvironmentId,
   type MessageId,
@@ -297,6 +298,7 @@ import {
   DownloadIcon,
   GitBranchIcon,
   TargetIcon,
+  TriangleAlertIcon,
   WifiOffIcon,
 } from "lucide-react";
 import { cn, randomUUID } from "~/lib/utils";
@@ -7408,6 +7410,21 @@ export default function ChatView(props: ChatViewProps) {
       onDismiss: acknowledgeActiveThreadWoke,
     };
   }, [acknowledgeActiveThreadWoke, activeThread?.id, activeThreadWokeVisible]);
+  // Another app owns this thread's native session (Codex Desktop): T3 shows
+  // it live, but sending from here would run a second copy beside that app.
+  const heldByBannerItem = useMemo<ComposerBannerStackItem | null>(() => {
+    const notice = serverThread === null ? null : threadHeldByNotice(serverThread.source);
+    if (notice === null) {
+      return null;
+    }
+    return {
+      id: `thread-held-by:${serverThread?.id ?? "unknown"}`,
+      variant: "warning",
+      icon: <TriangleAlertIcon />,
+      title: notice.title,
+      description: notice.description,
+    };
+  }, [serverThread]);
   const parkedThreadBannerItem = useMemo<ComposerBannerStackItem | null>(() => {
     if (!activeThreadSnoozed && !activeThreadSettled) {
       return null;
@@ -7594,6 +7611,8 @@ export default function ChatView(props: ChatViewProps) {
         })
       : null;
   const composerBannerItems = useMemo<ComposerBannerStackItem[]>(() => {
+    // "Don't send here" leads every tier: it changes what the composer means.
+    const heldByItems = heldByBannerItem === null ? [] : [heldByBannerItem];
     const limitRecoveryItems = limitRecoveryBanner === null ? [] : [limitRecoveryBanner];
     const backgroundWorkItems = [goalBannerItem, backgroundWorkBannerItem].filter(
       (item) => item !== null,
@@ -7607,6 +7626,7 @@ export default function ChatView(props: ChatViewProps) {
     const projectCloneItems = projectCloneBannerItem === null ? [] : [projectCloneBannerItem];
     if (!localCheckoutBranchMismatch || !showBranchMismatchBanner || !activeBranchMismatchKey) {
       return [
+        ...heldByItems,
         ...feedbackBannerItems,
         ...limitRecoveryItems,
         ...usageLimitsItems,
@@ -7619,6 +7639,7 @@ export default function ChatView(props: ChatViewProps) {
       ];
     }
     return [
+      ...heldByItems,
       ...feedbackBannerItems,
       ...limitRecoveryItems,
       ...usageLimitsItems,
@@ -7672,6 +7693,7 @@ export default function ChatView(props: ChatViewProps) {
     activeThreadShell,
     serverRuntime?.usageLimitResetAt,
     feedbackBannerItems,
+    heldByBannerItem,
     limitRecoveryBanner,
     handleRestoreThreadBranch,
     isRestoringThreadBranch,

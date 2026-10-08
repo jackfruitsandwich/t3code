@@ -54,6 +54,12 @@ export interface ParsedCliSession {
    */
   readonly launch?: "human" | "machine" | "subagent";
   /**
+   * The app that wrote the session, verbatim from the provider's own stamp
+   * (Codex `session_meta.originator`: "Codex Desktop", "codex-tui",
+   * "codex_exec"). Undefined when the provider leaves none (Claude).
+   */
+  readonly originator?: string;
+  /**
    * Stable ids from the session's earliest history. Forks copy history, so
    * two sessions sharing any of these ids are branches of one conversation;
    * used to group fork families and to keep machine-launched forks of a

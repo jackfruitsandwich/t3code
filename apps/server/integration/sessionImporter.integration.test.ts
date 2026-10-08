@@ -1405,6 +1405,62 @@ runtimeTest("ignores other provider accounts' bindings for the same session ids"
   }),
 );
 
+runtimeTest("marks Codex Desktop sessions as held by Desktop and keeps the mark on append", (h) =>
+  Effect.gen(function* () {
+    const desktopId = "dddddddd-5555-4555-8555-555555555551";
+    const terminalId = "dddddddd-5555-4555-8555-555555555552";
+    const cwd = yield* h.makeDir("desktop-workspace");
+    const desktopPath = h.codexFile("desktop");
+    yield* h.write(desktopPath, [
+      codex.meta(desktopId, cwd, "2026-07-09T08:00:00.000Z", {
+        ...GIT,
+        source: "vscode",
+        originator: "Codex Desktop",
+      }),
+      codex.user("Plan the migration", "2026-07-09T08:00:01.000Z"),
+      codex.assistant("Here is the plan.", "2026-07-09T08:00:09.000Z"),
+    ]);
+    yield* h.write(h.codexFile("terminal"), [
+      codex.meta(terminalId, cwd, "2026-07-09T09:00:00.000Z", {
+        ...GIT,
+        source: "vscode",
+        originator: "codex-tui",
+      }),
+      codex.user("Run the tests", "2026-07-09T09:00:01.000Z"),
+      codex.assistant("All green.", "2026-07-09T09:00:05.000Z"),
+    ]);
+
+    const importer = yield* h.importer();
+    yield* importer.sweepNow();
+
+    const desktopThreadId = importedThreadId(desktopId);
+    // The stamp lands on the stored thread and reaches clients through the shell.
+    assert.equal(
+      (yield* h.threads.getThreadRecords(desktopThreadId, [])).thread.heldBy,
+      "codex-desktop",
+    );
+    assert.equal((yield* h.liveShell(desktopThreadId)).heldBy, "codex-desktop");
+    // A terminal session is joinable through the shared daemon: no stamp.
+    assert.isUndefined((yield* h.liveShell(importedThreadId(terminalId))).heldBy);
+
+    // Desktop keeps writing; the appended message bumps recency and keeps the stamp.
+    yield* h.append(desktopPath, [
+      codex.user("Now do step one", "2026-07-09T10:00:00.000Z"),
+      codex.assistant("Step one done.", "2026-07-09T10:00:04.000Z"),
+    ]);
+    yield* importer.sweepNow();
+    const shell = yield* h.liveShell(desktopThreadId);
+    assert.equal(shell.heldBy, "codex-desktop");
+    assert.equal(DateTime.formatIso(shell.updatedAt), "2026-07-09T10:00:04.000Z");
+    assert.deepEqual(yield* h.texts(desktopThreadId), [
+      "Plan the migration",
+      "Here is the plan.",
+      "Now do step one",
+      "Step one done.",
+    ]);
+  }),
+);
+
 function joinPath(...segments: ReadonlyArray<string>) {
   return segments.join("/");
 }

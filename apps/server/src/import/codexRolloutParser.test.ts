@@ -109,6 +109,7 @@ describe("parseCodexRolloutJsonl", () => {
         { role: "assistant", text: "Imported." },
       ],
     );
+    assert.equal(parsed.originator, "Codex Desktop");
     assert.isTrue(isEligibleCliSession(parsed));
   });
 

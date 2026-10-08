@@ -41,7 +41,7 @@ import {
   type ProviderSubagentStatus,
 } from "@t3tools/client-runtime/state/thread-execution";
 import { formatModelSlugName, resolveSelectableModel } from "@t3tools/shared/model";
-import { isProviderNativeSubagentThread } from "@t3tools/contracts";
+import { isProviderNativeSubagentThread, threadHeldByNotice } from "@t3tools/contracts";
 import type { QueuedRunEdit } from "../../state/queued-run-edit";
 import type { FollowUpBehavior } from "../../lib/followUpBehavior";
 import type { ActiveTurnComposerAction } from "@t3tools/client-runtime/state/composer-dispatch";
@@ -90,6 +90,8 @@ import type { ComposerEditorHandle } from "../../components/ComposerEditor";
 import type { StatusTone } from "../../components/StatusPill";
 import type { DraftComposerAttachment } from "../../lib/composerImages";
 import { RenderErrorBoundary, RenderFailureView } from "../../components/RenderErrorBoundary";
+import { SymbolView } from "../../components/AppSymbol";
+import { AppText as Text } from "../../components/AppText";
 import { CHAT_CONTENT_MAX_WIDTH, type LayoutVariant } from "../../lib/layout";
 import { editPendingThreadMessage } from "../../state/edit-pending-thread-message";
 import { deviceEnvironment } from "../../state/device";
@@ -402,6 +404,8 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
   const composerEditorRef = useRef<ComposerEditorHandle>(null);
   // A provider-native subagent shows status instead of a composer.
   const isProviderSubagent = isProviderNativeSubagentThread(props.selectedThread.source);
+  // Another app owns this thread's native session (Codex Desktop); warn above the composer.
+  const heldByNotice = threadHeldByNotice(props.selectedThread.source);
   // Entering edit mode from the queue sheet should land in a ready composer,
   // not require a second tap on a composer already holding the message.
   const editingRunId = props.queuedRunEdit?.runId ?? null;
@@ -1255,6 +1259,26 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
                       onDismiss={() => clearThreadComposerError(selectedThreadKey)}
                     />
                   </Animated.View>
+                ) : null}
+                {heldByNotice !== null ? (
+                  <View className="px-4 pb-3">
+                    <View className="flex-row items-start gap-3 rounded-[20px] border-continuous bg-card p-4">
+                      <SymbolView
+                        name="exclamationmark.triangle"
+                        size={16}
+                        tintColorClassName="accent-icon"
+                        type="monochrome"
+                      />
+                      <View className="min-w-0 flex-1 gap-1">
+                        <Text className="text-sm font-medium text-foreground">
+                          {heldByNotice.title}
+                        </Text>
+                        <Text className="text-sm text-foreground-muted">
+                          {heldByNotice.description}
+                        </Text>
+                      </View>
+                    </View>
+                  </View>
                 ) : null}
                 {usageLimitsReport && activeUserInputRequestId === null ? (
                   <Animated.View

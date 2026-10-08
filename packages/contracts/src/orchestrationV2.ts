@@ -88,6 +88,15 @@ export type OrchestrationV2CreationSource = typeof OrchestrationV2CreationSource
 export const OrchestrationV2ThreadHistoryOrigin = Schema.Literals(["native", "v1_import"]);
 export type OrchestrationV2ThreadHistoryOrigin = typeof OrchestrationV2ThreadHistoryOrigin.Type;
 
+/**
+ * Another app owns the thread's native session and T3 cannot attach to it, so
+ * a message sent from T3 would run a second copy of the thread beside that
+ * app. Codex Desktop drives its sessions through a private app-server with no
+ * socket to join; the importer stamps its sessions so clients can warn.
+ */
+export const OrchestrationV2ThreadHeldBy = Schema.Literals(["codex-desktop"]);
+export type OrchestrationV2ThreadHeldBy = typeof OrchestrationV2ThreadHeldBy.Type;
+
 const OrchestrationV2CreationFields = {
   createdBy: OrchestrationV2Actor,
   creationSource: OrchestrationV2CreationSource,
@@ -380,6 +389,7 @@ export const OrchestrationV2AppThread = Schema.Struct({
   branchPullRequest: Schema.optional(Schema.NullOr(ThreadLinkedPullRequest)),
   activeProviderThreadId: Schema.NullOr(ProviderThreadId),
   historyOrigin: Schema.optional(OrchestrationV2ThreadHistoryOrigin),
+  heldBy: Schema.optional(OrchestrationV2ThreadHeldBy),
   lineage: OrchestrationV2AppThreadLineage,
   /** Personal fork: imported CLI sessions forked from the same conversation
       share this id, and the sidebars fold them under one row. */
@@ -451,6 +461,30 @@ export function isProviderNativeSubagentThread(
   thread: Pick<OrchestrationV2AppThread, "lineage" | "creationSource">,
 ): boolean {
   return thread.lineage.relationshipToParent === "subagent" && thread.creationSource === "provider";
+}
+
+export interface ThreadHeldByNotice {
+  readonly title: string;
+  readonly description: string;
+}
+
+/**
+ * Copy for the notice on a thread another app owns (see
+ * `OrchestrationV2ThreadHeldBy`); null when T3 can drive the thread itself.
+ */
+export function threadHeldByNotice(
+  thread: Pick<OrchestrationV2AppThread, "heldBy">,
+): ThreadHeldByNotice | null {
+  switch (thread.heldBy) {
+    case "codex-desktop":
+      return {
+        title: "This thread lives in Codex Desktop",
+        description:
+          "T3 follows it as Codex Desktop writes it. A message sent here would start a second copy of the thread that Codex Desktop never sees, so continue it there.",
+      };
+    case undefined:
+      return null;
+  }
 }
 
 export const OrchestrationV2RunStatus = Schema.Literals([
@@ -1854,6 +1888,7 @@ export const OrchestrationV2ThreadShell = Schema.Struct({
   forkedFrom: Schema.NullOr(OrchestrationV2AppThread.fields.forkedFrom),
   activeProviderThreadId: Schema.NullOr(ProviderThreadId),
   historyOrigin: Schema.optional(OrchestrationV2ThreadHistoryOrigin),
+  heldBy: Schema.optional(OrchestrationV2ThreadHeldBy),
   latestRunId: Schema.NullOr(RunId),
   latestRunRequestedAt: Schema.optional(Schema.NullOr(Schema.DateTimeUtc)),
   latestRunStartedAt: Schema.optional(Schema.NullOr(Schema.DateTimeUtc)),
