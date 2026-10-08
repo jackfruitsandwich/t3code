@@ -522,12 +522,13 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
     /**
      * The newest moment T3's own record of a thread reaches: every reply it
      * holds (the provider's, or imported) and the prompts of runs that
-     * completed. A prompt whose run failed never reached the native session,
-     * so it does not count.
+     * completed, by their last update, which for a streamed reply is its end.
+     * A prompt whose run failed never reached the native session, so it does
+     * not count.
      */
     const ownedWatermarkMs = (threadId: ThreadId) =>
       sql<{ readonly at: string | null }>`
-        SELECT max(message.created_at) AS at
+        SELECT max(message.updated_at) AS at
         FROM orchestration_v2_projection_messages AS message
         LEFT JOIN orchestration_v2_projection_runs AS run ON run.run_id = message.run_id
         WHERE message.thread_id = ${threadId}
@@ -720,8 +721,18 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         WHERE thread_id = ${input.threadId}
       `;
       const known = new Set(existing.map((row) => row.message_id));
+      // T3's own copies of native rows carry the row's uuid after the last
+      // colon (`assistant:<uuid>`, `message:provider:…:native-item:<uuid>`).
+      const knownNative = new Set(
+        existing.flatMap((row) => {
+          const colon = row.message_id.lastIndexOf(":");
+          return colon === -1 ? [] : [row.message_id.slice(colon + 1)];
+        }),
+      );
       const fresh = candidates.filter(
-        (message) => !known.has(importedMessageId(input.sessionId, message.sourceId)),
+        (message) =>
+          !known.has(importedMessageId(input.sessionId, message.sourceId)) &&
+          !knownNative.has(message.sourceId),
       );
       if (fresh.length === 0) return 0;
       const records = yield* threads.getThreadRecords(input.threadId, []);

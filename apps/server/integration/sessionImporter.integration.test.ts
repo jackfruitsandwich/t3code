@@ -1150,14 +1150,15 @@ runtimeTest(
       assert.isNotNull(payloadOf(adopted).importCursor);
       assert.deepEqual(adopted.resumeCursor, { threadId, resume: claudeId, turnCount: 3 });
 
-      // A turn T3 drove: its adapter wrote the reply, so rows up to that reply
-      // are T3's and never re-imported; what follows them in the terminal is.
+      // A turn T3 drove: its adapter wrote the reply as it streamed, so T3's
+      // copy can carry an earlier instant than the transcript row. The row's
+      // uuid names it as T3's; what follows it in the terminal is imported.
       yield* seedNativeReply(
         h,
         threadId,
         "assistant-5",
         "Replying natively through T3.",
-        "2026-07-01T10:20:00.000Z",
+        "2026-07-01T10:19:00.000Z",
       );
       yield* h.append(claudePath, [
         c.user("user-5", "Sent from T3", "2026-07-01T10:19:00.000Z"),
