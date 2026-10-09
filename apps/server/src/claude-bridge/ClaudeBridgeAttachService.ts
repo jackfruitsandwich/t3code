@@ -82,8 +82,9 @@ const make = Effect.gen(function* () {
         providerThreadId: thread.providerThreadId,
         driver: CLAUDE_PROVIDER,
         detail: text.trim().length > 0 ? text : null,
-        // The person typed this turn; it is theirs on every client.
-        createdBy: "user",
+        // A turn the person typed is theirs on every client; one the harness
+        // injected (a task notice, a hook's feedback) is not their message.
+        createdBy: isHarnessPrompt(text) ? "agent" : "user",
       });
     });
 
@@ -99,5 +100,19 @@ const make = Effect.gen(function* () {
     }
   }
 });
+
+/**
+ * Whether a terminal turn's prompt came from the Claude Code harness rather
+ * than the person: task-completion notices, hook feedback, interruptions.
+ */
+export function isHarnessPrompt(text: string): boolean {
+  const head = text.trimStart();
+  return (
+    head.startsWith("<task-notification>") ||
+    head.startsWith("<system-reminder>") ||
+    head.startsWith("Stop hook feedback:") ||
+    head.startsWith("[Request interrupted")
+  );
+}
 
 export const layer = Layer.effectDiscard(make);
