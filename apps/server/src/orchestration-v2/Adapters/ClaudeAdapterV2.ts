@@ -323,6 +323,8 @@ export interface ClaudeAgentSdkQueryOpenInput {
   readonly options: ClaudeAgentSdkQueryOptions;
   readonly threadId: ThreadId;
   readonly providerSessionId: OrchestrationV2ProviderSession["id"];
+  /** Unlike the SDK callback, null delegates to the live process's native permission handling. */
+  readonly bridgeCanUseTool?: CanUseTool;
 }
 
 export interface ClaudeAgentSdkQuerySession {
@@ -2461,7 +2463,9 @@ function isClaudeActiveSteeringAbortResult(message: SDKResultMessage): boolean {
 function isClaudeProviderContinuationTurn(
   input: ProviderAdapter.ProviderAdapterV2TurnInput,
 ): boolean {
-  return input.message.createdBy === "agent" && input.message.creationSource === "provider";
+  // Native user prompts already reached Claude, just like background wakes.
+  // Authorship changes their display, not whether T3 should send them again.
+  return input.message.creationSource === "provider";
 }
 
 // Root turn output whose owner (the offered prompt or a queued wake turn)
@@ -6750,11 +6754,7 @@ export function makeClaudeAdapterV2(
         ) {
           const context = yield* Ref.get(activeTurn);
           if (context === null) {
-            return {
-              behavior: "deny",
-              message: "Claude V2 adapter has no active turn for this tool request.",
-              toolUseID: callbackOptions.toolUseID,
-            } satisfies PermissionResult;
+            return null;
           }
 
           const nativeRequestId = callbackOptions.toolUseID;
@@ -6965,8 +6965,25 @@ export function makeClaudeAdapterV2(
           });
         });
 
-        const canUseTool: CanUseTool = (toolName, toolInput, callbackOptions) =>
+        const bridgeCanUseTool: CanUseTool = (toolName, toolInput, callbackOptions) =>
           runPromise(canUseToolEffect(toolName, toolInput, callbackOptions));
+
+        const canUseTool: CanUseTool = (toolName, toolInput, callbackOptions) =>
+          runPromise(
+            canUseToolEffect(toolName, toolInput, callbackOptions).pipe(
+              // SDK null suppresses the response; only the bridge can hand
+              // an unowned request back to an existing native permission UI.
+              Effect.map(
+                (result) =>
+                  result ??
+                  ({
+                    behavior: "deny",
+                    message: "Claude V2 adapter has no active turn for this tool request.",
+                    toolUseID: callbackOptions.toolUseID,
+                  } satisfies PermissionResult),
+              ),
+            ),
+          );
 
         const onUserDialog: NonNullable<ClaudeQueryOptions["onUserDialog"]> = (
           request,
@@ -7022,7 +7039,9 @@ export function makeClaudeAdapterV2(
                   toolUseID: request.toolUseID ?? callbackOptions.requestId,
                 },
               );
-              if (result.behavior !== "allow") return { behavior: "cancelled" as const };
+              if (result === null || result.behavior !== "allow") {
+                return { behavior: "cancelled" as const };
+              }
               const answers =
                 result.updatedInput === undefined
                   ? undefined
@@ -7182,6 +7201,7 @@ export function makeClaudeAdapterV2(
               threadId: turnInput.threadId,
               providerSessionId: input.providerSessionId,
               options: queryOptions,
+              bridgeCanUseTool,
             })
             .pipe(
               Effect.tapError(() =>

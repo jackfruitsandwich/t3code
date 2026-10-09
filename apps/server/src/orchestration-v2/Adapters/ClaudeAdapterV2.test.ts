@@ -2108,7 +2108,12 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         yield* Queue.unbounded<Extract<ProviderAdapterV2Event, { type: "turn.terminal" }>>();
       const systemNoticeReceipts =
         yield* Queue.unbounded<Extract<ProviderAdapterV2Event, { type: "turn_item.updated" }>>();
+      const runtimeRequestReceipts =
+        yield* Queue.unbounded<
+          Extract<ProviderAdapterV2Event, { type: "runtime_request.updated" }>
+        >();
       let openedOptions: ClaudeAdapterV2.ClaudeAgentSdkQueryOptions | undefined;
+      let bridgeCanUseTool: ClaudeAdapterV2.ClaudeAgentSdkQueryOpenInput["bridgeCanUseTool"];
       const adapter = ClaudeAdapterV2.makeClaudeAdapterV2({
         instanceId: ClaudeAdapterV2.CLAUDE_DEFAULT_INSTANCE_ID,
         settings: DEFAULT_CLAUDE_SETTINGS,
@@ -2129,6 +2134,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           open: (input) =>
             Effect.sync(() => {
               openedOptions = input.options;
+              bridgeCanUseTool = input.bridgeCanUseTool;
               return {
                 messages: Stream.fromQueue(sdkMessages).pipe(
                   Stream.flatMap((message) =>
@@ -2191,6 +2197,9 @@ describe("ClaudeAdapterV2 background wake turns", () => {
             if (event.type === "turn_item.updated" && event.turnItem.type === "system_notice") {
               yield* Queue.offer(systemNoticeReceipts, event);
             }
+            if (event.type === "runtime_request.updated") {
+              yield* Queue.offer(runtimeRequestReceipts, event);
+            }
           }),
         ),
         Effect.forkScoped,
@@ -2216,12 +2225,161 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         events,
         terminalReceipts,
         systemNoticeReceipts,
+        runtimeRequestReceipts,
         getOpenedOptions: () => openedOptions,
+        getBridgeCanUseTool: () => bridgeCanUseTool,
         terminalEvents,
         hasPendingBackgroundWork,
       };
     });
   const makeWakeHarness = makeWakeHarnessWithOptions();
+
+  it.effect.each(["user", "agent"] as const)(
+    "adopts provider-origin %s output without resending it, then sends a new T3 prompt once",
+    (createdBy) =>
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarnessWithOptions({
+          hasPendingWake: Effect.succeed(true),
+        });
+        const now = yield* DateTime.now;
+        const nativeAttempt = RunAttemptId.make(`native-${createdBy}-turn`);
+        yield* harness.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now,
+            attemptId: nativeAttempt,
+            text: "This prompt is already running in the terminal.",
+            attachments: [],
+            nativeThreadHasTurns: true,
+            messageCreatedBy: createdBy,
+            messageCreationSource: "provider",
+          }),
+        );
+        assert.lengthOf(harness.offeredMessages, 0);
+        yield* harness.offerAndWait(
+          makeAssistantTextFrame({ uuid: `native-${createdBy}-answer`, text: "Native answer." }),
+        );
+        yield* harness.offerAndWait(
+          makeResultFrame({ uuid: `native-${createdBy}-result`, result: "Native answer." }),
+        );
+        const terminal = yield* Queue.take(harness.terminalReceipts);
+        assert.equal(terminal.status, "completed");
+        assert.isTrue(
+          harness.events.some(
+            (event) => event.type === "message.updated" && event.message.text === "Native answer.",
+          ),
+        );
+        assert.lengthOf(harness.offeredMessages, 0);
+
+        yield* harness.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now,
+            attemptId: RunAttemptId.make(`client-after-native-${createdBy}`),
+            text: "A new prompt from T3.",
+            attachments: [],
+            providerTurnOrdinal: 2,
+          }),
+        );
+        assert.lengthOf(harness.offeredMessages, 1);
+        assert.equal(
+          harness.offeredMessages[0]?.message.content,
+          "Ultrathink:\nA new prompt from T3.",
+        );
+      }).pipe(Effect.scoped, Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+  );
+
+  it.effect(
+    "delegates an unowned bridge approval to native handling without parking SDK approvals",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        yield* harness.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("bridge-turn-before-native-approval"),
+            text: "Finish this turn.",
+            attachments: [],
+          }),
+        );
+        yield* harness.offerAndWait(
+          makeResultFrame({ uuid: "bridge-turn-finished", result: "Finished." }),
+        );
+        yield* Queue.take(harness.terminalReceipts);
+        const callbackOptions = {
+          signal: new AbortController().signal,
+          toolUseID: "native-bash-after-turn",
+          requestId: "native-bash-request",
+        };
+        const bridgeDecision = yield* Effect.promise(() =>
+          harness.getBridgeCanUseTool()!("Bash", { command: "echo retry-ok" }, callbackOptions),
+        );
+        assert.isNull(bridgeDecision);
+        assert.isFalse(harness.events.some((event) => event.type === "runtime_request.updated"));
+
+        const sdkDecision = yield* Effect.promise(() =>
+          harness.getOpenedOptions()!.canUseTool!(
+            "Bash",
+            { command: "echo retry-ok" },
+            callbackOptions,
+          ),
+        );
+        assert.equal(sdkDecision?.behavior, "deny");
+        const dialogDecision = yield* Effect.promise(() =>
+          harness.getOpenedOptions()!.onUserDialog!(
+            { dialogKind: "resume_return", payload: {}, toolUseID: "unowned-resume-dialog" },
+            { signal: callbackOptions.signal, requestId: "unowned-resume-dialog-request" },
+          ),
+        );
+        assert.deepEqual(dialogDecision, { behavior: "cancelled" });
+      }).pipe(Effect.scoped, Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+  );
+
+  it.effect("preserves a real user refusal through the bridge permission callback", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeWakeHarness;
+      yield* harness.runtime.startTurn(
+        makeClaudeTestTurnInput({
+          threadId: harness.threadId,
+          providerThread: harness.providerThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("bridge-user-denial"),
+          text: "Run a command.",
+          attachments: [],
+          runtimePolicy: ProviderAdapterV2RuntimePolicy.make({
+            runtimeMode: "approval-required",
+            interactionMode: "default",
+            cwd: "/workspace",
+          }),
+        }),
+      );
+      const decision = yield* Effect.promise(() =>
+        harness.getBridgeCanUseTool()!(
+          "Bash",
+          { command: "git status" },
+          {
+            signal: new AbortController().signal,
+            toolUseID: "declined-native-command",
+            requestId: "declined-native-request",
+          },
+        ),
+      ).pipe(Effect.forkScoped);
+      const request = yield* Queue.take(harness.runtimeRequestReceipts);
+      yield* harness.runtime.respondToRuntimeRequest({
+        requestId: request.runtimeRequest.id,
+        decision: "decline",
+      });
+      const result = yield* Fiber.join(decision);
+      assert.equal(result?.behavior, "deny");
+      if (result?.behavior !== "deny") return;
+      assert.equal(result.decisionClassification, "user_reject");
+      assert.equal(result.message, "User declined tool execution.");
+    }).pipe(Effect.scoped, Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+  );
 
   it.effect.each([
     { isError: false, title: "Check weather" },

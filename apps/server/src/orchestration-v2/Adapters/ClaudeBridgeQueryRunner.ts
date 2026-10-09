@@ -351,7 +351,7 @@ export const layer: Layer.Layer<
 
       const resolveApproval = (event: Extract<ClaudeBridgeEvent, { type: "approval.request" }>) =>
         Effect.gen(function* () {
-          const canUseTool = options.canUseTool;
+          const canUseTool = input.bridgeCanUseTool ?? options.canUseTool;
           if (canUseTool === undefined) {
             yield* registry.send(bridgeProcess, {
               type: "approval",
