@@ -82,6 +82,8 @@ const make = Effect.gen(function* () {
         providerThreadId: thread.providerThreadId,
         driver: CLAUDE_PROVIDER,
         detail: text.trim().length > 0 ? text : null,
+        // The person typed this turn; it is theirs on every client.
+        createdBy: "user",
       });
     });
 

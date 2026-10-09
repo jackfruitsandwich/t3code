@@ -154,6 +154,31 @@ describe("ProviderContinuationService", () => {
     }),
   );
 
+  it.effect("keeps a turn the person typed in a terminal theirs, with no background notice", () => {
+    return Effect.gen(function* () {
+      const dispatched = yield* Queue.unbounded<unknown>();
+      yield* Effect.gen(function* () {
+        const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+        yield* requests.offer({ ...request(), detail: "typed in the terminal", createdBy: "user" });
+        const command = (yield* Queue.take(dispatched)) as {
+          readonly text: string;
+          readonly createdBy: string;
+          readonly creationSource: string;
+          readonly notification?: OrchestrationV2Notification;
+        };
+        assert.equal(command.text, "typed in the terminal");
+        assert.equal(command.createdBy, "user");
+        assert.equal(command.creationSource, "provider");
+        assert.isUndefined(command.notification);
+      }).pipe(
+        Effect.provide(
+          layerTest({ dispatched, getThreadRecords: () => Effect.succeed(projection) }),
+        ),
+        Effect.scoped,
+      );
+    });
+  });
+
   it.effect("marks an adapter-buffered wake with the provider creation source", () => {
     return Effect.gen(function* () {
       const dispatched = yield* Queue.unbounded<unknown>();

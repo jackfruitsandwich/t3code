@@ -1,4 +1,5 @@
 import {
+  type OrchestrationV2Actor,
   type OrchestrationV2Notification,
   MessageId,
   ProviderDriverKind,
@@ -41,6 +42,14 @@ export interface ProviderContinuationRequest {
    * reach the provider as a real prompt.
    */
   readonly delivery?: "adapter_buffered" | "message_text";
+  /**
+   * Who wrote the continuation's prompt. A turn the person typed into a
+   * terminal, which the Claude bridge adopts, is theirs: it orders their inbox
+   * and holds the thread open like a message sent from any client, and it
+   * carries no background-activity notice. Default: the agent (a wake the
+   * provider produced).
+   */
+  readonly createdBy?: OrchestrationV2Actor;
   readonly dispatchIfCurrent?: <A, E, R>(
     effect: Effect.Effect<A, E, R>,
   ) => Effect.Effect<Option.Option<A>, E, R>;
