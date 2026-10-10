@@ -64,6 +64,11 @@ export class ClaudeBridgeLaunchError extends Schema.TaggedError<ClaudeBridgeLaun
   }
 }
 
+export interface ClaudeBridgeMissedTurn {
+  readonly start: Extract<ClaudeBridgeEvent, { readonly type: "turn.start" }>;
+  readonly complete: Extract<ClaudeBridgeEvent, { readonly type: "turn.complete" }> | null;
+}
+
 export interface ClaudeBridgeProcess {
   readonly sid: string;
   readonly instanceId: string;
@@ -123,6 +128,15 @@ export class ClaudeBridgeRegistry extends Context.Service<
     readonly onUnattachedEvent: (
       handler: ClaudeBridgeEventHandler,
     ) => Effect.Effect<void, never, Scope.Scope>;
+    /**
+     * The last turn the session began while nobody was subscribed, with its
+     * end if that came too: a short turn can be over before the run offered
+     * for it has attached, and whoever attaches next shows it. `peek` leaves
+     * it in place, since its end may still arrive before the caller has
+     * subscribed; `take` hands it over once, after subscribing.
+     */
+    readonly peekMissedTurn: (sid: string) => Effect.Effect<ClaudeBridgeMissedTurn | null>;
+    readonly takeMissedTurn: (sid: string) => Effect.Effect<ClaudeBridgeMissedTurn | null>;
     /** Starts a background Claude Code process for the session and waits for its mod to report. */
     readonly launch: (
       input: ClaudeBridgeLaunchInput,
@@ -303,6 +317,14 @@ const make = Effect.gen(function* () {
     .pipe(Effect.ignore);
 
   const subscribers = new Map<string, ClaudeBridgeEventHandler>();
+  const missedTurns = new Map<string, ClaudeBridgeMissedTurn>();
+  const peekMissedTurn = (sid: string) => Effect.sync(() => missedTurns.get(sid) ?? null);
+  const takeMissedTurn = (sid: string) =>
+    Effect.sync(() => {
+      const missed = missedTurns.get(sid) ?? null;
+      missedTurns.delete(sid);
+      return missed;
+    });
   const unattachedHandlers = new Set<ClaudeBridgeEventHandler>();
 
   const readJson = (file: string) =>
@@ -423,6 +445,14 @@ const make = Effect.gen(function* () {
         yield* subscriber(event, entry);
         return;
       }
+      if (event.type === "turn.start") {
+        missedTurns.set(entry.sid, { start: event, complete: null });
+      } else if (event.type === "turn.complete") {
+        const missed = missedTurns.get(entry.sid);
+        if (missed !== undefined && missed.start.turnId === event.turnId) {
+          missedTurns.set(entry.sid, { start: missed.start, complete: event });
+        }
+      }
       for (const handler of unattachedHandlers) {
         yield* handler(event, entry);
       }
@@ -457,6 +487,7 @@ const make = Effect.gen(function* () {
 
   const sweepDead = (entry: ClaudeBridgeProcess) =>
     Effect.gen(function* () {
+      missedTurns.delete(entry.sid);
       yield* fs.remove(entry.dir, { recursive: true }).pipe(Effect.ignore);
       const sidDir = path.join(claudeDir, entry.sid);
       const remaining = yield* listDirectories(sidDir);
@@ -767,6 +798,8 @@ const make = Effect.gen(function* () {
     clearHeartbeat,
     subscribe,
     onUnattachedEvent,
+    peekMissedTurn,
+    takeMissedTurn,
     launch,
     findTerminalHome,
     findSessionHome,
@@ -799,6 +832,8 @@ export const layerTest = Layer.succeed(
     clearHeartbeat: () => Effect.void,
     subscribe: () => Effect.void,
     onUnattachedEvent: () => Effect.void,
+    peekMissedTurn: () => Effect.succeed(null),
+    takeMissedTurn: () => Effect.succeed(null),
     launch: (input) =>
       Effect.fail(
         new ClaudeBridgeLaunchError({ sid: input.sid, detail: "Claude bridge disabled in tests." }),

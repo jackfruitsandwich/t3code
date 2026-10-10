@@ -150,12 +150,13 @@ export function planTranscriptHealing(input: {
       if (shown[index]) return;
       if (isClaudeHarnessPrompt(row.text)) return;
       // A prompt T3 shows in other words: the turn it started ran in T3, and
-      // that run has its prompt.
+      // that run has its prompt. Only a run known to have none (one that
+      // picked the turn up after it began) leaves the prompt to be added.
       for (let next = index + 1; next < rows.length; next += 1) {
         const later = rows[next]!;
         if (later.role === "user" && later.command !== true) break;
         const live = later.role === "assistant" ? knownByNative.get(later.sourceId) : undefined;
-        if (live !== undefined && live.runId !== null && runsWithPrompt.has(live.runId)) return;
+        if (live !== undefined && (live.runId === null || runsWithPrompt.has(live.runId))) return;
       }
     } else {
       if (shown[index]) return;

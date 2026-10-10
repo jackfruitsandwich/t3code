@@ -66,12 +66,12 @@ const make = Effect.gen(function* () {
 
   const offerTurn = (
     entry: ClaudeBridgeRegistry.ClaudeBridgeProcess,
-    turnId: string,
-    text: string,
+    turn: { readonly turnId: string; readonly text: string; readonly transcriptOffset: number },
   ) =>
     Effect.gen(function* () {
       yield* afterStartupRecovery;
       const sid = entry.sid;
+      const { turnId, text } = turn;
       const key = `${sid}:${turnId}`;
       if (offeredTurns.has(key)) return;
       offeredTurns.add(key);
@@ -82,25 +82,22 @@ const make = Effect.gen(function* () {
       if (thread === null) {
         // A session a person just started in a terminal: it gets its thread
         // now, so its first turn shows while it runs. What the session wrote
-        // before this turn comes in as history; the turn arrives live.
+        // before this turn comes in as history; the turn itself arrives
+        // through the attachment, also when it has already ended by then.
+        // The turn's own report says where it begins: the session file may
+        // not name the turn yet.
         const session = (yield* registry.readSession(entry)) ?? entry.session;
         if (session.isInteractive) {
-          const turn = session.activeTurn;
           yield* importer.adoptLiveClaudeSession({
             sessionId: sid,
             transcriptPath: session.transcriptPath,
             cwd: session.cwd,
-            turnOffset: turn === null ? Number.MAX_SAFE_INTEGER : turn.transcriptOffset,
+            turnOffset: turn.transcriptOffset,
             promptText: text,
           });
           thread = yield* lookupThread(sid);
-          if (thread !== null && turn?.turnId !== turnId) {
-            // The turn ended before the thread existed: it came in as history.
-            yield* Effect.logInfo("claude-bridge.session-adopted", { sid, turnId, live: false });
-            return;
-          }
           if (thread !== null) {
-            yield* Effect.logInfo("claude-bridge.session-adopted", { sid, turnId, live: true });
+            yield* Effect.logInfo("claude-bridge.session-adopted", { sid, turnId });
           }
         }
       }
@@ -130,7 +127,7 @@ const make = Effect.gen(function* () {
     });
 
   yield* registry.onUnattachedEvent((event, entry) =>
-    event.type === "turn.start" ? offerTurn(entry, event.turnId, event.text) : Effect.void,
+    event.type === "turn.start" ? offerTurn(entry, event) : Effect.void,
   );
 
   // A turn already running when this server came up (a restart mid-turn).
@@ -140,7 +137,7 @@ const make = Effect.gen(function* () {
     const live = yield* registry.listLiveProcesses;
     for (const entry of live) {
       if (entry.session.activeTurn !== null && entry.session.activeTurn.promptUuid === undefined) {
-        yield* offerTurn(entry, entry.session.activeTurn.turnId, "");
+        yield* offerTurn(entry, { ...entry.session.activeTurn, text: "" });
       }
     }
   }).pipe(Effect.forkScoped);

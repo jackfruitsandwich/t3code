@@ -10,6 +10,7 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Queue from "effect/Queue";
+import * as Stream from "effect/Stream";
 
 import * as ClaudeBridgeRegistry from "../../claude-bridge/ClaudeBridgeRegistry.ts";
 import type { ClaudeBridgeCommandBody } from "../../claude-bridge/ClaudeBridgeProtocol.ts";
@@ -28,6 +29,10 @@ const userMessage = (content: SDKUserMessage["message"]["content"]): SDKUserMess
 const attach = (input: {
   readonly protocol: number;
   readonly slashCommands?: ReadonlyArray<string>;
+  /** What the session's transcript holds when the runner attaches. */
+  readonly transcript?: string;
+  /** A turn the session began, and maybe ended, while nothing was attached. */
+  readonly missedTurn?: (now: number) => ClaudeBridgeRegistry.ClaudeBridgeMissedTurn;
   readonly bridgeCanUseTool: (
     tool: string,
     toolInput: Record<string, unknown>,
@@ -39,8 +44,9 @@ const attach = (input: {
     const fs = yield* FileSystem.FileSystem;
     const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-bridge-runner-" });
     const transcriptPath = `${root}/transcript.jsonl`;
-    yield* fs.writeFileString(transcriptPath, "");
+    yield* fs.writeFileString(transcriptPath, input.transcript ?? "");
     const now = yield* Clock.currentTimeMillis;
+    let missedTurn = input.missedTurn?.(now) ?? null;
     const process: ClaudeBridgeRegistry.ClaudeBridgeProcess = {
       sid: "bridge-session",
       instanceId: "bridge-instance",
@@ -86,6 +92,13 @@ const attach = (input: {
       clearHeartbeat: () => Effect.void,
       subscribe: (_sid, handler) => Deferred.succeed(subscribed, handler).pipe(Effect.asVoid),
       onUnattachedEvent: () => Effect.void,
+      peekMissedTurn: () => Effect.sync(() => missedTurn),
+      takeMissedTurn: () =>
+        Effect.sync(() => {
+          const taken = missedTurn;
+          missedTurn = null;
+          return taken;
+        }),
       launch: () => Effect.die("This test must attach without launching Claude."),
       findTerminalHome: () => Effect.succeed(null),
       findSessionHome: () => Effect.succeed(root),
@@ -368,6 +381,89 @@ describe("ClaudeBridgeQueryRunner slash commands", () => {
       );
       assert.strictEqual(result._tag, "Failure");
       assert.strictEqual(yield* Queue.size(bridge.commands), 0);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+});
+
+describe("ClaudeBridgeQueryRunner missed turns", () => {
+  const reply = JSON.stringify({
+    type: "assistant",
+    uuid: "00000000-0000-4000-8000-0000000000a1",
+    parentUuid: null,
+    isSidechain: false,
+    requestId: "req_1",
+    timestamp: "2026-07-01T10:00:01.000Z",
+    message: {
+      id: "msg_1",
+      type: "message",
+      role: "assistant",
+      model: "claude-sonnet-4-6",
+      content: [{ type: "text", text: "quick answer" }],
+      stop_reason: "end_turn",
+      usage: { input_tokens: 3, output_tokens: 2 },
+    },
+  });
+  const transcript = `${reply}\n`;
+  const turn = (now: number, endedAgoMs: number): ClaudeBridgeRegistry.ClaudeBridgeMissedTurn => ({
+    start: {
+      type: "turn.start",
+      seq: 1,
+      at: now - endedAgoMs - 1_000,
+      turnId: "turn-quick",
+      text: "quick question",
+      transcriptOffset: 0,
+    },
+    complete: {
+      type: "turn.complete",
+      seq: 2,
+      at: now - endedAgoMs,
+      turnId: "turn-quick",
+      reason: "answer",
+      answer: "quick answer",
+      isAborted: false,
+      durationMs: 1_000,
+      transcriptOffset: Buffer.byteLength(transcript),
+    },
+  });
+  const framesUntilResult = (bridge: {
+    readonly session: ClaudeAdapterV2.ClaudeAgentSdkQuerySession;
+  }) =>
+    bridge.session.messages.pipe(
+      Stream.takeUntil((message) => message.type === "result"),
+      Stream.runCollect,
+      Effect.map((frames) => Array.from(frames)),
+    );
+
+  // The runner reads the transcript from disk on its own clock; these wait
+  // for the frames it produces, on the live clock.
+  it.live("shows a turn that was over before the attachment, from its start", () =>
+    Effect.gen(function* () {
+      const bridge = yield* attach({
+        protocol: 2,
+        bridgeCanUseTool: () => null,
+        transcript,
+        missedTurn: (now) => turn(now, 500),
+      });
+      const frames = yield* framesUntilResult(bridge);
+      const texts = frames.flatMap((frame) =>
+        frame.type === "assistant"
+          ? frame.message.content.flatMap((block) => (block.type === "text" ? [block.text] : []))
+          : [],
+      );
+      assert.deepStrictEqual(texts, ["quick answer"]);
+      assert.strictEqual(frames.at(-1)?.type, "result");
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.live("leaves an older finished turn to the thread's history", () =>
+    Effect.gen(function* () {
+      const bridge = yield* attach({
+        protocol: 2,
+        bridgeCanUseTool: () => null,
+        transcript,
+        missedTurn: (now) => turn(now, 60_000),
+      });
+      assert.isFalse(yield* bridge.session.hasPendingWake ?? Effect.succeed(true));
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 });

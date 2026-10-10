@@ -909,12 +909,17 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
     };
 
     /**
-     * The thread of a session that is running now shows what the session's
-     * transcript holds: rows the live attachment never delivered are added,
-     * each after the run that was the latest when it was written. See
+     * A thread that shows a session through a live attachment holds what the
+     * session's transcript holds: rows the attachment never delivered are
+     * added, each after the run that was the latest when it was written. See
      * `transcriptHealing`.
+     *
+     * The comparison is by row id, so it needs a thread whose replies carry
+     * the transcript's ids. A session that is running is always compared; one
+     * that has ended only when the thread holds such a reply (`false` is
+     * returned otherwise, and the caller catches up by time as before).
      */
-    const healLiveThread = Effect.fn("SessionImporter.healLiveThread")(function* (input: {
+    const healBridgedThread = Effect.fn("SessionImporter.healBridgedThread")(function* (input: {
       readonly driver: ProviderDriverKind;
       readonly sessionId: string;
       readonly filePath: string;
@@ -922,6 +927,7 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
       readonly threadId: ThreadId;
       readonly runs: ReadonlyArray<HealingRun>;
       readonly context: SweepContext;
+      readonly live: boolean;
     }) {
       const { threadId, sessionId, parsed } = input;
       yield* threads.ensureLegacyTranscript(threadId);
@@ -936,6 +942,18 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         FROM orchestration_v2_projection_messages
         WHERE thread_id = ${threadId}
       `;
+      if (!input.live) {
+        const rowIds = new Set(parsed.messages.map((message) => message.sourceId));
+        const holdsTranscriptReply = known.some((message) => {
+          const colon = message.message_id.lastIndexOf(":");
+          return (
+            message.role === "assistant" &&
+            colon !== -1 &&
+            rowIds.has(message.message_id.slice(colon + 1))
+          );
+        });
+        if (!holdsTranscriptReply) return false;
+      }
       const missing = planTranscriptHealing({
         rows: parsed.messages,
         known: known.flatMap((message) =>
@@ -974,11 +992,12 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         }
         yield* eventSink.write({ events });
         input.context.stats.updatedCount += 1;
-        yield* Effect.logInfo("session.importer.live-thread-healed", {
+        yield* Effect.logInfo("session.importer.bridged-thread-healed", {
           provider: input.driver,
           sessionId,
           threadId,
           addedCount: missing.length,
+          live: input.live,
         });
       }
       yield* upsertImportBinding({
@@ -988,6 +1007,7 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         parsed,
         filePath: input.filePath,
       });
+      return true;
     });
 
     /**
@@ -1019,10 +1039,7 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         parsed: input.parsed,
         runs,
       });
-      if (live !== null) {
-        yield* healLiveThread({ ...input, runs });
-        return;
-      }
+      if (yield* healBridgedThread({ ...input, runs, live: live !== null })) return;
       if (input.parsed.lineCount <= input.fromLineIndex) return;
       const afterMs = yield* ownedWatermarkMs(input.threadId);
       const appendedCount = yield* appendMessages({

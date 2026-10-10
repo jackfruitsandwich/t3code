@@ -61,6 +61,12 @@ const TAIL_INTERVAL_MS = 300;
 /** A turn's result waits this long after the last transcript row, so a late row cannot land after it. */
 const COMPLETE_QUIET_MS = 400;
 /**
+ * How recently a turn nobody was attached for must have ended to be shown
+ * from its start by the next attachment. Shorter than the importer's settle
+ * time, so a turn is never both replayed here and brought in as history.
+ */
+const MISSED_TURN_REPLAY_MS = 15_000;
+/**
  * A slash command typed in the terminal that starts no turn (`/model`,
  * `/rename`) leaves only its printed output. After this much quiet the output
  * is shown as a short turn of its own.
@@ -314,11 +320,37 @@ export const layer: Layer.Layer<
         yield* Scope.close(sessionScope, Exit.void);
       });
 
+      const missedTurn = yield* registry.peekMissedTurn(sid);
+      let replayedTurnId: string | null = null;
       if (bridgeProcess.session.activeTurn !== null) {
         translator.adoptTurn(bridgeProcess.session.activeTurn);
         state.byteOffset = bridgeProcess.session.activeTurn.transcriptOffset;
       } else {
         state.byteOffset = yield* transcriptSize(state.transcriptPath);
+        // A short turn can be over before the run offered for it attaches.
+        // It is shown from its start, as if this had attached in time. Only a
+        // turn that just ended: an older one has reached the thread as history.
+        const now = yield* Clock.currentTimeMillis;
+        const endedAt = missedTurn?.complete?.at ?? missedTurn?.start.at;
+        if (missedTurn !== null && endedAt !== undefined && now - endedAt < MISSED_TURN_REPLAY_MS) {
+          translator.adoptTurn({
+            turnId: missedTurn.start.turnId,
+            startedAt: missedTurn.start.at,
+            transcriptOffset: missedTurn.start.transcriptOffset,
+            ...(missedTurn.start.commandId === undefined
+              ? {}
+              : { commandId: missedTurn.start.commandId }),
+            ...(missedTurn.start.promptUuid === undefined
+              ? {}
+              : { promptUuid: missedTurn.start.promptUuid }),
+          });
+          state.byteOffset = missedTurn.start.transcriptOffset;
+          replayedTurnId = missedTurn.start.turnId;
+          yield* Effect.logInfo("claude-bridge.missed-turn-replayed", {
+            sid,
+            turnId: missedTurn.start.turnId,
+          });
+        }
       }
 
       // The session's permission mode as its transcript last recorded it, for
@@ -826,6 +858,16 @@ export const layer: Layer.Layer<
       yield* registry
         .subscribe(sid, (event) => handleEvent(event))
         .pipe(Effect.provideService(Scope.Scope, sessionScope));
+      // From here the session's events come to this attachment. The end of a
+      // replayed turn that arrived before this point is taken up now.
+      const missedBeforeSubscribing = yield* registry.takeMissedTurn(sid);
+      if (
+        replayedTurnId !== null &&
+        missedBeforeSubscribing?.complete != null &&
+        missedBeforeSubscribing.start.turnId === replayedTurnId
+      ) {
+        yield* handleEvent(missedBeforeSubscribing.complete);
+      }
       yield* tail.pipe(
         Effect.catchCause((cause) =>
           Effect.logWarning("claude-bridge.tail-failed", { sid, cause }).pipe(
