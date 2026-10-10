@@ -29,8 +29,14 @@ import type {
 
 import { isRecord, parseJsonlLine } from "../import/sessionImportTypes.ts";
 
-export const CLAUDE_BRIDGE_PROTOCOL_VERSION = 1;
-export const CLAUDE_BRIDGE_MOD_VERSION = "0.1.2";
+export const CLAUDE_BRIDGE_PROTOCOL_VERSION = 2;
+export const CLAUDE_BRIDGE_MOD_VERSION = "0.2.0";
+/**
+ * The first protocol whose mod runs slash commands, answers questions with
+ * their answers and reports the session's own commands. A process still on an
+ * older mod keeps working for prompts, approvals and interrupts.
+ */
+export const CLAUDE_BRIDGE_WINDOW_PROTOCOL = 2;
 export const CLAUDE_BRIDGE_PLUGIN_NAME = "t3bridge";
 export const CLAUDE_BRIDGE_MARKETPLACE_NAME = "t3-bridge";
 /** `plugin@marketplace`, the key Claude's plugin registry files use. */
@@ -47,6 +53,12 @@ export const CLAUDE_BRIDGE_T3_HEARTBEAT_MS = 3_000;
  * from the real SDK.
  */
 export const CLAUDE_BRIDGE_WAKE_DETAIL_KEY = "t3_wake_detail";
+/**
+ * Set on the synthesized `assistant` frame that carries a slash command's
+ * printed output, so the runner can keep it for the turn or command it
+ * belongs to.
+ */
+export const CLAUDE_BRIDGE_COMMAND_OUTPUT_KEY = "t3_command_output";
 
 export interface ClaudeBridgeActiveTurn {
   readonly turnId: string;
@@ -70,6 +82,13 @@ export interface ClaudeBridgeSessionFile {
   readonly startedAt: number;
   readonly heartbeatAt: number;
   readonly model: string | null;
+  /** The session's live permission mode, once a hook payload has named it. */
+  readonly permissionMode: string | null;
+  readonly effort: string | null;
+  /** Bumped each time the mod rewrites `commands.json`. */
+  readonly commandsRev: number;
+  /** Whether a person can see this process's own dialogs (a terminal runs or is attached to it). */
+  readonly terminalPresent: boolean;
   readonly activeTurn: ClaudeBridgeActiveTurn | null;
   readonly modVersion: string;
   readonly ended: {
@@ -81,13 +100,37 @@ export interface ClaudeBridgeSessionFile {
 
 export type ClaudeBridgeCommandBody =
   | { readonly type: "prompt"; readonly text: string; readonly promptUuid: string }
+  /** A slash command, run in the session as if the person typed `/name args` there. */
+  | {
+      readonly type: "command";
+      readonly name: string;
+      readonly args: string;
+      readonly promptUuid: string;
+    }
   | {
       readonly type: "approval";
       readonly toolUseId: string;
       readonly decision: "allow" | "deny" | "ask";
       readonly reason?: string;
+      /** `session`: the same call is not asked again in this process. */
+      readonly scope?: "session";
+    }
+  /** The person's answers to a question Claude asked, keyed by question text. */
+  | {
+      readonly type: "answer";
+      readonly toolUseId: string;
+      readonly decision: "answer" | "deny" | "ask";
+      readonly answers?: Readonly<Record<string, string>>;
+      readonly reason?: string;
     }
   | { readonly type: "interrupt"; readonly turnId?: string };
+
+/** One slash command of a session, as its own typeahead lists it. */
+export interface ClaudeBridgeSlashCommand {
+  readonly name: string;
+  readonly description: string;
+  readonly source: string;
+}
 
 export type ClaudeBridgeCommand = ClaudeBridgeCommandBody & {
   readonly seq: number;
@@ -143,6 +186,23 @@ export type ClaudeBridgeEvent = { readonly seq: number; readonly at: number } & 
       readonly toolUseId: string;
       readonly decision: string;
       readonly by: string;
+    }
+  | {
+      readonly type: "question.request";
+      readonly toolUseId: string;
+      readonly questions: unknown;
+      readonly turnId?: string;
+    }
+  | { readonly type: "question.resolved"; readonly toolUseId: string; readonly by: string }
+  /** How a slash command T3 asked for ended, when it started no turn of its own. */
+  | {
+      readonly type: "command.result";
+      readonly commandId: string;
+      readonly promptUuid?: string;
+      readonly ok: boolean;
+      readonly startedTurn: boolean;
+      readonly waitingInTerminal: boolean;
+      readonly text: string;
     }
   | { readonly type: "ended"; readonly reason: string; readonly sessionId: string }
   | { readonly type: "error"; readonly message: string; readonly commandId?: string }
@@ -210,6 +270,14 @@ export function parseClaudeBridgeSessionFile(value: unknown): ClaudeBridgeSessio
     startedAt: readNumber(value.startedAt) ?? heartbeatAt,
     heartbeatAt,
     model: readOptionalString(value.model) ?? null,
+    permissionMode: readOptionalString(value.permissionMode) ?? null,
+    effort: readOptionalString(value.effort) ?? null,
+    commandsRev: readNumber(value.commandsRev) ?? 0,
+    // An older mod does not say; its interactive flag is the best reading.
+    terminalPresent:
+      typeof value.terminalPresent === "boolean"
+        ? value.terminalPresent
+        : value.isInteractive === true,
     activeTurn: parsedTurn,
     modVersion: readOptionalString(value.modVersion) ?? "",
     ended:
@@ -293,6 +361,35 @@ export function parseClaudeBridgeEvent(value: unknown): ClaudeBridgeEvent | null
         decision: readOptionalString(value.decision) ?? "ask",
         by: readOptionalString(value.by) ?? "unknown",
       };
+    case "question.request":
+      if (typeof value.toolUseId !== "string") return null;
+      return {
+        ...base,
+        type: "question.request",
+        toolUseId: value.toolUseId,
+        questions: value.questions,
+        ...(typeof value.turnId === "string" ? { turnId: value.turnId } : {}),
+      };
+    case "question.resolved":
+      if (typeof value.toolUseId !== "string") return null;
+      return {
+        ...base,
+        type: "question.resolved",
+        toolUseId: value.toolUseId,
+        by: readOptionalString(value.by) ?? "unknown",
+      };
+    case "command.result":
+      if (typeof value.commandId !== "string") return null;
+      return {
+        ...base,
+        type: "command.result",
+        commandId: value.commandId,
+        ...(typeof value.promptUuid === "string" ? { promptUuid: value.promptUuid } : {}),
+        ok: value.ok === true,
+        startedTurn: value.startedTurn === true,
+        waitingInTerminal: value.waitingInTerminal === true,
+        text: readOptionalString(value.text) ?? "",
+      };
     case "ended":
       return {
         ...base,
@@ -310,6 +407,88 @@ export function parseClaudeBridgeEvent(value: unknown): ClaudeBridgeEvent | null
     default:
       return null;
   }
+}
+
+export function parseClaudeBridgeSlashCommands(
+  value: unknown,
+): ReadonlyArray<ClaudeBridgeSlashCommand> | null {
+  if (!Array.isArray(value)) return null;
+  const commands: Array<ClaudeBridgeSlashCommand> = [];
+  for (const entry of value) {
+    if (!isRecord(entry) || typeof entry.name !== "string" || entry.name.length === 0) continue;
+    commands.push({
+      name: entry.name,
+      description: readOptionalString(entry.description) ?? "",
+      source: readOptionalString(entry.source) ?? "builtin",
+    });
+  }
+  return commands;
+}
+
+/**
+ * Splits `/name args` the way Claude Code's prompt box does: the name is the
+ * first word after the slash, the rest is the arguments as typed. Null for
+ * anything that is not one slash command (a path, plain text, `/` alone).
+ */
+export function parseClaudeSlashCommandText(
+  text: string,
+): { readonly name: string; readonly args: string } | null {
+  const match = /^\/([A-Za-z0-9][A-Za-z0-9:_-]*)(?:[ \t]+([\s\S]*))?$/u.exec(text.trim());
+  if (match === null || match[1] === undefined) return null;
+  return { name: match[1], args: (match[2] ?? "").trim() };
+}
+
+const LOCAL_COMMAND_STDOUT = /^\s*<local-command-stdout>([\s\S]*)<\/local-command-stdout>\s*$/u;
+const COMMAND_NAME = /<command-name>\s*(\/[^<\s]+)\s*<\/command-name>/u;
+const COMMAND_ARGS = /<command-args>([\s\S]*?)<\/command-args>/u;
+
+const rowText = (row: Record<string, unknown>): string | null => {
+  if (!isRecord(row.message)) return null;
+  const content = row.message.content;
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return null;
+  const parts: Array<string> = [];
+  for (const block of content) {
+    if (isRecord(block) && block.type === "text" && typeof block.text === "string") {
+      parts.push(block.text);
+    }
+  }
+  return parts.length === 0 ? null : parts.join("");
+};
+
+/** `/name args` of the transcript row Claude Code writes when a slash command runs, else null. */
+export function claudeTranscriptCommandText(row: unknown): string | null {
+  if (!isRecord(row) || row.type !== "user") return null;
+  const text = rowText(row);
+  if (text === null) return null;
+  const name = COMMAND_NAME.exec(text)?.[1];
+  if (name === undefined) return null;
+  const args = COMMAND_ARGS.exec(text)?.[1]?.trim() ?? "";
+  return args.length === 0 ? name : `${name} ${args}`;
+}
+
+/** The session's permission mode as a transcript bookkeeping row records a change of it. */
+export function claudeTranscriptPermissionMode(row: unknown): string | null {
+  if (!isRecord(row) || row.type !== "permission-mode") return null;
+  return typeof row.permissionMode === "string" ? row.permissionMode : null;
+}
+
+export function isClaudeBridgeCommandOutputFrame(message: SDKMessage): boolean {
+  return Reflect.get(message, CLAUDE_BRIDGE_COMMAND_OUTPUT_KEY) === true;
+}
+
+/**
+ * Whether a turn's prompt came from the Claude Code harness rather than the
+ * person: task-completion notices, hook feedback, interruptions.
+ */
+export function isClaudeHarnessPrompt(text: string): boolean {
+  const head = text.trimStart();
+  return (
+    head.startsWith("<task-notification>") ||
+    head.startsWith("<system-reminder>") ||
+    head.startsWith("Stop hook feedback:") ||
+    head.startsWith("[Request interrupted")
+  );
 }
 
 /** The continuation text a bridge `user` frame carries, if any. */
@@ -536,8 +715,46 @@ export function makeClaudeBridgeFrameTranslator(
         return [frame];
       }
       if (row.type === "user" && isRecord(row.message)) {
+        const text = rowText(row);
+        // What a slash command printed. Claude Code reports it to an SDK host
+        // as a synthetic assistant message; the same frame here shows the
+        // output and feeds the adapter's goal reader ("Goal set: ...").
+        const stdout = text === null ? null : (LOCAL_COMMAND_STDOUT.exec(text)?.[1] ?? null);
+        if (stdout !== null) {
+          if (stdout.trim().length === 0) return [];
+          const frame = {
+            type: "assistant",
+            message: {
+              id: `bridge-stdout-${row.uuid}`,
+              type: "message",
+              role: "assistant",
+              model: "<synthetic>",
+              content: [{ type: "text", text: stdout }],
+              stop_reason: "stop_sequence",
+              stop_sequence: "",
+              usage: zeroUsage(),
+            },
+            parent_tool_use_id: null,
+            uuid: asUuid(row.uuid),
+            session_id: sessionId,
+            [CLAUDE_BRIDGE_COMMAND_OUTPUT_KEY]: true,
+          } as unknown as SDKAssistantMessage;
+          return [frame];
+        }
+        // A goal's unmet check comes back as hook feedback; the adapter counts it.
+        if (row.isMeta === true && text !== null && text.startsWith("Stop hook feedback:")) {
+          const frame = {
+            type: "user",
+            message: { role: "user", content: text },
+            parent_tool_use_id: null,
+            isSynthetic: true,
+            uuid: asUuid(row.uuid),
+            session_id: sessionId,
+          } as unknown as SDKUserMessage;
+          return [frame];
+        }
         // Typed prompts come through the mod's turn.start; only tool results
-        // carry anything the adapter renders.
+        // carry anything else the adapter renders.
         if (row.isMeta === true || !hasToolResultBlock(row.message.content)) return [];
         const frame = {
           type: "user",

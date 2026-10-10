@@ -41,8 +41,12 @@ import * as Stream from "effect/Stream";
 import * as ClaudeBridgeRegistry from "../../claude-bridge/ClaudeBridgeRegistry.ts";
 import {
   CLAUDE_BRIDGE_T3_HEARTBEAT_MS,
+  CLAUDE_BRIDGE_WINDOW_PROTOCOL,
+  claudeTranscriptCommandText,
+  isClaudeBridgeCommandOutputFrame,
   isClaudeBridgeSessionLive,
   makeClaudeBridgeFrameTranslator,
+  parseClaudeSlashCommandText,
   readTranscriptRows,
   type ClaudeBridgeEvent,
 } from "../../claude-bridge/ClaudeBridgeProtocol.ts";
@@ -54,6 +58,12 @@ export const CLAUDE_TRANSPORT_ENV = "T3CODE_CLAUDE_TRANSPORT";
 const TAIL_INTERVAL_MS = 300;
 /** A turn's result waits this long after the last transcript row, so a late row cannot land after it. */
 const COMPLETE_QUIET_MS = 400;
+/**
+ * A slash command typed in the terminal that starts no turn (`/model`,
+ * `/rename`) leaves only its printed output. After this much quiet the output
+ * is shown as a short turn of its own.
+ */
+const LOCAL_COMMAND_QUIET_MS = 1_500;
 
 const runnerError = (cause: unknown, method: string) =>
   new ClaudeAdapterV2.ClaudeAgentSdkQueryRunnerError({ method, cause });
@@ -238,8 +248,28 @@ export const layer: Layer.Layer<
           readonly event: Extract<ClaudeBridgeEvent, { type: "turn.complete" }>;
           readonly seenAt: number;
         } | null,
-        pendingPrompt: null as { commandId: string; readonly promptUuid: string } | null,
+        pendingPrompt: null as {
+          commandId: string;
+          readonly promptUuid: string;
+          /** `/name args` when the prompt is a slash command. */
+          readonly label: string | null;
+        } | null,
         approvals: new Map<string, AbortController>(),
+        /** Requests the session settled without T3: nothing is sent back for them. */
+        settledElsewhere: new Set<string>(),
+        /** Printed command output read while no turn was open, kept for whatever it belongs to. */
+        heldOutput: [] as Array<SDKMessage>,
+        heldAt: 0,
+        lastCommandText: null as string | null,
+        /** A slash command T3 ran that started no turn, waiting for its output rows. */
+        pendingLocal: null as {
+          readonly commandId: string;
+          readonly promptUuid: string;
+          readonly label: string;
+          readonly ok: boolean;
+          readonly text: string;
+          readonly seenAt: number;
+        } | null,
       };
 
       const emit = (frames: ReadonlyArray<SDKMessage>) =>
@@ -291,7 +321,89 @@ export const layer: Layer.Layer<
         state.byteOffset += lastNewline + 1;
         state.lastRowAt = yield* Clock.currentTimeMillis;
         for (const row of readTranscriptRows(text).rows) {
-          yield* emit(translator.onTranscriptRow(row));
+          const commandText = claudeTranscriptCommandText(row);
+          if (commandText !== null) state.lastCommandText = commandText;
+          for (const frame of translator.onTranscriptRow(row)) {
+            if (isClaudeBridgeCommandOutputFrame(frame) && !translator.hasOpenTurn()) {
+              state.heldOutput.push(frame);
+              state.heldAt = state.lastRowAt;
+            } else {
+              yield* emit([frame]);
+            }
+          }
+        }
+      });
+
+      /** A turn's worth of frames for a slash command that started no model turn. */
+      const emitCommandTurn = (input: {
+        readonly turnId: string;
+        readonly text: string;
+        readonly promptUuid: string | null;
+        readonly ok: boolean;
+        readonly answer: string;
+      }) =>
+        Effect.gen(function* () {
+          const now = yield* Clock.currentTimeMillis;
+          yield* emit(
+            translator.onTurnStart({
+              seq: 0,
+              at: now,
+              type: "turn.start",
+              turnId: input.turnId,
+              text: input.text,
+              transcriptOffset: 0,
+              ...(input.promptUuid === null ? {} : { promptUuid: input.promptUuid }),
+            }),
+          );
+          const output = state.heldOutput.splice(0);
+          yield* emit(output);
+          yield* emit(
+            translator.onTurnComplete({
+              seq: 0,
+              at: now,
+              type: "turn.complete",
+              turnId: input.turnId,
+              reason: input.ok ? "answer" : "error",
+              answer: input.ok && output.length > 0 ? "" : input.answer,
+              isAborted: false,
+              durationMs: 0,
+              transcriptOffset: 0,
+              ...(input.promptUuid === null ? {} : { promptUuid: input.promptUuid }),
+            }),
+          );
+        });
+
+      const settleLocalCommands = Effect.gen(function* () {
+        const now = yield* Clock.currentTimeMillis;
+        const local = state.pendingLocal;
+        if (local !== null) {
+          if (now - local.seenAt < COMPLETE_QUIET_MS || now - state.lastRowAt < COMPLETE_QUIET_MS) {
+            return;
+          }
+          state.pendingLocal = null;
+          yield* emitCommandTurn({
+            turnId: `command-${local.commandId}`,
+            text: local.label,
+            promptUuid: local.promptUuid,
+            ok: local.ok,
+            answer: local.text.length > 0 ? local.text : local.ok ? "(no output)" : local.label,
+          });
+          return;
+        }
+        if (
+          state.heldOutput.length > 0 &&
+          state.pendingPrompt === null &&
+          state.pendingComplete === null &&
+          !translator.hasOpenTurn() &&
+          now - state.heldAt >= LOCAL_COMMAND_QUIET_MS
+        ) {
+          yield* emitCommandTurn({
+            turnId: `local-${now}`,
+            text: state.lastCommandText ?? "(slash command)",
+            promptUuid: null,
+            ok: true,
+            answer: "",
+          });
         }
       });
 
@@ -345,6 +457,7 @@ export const layer: Layer.Layer<
             ),
           );
           yield* settlePendingComplete;
+          yield* settleLocalCommands;
           yield* Effect.sleep(`${TAIL_INTERVAL_MS} millis`);
         }
       });
@@ -376,6 +489,9 @@ export const layer: Layer.Layer<
           );
           state.approvals.delete(event.toolUseId);
           if (state.closed) return;
+          // The session settled it without T3 (answered in the terminal, the
+          // turn ended): there is no one left to tell.
+          if (state.settledElsewhere.delete(event.toolUseId)) return;
           if (result._tag === "Failure") {
             yield* registry.send(bridgeProcess, {
               type: "approval",
@@ -393,17 +509,98 @@ export const layer: Layer.Layer<
             });
             return;
           }
-          yield* registry.send(
-            bridgeProcess,
-            decision.behavior === "allow"
-              ? { type: "approval", toolUseId: event.toolUseId, decision: "allow" }
-              : {
-                  type: "approval",
-                  toolUseId: event.toolUseId,
-                  decision: "deny",
-                  reason: decision.message,
-                },
+          if (decision.behavior === "allow") {
+            // "Allow for this session" arrives as permission updates; the mod
+            // keeps the grant for the life of the process.
+            const forSession = (decision.updatedPermissions?.length ?? 0) > 0;
+            yield* registry.send(bridgeProcess, {
+              type: "approval",
+              toolUseId: event.toolUseId,
+              decision: "allow",
+              ...(forSession ? { scope: "session" as const } : {}),
+            });
+            return;
+          }
+          yield* registry.send(bridgeProcess, {
+            type: "approval",
+            toolUseId: event.toolUseId,
+            decision: "deny",
+            reason: decision.message,
+          });
+          // Cancel is more than a refusal: in the terminal it stops the turn.
+          if (decision.interrupt === true) {
+            yield* registry.send(bridgeProcess, { type: "interrupt" });
+          }
+        });
+
+      /** A question Claude asked: answered with the person's answers, not with an approval. */
+      const resolveQuestion = (event: Extract<ClaudeBridgeEvent, { type: "question.request" }>) =>
+        Effect.gen(function* () {
+          const canUseTool = input.bridgeCanUseTool ?? options.canUseTool;
+          const handBack = registry.send(bridgeProcess, {
+            type: "answer",
+            toolUseId: event.toolUseId,
+            decision: "ask",
+          });
+          if (canUseTool === undefined) {
+            yield* handBack;
+            return;
+          }
+          const controller = new AbortController();
+          state.approvals.set(event.toolUseId, controller);
+          const result = yield* Effect.result(
+            Effect.tryPromise({
+              try: () =>
+                canUseTool(
+                  "AskUserQuestion",
+                  { questions: event.questions },
+                  {
+                    signal: controller.signal,
+                    toolUseID: event.toolUseId,
+                    requestId: event.toolUseId,
+                  },
+                ),
+              catch: (cause) => runnerError(cause, "canUseTool"),
+            }),
           );
+          state.approvals.delete(event.toolUseId);
+          if (state.closed) return;
+          if (state.settledElsewhere.delete(event.toolUseId)) return;
+          if (result._tag === "Failure" || result.success === null) {
+            yield* handBack;
+            return;
+          }
+          const decision = result.success;
+          if (decision.behavior !== "allow") {
+            yield* registry.send(bridgeProcess, {
+              type: "answer",
+              toolUseId: event.toolUseId,
+              decision: "deny",
+              reason: decision.message,
+            });
+            return;
+          }
+          const given = isRecord(decision.updatedInput) ? decision.updatedInput.answers : null;
+          const answers: Record<string, string> = {};
+          if (isRecord(given)) {
+            for (const [question, answer] of Object.entries(given)) {
+              if (typeof answer === "string") answers[question] = answer;
+            }
+          }
+          yield* registry.send(bridgeProcess, {
+            type: "answer",
+            toolUseId: event.toolUseId,
+            decision: "answer",
+            answers,
+          });
+        });
+
+      const settleElsewhere = (toolUseId: string) =>
+        Effect.sync(() => {
+          const controller = state.approvals.get(toolUseId);
+          if (controller === undefined) return;
+          state.settledElsewhere.add(toolUseId);
+          controller.abort();
         });
 
       const handleEvent = (event: ClaudeBridgeEvent) =>
@@ -423,10 +620,39 @@ export const layer: Layer.Layer<
                 state.pendingPrompt = null;
               }
               yield* emit(translator.onTurnStart(event));
+              // Output a slash command printed just before its turn began.
+              yield* emit(state.heldOutput.splice(0));
               return;
             }
             case "turn.complete": {
+              // Whatever this turn still asked is over with it.
+              for (const toolUseId of [...state.approvals.keys()]) {
+                yield* settleElsewhere(toolUseId);
+              }
               state.pendingComplete = { event, seenAt: yield* Clock.currentTimeMillis };
+              return;
+            }
+            case "command.result": {
+              if (state.pendingPrompt?.commandId !== event.commandId) return;
+              const pending = state.pendingPrompt;
+              state.pendingPrompt = null;
+              if (event.startedTurn) return;
+              state.pendingLocal = {
+                commandId: event.commandId,
+                promptUuid: pending.promptUuid,
+                label: pending.label ?? "(slash command)",
+                ok: event.ok,
+                text: event.text,
+                seenAt: yield* Clock.currentTimeMillis,
+              };
+              return;
+            }
+            case "question.request": {
+              yield* resolveQuestion(event).pipe(Effect.forkIn(sessionScope));
+              return;
+            }
+            case "question.resolved": {
+              if (event.by !== "t3") yield* settleElsewhere(event.toolUseId);
               return;
             }
             case "prompt.dropped": {
@@ -457,8 +683,10 @@ export const layer: Layer.Layer<
               yield* endSession(event.reason);
               return;
             }
-            case "approval.resolved":
+            case "approval.resolved": {
+              if (event.by !== "t3") yield* settleElsewhere(event.toolUseId);
               return;
+            }
             case "error": {
               yield* Effect.logWarning("claude-bridge.mod-error", { sid, message: event.message });
               return;
@@ -493,11 +721,47 @@ export const layer: Layer.Layer<
               typeof message.uuid === "string"
                 ? message.uuid
                 : yield* crypto.randomUUIDv4.pipe(Effect.orDie);
-            const pending = { commandId: "", promptUuid };
+            // A slash command runs as a command in the session, exactly as if
+            // typed there: Claude Code refuses one sent as prompt text.
+            const slash = parseClaudeSlashCommandText(text);
+            if (slash !== null) {
+              const live = (yield* registry.readSession(bridgeProcess)) ?? bridgeProcess.session;
+              if (live.protocol < CLAUDE_BRIDGE_WINDOW_PROTOCOL) {
+                return yield* runnerError(
+                  new Error(
+                    `This Claude Code session still runs an older T3 bridge (${live.modVersion}). Type /reload-plugins in its terminal, or restart the session, and slash commands will run from here.`,
+                  ),
+                  "offer",
+                );
+              }
+              const commands = yield* registry.readCommands(bridgeProcess);
+              if (commands === null || commands.some((command) => command.name === slash.name)) {
+                const label =
+                  slash.args.length === 0 ? `/${slash.name}` : `/${slash.name} ${slash.args}`;
+                const pending = { commandId: "", promptUuid, label };
+                state.pendingPrompt = pending;
+                pending.commandId = yield* registry.send(bridgeProcess, {
+                  type: "command",
+                  name: slash.name,
+                  args: slash.args,
+                  promptUuid,
+                });
+                yield* logProtocolEvent({
+                  direction: "outgoing",
+                  stage: "decoded",
+                  payload: { type: "bridge.command", name: slash.name, args: slash.args },
+                });
+                return;
+              }
+            }
+            const pending = { commandId: "", promptUuid, label: null };
             state.pendingPrompt = pending;
             pending.commandId = yield* registry.send(bridgeProcess, {
               type: "prompt",
-              text,
+              // Text that only looks like a command (a path, an unknown name)
+              // goes to the model as written; the leading space keeps Claude
+              // Code from refusing it as a command.
+              text: text.startsWith("/") ? ` ${text}` : text,
               promptUuid,
             });
             yield* logProtocolEvent({

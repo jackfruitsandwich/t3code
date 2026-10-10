@@ -17,6 +17,7 @@ import * as SqlClient from "effect/sql/SqlClient";
 import * as SessionImporter from "../import/Services/SessionImporter.ts";
 import { CLAUDE_PROVIDER } from "../orchestration-v2/Adapters/ClaudeAdapterV2.ts";
 import * as ProviderContinuationRequests from "../orchestration-v2/ProviderContinuationRequests.ts";
+import { isClaudeHarnessPrompt } from "./ClaudeBridgeProtocol.ts";
 import * as ClaudeBridgeRegistry from "./ClaudeBridgeRegistry.ts";
 
 const make = Effect.gen(function* () {
@@ -101,18 +102,7 @@ const make = Effect.gen(function* () {
   }
 });
 
-/**
- * Whether a terminal turn's prompt came from the Claude Code harness rather
- * than the person: task-completion notices, hook feedback, interruptions.
- */
-export function isHarnessPrompt(text: string): boolean {
-  const head = text.trimStart();
-  return (
-    head.startsWith("<task-notification>") ||
-    head.startsWith("<system-reminder>") ||
-    head.startsWith("Stop hook feedback:") ||
-    head.startsWith("[Request interrupted")
-  );
-}
+/** Kept under this name for its callers; see `isClaudeHarnessPrompt`. */
+export const isHarnessPrompt = isClaudeHarnessPrompt;
 
 export const layer = Layer.effectDiscard(make);

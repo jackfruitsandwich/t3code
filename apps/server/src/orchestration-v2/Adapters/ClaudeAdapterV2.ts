@@ -90,7 +90,10 @@ import { resolveClaudeSdkExecutablePath } from "../../provider/Drivers/ClaudeExe
 import { planClaudeSkillDispatch } from "../../provider/Drivers/ClaudeSkillDispatch.ts";
 import { discoverClaudeSkills } from "../../provider/Drivers/ClaudeSkills.ts";
 import { compileClaudeModelSelection } from "../../claudeModelOptions.ts";
-import { claudeBridgeWakeDetail } from "../../claude-bridge/ClaudeBridgeProtocol.ts";
+import {
+  claudeBridgeWakeDetail,
+  isClaudeHarnessPrompt,
+} from "../../claude-bridge/ClaudeBridgeProtocol.ts";
 import * as ServerConfig from "../../config.ts";
 import { expandHomePath } from "../../pathExpansion.ts";
 import {
@@ -3171,7 +3174,12 @@ export function makeClaudeAdapterV2(
         const wakeBuffers = yield* Ref.make(
           new Map<
             string,
-            { readonly messages: ReadonlyArray<SDKMessage>; readonly detail: string | null }
+            {
+              readonly messages: ReadonlyArray<SDKMessage>;
+              readonly detail: string | null;
+              /** Whether `detail` is a prompt typed into the native process. */
+              readonly typed?: boolean;
+            }
           >(),
         );
         // Background work that ended and has not been named by a wake offer yet,
@@ -5396,6 +5404,9 @@ export function makeClaudeAdapterV2(
             updated.set(wakeInput.nativeThreadId, {
               messages: [...(existing?.messages ?? []), message],
               detail: notificationSummary ?? typedPromptDetail ?? existing?.detail ?? null,
+              typed:
+                notificationSummary === null &&
+                (typedPromptDetail !== null || existing?.typed === true),
             });
             return updated;
           });
@@ -5454,8 +5465,12 @@ export function makeClaudeAdapterV2(
           if (!shouldOffer) {
             return;
           }
-          const detail =
-            (yield* Ref.get(wakeBuffers)).get(wakeInput.nativeThreadId)?.detail ?? null;
+          const wakeBuffer = (yield* Ref.get(wakeBuffers)).get(wakeInput.nativeThreadId);
+          const detail = wakeBuffer?.detail ?? null;
+          // A prompt the person typed in the terminal is their message here too;
+          // without this it would be filed as background activity.
+          const typedByPerson =
+            wakeBuffer?.typed === true && detail !== null && !isClaudeHarnessPrompt(detail);
           const reports = yield* takeWakeReports(wakeInput.nativeThreadId);
           const notification = backgroundWorkNotification(
             [...(reports?.values() ?? [])].map((entry) => entry.report),
@@ -5471,6 +5486,7 @@ export function makeClaudeAdapterV2(
             driver: CLAUDE_PROVIDER,
             detail,
             ...(notification === null ? {} : { notification }),
+            ...(typedByPerson && notification === null ? { createdBy: "user" as const } : {}),
           });
         });
 
@@ -6751,6 +6767,10 @@ export function makeClaudeAdapterV2(
           toolName: Parameters<CanUseTool>[0],
           toolInput: Parameters<CanUseTool>[1],
           callbackOptions: Parameters<CanUseTool>[2],
+          // A bridged session has already applied its own permission mode and
+          // asks only what that mode leaves to the person; T3's runtime mode
+          // must not answer in their place.
+          origin: "sdk" | "bridge" = "sdk",
         ) {
           const context = yield* Ref.get(activeTurn);
           if (context === null) {
@@ -6888,7 +6908,7 @@ export function makeClaudeAdapterV2(
             } satisfies PermissionResult;
           }
 
-          if (!requiresClaudeApproval(context)) {
+          if (origin === "sdk" && !requiresClaudeApproval(context)) {
             return {
               behavior: "allow",
               updatedInput: toolInput,
@@ -6966,7 +6986,7 @@ export function makeClaudeAdapterV2(
         });
 
         const bridgeCanUseTool: CanUseTool = (toolName, toolInput, callbackOptions) =>
-          runPromise(canUseToolEffect(toolName, toolInput, callbackOptions));
+          runPromise(canUseToolEffect(toolName, toolInput, callbackOptions, "bridge"));
 
         const canUseTool: CanUseTool = (toolName, toolInput, callbackOptions) =>
           runPromise(

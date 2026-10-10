@@ -34,11 +34,14 @@ import {
   isClaudeBridgeSessionLive,
   parseClaudeBridgeEvent,
   parseClaudeBridgeSessionFile,
+  parseClaudeBridgeSlashCommands,
+  CLAUDE_BRIDGE_MOD_VERSION,
   type ClaudeBridgeCommand,
   type ClaudeBridgeCommandBody,
   type ClaudeBridgeEvent,
   type ClaudeBridgeInbox,
   type ClaudeBridgeSessionFile,
+  type ClaudeBridgeSlashCommand,
 } from "./ClaudeBridgeProtocol.ts";
 
 const EVENT_PUMP_INTERVAL_MS = 400;
@@ -99,6 +102,10 @@ export class ClaudeBridgeRegistry extends Context.Service<
     readonly readSession: (
       process: ClaudeBridgeProcess,
     ) => Effect.Effect<ClaudeBridgeSessionFile | null>;
+    /** The slash commands the process's session has, or null while the mod has not listed them. */
+    readonly readCommands: (
+      process: ClaudeBridgeProcess,
+    ) => Effect.Effect<ReadonlyArray<ClaudeBridgeSlashCommand> | null>;
     /** Appends a command to the process inbox and returns its id. */
     readonly send: (
       process: ClaudeBridgeProcess,
@@ -157,6 +164,42 @@ export function claudeLaunchEnvironment(
     ...rest
   } = environment;
   return { ...rest, [CLAUDE_BRIDGE_DIR_ENV]: bridgeDir };
+}
+
+/**
+ * The environment a Claude process of `home` runs under. Claude keeps its
+ * global state (trusted folders, onboarding, account) in `~/.claude.json` only
+ * while `CLAUDE_CONFIG_DIR` is unset; naming the default home explicitly makes
+ * it read `~/.claude/.claude.json` instead, which holds no trusted folder, so
+ * every background launch there is refused as untrusted. The default home is
+ * therefore selected by leaving the variable out.
+ */
+export function claudeHomeEnvironment(
+  environment: NodeJS.ProcessEnv,
+  home: string,
+  defaultHome: string,
+): NodeJS.ProcessEnv {
+  if (home === defaultHome) {
+    const { CLAUDE_CONFIG_DIR: _configDir, ...rest } = environment;
+    return rest;
+  }
+  return { ...environment, CLAUDE_CONFIG_DIR: home };
+}
+
+/**
+ * Marks `folder` trusted in the parsed content of a Claude global state file,
+ * keeping everything else. Returns null when it already is, or when the
+ * content is not the object Claude writes (never invent that file).
+ */
+export function withTrustedClaudeFolder(state: unknown, folder: string): unknown | null {
+  if (!isRecord(state)) return null;
+  const projects = isRecord(state.projects) ? state.projects : {};
+  const existing = isRecord(projects[folder]) ? projects[folder] : {};
+  if (existing.hasTrustDialogAccepted === true) return null;
+  return {
+    ...state,
+    projects: { ...projects, [folder]: { ...existing, hasTrustDialogAccepted: true } },
+  };
 }
 
 /**
@@ -244,6 +287,21 @@ const make = Effect.gen(function* () {
     path.join(serverConfig.stateDir, "claude-bridge"),
   ).pipe(Effect.orDie);
 
+  /** `~/.claude` as the launched processes see it. */
+  const defaultHomeFor = (environment: NodeJS.ProcessEnv) =>
+    path.join(environment.HOME ?? hostEnvironment.HOME ?? "", ".claude");
+  const homeEnvironment = (environment: NodeJS.ProcessEnv, home: string) =>
+    claudeHomeEnvironment(environment, home, defaultHomeFor(environment));
+
+  // What a running mod compares itself with: a process on an older mod loads
+  // this one by itself the next time it is idle.
+  yield* fs
+    .writeFileString(
+      path.join(claudeDir, "mod-version.json"),
+      encodeJson({ version: CLAUDE_BRIDGE_MOD_VERSION }),
+    )
+    .pipe(Effect.ignore);
+
   const subscribers = new Map<string, ClaudeBridgeEventHandler>();
   const unattachedHandlers = new Set<ClaudeBridgeEventHandler>();
 
@@ -313,6 +371,11 @@ const make = Effect.gen(function* () {
 
   const readSession = (entry: ClaudeBridgeProcess) =>
     readJson(path.join(entry.dir, "session.json")).pipe(Effect.map(parseClaudeBridgeSessionFile));
+
+  const readCommands = (entry: ClaudeBridgeProcess) =>
+    readJson(path.join(entry.dir, "commands.json")).pipe(
+      Effect.map(parseClaudeBridgeSlashCommands),
+    );
 
   // One writer per inbox (this server), so read-modify-write is safe; the
   // atomic rename keeps the mod from reading a half-written file.
@@ -509,7 +572,7 @@ const make = Effect.gen(function* () {
     runClaude({
       binaryPath: input.binaryPath,
       cwd: input.cwd,
-      environment: { ...input.environment, CLAUDE_CONFIG_DIR: home },
+      environment: homeEnvironment(input.environment, home),
       args: ["agents", "--json"],
     }).pipe(
       Effect.map((output) => {
@@ -577,12 +640,39 @@ const make = Effect.gen(function* () {
       .exists(path.join(input.configDir, "jobs", input.sid.slice(0, 8), "state.json"))
       .pipe(Effect.orElseSucceed(() => false));
 
+  /**
+   * Records the thread's folder as trusted in the home's global state file.
+   * T3 already runs Claude in that folder over the SDK, which asks for no
+   * trust; a background launch reads the saved answer instead of asking, so a
+   * folder nobody opened in a terminal would otherwise never start.
+   */
+  const trustWorkspace = (input: ClaudeBridgeLaunchInput) =>
+    Effect.gen(function* () {
+      const defaultHome = defaultHomeFor(input.environment);
+      const stateFile =
+        input.configDir === defaultHome
+          ? path.join(path.dirname(defaultHome), ".claude.json")
+          : path.join(input.configDir, ".claude.json");
+      const folder = yield* fs.realPath(input.cwd).pipe(Effect.orElseSucceed(() => input.cwd));
+      const next = withTrustedClaudeFolder(yield* readJson(stateFile), folder);
+      if (next === null) return false;
+      yield* writeFileStringAtomically({
+        filePath: stateFile,
+        contents: `${encodeJson(next)}\n`,
+      }).pipe(
+        Effect.provideService(FileSystem.FileSystem, fs),
+        Effect.provideService(Path.Path, path),
+      );
+      yield* Effect.logInfo("claude-bridge.workspace-trusted", { folder, stateFile });
+      return true;
+    }).pipe(Effect.orElseSucceed(() => false));
+
   const launch = (input: ClaudeBridgeLaunchInput) =>
     Effect.gen(function* () {
       const hasSavedOptions = yield* hasSavedJobOptions(input);
       // The process runs under the session's home, so it keeps that home's account.
-      const environment = { ...input.environment, CLAUDE_CONFIG_DIR: input.configDir };
-      const output = yield* runClaude({
+      const environment = homeEnvironment(input.environment, input.configDir);
+      const start = runClaude({
         binaryPath: input.binaryPath,
         args: claudeLaunchArgs(input, { hasSavedOptions }),
         cwd: input.cwd,
@@ -597,6 +687,13 @@ const make = Effect.gen(function* () {
             }),
         ),
       );
+      let output = yield* start;
+      if (
+        /not trusted/i.test(`${output.stdout}\n${output.stderr}`) &&
+        (yield* trustWorkspace(input))
+      ) {
+        output = yield* start;
+      }
       const text = `${output.stdout}\n${output.stderr}`;
       const copy = /started a copy[^\n]*? as ([0-9a-f]{8})/i.exec(text);
       if (copy !== null) {
@@ -644,7 +741,7 @@ const make = Effect.gen(function* () {
           if (wasListed && !listed) {
             return yield* new ClaudeBridgeLaunchError({
               sid: input.sid,
-              detail: `Claude Code dropped the background job for session ${input.sid}: it could not resume it. The session's transcript may be missing from ${input.environment.CLAUDE_CONFIG_DIR ?? "~/.claude"}.`,
+              detail: `Claude Code dropped the background job for session ${input.sid}: it could not resume it. The session's transcript may be missing from ${input.configDir}.`,
             });
           }
           wasListed = wasListed || listed;
@@ -664,6 +761,7 @@ const make = Effect.gen(function* () {
     listLiveProcesses,
     findLiveProcess,
     readSession,
+    readCommands,
     send,
     heartbeat,
     clearHeartbeat,
@@ -695,6 +793,7 @@ export const layerTest = Layer.succeed(
     listLiveProcesses: Effect.succeed([]),
     findLiveProcess: () => Effect.succeed(null),
     readSession: () => Effect.succeed(null),
+    readCommands: () => Effect.succeed(null),
     send: () => Effect.succeed("unused"),
     heartbeat: () => Effect.void,
     clearHeartbeat: () => Effect.void,

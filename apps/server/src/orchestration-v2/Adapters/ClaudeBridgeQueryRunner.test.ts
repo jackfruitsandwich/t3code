@@ -24,133 +24,350 @@ const userMessage = (content: SDKUserMessage["message"]["content"]): SDKUserMess
   parent_tool_use_id: null,
 });
 
+/** A runner attached to one fake live process; what T3 sends to the mod lands in `commands`. */
+const attach = (input: {
+  readonly protocol: number;
+  readonly slashCommands?: ReadonlyArray<string>;
+  readonly bridgeCanUseTool: (
+    tool: string,
+    toolInput: Record<string, unknown>,
+    toolUseId: string,
+    signal: AbortSignal,
+  ) => PermissionResult | null | Promise<PermissionResult | null>;
+}) =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-bridge-runner-" });
+    const transcriptPath = `${root}/transcript.jsonl`;
+    yield* fs.writeFileString(transcriptPath, "");
+    const now = yield* Clock.currentTimeMillis;
+    const process: ClaudeBridgeRegistry.ClaudeBridgeProcess = {
+      sid: "bridge-session",
+      instanceId: "bridge-instance",
+      dir: root,
+      session: {
+        protocol: input.protocol,
+        sid: "bridge-session",
+        instanceId: "bridge-instance",
+        cwd: root,
+        configDir: root,
+        transcriptPath,
+        surfaces: ["terminal"],
+        isInteractive: true,
+        terminalPresent: true,
+        startedAt: now,
+        heartbeatAt: now,
+        model: "claude-sonnet-4-6",
+        permissionMode: "default",
+        effort: null,
+        commandsRev: 1,
+        activeTurn: null,
+        modVersion: "test",
+        ended: null,
+      },
+    };
+    const commands = yield* Queue.unbounded<ClaudeBridgeCommandBody>();
+    const subscribed = yield* Deferred.make<ClaudeBridgeRegistry.ClaudeBridgeEventHandler>();
+    const registry = ClaudeBridgeRegistry.ClaudeBridgeRegistry.of({
+      bridgeDir: root,
+      plugin: { marketplaceDir: root, pluginDir: root },
+      isPluginInstalled: () => Effect.succeed(true),
+      listLiveProcesses: Effect.succeed([process]),
+      findLiveProcess: () => Effect.succeed(process),
+      readSession: () => Effect.succeed(process.session),
+      readCommands: () =>
+        Effect.succeed(
+          input.slashCommands === undefined
+            ? null
+            : input.slashCommands.map((name) => ({ name, description: "", source: "builtin" })),
+        ),
+      send: (_process, command) => Queue.offer(commands, command).pipe(Effect.as("command-1")),
+      heartbeat: () => Effect.void,
+      clearHeartbeat: () => Effect.void,
+      subscribe: (_sid, handler) => Deferred.succeed(subscribed, handler).pipe(Effect.asVoid),
+      onUnattachedEvent: () => Effect.void,
+      launch: () => Effect.die("This test must attach without launching Claude."),
+      findTerminalHome: () => Effect.succeed(null),
+      findSessionHome: () => Effect.succeed(root),
+    });
+    const services = yield* Layer.build(ClaudeBridgeQueryRunner.layer).pipe(
+      Effect.provideService(ClaudeBridgeRegistry.ClaudeBridgeRegistry, registry),
+      Effect.provideService(
+        ProviderEventLoggers.ProviderEventLoggers,
+        ProviderEventLoggers.NoOpProviderEventLoggers,
+      ),
+      Effect.provideService(HostProcessEnvironment, { CLAUDE_CONFIG_DIR: root }),
+      Effect.provideService(HostProcessWorkingDirectory, root),
+    );
+    const runner = Context.get(services, ClaudeAdapterV2.ClaudeAgentSdkQueryRunner);
+    const counts = { sdkCalls: 0 };
+    const bridgeCalls: Array<{
+      tool: string;
+      input: Record<string, unknown>;
+      toolUseId: string;
+    }> = [];
+    const session = yield* runner.open({
+      threadId: ThreadId.make("bridge-thread"),
+      providerSessionId: ProviderSessionId.make("bridge-provider-session"),
+      options: {
+        resume: process.sid,
+        cwd: root,
+        model: "claude-sonnet-4-6",
+        tools: [],
+        permissionMode: "default",
+        canUseTool: () => {
+          counts.sdkCalls += 1;
+          return Promise.resolve({ behavior: "deny", message: "SDK callback must not run." });
+        },
+      },
+      bridgeCanUseTool: (tool, toolInput, options) => {
+        bridgeCalls.push({ tool, input: toolInput, toolUseId: options.toolUseID });
+        return Promise.resolve(
+          input.bridgeCanUseTool(tool, toolInput, options.toolUseID, options.signal),
+        );
+      },
+    });
+    yield* Effect.addFinalizer(() => session.close.pipe(Effect.orDie));
+    const handler = yield* Deferred.await(subscribed);
+    return { session, handler, commands, process, bridgeCalls, counts, now };
+  });
+
 describe("ClaudeBridgeQueryRunner permissions", () => {
   const cases: ReadonlyArray<{
     name: string;
     result: PermissionResult | null;
-    expected: ClaudeBridgeCommandBody;
+    expected: ReadonlyArray<ClaudeBridgeCommandBody>;
   }> = [
     {
       name: "returns an unowned request to native permission handling",
       result: null,
-      expected: { type: "approval", toolUseId: "tool-1", decision: "ask" },
+      expected: [{ type: "approval", toolUseId: "tool-1", decision: "ask" }],
     },
     {
       name: "preserves a real denial and its reason",
       result: { behavior: "deny", message: "The user denied this command." },
-      expected: {
-        type: "approval",
-        toolUseId: "tool-1",
-        decision: "deny",
-        reason: "The user denied this command.",
-      },
+      expected: [
+        {
+          type: "approval",
+          toolUseId: "tool-1",
+          decision: "deny",
+          reason: "The user denied this command.",
+        },
+      ],
     },
     {
       name: "forwards an approved request",
       result: { behavior: "allow" },
-      expected: { type: "approval", toolUseId: "tool-1", decision: "allow" },
+      expected: [{ type: "approval", toolUseId: "tool-1", decision: "allow" }],
+    },
+    {
+      name: "keeps an approval for the session as a session grant",
+      result: {
+        behavior: "allow",
+        updatedPermissions: [
+          {
+            type: "addRules",
+            rules: [{ toolName: "Bash" }],
+            behavior: "allow",
+            destination: "session",
+          },
+        ],
+      },
+      expected: [{ type: "approval", toolUseId: "tool-1", decision: "allow", scope: "session" }],
+    },
+    {
+      name: "stops the turn when the person cancels instead of declining",
+      result: { behavior: "deny", message: "User cancelled tool execution.", interrupt: true },
+      expected: [
+        {
+          type: "approval",
+          toolUseId: "tool-1",
+          decision: "deny",
+          reason: "User cancelled tool execution.",
+        },
+        { type: "interrupt" },
+      ],
     },
   ];
 
   it.effect.each(cases)("$name", (testCase) =>
     Effect.gen(function* () {
-      const fs = yield* FileSystem.FileSystem;
-      const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-bridge-permission-" });
-      const transcriptPath = `${root}/transcript.jsonl`;
-      yield* fs.writeFileString(transcriptPath, "");
-      const now = yield* Clock.currentTimeMillis;
-      const process: ClaudeBridgeRegistry.ClaudeBridgeProcess = {
-        sid: "bridge-permission-session",
-        instanceId: "bridge-permission-instance",
-        dir: root,
-        session: {
-          protocol: 1,
-          sid: "bridge-permission-session",
-          instanceId: "bridge-permission-instance",
-          cwd: root,
-          configDir: root,
-          transcriptPath,
-          surfaces: ["terminal"],
-          isInteractive: true,
-          startedAt: now,
-          heartbeatAt: now,
-          model: "claude-sonnet-4-6",
-          activeTurn: null,
-          modVersion: "test",
-          ended: null,
-        },
-      };
-      const commands = yield* Queue.unbounded<ClaudeBridgeCommandBody>();
-      const subscribed = yield* Deferred.make<ClaudeBridgeRegistry.ClaudeBridgeEventHandler>();
-      const registry = ClaudeBridgeRegistry.ClaudeBridgeRegistry.of({
-        bridgeDir: root,
-        plugin: { marketplaceDir: root, pluginDir: root },
-        isPluginInstalled: () => Effect.succeed(true),
-        listLiveProcesses: Effect.succeed([process]),
-        findLiveProcess: () => Effect.succeed(process),
-        readSession: () => Effect.succeed(process.session),
-        send: (_process, command) => Queue.offer(commands, command).pipe(Effect.as("command-1")),
-        heartbeat: () => Effect.void,
-        clearHeartbeat: () => Effect.void,
-        subscribe: (_sid, handler) => Deferred.succeed(subscribed, handler).pipe(Effect.asVoid),
-        onUnattachedEvent: () => Effect.void,
-        launch: () => Effect.die("This test must attach without launching Claude."),
-        findTerminalHome: () => Effect.succeed(null),
-        findSessionHome: () => Effect.succeed(root),
-      });
-      const services = yield* Layer.build(ClaudeBridgeQueryRunner.layer).pipe(
-        Effect.provideService(ClaudeBridgeRegistry.ClaudeBridgeRegistry, registry),
-        Effect.provideService(
-          ProviderEventLoggers.ProviderEventLoggers,
-          ProviderEventLoggers.NoOpProviderEventLoggers,
-        ),
-        Effect.provideService(HostProcessEnvironment, { CLAUDE_CONFIG_DIR: root }),
-        Effect.provideService(HostProcessWorkingDirectory, root),
-      );
-      const runner = Context.get(services, ClaudeAdapterV2.ClaudeAgentSdkQueryRunner);
-      let sdkCalls = 0;
-      const bridgeCalls: Array<{
-        tool: string;
-        input: Record<string, unknown>;
-        toolUseId: string;
-      }> = [];
-      const session = yield* runner.open({
-        threadId: ThreadId.make("bridge-permission-thread"),
-        providerSessionId: ProviderSessionId.make("bridge-permission-provider-session"),
-        options: {
-          resume: process.sid,
-          cwd: root,
-          model: "claude-sonnet-4-6",
-          tools: [],
-          permissionMode: "default",
-          canUseTool: () => {
-            sdkCalls += 1;
-            return Promise.resolve({ behavior: "deny", message: "SDK callback must not run." });
-          },
-        },
-        bridgeCanUseTool: (tool, input, options) => {
-          bridgeCalls.push({ tool, input, toolUseId: options.toolUseID });
-          return Promise.resolve(testCase.result);
-        },
-      });
-      yield* Effect.addFinalizer(() => session.close.pipe(Effect.orDie));
-      const handler = yield* Deferred.await(subscribed);
-      yield* handler(
+      const bridge = yield* attach({ protocol: 2, bridgeCanUseTool: () => testCase.result });
+      yield* bridge.handler(
         {
           type: "approval.request",
           seq: 1,
-          at: now,
+          at: bridge.now,
           toolUseId: "tool-1",
           tool: "Bash",
           input: { command: "pwd" },
         },
-        process,
+        bridge.process,
       );
-      assert.deepStrictEqual(yield* Queue.take(commands), testCase.expected);
-      assert.deepStrictEqual(bridgeCalls, [
+      for (const expected of testCase.expected) {
+        assert.deepStrictEqual(yield* Queue.take(bridge.commands), expected);
+      }
+      assert.deepStrictEqual(bridge.bridgeCalls, [
         { tool: "Bash", input: { command: "pwd" }, toolUseId: "tool-1" },
       ]);
-      assert.strictEqual(sdkCalls, 0);
+      assert.strictEqual(bridge.counts.sdkCalls, 0);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("sends nothing back for a request the session settled without T3", () =>
+    Effect.gen(function* () {
+      const bridge = yield* attach({
+        protocol: 2,
+        bridgeCanUseTool: (_tool, _input, toolUseId, signal) =>
+          toolUseId === "tool-1"
+            ? // The person has not answered in T3; the wait ends only when aborted.
+              new Promise<PermissionResult>((resolve) => {
+                signal.addEventListener("abort", () =>
+                  resolve({ behavior: "deny", message: "User cancelled tool execution." }),
+                );
+              })
+            : { behavior: "allow" },
+      });
+      const request = (toolUseId: string) =>
+        bridge.handler(
+          {
+            type: "approval.request",
+            seq: 1,
+            at: bridge.now,
+            toolUseId,
+            tool: "Bash",
+            input: { command: "pwd" },
+          },
+          bridge.process,
+        );
+      yield* request("tool-1");
+      yield* bridge.handler(
+        {
+          type: "approval.resolved",
+          seq: 2,
+          at: bridge.now,
+          toolUseId: "tool-1",
+          decision: "allow",
+          by: "terminal",
+        },
+        bridge.process,
+      );
+      yield* request("tool-2");
+      // The first thing T3 says is about the second request: the settled one got no reply.
+      assert.deepStrictEqual(yield* Queue.take(bridge.commands), {
+        type: "approval",
+        toolUseId: "tool-2",
+        decision: "allow",
+      });
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+});
+
+describe("ClaudeBridgeQueryRunner questions", () => {
+  it.effect("answers a question with the person's answers, not with an approval", () =>
+    Effect.gen(function* () {
+      const questions = [
+        { question: "Which one?", header: "Pick", multiSelect: false, options: [] },
+      ];
+      const bridge = yield* attach({
+        protocol: 2,
+        bridgeCanUseTool: (_tool, toolInput) => ({
+          behavior: "allow",
+          updatedInput: { questions: toolInput.questions, answers: { "Which one?": "Beta" } },
+        }),
+      });
+      yield* bridge.handler(
+        { type: "question.request", seq: 1, at: bridge.now, toolUseId: "ask-1", questions },
+        bridge.process,
+      );
+      assert.deepStrictEqual(yield* Queue.take(bridge.commands), {
+        type: "answer",
+        toolUseId: "ask-1",
+        decision: "answer",
+        answers: { "Which one?": "Beta" },
+      });
+      assert.deepStrictEqual(bridge.bridgeCalls, [
+        { tool: "AskUserQuestion", input: { questions }, toolUseId: "ask-1" },
+      ]);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("hands a question nobody in T3 owns back to the terminal dialog", () =>
+    Effect.gen(function* () {
+      const bridge = yield* attach({ protocol: 2, bridgeCanUseTool: () => null });
+      yield* bridge.handler(
+        { type: "question.request", seq: 1, at: bridge.now, toolUseId: "ask-2", questions: [] },
+        bridge.process,
+      );
+      assert.deepStrictEqual(yield* Queue.take(bridge.commands), {
+        type: "answer",
+        toolUseId: "ask-2",
+        decision: "ask",
+      });
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+});
+
+describe("ClaudeBridgeQueryRunner slash commands", () => {
+  it.effect("runs a slash command as a command in the session, not as prompt text", () =>
+    Effect.gen(function* () {
+      const bridge = yield* attach({
+        protocol: 2,
+        slashCommands: ["model", "goal"],
+        bridgeCanUseTool: () => null,
+      });
+      yield* bridge.session.offer({
+        ...userMessage("/model claude-opus-5-5"),
+        uuid: "00000000-0000-4000-8000-000000000001",
+      });
+      assert.deepStrictEqual(yield* Queue.take(bridge.commands), {
+        type: "command",
+        name: "model",
+        args: "claude-opus-5-5",
+        promptUuid: "00000000-0000-4000-8000-000000000001",
+      });
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("sends text that only looks like a command to the model as written", () =>
+    Effect.gen(function* () {
+      const bridge = yield* attach({
+        protocol: 2,
+        slashCommands: ["model"],
+        bridgeCanUseTool: () => null,
+      });
+      yield* bridge.session.offer({
+        ...userMessage("/Users/jack/notes.md is stale"),
+        uuid: "00000000-0000-4000-8000-000000000002",
+      });
+      assert.deepStrictEqual(yield* Queue.take(bridge.commands), {
+        type: "prompt",
+        text: " /Users/jack/notes.md is stale",
+        promptUuid: "00000000-0000-4000-8000-000000000002",
+      });
+      yield* bridge.session.offer({
+        ...userMessage("/nosuchcommand now"),
+        uuid: "00000000-0000-4000-8000-000000000003",
+      });
+      assert.deepStrictEqual(yield* Queue.take(bridge.commands), {
+        type: "prompt",
+        text: " /nosuchcommand now",
+        promptUuid: "00000000-0000-4000-8000-000000000003",
+      });
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("says so when the session still runs a mod that cannot run commands", () =>
+    Effect.gen(function* () {
+      const bridge = yield* attach({ protocol: 1, bridgeCanUseTool: () => null });
+      const result = yield* Effect.result(
+        bridge.session.offer({
+          ...userMessage("/compact"),
+          uuid: "00000000-0000-4000-8000-000000000004",
+        }),
+      );
+      assert.strictEqual(result._tag, "Failure");
+      assert.strictEqual(yield* Queue.size(bridge.commands), 0);
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 });

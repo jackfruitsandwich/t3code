@@ -64,18 +64,23 @@ const HOOKS_JSON = JSON.stringify(
   2,
 );
 
-const REGISTER_JS = `// t3bridge ${CLAUDE_BRIDGE_MOD_VERSION}: live sync between this Claude Code session and T3 Code.
+const REGISTER_JS = `// t3bridge ${CLAUDE_BRIDGE_MOD_VERSION}: makes T3 Code a window onto this Claude Code session.
 // Files, under <bridge root>/claude/<session id>/<instance id>/:
 //   session.json       this process, rewritten every few seconds (heartbeat)
-//   inbox.json         commands from T3; inbox-cursor.json marks the last seq handled
+//   commands.json      the slash commands this session has, rewritten when they change
+//   inbox.json         requests from T3; inbox-cursor.json marks the last seq handled
 //   events/<seq>.json  events for T3, one file each; T3 deletes what it has read
 //   t3.json            T3's own heartbeat while it is attached
-const PROTOCOL = 1
+// <bridge root>/claude/mod-version.json names the mod version the server ships.
+const PROTOCOL = 2
 const MOD_VERSION = '${CLAUDE_BRIDGE_MOD_VERSION}'
 const HEARTBEAT_MS = 3000
 const INBOX_POLL_MS = 500
+const COMMANDS_REFRESH_MS = 60000
 const T3_LIVE_MS = 12000
 const PROMPT_MATCH_WINDOW_MS = 20000
+const COMMAND_TURN_WAIT_MS = 1500
+const COMMAND_PANEL_WAIT_MS = 6000
 
 const instanceId = Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8)
 let root = null
@@ -93,11 +98,20 @@ let inboxSeq = 0
 let eventSeq = 0
 let ended = null
 let timersStarted = false
+let permissionMode = null
+let effort = null
+let commandsBody = ''
+let commandsRev = 0
+// Terminal clients attached to a background session, by client id.
+const attached = new Set()
 // A session an SDK host drives (T3's own first turn, claude -p, the Agent
 // SDK) draws on no surface and takes no typed prompts: nothing to bridge, and
 // its turns must not look like terminal turns to T3.
 let passive = false
 const decisions = new Map()
+const answers = new Map()
+// Tool calls the person allowed for the rest of this session from T3.
+const grants = []
 // Stale-tip guard state: message rows present when this process started, and
 // the rows it appended itself. Any other row means another process moved the
 // conversation on.
@@ -157,6 +171,17 @@ async function transcriptOffset($) {
   try { return (await $.fs.stat(transcriptPath)).size } catch { return 0 }
 }
 
+// What the classic hook payloads say about the session right now.
+function noteClassic(e) {
+  if (!e) return
+  if (typeof e.permission_mode === 'string') permissionMode = e.permission_mode
+  if (e.effort && typeof e.effort.level === 'string') effort = e.effort.level
+}
+
+function terminalPresent() {
+  return isInteractive || attached.size > 0
+}
+
 async function heartbeat($) {
   if (!dir || passive) return
   try { surfaces = await $.session.surfaces() } catch { surfaces = [] }
@@ -171,13 +196,29 @@ async function heartbeat($) {
     transcriptPath: transcriptPath,
     surfaces: surfaces,
     isInteractive: isInteractive,
+    terminalPresent: terminalPresent(),
     startedAt: startedAt,
     heartbeatAt: Date.now(),
     model: model,
+    permissionMode: permissionMode,
+    effort: effort,
+    commandsRev: commandsRev,
     activeTurn: activeTurn,
     modVersion: MOD_VERSION,
     ended: ended,
   })
+}
+
+// The slash commands this session has, as its own typeahead lists them.
+async function refreshCommands($) {
+  if (!dir || passive) return
+  let list
+  try { list = await $.command.list() } catch { return }
+  const body = JSON.stringify(list.map((c) => ({ name: c.name, description: c.description, source: c.source })))
+  if (body === commandsBody) return
+  commandsBody = body
+  commandsRev += 1
+  try { await $.fs.write(dir + '/commands.json', body) } catch {}
 }
 
 async function t3Attached($) {
@@ -205,7 +246,26 @@ async function openSessionDir($) {
   ended = null
   activeTurn = null
   pendingCommand = null
+  commandsBody = ''
   await heartbeat($)
+  await refreshCommands($)
+  await heartbeat($)
+}
+
+// When the server ships a newer mod, load it here without the person doing
+// anything. Tried once per shipped version, so a reload that changes nothing
+// cannot loop.
+async function reloadIfOutdated($) {
+  if (!root || !sid || activeTurn || pendingCommand) return
+  let shipped
+  try { shipped = JSON.parse(await $.fs.read(root + '/claude/mod-version.json')) } catch { return }
+  if (!shipped || typeof shipped.version !== 'string' || shipped.version === MOD_VERSION) return
+  const key = 'reload:' + sid + ':' + instanceId
+  try {
+    if ((await $.store.get(key)) === shipped.version) return
+    await $.store.set(key, shipped.version)
+  } catch { return }
+  try { await $.command.run({ command: 'reload-plugins' }) } catch {}
 }
 
 async function pollInbox($) {
@@ -231,19 +291,68 @@ async function pollInbox($) {
   }
 }
 
+async function sleepOutsideBudget($) {
+  try { await $.process.run(['sleep', '1'], { timeoutMs: 5000 }) } catch {}
+}
+
+// Runs a slash command exactly as if the person typed it here. A command that
+// starts a turn (a skill, /goal <condition>) reports through that turn; one
+// that only prints reports its output; one that opened a panel in the
+// terminal is reported as waiting there, because nothing but the person can
+// close it.
+function runSlashCommand($, command) {
+  const label = '/' + command.name + (command.args ? ' ' + command.args : '')
+  pendingCommand = { id: command.id, text: label, promptUuid: command.promptUuid, at: Date.now() }
+  let settled = false
+  const mine = () => pendingCommand !== null && pendingCommand.id === command.id
+  $.clock.after(COMMAND_PANEL_WAIT_MS, () => {
+    if (settled || !mine()) return
+    settled = true
+    pendingCommand = null
+    emit($, 'command.result', {
+      commandId: command.id,
+      promptUuid: command.promptUuid,
+      ok: false,
+      waitingInTerminal: true,
+      startedTurn: false,
+      text: label + ' opened a panel in the Claude Code terminal and is waiting there. Close it in that terminal (Esc); nothing else runs in this session until then.',
+    }).catch(() => {})
+  })
+  $.command.run({ command: command.name, args: command.args || '' }).then(async (result) => {
+    if (settled) return
+    const deadline = Date.now() + COMMAND_TURN_WAIT_MS
+    while (Date.now() < deadline && mine()) {
+      try { await $.clock.sleep(100) } catch { break }
+    }
+    if (settled) return
+    settled = true
+    const startedTurn = !mine()
+    if (!startedTurn) pendingCommand = null
+    await emit($, 'command.result', {
+      commandId: command.id,
+      promptUuid: command.promptUuid,
+      ok: true,
+      startedTurn: startedTurn,
+      text: result && typeof result.text === 'string' ? result.text : '',
+    })
+    await refreshCommands($)
+    await heartbeat($)
+  }).catch(async (err) => {
+    if (settled) return
+    settled = true
+    if (mine()) pendingCommand = null
+    await emit($, 'command.result', { commandId: command.id, promptUuid: command.promptUuid, ok: false, startedTurn: false, text: String(err) })
+  })
+}
+
 async function handleCommand($, command) {
   if (command.type === 'prompt') {
     pendingCommand = { id: command.id, text: command.text, promptUuid: command.promptUuid, at: Date.now() }
-    // The person's half-typed draft survives a prompt T3 submits.
-    let draft = { text: '', cursor: 0 }
-    try { draft = await $.prompt.read() } catch {}
+    // The person's half-typed draft stays where it is: a submit does not touch it.
     $.prompt.submit({ text: command.text, asUser: true }).then(async (result) => {
       if (result && result.drop) {
         if (pendingCommand && pendingCommand.id === command.id) pendingCommand = null
         await emit($, 'prompt.dropped', { commandId: command.id, reason: String(result.drop) })
-      }
-      if (draft.text) {
-        try { await $.prompt.fill({ text: draft.text, mode: 'replace' }) } catch {}
       }
     }).catch(async (err) => {
       if (pendingCommand && pendingCommand.id === command.id) pendingCommand = null
@@ -251,8 +360,16 @@ async function handleCommand($, command) {
     })
     return
   }
+  if (command.type === 'command') {
+    runSlashCommand($, command)
+    return
+  }
   if (command.type === 'approval') {
     decisions.set(command.toolUseId, command)
+    return
+  }
+  if (command.type === 'answer') {
+    answers.set(command.toolUseId, command)
     return
   }
   if (command.type === 'interrupt') {
@@ -265,11 +382,39 @@ function startTimers($) {
   if (timersStarted || passive) return
   timersStarted = true
   $.clock.every(HEARTBEAT_MS, () => {
-    openSessionDir($).then(() => heartbeat($)).catch(() => {})
+    openSessionDir($).then(() => heartbeat($)).then(() => reloadIfOutdated($)).catch(() => {})
   })
   $.clock.every(INBOX_POLL_MS, () => {
     pollInbox($).catch(() => {})
   })
+  $.clock.every(COMMANDS_REFRESH_MS, () => {
+    refreshCommands($).then(() => heartbeat($)).catch(() => {})
+  })
+}
+
+function grantKey(e) {
+  let input = ''
+  try { input = JSON.stringify(e.input) } catch {}
+  return e.tool + ':' + input
+}
+
+function isGranted(e) {
+  const key = grantKey(e)
+  for (const grant of grants) {
+    if (grant.tool !== e.tool) continue
+    if (grant.wholeTool || grant.key === key) return true
+  }
+  return false
+}
+
+// While T3 is attached, the surface that started the turn answers it: a turn
+// T3 started is held for T3, and a turn typed in the terminal keeps Claude
+// Code's own dialog. A background session nobody has open is held for T3 too,
+// since its dialog would be shown to no one.
+async function heldForT3($) {
+  if (!(await t3Attached($))) return false
+  if (activeTurn && activeTurn.commandId) return true
+  return !terminalPresent()
 }
 
 export function register(on) {
@@ -290,7 +435,35 @@ export function register(on) {
   // known at session.start, which may come after this event.
   on('classic.SessionStart', async ($, e, next) => {
     transcriptPath = String(e.transcript_path || transcriptPath)
+    noteClassic(e)
     await takeBaseline($)
+    await heartbeat($)
+    return next(e)
+  })
+
+  on('classic.UserPromptSubmit', async ($, e, next) => {
+    noteClassic(e)
+    return next(e)
+  })
+
+  on('classic.PreToolUse', async ($, e, next) => {
+    noteClassic(e)
+    return next(e)
+  })
+
+  on('classic.Stop', async ($, e, next) => {
+    noteClassic(e)
+    return next(e)
+  })
+
+  on('session.attach', async ($, e, next) => {
+    if (e && typeof e.clientId === 'string') attached.add(e.clientId)
+    await heartbeat($)
+    return next(e)
+  })
+
+  on('session.detach', async ($, e, next) => {
+    if (e && typeof e.clientId === 'string') attached.delete(e.clientId)
     await heartbeat($)
     return next(e)
   })
@@ -349,14 +522,37 @@ export function register(on) {
     return next(e)
   })
 
-  // While T3 is attached it decides approvals: a background session reports a
-  // terminal surface whether or not anyone is attached to it, so there is no
-  // way to tell an unseen dialog from a seen one. The wait runs through host
-  // calls, which do not count against the hook's budget.
+  // A question Claude asks the person. Held for T3 it is answered with the
+  // answers themselves, as the terminal dialog would return them; a bare
+  // approval cannot answer a question.
+  on('tool.call', { tool: 'AskUserQuestion' }, async ($, e, next) => {
+    if (!e.tool_use_id || e.agentId || !(await heldForT3($))) return next(e)
+    const toolUseId = e.tool_use_id
+    await emit($, 'question.request', { toolUseId: toolUseId, questions: e.questions, turnId: activeTurn ? activeTurn.turnId : undefined })
+    for (;;) {
+      const answer = answers.get(toolUseId)
+      if (answer) {
+        answers.delete(toolUseId)
+        if (answer.decision === 'ask') return next(e)
+        await emit($, 'question.resolved', { toolUseId: toolUseId, by: 't3' })
+        if (answer.decision === 'deny') return { deny: answer.reason || 'The user declined to answer.' }
+        return { result: { questions: e.questions, answers: answer.answers || {} } }
+      }
+      if (!(await t3Attached($))) {
+        await emit($, 'question.resolved', { toolUseId: toolUseId, by: 'detached' })
+        return next(e)
+      }
+      await sleepOutsideBudget($)
+    }
+  })
+
+  // The wait runs through host calls, which do not count against the hook's
+  // budget.
   on('tool.check', async ($, e, next) => {
     const verdict = await next(e)
     if (!verdict || verdict.decision !== 'ask' || !e.tool_use_id || e.agentId) return verdict
-    if (!(await t3Attached($))) return verdict
+    if (isGranted(e)) return { decision: 'allow', reason: 'Allowed for this session in T3 Code' }
+    if (!(await heldForT3($))) return verdict
     const toolUseId = e.tool_use_id
     await emit($, 'approval.request', { toolUseId: toolUseId, tool: e.tool, input: e.input, reason: verdict.reason, turnId: activeTurn ? activeTurn.turnId : undefined })
     for (;;) {
@@ -365,15 +561,15 @@ export function register(on) {
         decisions.delete(toolUseId)
         if (decision.decision === 'ask') return verdict
         await emit($, 'approval.resolved', { toolUseId: toolUseId, decision: decision.decision, by: 't3' })
-        return decision.decision === 'allow'
-          ? { decision: 'allow', reason: 'Approved in T3 Code' }
-          : { decision: 'deny', reason: decision.reason || 'Denied in T3 Code' }
+        if (decision.decision !== 'allow') return { decision: 'deny', reason: decision.reason || 'Denied in T3 Code' }
+        if (decision.scope === 'session') grants.push({ tool: e.tool, key: grantKey(e), wholeTool: decision.wholeTool === true })
+        return { decision: 'allow', reason: 'Approved in T3 Code' }
       }
       if (!(await t3Attached($))) {
         await emit($, 'approval.resolved', { toolUseId: toolUseId, decision: 'ask', by: 'detached' })
         return verdict
       }
-      try { await $.process.run(['sleep', '1'], { timeoutMs: 5000 }) } catch {}
+      await sleepOutsideBudget($)
     }
   })
 
