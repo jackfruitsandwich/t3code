@@ -561,7 +561,6 @@ export const layer: Layer.Layer<
             size - state.byteOffset,
           );
           const decoder = new TextDecoder();
-          let typedMidTurn = false;
           let lineStart = 0;
           for (;;) {
             const newline = bytes.indexOf(0x0a, lineStart);
@@ -571,7 +570,12 @@ export const layer: Layer.Layer<
             lineStart = newline + 1;
             state.lastRowAt = yield* Clock.currentTimeMillis;
             if (row === undefined) continue;
-            typedMidTurn = typedMidTurn || isClaudeTypedMidTurnRow(row);
+            // What the person typed into the running turn is in the record
+            // only. It is placed in the thread now, before the rows that
+            // follow it are shown, so it sits where it was written.
+            if (isClaudeTypedMidTurnRow(row)) {
+              yield* registry.noteRecordChange(bridgeProcess, "typed-mid-turn");
+            }
             transcriptMode = claudeTranscriptPermissionMode(row) ?? transcriptMode;
             const commandText = claudeTranscriptCommandText(row);
             // The mod loading a newer version of itself: nobody asked for it.
@@ -623,8 +627,6 @@ export const layer: Layer.Layer<
               if (untilTurnEnd) break;
             }
           }
-          // What the person typed into the running turn is in the record only.
-          if (typedMidTurn) yield* registry.noteRecordChange(bridgeProcess, "typed-mid-turn");
         });
       const readNewRows = readRows(false);
 

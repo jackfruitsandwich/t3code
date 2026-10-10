@@ -136,6 +136,18 @@ const make = Effect.gen(function* () {
   yield* registry.onRecordChange((entry, change) =>
     Effect.gen(function* () {
       const sid = entry.sid;
+      // The attachment is waiting on this one: the message goes into the
+      // thread before the rows written after it are shown.
+      if (change === "typed-mid-turn") {
+        const session = (yield* registry.readSession(entry)) ?? entry.session;
+        if (session.transcriptPath.length > 0) {
+          yield* importer.healLiveClaudeSession({
+            sessionId: sid,
+            transcriptPath: session.transcriptPath,
+          });
+        }
+        return;
+      }
       const state = comparing.get(sid) ?? { passes: 0, running: false };
       comparing.set(sid, state);
       // A turn's own run is still closing just after it ends: once now for
