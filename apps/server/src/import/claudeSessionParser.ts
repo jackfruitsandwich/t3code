@@ -13,7 +13,11 @@
  *
  * @module import/claudeSessionParser
  */
-import { claudeTranscriptCommandText } from "../claude-bridge/ClaudeBridgeProtocol.ts";
+import {
+  claudeTranscriptCommandOutput,
+  claudeTranscriptCommandText,
+  stripTerminalStyling,
+} from "../claude-bridge/ClaudeBridgeProtocol.ts";
 import {
   isCommandNoiseText,
   isRecord,
@@ -133,7 +137,10 @@ export function parseClaudeSessionJsonl(content: string): ParsedCliSession {
     if (entry.isCompactSummary === true || entry.isVisibleInTranscriptOnly === true) {
       continue;
     }
-    if (entry.isSidechain === true || entry.isMeta === true) {
+    // A `!` command is the person's line whoever wrote its row: the bridge
+    // mod writes it for a command sent from T3, and its rows are meta rows.
+    const shellInput = claudeTranscriptCommandText(entry)?.startsWith("! ") === true;
+    if (entry.isSidechain === true || (entry.isMeta === true && !shellInput)) {
       continue;
     }
 
@@ -156,7 +163,13 @@ export function parseClaudeSessionJsonl(content: string): ParsedCliSession {
     // The terminal shows a slash command as `/name args` and what it printed
     // as output, not as the markup the transcript wraps them in.
     const commandText = claudeTranscriptCommandText(entry);
-    const commandOutput = LOCAL_COMMAND_STDOUT.exec(rawText)?.[1]?.trim();
+    // A slash command's output, or what a `!` command printed.
+    const localOutput = LOCAL_COMMAND_STDOUT.exec(rawText)?.[1];
+    const commandOutput = (
+      localOutput === undefined
+        ? (claudeTranscriptCommandOutput(entry) ?? undefined)
+        : stripTerminalStyling(localOutput)
+    )?.trim();
     if (commandText === null && commandOutput === undefined && localCommand) {
       continue;
     }

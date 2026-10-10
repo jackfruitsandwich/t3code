@@ -30,7 +30,7 @@ import type {
 import { isRecord, parseJsonlLine } from "../import/sessionImportTypes.ts";
 
 export const CLAUDE_BRIDGE_PROTOCOL_VERSION = 2;
-export const CLAUDE_BRIDGE_MOD_VERSION = "0.3.3";
+export const CLAUDE_BRIDGE_MOD_VERSION = "0.3.4";
 /**
  * The first protocol whose mod runs slash commands, answers questions with
  * their answers and reports the session's own commands. A process still on an
@@ -107,6 +107,8 @@ export type ClaudeBridgeCommandBody =
       readonly args: string;
       readonly promptUuid: string;
     }
+  /** A shell command run in the session without asking the model, as `!` does in the terminal. */
+  | { readonly type: "bash"; readonly command: string; readonly promptUuid: string }
   | {
       readonly type: "approval";
       readonly toolUseId: string;
@@ -536,7 +538,53 @@ export function parseClaudeSlashCommandText(
 
 const LOCAL_COMMAND_STDOUT = /^\s*<local-command-stdout>([\s\S]*)<\/local-command-stdout>\s*$/u;
 const COMMAND_NAME = /<command-name>\s*(\/[^<\s]+)\s*<\/command-name>/u;
+/** What `!` leaves in the record: the command, then what it printed. */
+const BASH_INPUT = /^\s*<bash-input>([\s\S]*)<\/bash-input>\s*$/u;
+const BASH_OUTPUT =
+  /^\s*<bash-stdout>([\s\S]*?)<\/bash-stdout>(?:\s*<bash-stderr>([\s\S]*?)<\/bash-stderr>)?\s*$/u;
+/** The first mod that runs `!` commands sent from T3. */
+export const CLAUDE_BRIDGE_BASH_MOD_VERSION = "0.3.4";
+/** Whether a mod version is at least `wanted` (`major.minor.patch`). */
+export function claudeBridgeModAtLeast(
+  version: string | null | undefined,
+  wanted: string,
+): boolean {
+  const parts = (text: string) => text.split(".").map((part) => Number.parseInt(part, 10) || 0);
+  const [have, want] = [parts(version ?? "0.0.0"), parts(wanted)];
+  for (let index = 0; index < 3; index += 1) {
+    if ((have[index] ?? 0) !== (want[index] ?? 0)) return (have[index] ?? 0) > (want[index] ?? 0);
+  }
+  return true;
+}
+/**
+ * How a turn is named when all that is known of its start is its prompt. A
+ * turn that follows a `!` command starts with what the command printed; the
+ * mod names it by the command, and one that could not is named plainly.
+ */
+export const claudeTurnPromptLabel = (text: string): string =>
+  BASH_OUTPUT.test(text) ? "! (shell command)" : text;
+/** `! command` of a row `!` wrote, else null. */
+const bashCommandText = (text: string): string | null => {
+  const command = BASH_INPUT.exec(text)?.[1]?.trim();
+  return command === undefined || command.length === 0 ? null : `! ${command}`;
+};
+/** What a `!` command printed, both streams, when the row is its output; else null. */
+const bashOutputText = (text: string): string | null => {
+  const match = BASH_OUTPUT.exec(text);
+  if (match === null) return null;
+  return [match[1] ?? "", match[2] ?? ""].filter((part) => part.trim().length > 0).join("\n");
+};
 const COMMAND_ARGS = /<command-args>([\s\S]*?)<\/command-args>/u;
+const ESCAPE = String.fromCharCode(27);
+const TERMINAL_STYLING = new RegExp(
+  `${ESCAPE}\\[[0-9;?]*[ -/]*[@-~]|${ESCAPE}\\][^${ESCAPE}\\u0007]*(?:\\u0007|${ESCAPE}\\\\)`,
+  "gu",
+);
+/**
+ * Command output as the terminal shows it: the record keeps the colour and
+ * dimming codes the terminal turns into styling, which are not text.
+ */
+export const stripTerminalStyling = (text: string): string => text.replace(TERMINAL_STYLING, "");
 
 const rowText = (row: Record<string, unknown>): string | null => {
   if (!isRecord(row.message)) return null;
@@ -571,7 +619,7 @@ export function claudeTranscriptCommandText(row: unknown): string | null {
   const text = commandRowText(row);
   if (text === null) return null;
   const name = COMMAND_NAME.exec(text)?.[1];
-  if (name === undefined) return null;
+  if (name === undefined) return bashCommandText(text);
   const args = COMMAND_ARGS.exec(text)?.[1]?.trim() ?? "";
   return args.length === 0 ? name : `${name} ${args}`;
 }
@@ -590,7 +638,9 @@ export function isClaudeBridgeModRow(row: unknown): boolean {
 export function claudeTranscriptCommandOutput(row: unknown): string | null {
   if (!isRecord(row)) return null;
   const text = commandRowText(row);
-  return text === null ? null : (LOCAL_COMMAND_STDOUT.exec(text)?.[1] ?? null);
+  const output =
+    text === null ? null : (LOCAL_COMMAND_STDOUT.exec(text)?.[1] ?? bashOutputText(text));
+  return output === null ? null : stripTerminalStyling(output);
 }
 
 /**
@@ -886,9 +936,7 @@ export function makeClaudeBridgeFrameTranslator(
         // What a slash command printed. Claude Code reports it to an SDK host
         // as a synthetic assistant message; the same frame here shows the
         // output and feeds the adapter's goal reader ("Goal set: ...").
-        const commandText = commandRowText(row);
-        const stdout =
-          commandText === null ? null : (LOCAL_COMMAND_STDOUT.exec(commandText)?.[1] ?? null);
+        const stdout = claudeTranscriptCommandOutput(row);
         if (stdout !== null) {
           if (stdout.trim().length === 0) return [];
           const frame = {

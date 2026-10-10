@@ -226,6 +226,41 @@ describe("parseClaudeSessionJsonl", () => {
     );
   });
 
+  it("shows a ! command and what it printed, without the terminal's styling codes", () => {
+    const escape = String.fromCharCode(27);
+    const parsed = parseClaudeSessionJsonl(
+      line(userEntry()) +
+        line(assistantEntry()) +
+        line(
+          userEntry({
+            uuid: "bash-1",
+            // As the bridge mod writes it for a command sent from T3.
+            isMeta: true,
+            origin: { kind: "plugin", name: "t3bridge" },
+            message: { role: "user", content: "<bash-input>echo hi</bash-input>" },
+          }),
+        ) +
+        line(
+          userEntry({
+            uuid: "bash-2",
+            message: {
+              role: "user",
+              content: `<bash-stdout>${escape}[32mhi${escape}[0m\n</bash-stdout><bash-stderr></bash-stderr>`,
+            },
+          }),
+        ),
+    );
+    assert.deepEqual(
+      parsed.messages.map((message) => [message.role, message.text]),
+      [
+        ["user", "Fix the login bug"],
+        ["assistant", "I found the bug."],
+        ["user", "! echo hi"],
+        ["assistant", "hi"],
+      ],
+    );
+  });
+
   it("shows a command once when the record keeps both the typed line and the command's row", () => {
     const parsed = parseClaudeSessionJsonl(
       line(userEntry()) +

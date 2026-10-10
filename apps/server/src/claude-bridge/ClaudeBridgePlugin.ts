@@ -87,6 +87,9 @@ const T3_TOOLS = __T3_TOOLS__
 const T3_TOOL_PREFIX = 'mcp__${CLAUDE_BRIDGE_PLUGIN_NAME}__'
 const MCP_PROTOCOL = '2025-06-18'
 const T3_TOOL_ATTACH_WAIT = 20
+const SHELL_COMMAND_TIMEOUT_MS = 120000
+const SHELL_INPUT_ROW = /^\\s*<bash-input>([\\s\\S]*)<\\/bash-input>\\s*$/
+const SHELL_OUTPUT_ROW = /^\\s*<bash-stdout>/
 const COMMAND_TURN_WAIT_MS = 1500
 const COMMAND_PANEL_WAIT_MS = 6000
 // Built-in commands that, typed with no argument, open a panel in the terminal
@@ -108,6 +111,9 @@ let surfaces = []
 const startedAt = Date.now()
 let activeTurn = null
 let pendingCommand = null
+// The last "!" command the record took: the turn that follows it is started
+// with what the command printed, and is shown as the command.
+let lastShellInput = null
 let inboxSeq = 0
 let eventSeq = 0
 let ended = null
@@ -115,6 +121,10 @@ let timersStarted = false
 let permissionMode = null
 let toolsDeclared = false
 const drawing = new Map()
+// Tool calls Claude Code is about to ask about, until their dialog opens, and
+// the calls whose result is already in the record (answered, here or anywhere).
+const asks = []
+const settledCalls = new Set()
 let mcpSession = null
 let mcpRequestId = 0
 let effort = null
@@ -567,6 +577,33 @@ async function runSlashCommand($, command) {
   })
 }
 
+// "!" in the terminal runs a shell command with no permission prompt, writes
+// the command and what it printed into the record, and hands that output to
+// the model, which replies. The same from T3: run here, recorded the same
+// way, and what it printed submitted as the turn's prompt.
+async function runShellCommand($, command) {
+  const report = (data) => emit($, 'command.result', Object.assign({ commandId: command.id, promptUuid: command.promptUuid, startedTurn: false }, data))
+  let shell = '/bin/sh'
+  try { shell = (await $.env.get('SHELL')) || shell } catch {}
+  let outcome
+  try {
+    outcome = await $.process.run([shell, '-c', command.command], { timeoutMs: SHELL_COMMAND_TIMEOUT_MS })
+  } catch (err) {
+    await report({ ok: false, text: String((err && err.message) || err) })
+    return
+  }
+  const printed = '<bash-stdout>' + String(outcome.stdout || '').trimEnd() + '</bash-stdout><bash-stderr>' + String(outcome.stderr || '').trimEnd() + '</bash-stderr>'
+  try {
+    await $.session.append({ message: { type: 'user', content: [{ type: 'text', text: '<bash-input>' + command.command + '</bash-input>' }] } })
+  } catch {}
+  pendingCommand = { id: command.id, text: printed, promptUuid: command.promptUuid, at: Date.now() }
+  const dropped = async (reason) => {
+    if (pendingCommand && pendingCommand.id === command.id) pendingCommand = null
+    await emit($, 'prompt.dropped', { commandId: command.id, reason: String(reason) })
+  }
+  $.prompt.submit({ text: printed, asUser: true }).then((result) => (result && result.drop ? dropped(result.drop) : undefined)).catch(dropped)
+}
+
 async function handleCommand($, command) {
   if (command.type === 'prompt') {
     pendingCommand = { id: command.id, text: command.text, promptUuid: command.promptUuid, at: Date.now() }
@@ -584,6 +621,10 @@ async function handleCommand($, command) {
   }
   if (command.type === 'command') {
     await runSlashCommand($, command)
+    return
+  }
+  if (command.type === 'bash') {
+    await runShellCommand($, command)
     return
   }
   if (command.type === 'config') {
@@ -756,6 +797,21 @@ export function register(on) {
 
   on('session.append', async ($, e, next) => {
     if (e && typeof e.uuid === 'string') own.add(e.uuid)
+    try {
+      const raw = e && e.message ? e.message.content : null
+      const text = typeof raw === 'string' ? raw : Array.isArray(raw) ? raw.map((block) => (block && block.type === 'text' ? String(block.text || '') : '')).join('') : ''
+      const shell = SHELL_INPUT_ROW.exec(text)
+      if (shell) lastShellInput = shell[1].trim()
+    } catch {}
+    try {
+      const content = e && e.message && Array.isArray(e.message.content) ? e.message.content : []
+      for (const block of content) {
+        if (block && block.type === 'tool_result' && typeof block.tool_use_id === 'string') {
+          settledCalls.add(block.tool_use_id)
+          if (settledCalls.size > 64) settledCalls.delete(settledCalls.values().next().value)
+        }
+      }
+    } catch {}
     return next(e)
   })
 
@@ -783,7 +839,14 @@ export function register(on) {
       pendingCommand = null
     }
     activeTurn = { turnId: e.turnId, startedAt: Date.now(), transcriptOffset: offset, commandId: commandId, promptUuid: promptUuid }
-    await emit($, 'turn.start', { turnId: e.turnId, text: e.text, transcriptOffset: offset, commandId: commandId, promptUuid: promptUuid })
+    // A turn that follows a "!" command starts with what the command printed.
+    // What the person did was type the command: the turn is named by that.
+    let text = e.text
+    if (typeof text === 'string' && SHELL_OUTPUT_ROW.test(text) && lastShellInput !== null) {
+      text = '! ' + lastShellInput
+      lastShellInput = null
+    }
+    await emit($, 'turn.start', { turnId: e.turnId, text: text, transcriptOffset: offset, commandId: commandId, promptUuid: promptUuid })
     await heartbeat($)
     return next(e)
   })
@@ -840,7 +903,17 @@ export function register(on) {
     // T3's display tools change nothing in the workspace; T3 allows them wherever it attaches them.
     if (isT3ReadOnlyTool(e.tool)) return { decision: 'allow', reason: 'T3 Code display tool' }
     if (isGranted(e)) return { decision: 'allow', reason: 'Allowed for this session in T3 Code' }
-    if (!(await heldForT3($))) return verdict
+    if (!(await t3Attached($))) return verdict
+    // With a terminal on the session, Claude Code's own dialog opens there
+    // and T3 shows the same request; whichever is answered first settles it
+    // (see classic.PermissionRequest). The call is remembered until then.
+    if (terminalPresent()) {
+      asks.push({ toolUseId: e.tool_use_id, tool: e.tool, key: grantKey(e), at: Date.now() })
+      if (asks.length > 16) asks.shift()
+      return verdict
+    }
+    // A background session nobody has open: its dialog would be shown to no
+    // one, so the request is held for T3 alone.
     const toolUseId = e.tool_use_id
     await emit($, 'approval.request', { toolUseId: toolUseId, tool: e.tool, input: e.input, reason: verdict.reason, turnId: activeTurn ? activeTurn.turnId : undefined })
     for (;;) {
@@ -856,6 +929,53 @@ export function register(on) {
       if (!(await t3Attached($))) {
         await emit($, 'approval.resolved', { toolUseId: toolUseId, decision: 'ask', by: 'detached' })
         return verdict
+      }
+      await sleepOutsideBudget($)
+    }
+  })
+
+  // Claude Code is opening its permission dialog in the terminal. T3 shows
+  // the same request, and its answer closes the dialog; an answer in the
+  // terminal comes first as often, and T3 then puts its card away. If T3
+  // goes away and comes back while the dialog is still open, it is told again.
+  on('classic.PermissionRequest', async ($, e, next) => {
+    noteClassic($, e)
+    let ask = null
+    try {
+      const key = e.tool_name + ':' + JSON.stringify(e.tool_input)
+      for (let index = asks.length - 1; index >= 0; index -= 1) {
+        if (asks[index].key === key && Date.now() - asks[index].at < 20000) {
+          ask = asks.splice(index, 1)[0]
+          break
+        }
+      }
+    } catch {}
+    if (!ask || !(await t3Attached($))) return next(e)
+    const toolUseId = ask.toolUseId
+    const request = { toolUseId: toolUseId, tool: e.tool_name, input: e.tool_input, turnId: activeTurn ? activeTurn.turnId : undefined, alsoInTerminal: true }
+    await emit($, 'approval.request', request)
+    let told = true
+    for (;;) {
+      const decision = decisions.get(toolUseId)
+      if (decision) {
+        decisions.delete(toolUseId)
+        if (decision.decision === 'ask') return next(e)
+        await emit($, 'approval.resolved', { toolUseId: toolUseId, decision: decision.decision, by: 't3' })
+        if (decision.decision !== 'allow') return { decision: { behavior: 'deny', message: decision.reason || 'Denied in T3 Code' } }
+        if (decision.scope === 'session') grants.push({ tool: ask.tool, key: ask.key, wholeTool: decision.wholeTool === true })
+        return { decision: { behavior: 'allow' } }
+      }
+      if (settledCalls.has(toolUseId)) {
+        await emit($, 'approval.resolved', { toolUseId: toolUseId, decision: 'ask', by: 'terminal' })
+        return next(e)
+      }
+      const attachedNow = await t3Attached($)
+      if (!attachedNow && told) {
+        told = false
+        await emit($, 'approval.resolved', { toolUseId: toolUseId, decision: 'ask', by: 'detached' })
+      } else if (attachedNow && !told) {
+        told = true
+        await emit($, 'approval.request', request)
       }
       await sleepOutsideBudget($)
     }

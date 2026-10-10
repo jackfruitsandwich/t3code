@@ -1,7 +1,10 @@
 import { assert, describe, it } from "@effect/vitest";
 
 import {
+  claudeBridgeModAtLeast,
   claudeBridgeWakeDetail,
+  claudeTranscriptCommandOutput,
+  claudeTranscriptCommandText,
   claudeTranscriptOffsetAt,
   isClaudeTypedMidTurnRow,
   makeClaudeBridgeFrameTranslator,
@@ -261,6 +264,46 @@ describe("ClaudeBridgeProtocol record helpers", () => {
       ),
       1_000 + first.length,
     );
+  });
+
+  it("reads a ! command and what it printed the way the terminal shows them", () => {
+    const row = (content: string) => ({ type: "user", message: { role: "user", content } });
+    assert.strictEqual(
+      claudeTranscriptCommandText(row("<bash-input>git status --short</bash-input>")),
+      "! git status --short",
+    );
+    assert.strictEqual(
+      claudeTranscriptCommandOutput(
+        row("<bash-stdout> M a.ts\n</bash-stdout><bash-stderr>warning: x</bash-stderr>"),
+      ),
+      " M a.ts\n\nwarning: x",
+    );
+    assert.strictEqual(
+      claudeTranscriptCommandOutput(row("<bash-stdout></bash-stdout><bash-stderr></bash-stderr>")),
+      "",
+    );
+    assert.isNull(claudeTranscriptCommandOutput(row("plain text")));
+  });
+
+  it("drops the terminal's colour and dimming codes from what a command printed", () => {
+    const escape = String.fromCharCode(27);
+    assert.strictEqual(
+      claudeTranscriptCommandOutput({
+        type: "user",
+        message: {
+          role: "user",
+          content: `<local-command-stdout>${escape}[2mCompacted (ctrl+o to see full summary)${escape}[22m</local-command-stdout>`,
+        },
+      }),
+      "Compacted (ctrl+o to see full summary)",
+    );
+  });
+
+  it("compares bridge mod versions by number", () => {
+    assert.isTrue(claudeBridgeModAtLeast("0.3.4", "0.3.4"));
+    assert.isTrue(claudeBridgeModAtLeast("0.10.0", "0.3.4"));
+    assert.isFalse(claudeBridgeModAtLeast("0.3.3", "0.3.4"));
+    assert.isFalse(claudeBridgeModAtLeast("", "0.3.4"));
   });
 
   it("tells the person's mid-turn message from the harness's notices", () => {

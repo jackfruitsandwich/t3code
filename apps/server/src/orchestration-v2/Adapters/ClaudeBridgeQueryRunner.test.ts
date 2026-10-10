@@ -29,6 +29,8 @@ const userMessage = (content: SDKUserMessage["message"]["content"]): SDKUserMess
 const attach = (input: {
   readonly protocol: number;
   readonly slashCommands?: ReadonlyArray<string>;
+  /** The bridge mod the session runs. */
+  readonly modVersion?: string;
   /** What the session's transcript holds when the runner attaches. */
   readonly transcript?: string;
   /** A turn the session began, and maybe ended, while nothing was attached. */
@@ -68,7 +70,7 @@ const attach = (input: {
         effort: null,
         commandsRev: 1,
         activeTurn: null,
-        modVersion: "test",
+        modVersion: input.modVersion ?? "test",
         ended: null,
       },
     };
@@ -346,6 +348,41 @@ describe("ClaudeBridgeQueryRunner slash commands", () => {
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
+  it.effect("runs a line that starts with ! as a shell command in the session", () =>
+    Effect.gen(function* () {
+      const bridge = yield* attach({
+        protocol: 2,
+        modVersion: "0.3.4",
+        bridgeCanUseTool: () => null,
+      });
+      yield* bridge.session.offer({
+        ...userMessage("! git status --short"),
+        uuid: "00000000-0000-4000-8000-000000000011",
+      });
+      assert.deepStrictEqual(yield* Queue.take(bridge.commands), {
+        type: "bash",
+        command: "git status --short",
+        promptUuid: "00000000-0000-4000-8000-000000000011",
+      });
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("sends such a line as written to a session whose mod cannot run it", () =>
+    Effect.gen(function* () {
+      const bridge = yield* attach({
+        protocol: 2,
+        modVersion: "0.3.3",
+        bridgeCanUseTool: () => null,
+      });
+      yield* bridge.session.offer({
+        ...userMessage("! git status --short"),
+        uuid: "00000000-0000-4000-8000-000000000012",
+      });
+      const sent = yield* Queue.take(bridge.commands);
+      assert.strictEqual(sent.type, "prompt");
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
   it.effect("sends text that only looks like a command to the model as written", () =>
     Effect.gen(function* () {
       const bridge = yield* attach({
@@ -547,6 +584,29 @@ describe("ClaudeBridgeQueryRunner messages the terminal drew", () => {
         yield* bridge.session.messages.pipe(Stream.take(1), Stream.runCollect),
       );
       assert.deepStrictEqual(shape(next), ["result"]);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+  it.live("shows one once when the record's copy of it arrives seconds later", () =>
+    Effect.gen(function* () {
+      const bridge = yield* attach({ protocol: 2, bridgeCanUseTool: () => null, transcript: "" });
+      const fs = yield* FileSystem.FileSystem;
+      const file = bridge.process.session.transcriptPath;
+      yield* bridge.handler(start(bridge), bridge.process);
+      yield* bridge.handler(drawn(bridge, "About to list the files."), bridge.process);
+      // Nothing in the record yet: the drawn message is shown after its wait.
+      const first = Array.from(
+        yield* bridge.session.messages.pipe(Stream.take(3), Stream.runCollect),
+      );
+      assert.deepStrictEqual(shape(first), ["user", "system", `${DRAWN}:text`]);
+      yield* fs.writeFileString(
+        file,
+        row(TEXT_ROW, [{ type: "text", text: "About to list the files." }]) + toolUse,
+        { flag: "a" },
+      );
+      const next = Array.from(
+        yield* bridge.session.messages.pipe(Stream.take(1), Stream.runCollect),
+      );
+      assert.deepStrictEqual(shape(next), [`${TOOL_ROW}:tool_use`]);
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 });

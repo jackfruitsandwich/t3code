@@ -42,6 +42,8 @@ import * as ClaudeBridgeRegistry from "../../claude-bridge/ClaudeBridgeRegistry.
 import {
   CLAUDE_BRIDGE_T3_HEARTBEAT_MS,
   CLAUDE_BRIDGE_WINDOW_PROTOCOL,
+  claudeBridgeModAtLeast,
+  CLAUDE_BRIDGE_BASH_MOD_VERSION,
   claudeConfigModelChoice,
   claudeTranscriptCommandText,
   claudeTranscriptCommandOutput,
@@ -70,6 +72,14 @@ const DRAWN_MESSAGE_WAIT_MS = 2_500;
 const RECORDED_TEXT_MEMORY_MS = 60_000;
 const normalizeDrawn = (text: string) => text.replace(/\s+/gu, " ").trim();
 /** The text blocks of a reply row of the record. */
+/** An assistant row without its text blocks, or null when text is all it holds. */
+const withoutTextBlocks = (row: Record<string, unknown>): Record<string, unknown> | null => {
+  const message = isRecord(row.message) ? row.message : null;
+  const content = message !== null && Array.isArray(message.content) ? message.content : [];
+  const rest = content.filter((block) => !(isRecord(block) && block.type === "text"));
+  return rest.length === 0 ? null : { ...row, message: { ...message, content: rest } };
+};
+
 const assistantRowText = (row: Record<string, unknown>): string => {
   const content = isRecord(row.message) ? row.message.content : null;
   if (typeof content === "string") return content;
@@ -344,6 +354,8 @@ export const layer: Layer.Layer<
           readonly text: string;
           readonly at: number;
         }>,
+        /** Drawn messages already shown: the record's own copy, arriving later, is the same row. */
+        shownDrawn: [] as Array<{ readonly messageId: string; readonly text: string }>,
         /** Texts of the record's recent replies, to tell a drawn message it already holds. */
         recordedTexts: [] as Array<{ readonly text: string; readonly at: number }>,
         /** A slash command T3 ran that started no turn, waiting for its output rows. */
@@ -536,6 +548,8 @@ export const layer: Layer.Layer<
           state.drawnMessages = state.drawnMessages.filter((drawn) => !due.includes(drawn));
           if (!translator.hasOpenTurn()) return;
           for (const drawn of due) {
+            state.shownDrawn.push({ messageId: drawn.messageId, text: normalizeDrawn(drawn.text) });
+            if (state.shownDrawn.length > 24) state.shownDrawn.shift();
             yield* emit(
               translator.onTranscriptRow({
                 type: "assistant",
@@ -565,7 +579,7 @@ export const layer: Layer.Layer<
           for (;;) {
             const newline = bytes.indexOf(0x0a, lineStart);
             if (newline === -1) break;
-            const row = parseJsonlLine(decoder.decode(bytes.subarray(lineStart, newline)));
+            let row = parseJsonlLine(decoder.decode(bytes.subarray(lineStart, newline)));
             state.byteOffset += newline + 1 - lineStart;
             lineStart = newline + 1;
             state.lastRowAt = yield* Clock.currentTimeMillis;
@@ -605,6 +619,16 @@ export const layer: Layer.Layer<
             if (isRecord(row) && row.type === "assistant" && row.isSidechain !== true) {
               const recorded = normalizeDrawn(assistantRowText(row));
               if (recorded.length > 0) {
+                // The record can be seconds behind the terminal. A message
+                // already shown from what the terminal drew is this row's
+                // text: it is not shown a second time.
+                const shown = state.shownDrawn.findIndex((drawn) => drawn.text === recorded);
+                if (shown !== -1) {
+                  state.shownDrawn.splice(shown, 1);
+                  const rest = withoutTextBlocks(row);
+                  if (rest === null) continue;
+                  row = rest;
+                }
                 state.recordedTexts.push({ text: recorded, at: state.lastRowAt });
                 if (state.recordedTexts.length > 24) state.recordedTexts.shift();
                 state.drawnMessages = state.drawnMessages.filter(
@@ -752,7 +776,30 @@ export const layer: Layer.Layer<
           modVersion: newest.session.modVersion,
         });
         const pending = state.pendingPrompt;
-        if (pending !== null) pending.commandId = yield* registry.send(newest, pending.body);
+        if (pending === null) return true;
+        if (pending.body.type === "bash") {
+          // A shell command may already have run in the instance that went
+          // away: it is not run a second time on a guess.
+          state.pendingPrompt = null;
+          const at = yield* Clock.currentTimeMillis;
+          yield* emit(
+            translator.onTurnComplete({
+              seq: 0,
+              at,
+              type: "turn.complete",
+              turnId: `dropped-${pending.commandId}`,
+              reason: "error",
+              answer:
+                "The session reloaded its T3 mod while this command was being handed over. It may or may not have run; it was not sent again.",
+              isAborted: false,
+              durationMs: 0,
+              transcriptOffset: 0,
+              promptUuid: pending.promptUuid,
+            }),
+          );
+          return true;
+        }
+        pending.commandId = yield* registry.send(newest, pending.body);
         return true;
       });
 
@@ -1118,6 +1165,20 @@ export const layer: Layer.Layer<
             if (state.selection !== null)
               yield* registry.writeClientSelection(sid, state.selection);
             yield* followReloadedMod;
+            // "!" runs a shell command in the session without asking the
+            // model, as it does typed in the terminal. A session whose mod
+            // cannot do that gets the text as written, as before.
+            const shell = /^\s*!\s*(\S[\s\S]*)$/u.exec(text)?.[1]?.trim();
+            if (shell !== undefined) {
+              const live = (yield* registry.readSession(bridgeProcess)) ?? bridgeProcess.session;
+              if (claudeBridgeModAtLeast(live.modVersion, CLAUDE_BRIDGE_BASH_MOD_VERSION)) {
+                const body: ClaudeBridgeCommandBody = { type: "bash", command: shell, promptUuid };
+                const pending = { commandId: "", promptUuid, label: `! ${shell}`, body };
+                state.pendingPrompt = pending;
+                pending.commandId = yield* registry.send(bridgeProcess, body);
+                return;
+              }
+            }
             // A slash command runs as a command in the session, exactly as if
             // typed there: Claude Code refuses one sent as prompt text.
             const slash = parseClaudeSlashCommandText(text);

@@ -18,7 +18,7 @@ import * as SessionImporter from "../import/Services/SessionImporter.ts";
 import { CLAUDE_PROVIDER } from "../orchestration-v2/Adapters/ClaudeAdapterV2.ts";
 import * as ProviderContinuationRequests from "../orchestration-v2/ProviderContinuationRequests.ts";
 import * as ProviderRuntimeRecoveryService from "../orchestration-v2/ProviderRuntimeRecoveryService.ts";
-import { isClaudeHarnessPrompt } from "./ClaudeBridgeProtocol.ts";
+import { claudeTurnPromptLabel, isClaudeHarnessPrompt } from "./ClaudeBridgeProtocol.ts";
 import * as ClaudeBridgeRegistry from "./ClaudeBridgeRegistry.ts";
 
 const make = Effect.gen(function* () {
@@ -71,7 +71,8 @@ const make = Effect.gen(function* () {
     Effect.gen(function* () {
       yield* afterStartupRecovery;
       const sid = entry.sid;
-      const { turnId, text } = turn;
+      const { turnId } = turn;
+      const text = claudeTurnPromptLabel(turn.text);
       const key = `${sid}:${turnId}`;
       if (offeredTurns.has(key)) return;
       offeredTurns.add(key);
