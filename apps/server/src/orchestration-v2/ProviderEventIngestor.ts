@@ -1,3 +1,4 @@
+import type { OrchestrationV2AppThread } from "@t3tools/contracts";
 import {
   NodeId,
   CommandId,
@@ -386,9 +387,92 @@ export const layer: Layer.Layer<
       },
     );
 
+    /**
+     * A thread that is a window onto a native session shows that session's
+     * model and modes, whoever changed them (the terminal, `/model`, shift+tab).
+     * Same lock and whole-row write as syncSubagentThreadModel.
+     */
+    const syncObservedThreadSettings = Effect.fn(
+      "ProviderEventIngestor.syncObservedThreadSettings",
+    )(function* (
+      input: ProviderEventIngestInput,
+      observed: Extract<ProviderAdapterV2Event, { type: "thread_settings.observed" }>,
+    ) {
+      const differs = (thread: OrchestrationV2AppThread) =>
+        (observed.model !== undefined && thread.modelSelection.model !== observed.model) ||
+        (observed.runtimeMode !== undefined && thread.runtimeMode !== observed.runtimeMode) ||
+        (observed.interactionMode !== undefined &&
+          thread.interactionMode !== observed.interactionMode);
+      const staleThread = projections.getThread(observed.threadId).pipe(
+        Effect.map((thread) => (differs(thread) ? thread : null)),
+        Effect.catchTags({ ProjectionStoreThreadNotFoundError: () => Effect.succeed(null) }),
+      );
+      if ((yield* staleThread) === null) return [];
+      return yield* threadCommands.withLock(
+        observed.threadId,
+        Effect.gen(function* () {
+          let thread = yield* staleThread;
+          if (thread === null) return [];
+          const now = yield* DateTime.now;
+          const events: Array<OrchestrationV2DomainEvent> = [];
+          if (observed.model !== undefined && thread.modelSelection.model !== observed.model) {
+            thread = {
+              ...thread,
+              // The previous model's options belong to that model.
+              modelSelection: {
+                instanceId: thread.modelSelection.instanceId,
+                model: observed.model,
+                ...(observed.contextWindow === undefined
+                  ? {}
+                  : { options: [{ id: "contextWindow", value: observed.contextWindow }] }),
+              },
+              updatedAt: now,
+            };
+            events.push(
+              yield* makeDomainEvent(input, {
+                type: "thread.model-selection-updated",
+                threadId: thread.id,
+                payload: thread,
+                occurredAt: now,
+              }),
+            );
+          }
+          if (observed.runtimeMode !== undefined && thread.runtimeMode !== observed.runtimeMode) {
+            thread = { ...thread, runtimeMode: observed.runtimeMode, updatedAt: now };
+            events.push(
+              yield* makeDomainEvent(input, {
+                type: "thread.runtime-mode-updated",
+                threadId: thread.id,
+                payload: thread,
+                occurredAt: now,
+              }),
+            );
+          }
+          if (
+            observed.interactionMode !== undefined &&
+            thread.interactionMode !== observed.interactionMode
+          ) {
+            thread = { ...thread, interactionMode: observed.interactionMode, updatedAt: now };
+            events.push(
+              yield* makeDomainEvent(input, {
+                type: "thread.interaction-mode-updated",
+                threadId: thread.id,
+                payload: thread,
+                occurredAt: now,
+              }),
+            );
+          }
+          return events.length === 0 ? [] : yield* eventSink.write({ events });
+        }),
+      );
+    });
+
     const normalize: ProviderEventIngestorV2Shape["normalize"] = (input) =>
       Effect.gen(function* () {
         switch (input.event.type) {
+          // Written straight onto the thread row after the publish; see publish.
+          case "thread_settings.observed":
+            return [];
           case "app_thread.created":
             return [
               yield* makeDomainEvent(input, {
@@ -550,6 +634,18 @@ export const layer: Layer.Layer<
       normalize,
       ingestNormalized: (input) =>
         Effect.gen(function* () {
+          if (input.event.type === "thread_settings.observed") {
+            return yield* syncObservedThreadSettings(input, input.event).pipe(
+              Effect.mapError(
+                (cause) =>
+                  new ProviderEventPublishError({
+                    providerSessionId: input.providerSessionId,
+                    eventCount: 1,
+                    cause,
+                  }),
+              ),
+            );
+          }
           const events = yield* normalize(input);
           if (events.length === 0) {
             return [];

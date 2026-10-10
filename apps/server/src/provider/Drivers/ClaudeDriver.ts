@@ -17,6 +17,7 @@ import * as Cache from "effect/Cache";
 import * as Duration from "effect/Duration";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
+import { HostProcessEnvironment } from "@t3tools/shared/hostProcess";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
@@ -25,6 +26,8 @@ import { ChildProcessSpawner } from "effect/process";
 
 import { makeClaudeTextGeneration } from "../../textGeneration/ClaudeTextGeneration.ts";
 import * as BackgroundPolicy from "../../background/BackgroundPolicy.ts";
+import { CLAUDE_BRIDGE_DIR_ENV } from "../../claude-bridge/ClaudeBridgeProtocol.ts";
+import { liveClaudeCommandsForCwd } from "../../claude-bridge/ClaudeBridgeSessionCommands.ts";
 import * as ServerConfig from "../../config.ts";
 import { expandHomePath } from "../../pathExpansion.ts";
 import * as ProviderEventLoggers from "../ProviderEventLoggers.ts";
@@ -120,7 +123,11 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv> = {
       const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
       const fileSystem = yield* FileSystem.FileSystem;
       const path = yield* Path.Path;
-      const { cwd } = yield* ServerConfig.ServerConfig;
+      const { cwd, stateDir } = yield* ServerConfig.ServerConfig;
+      const hostEnvironment = yield* HostProcessEnvironment;
+      // Where the t3bridge mod keeps each live session's files (ClaudeBridgeRegistry).
+      const bridgeDir =
+        hostEnvironment[CLAUDE_BRIDGE_DIR_ENV]?.trim() || path.join(stateDir, "bridge");
       const httpClient = yield* HttpClient.HttpClient;
       const resetCreditCoordinator = yield* ResetCreditCoordinator.ResetCreditCoordinator;
       const serverSettings = yield* ServerSettings.ServerSettingsService;
@@ -351,6 +358,29 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv> = {
           snapshot.getSnapshot.pipe(
             Effect.flatMap((machineSnapshot) =>
               probeClaudeWorkspaceSnapshot(effectiveConfig, machineSnapshot, cwd, processEnv),
+            ),
+            // What the person can run from T3 is what the session they talk to
+            // has: add the commands of the Claude Code sessions live in this
+            // folder to what a fresh SDK session would list.
+            Effect.flatMap((workspaceSnapshot) =>
+              liveClaudeCommandsForCwd(bridgeDir, cwd).pipe(
+                Effect.map((live) => {
+                  const known = new Set(workspaceSnapshot.slashCommands.map((entry) => entry.name));
+                  const added = live.flatMap((entry) => {
+                    const name = entry.name.trim();
+                    if (name.length === 0 || known.has(name)) return [];
+                    known.add(name);
+                    const description = entry.description.trim();
+                    return [description.length === 0 ? { name } : { name, description }];
+                  });
+                  return added.length === 0
+                    ? workspaceSnapshot
+                    : {
+                        ...workspaceSnapshot,
+                        slashCommands: [...workspaceSnapshot.slashCommands, ...added],
+                      };
+                }),
+              ),
             ),
             Effect.provideService(FileSystem.FileSystem, fileSystem),
             Effect.provideService(Path.Path, path),

@@ -123,7 +123,65 @@ export type ClaudeBridgeCommandBody =
       readonly answers?: Readonly<Record<string, string>>;
       readonly reason?: string;
     }
+  /** One row of the session's `/config`, changed as if the person picked it there. */
+  | { readonly type: "config"; readonly key: string; readonly value: string | boolean | number }
   | { readonly type: "interrupt"; readonly turnId?: string };
+
+/**
+ * Built-in commands that open a panel in the terminal when typed with no
+ * argument. The first group was observed on Claude Code 2.1.296 by running
+ * every listed built-in bare in a throwaway session and seeing which never
+ * returned; the second group are pickers, sign-in and setup screens by their
+ * nature. A panel can be closed only at that terminal, and everything queued
+ * behind it waits, so the mod does not run these bare for T3. Any other command
+ * found to wait this way is remembered by the mod itself.
+ */
+export const CLAUDE_BARE_PANEL_COMMANDS: ReadonlyArray<string> = [
+  "add-dir",
+  "advisor",
+  "autocompact",
+  "config",
+  "effort",
+  "fast",
+  "help",
+  "mcp",
+  "model",
+  "plugin",
+  "skills",
+  "status",
+  "theme",
+  "scroll-speed",
+  "usage",
+  "permissions",
+  "goal",
+  "hooks",
+  "tasks",
+  "workflows",
+  "artifacts",
+  "agents",
+  "output-style",
+  "resume",
+  "rewind",
+  "memory",
+  "export",
+  "copy",
+  "sandbox",
+  "keybindings",
+  "login",
+  "logout",
+  "ide",
+  "bug",
+  "feedback",
+  "upgrade",
+  "privacy-settings",
+  "terminal-setup",
+  "mobile",
+  "desktop",
+  "chrome",
+  "remote-control",
+  "install-github-app",
+  "install-slack-app",
+];
 
 /** One slash command of a session, as its own typeahead lists it. */
 export interface ClaudeBridgeSlashCommand {
@@ -194,6 +252,13 @@ export type ClaudeBridgeEvent = { readonly seq: number; readonly at: number } & 
       readonly turnId?: string;
     }
   | { readonly type: "question.resolved"; readonly toolUseId: string; readonly by: string }
+  | {
+      readonly type: "config.result";
+      readonly commandId: string;
+      readonly key: string;
+      readonly ok: boolean;
+      readonly text: string;
+    }
   /** How a slash command T3 asked for ended, when it started no turn of its own. */
   | {
       readonly type: "command.result";
@@ -390,6 +455,16 @@ export function parseClaudeBridgeEvent(value: unknown): ClaudeBridgeEvent | null
         waitingInTerminal: value.waitingInTerminal === true,
         text: readOptionalString(value.text) ?? "",
       };
+    case "config.result":
+      if (typeof value.commandId !== "string") return null;
+      return {
+        ...base,
+        type: "config.result",
+        commandId: value.commandId,
+        key: readOptionalString(value.key) ?? "",
+        ok: value.ok === true,
+        text: readOptionalString(value.text) ?? "",
+      };
     case "ended":
       return {
         ...base,
@@ -456,10 +531,23 @@ const rowText = (row: Record<string, unknown>): string | null => {
   return parts.length === 0 ? null : parts.join("");
 };
 
+/**
+ * The text of a row a slash command leaves. A command that feeds the
+ * conversation (`/goal`) writes `user` rows; one that only acts locally
+ * (`/rename`, `/model`) writes `system` rows of subtype `local_command`.
+ */
+const commandRowText = (row: Record<string, unknown>): string | null => {
+  if (row.type === "user") return rowText(row);
+  if (row.type === "system" && row.subtype === "local_command") {
+    return typeof row.content === "string" ? row.content : null;
+  }
+  return null;
+};
+
 /** `/name args` of the transcript row Claude Code writes when a slash command runs, else null. */
 export function claudeTranscriptCommandText(row: unknown): string | null {
-  if (!isRecord(row) || row.type !== "user") return null;
-  const text = rowText(row);
+  if (!isRecord(row)) return null;
+  const text = commandRowText(row);
   if (text === null) return null;
   const name = COMMAND_NAME.exec(text)?.[1];
   if (name === undefined) return null;
@@ -475,6 +563,38 @@ export function claudeTranscriptPermissionMode(row: unknown): string | null {
 
 export function isClaudeBridgeCommandOutputFrame(message: SDKMessage): boolean {
   return Reflect.get(message, CLAUDE_BRIDGE_COMMAND_OUTPUT_KEY) === true;
+}
+
+/**
+ * The name `/config`'s model row takes for a model id T3 names in full
+ * (`claude-opus-5-5[1m]` → `opus[1m]`), or null when the id names no family
+ * that row offers.
+ */
+export function claudeConfigModelChoice(modelId: string): string | null {
+  const family = /(opus|sonnet|haiku|fable)/u.exec(modelId.toLowerCase())?.[1];
+  if (family === undefined) return null;
+  return /\[1m\]\s*$/u.test(modelId) ? `${family}[1m]` : family;
+}
+
+/** A session's permission mode as the two settings a T3 thread shows it with. */
+export function threadModesForClaudePermissionMode(mode: string): {
+  readonly runtimeMode?: "approval-required" | "auto-accept-edits" | "auto" | "full-access";
+  readonly interactionMode: "default" | "plan";
+} | null {
+  switch (mode) {
+    case "plan":
+      return { interactionMode: "plan" };
+    case "default":
+      return { runtimeMode: "approval-required", interactionMode: "default" };
+    case "acceptEdits":
+      return { runtimeMode: "auto-accept-edits", interactionMode: "default" };
+    case "auto":
+      return { runtimeMode: "auto", interactionMode: "default" };
+    case "bypassPermissions":
+      return { runtimeMode: "full-access", interactionMode: "default" };
+    default:
+      return null;
+  }
 }
 
 /**
@@ -714,12 +834,13 @@ export function makeClaudeBridgeFrameTranslator(
         } as unknown as SDKAssistantMessage;
         return [frame];
       }
-      if (row.type === "user" && isRecord(row.message)) {
-        const text = rowText(row);
+      {
         // What a slash command printed. Claude Code reports it to an SDK host
         // as a synthetic assistant message; the same frame here shows the
         // output and feeds the adapter's goal reader ("Goal set: ...").
-        const stdout = text === null ? null : (LOCAL_COMMAND_STDOUT.exec(text)?.[1] ?? null);
+        const commandText = commandRowText(row);
+        const stdout =
+          commandText === null ? null : (LOCAL_COMMAND_STDOUT.exec(commandText)?.[1] ?? null);
         if (stdout !== null) {
           if (stdout.trim().length === 0) return [];
           const frame = {
@@ -741,6 +862,9 @@ export function makeClaudeBridgeFrameTranslator(
           } as unknown as SDKAssistantMessage;
           return [frame];
         }
+      }
+      if (row.type === "user" && isRecord(row.message)) {
+        const text = rowText(row);
         // A goal's unmet check comes back as hook feedback; the adapter counts it.
         if (row.isMeta === true && text !== null && text.startsWith("Stop hook feedback:")) {
           const frame = {

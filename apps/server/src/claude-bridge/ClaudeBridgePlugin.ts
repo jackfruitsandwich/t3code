@@ -18,6 +18,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 
 import {
+  CLAUDE_BARE_PANEL_COMMANDS,
   CLAUDE_BRIDGE_MARKETPLACE_NAME,
   CLAUDE_BRIDGE_MOD_VERSION,
   CLAUDE_BRIDGE_PLUGIN_NAME,
@@ -81,6 +82,12 @@ const T3_LIVE_MS = 12000
 const PROMPT_MATCH_WINDOW_MS = 20000
 const COMMAND_TURN_WAIT_MS = 1500
 const COMMAND_PANEL_WAIT_MS = 6000
+// Built-in commands that, typed with no argument, open a panel in the terminal
+// (observed on Claude Code 2.1.296 by running each one). A panel can only be
+// closed by the person at that terminal and everything queued behind it waits,
+// so these are not run from T3 without an argument. Commands found to behave
+// this way later are remembered in the plugin store.
+const KNOWN_PANELS = new Set([${CLAUDE_BARE_PANEL_COMMANDS.map((name) => `'${name}'`).join(", ")}])
 
 const instanceId = Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8)
 let root = null
@@ -209,6 +216,27 @@ async function heartbeat($) {
   })
 }
 
+async function opensPanel($, name) {
+  if (KNOWN_PANELS.has(name)) return true
+  try { return (await $.store.get('panel:' + name)) === true } catch { return false }
+}
+
+// The model row of /config takes these names; a full model id maps onto one.
+async function modelChoice($, wanted) {
+  let options = []
+  try {
+    const row = (await $.config.list()).find((entry) => entry.key === 'model')
+    options = row && Array.isArray(row.options) ? row.options : []
+  } catch { return null }
+  const text = String(wanted).trim()
+  if (options.includes(text)) return text
+  const family = /(opus|sonnet|haiku|fable)/.exec(text.toLowerCase())
+  if (!family) return null
+  const wide = /\[1m\]\s*$/.test(text) ? family[1] + '[1m]' : null
+  if (wide && options.includes(wide)) return wide
+  return options.includes(family[1]) ? family[1] : null
+}
+
 // The slash commands this session has, as its own typeahead lists them.
 async function refreshCommands($) {
   if (!dir || passive) return
@@ -300,8 +328,27 @@ async function sleepOutsideBudget($) {
 // that only prints reports its output; one that opened a panel in the
 // terminal is reported as waiting there, because nothing but the person can
 // close it.
-function runSlashCommand($, command) {
+async function runSlashCommand($, command) {
   const label = '/' + command.name + (command.args ? ' ' + command.args : '')
+  const report = (data) => emit($, 'command.result', Object.assign({ commandId: command.id, promptUuid: command.promptUuid, startedTurn: false }, data))
+  if (!command.args && (await opensPanel($, command.name))) {
+    await report({ ok: true, text: 'Not run: ' + label + ' opens a panel in the Claude Code terminal, which only that terminal can show and close. Run it there, or give it an argument here (for example /model sonnet, /effort high, /goal <condition>).' })
+    return
+  }
+  // Mid-conversation, /model <name> asks the terminal to confirm. The same
+  // change through the settings row applies at once, as picking it in /config does.
+  if (command.name === 'model' && command.args) {
+    const choice = await modelChoice($, command.args)
+    if (choice !== null) {
+      let outcome
+      try { outcome = await $.config.set({ key: 'model', value: choice }) } catch (err) { outcome = { deny: String(err) } }
+      let model = choice
+      try { model = await $.session.model() } catch {}
+      await heartbeat($)
+      await report(outcome && outcome.deny ? { ok: false, text: String(outcome.deny) } : { ok: true, text: 'Set model to ' + model })
+      return
+    }
+  }
   pendingCommand = { id: command.id, text: label, promptUuid: command.promptUuid, at: Date.now() }
   let settled = false
   const mine = () => pendingCommand !== null && pendingCommand.id === command.id
@@ -309,12 +356,10 @@ function runSlashCommand($, command) {
     if (settled || !mine()) return
     settled = true
     pendingCommand = null
-    emit($, 'command.result', {
-      commandId: command.id,
-      promptUuid: command.promptUuid,
+    $.store.set('panel:' + command.name, true).catch(() => {})
+    report({
       ok: false,
       waitingInTerminal: true,
-      startedTurn: false,
       text: label + ' opened a panel in the Claude Code terminal and is waiting there. Close it in that terminal (Esc); nothing else runs in this session until then.',
     }).catch(() => {})
   })
@@ -361,7 +406,14 @@ async function handleCommand($, command) {
     return
   }
   if (command.type === 'command') {
-    runSlashCommand($, command)
+    await runSlashCommand($, command)
+    return
+  }
+  if (command.type === 'config') {
+    let outcome
+    try { outcome = await $.config.set({ key: command.key, value: command.value }) } catch (err) { outcome = { deny: String(err) } }
+    await heartbeat($)
+    await emit($, 'config.result', { commandId: command.id, key: command.key, ok: !(outcome && outcome.deny), text: outcome && outcome.deny ? String(outcome.deny) : '' })
     return
   }
   if (command.type === 'approval') {

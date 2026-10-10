@@ -42,7 +42,9 @@ import * as ClaudeBridgeRegistry from "../../claude-bridge/ClaudeBridgeRegistry.
 import {
   CLAUDE_BRIDGE_T3_HEARTBEAT_MS,
   CLAUDE_BRIDGE_WINDOW_PROTOCOL,
+  claudeConfigModelChoice,
   claudeTranscriptCommandText,
+  claudeTranscriptPermissionMode,
   isClaudeBridgeCommandOutputFrame,
   isClaudeBridgeSessionLive,
   makeClaudeBridgeFrameTranslator,
@@ -98,6 +100,18 @@ export function claudeBridgeImageNote(imageCount: number): string {
   const noun = imageCount === 1 ? "an image" : `${imageCount} images`;
   return `[T3: the user attached ${noun} to this message. This Claude Code process receives only the text, so before answering open each attached image with the Read tool at its "is saved at" path above.]`;
 }
+
+/**
+ * What each bridged session last reported as its own model and permission
+ * mode, as T3 has shown it. A T3 setting that differs from the session's is
+ * the person's change only if T3 had already shown the session's value; before
+ * that it is a stale default (an imported thread is stamped with one) and the
+ * session's value wins.
+ */
+const shownNativeSettings = new Map<string, ClaudeAdapterV2.ClaudeBridgeNativeSettings>();
+
+/** How many trailing bytes of a transcript are read to find the session's current permission mode. */
+const PERMISSION_MODE_SCAN_BYTES = 262_144;
 
 export const layer: Layer.Layer<
   ClaudeAdapterV2.ClaudeAgentSdkQueryRunner,
@@ -306,6 +320,84 @@ export const layer: Layer.Layer<
         state.byteOffset = yield* transcriptSize(state.transcriptPath);
       }
 
+      // The session's permission mode as its transcript last recorded it, for
+      // a process whose mod has not named it yet.
+      let transcriptMode: string | null = null;
+      if (state.transcriptPath.length > 0) {
+        const size = yield* transcriptSize(state.transcriptPath);
+        const from = Math.max(0, size - PERMISSION_MODE_SCAN_BYTES);
+        const tailBytes = yield* readTranscriptBytes(state.transcriptPath, from, size - from);
+        const tailText = new TextDecoder().decode(tailBytes);
+        for (const row of readTranscriptRows(tailText.slice(tailText.indexOf("\n") + 1)).rows) {
+          transcriptMode = claudeTranscriptPermissionMode(row) ?? transcriptMode;
+        }
+      }
+
+      const nativeSettings = (
+        session: ClaudeBridgeRegistry.ClaudeBridgeProcess["session"],
+      ): ClaudeAdapterV2.ClaudeBridgeNativeSettings => ({
+        model: session.model,
+        permissionMode: transcriptMode ?? session.permissionMode,
+      });
+      /** Shows the session's own settings on the thread when they differ from what T3 last showed. */
+      const showNativeSettings = (
+        settings: ClaudeAdapterV2.ClaudeBridgeNativeSettings,
+        // A run only takes what arrives while it is open, so each turn says it again.
+        again = false,
+      ) =>
+        Effect.sync(() => {
+          const shown = shownNativeSettings.get(sid);
+          if (
+            !again &&
+            shown !== undefined &&
+            shown.model === settings.model &&
+            shown.permissionMode === settings.permissionMode
+          ) {
+            return;
+          }
+          shownNativeSettings.set(sid, settings);
+          input.bridgeOnNativeSettings?.(settings);
+        });
+
+      // A setting changed in T3 since it last showed the session's value is
+      // the person's change: apply it in the session, where the mod confirms
+      // it and the next heartbeat shows it. Anything else follows the session.
+      {
+        const native = nativeSettings(bridgeProcess.session);
+        const shown = shownNativeSettings.get(sid);
+        const canForward =
+          shown !== undefined && bridgeProcess.session.protocol >= CLAUDE_BRIDGE_WINDOW_PROTOCOL;
+        const wantedModel = claudeConfigModelChoice(options.model);
+        const nativeModel = native.model === null ? null : claudeConfigModelChoice(native.model);
+        if (
+          canForward &&
+          shown.model === native.model &&
+          wantedModel !== null &&
+          nativeModel !== null &&
+          wantedModel !== nativeModel
+        ) {
+          yield* registry.send(bridgeProcess, { type: "config", key: "model", value: wantedModel });
+          yield* Effect.logInfo("claude-bridge.model-forwarded", { sid, model: wantedModel });
+        }
+        if (
+          canForward &&
+          shown.permissionMode === native.permissionMode &&
+          options.permissionMode === "plan" &&
+          native.permissionMode !== null &&
+          native.permissionMode !== "plan"
+        ) {
+          const promptUuid = yield* crypto.randomUUIDv4.pipe(Effect.orDie);
+          yield* registry.send(bridgeProcess, {
+            type: "command",
+            name: "plan",
+            args: "",
+            promptUuid,
+          });
+          yield* Effect.logInfo("claude-bridge.plan-mode-forwarded", { sid });
+        }
+        yield* showNativeSettings(native);
+      }
+
       const readNewRows = Effect.gen(function* () {
         if (state.transcriptPath.length === 0) return;
         const size = yield* transcriptSize(state.transcriptPath);
@@ -321,6 +413,7 @@ export const layer: Layer.Layer<
         state.byteOffset += lastNewline + 1;
         state.lastRowAt = yield* Clock.currentTimeMillis;
         for (const row of readTranscriptRows(text).rows) {
+          transcriptMode = claudeTranscriptPermissionMode(row) ?? transcriptMode;
           const commandText = claudeTranscriptCommandText(row);
           if (commandText !== null) state.lastCommandText = commandText;
           for (const frame of translator.onTranscriptRow(row)) {
@@ -451,6 +544,7 @@ export const layer: Layer.Layer<
             state.byteOffset = yield* transcriptSize(state.transcriptPath);
           }
           if (session.model !== null) translator.setModel(session.model);
+          yield* showNativeSettings(nativeSettings(session));
           yield* readNewRows.pipe(
             Effect.catchCause((cause) =>
               Effect.logWarning("claude-bridge.transcript-read-failed", { sid, cause }),
@@ -622,6 +716,8 @@ export const layer: Layer.Layer<
               yield* emit(translator.onTurnStart(event));
               // Output a slash command printed just before its turn began.
               yield* emit(state.heldOutput.splice(0));
+              const live = yield* registry.readSession(bridgeProcess);
+              if (live !== null) yield* showNativeSettings(nativeSettings(live), true);
               return;
             }
             case "turn.complete": {
@@ -685,6 +781,16 @@ export const layer: Layer.Layer<
             }
             case "approval.resolved": {
               if (event.by !== "t3") yield* settleElsewhere(event.toolUseId);
+              return;
+            }
+            case "config.result": {
+              if (!event.ok) {
+                yield* Effect.logWarning("claude-bridge.config-refused", {
+                  sid,
+                  key: event.key,
+                  reason: event.text,
+                });
+              }
               return;
             }
             case "error": {

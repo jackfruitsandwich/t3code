@@ -91,6 +91,20 @@ export const ProviderAdapterV2Event = Schema.Union([
     driver: ProviderDriverKind,
     providerThread: OrchestrationV2ProviderThread,
   }),
+  /**
+   * What a native session the thread is a window onto reports as its own
+   * settings. The thread row follows it; nothing is sent back to the provider.
+   */
+  Schema.Struct({
+    type: Schema.Literal("thread_settings.observed"),
+    driver: ProviderDriverKind,
+    threadId: ThreadId,
+    model: Schema.optional(Schema.String),
+    /** Present with `model` when the native id names a context-window variant. */
+    contextWindow: Schema.optional(Schema.String),
+    runtimeMode: Schema.optional(RuntimeMode),
+    interactionMode: Schema.optional(ProviderInteractionMode),
+  }),
   Schema.Struct({
     type: Schema.Literal("provider_turn.updated"),
     driver: ProviderDriverKind,

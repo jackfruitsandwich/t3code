@@ -373,6 +373,8 @@ export function routeProviderEvent(
       // The session manager persists process-wide status once for every
       // attached app thread before broadcasting the adapter event.
       return [false, state];
+    case "thread_settings.observed":
+      return [ownsThread(event.threadId), state];
     case "app_thread.created": {
       if (event.appThread.id === input.threadId) {
         return [true, state];

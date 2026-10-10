@@ -93,6 +93,7 @@ import { compileClaudeModelSelection } from "../../claudeModelOptions.ts";
 import {
   claudeBridgeWakeDetail,
   isClaudeHarnessPrompt,
+  threadModesForClaudePermissionMode,
 } from "../../claude-bridge/ClaudeBridgeProtocol.ts";
 import * as ServerConfig from "../../config.ts";
 import { expandHomePath } from "../../pathExpansion.ts";
@@ -328,6 +329,16 @@ export interface ClaudeAgentSdkQueryOpenInput {
   readonly providerSessionId: OrchestrationV2ProviderSession["id"];
   /** Unlike the SDK callback, null delegates to the live process's native permission handling. */
   readonly bridgeCanUseTool?: CanUseTool;
+  /**
+   * Called with what a bridged session reports as its own model and
+   * permission mode, at attach and whenever either changes there.
+   */
+  readonly bridgeOnNativeSettings?: (settings: ClaudeBridgeNativeSettings) => void;
+}
+
+export interface ClaudeBridgeNativeSettings {
+  readonly model: string | null;
+  readonly permissionMode: string | null;
 }
 
 export interface ClaudeAgentSdkQuerySession {
@@ -6985,6 +6996,34 @@ export function makeClaudeAdapterV2(
           });
         });
 
+        /**
+         * The thread shows the bridged session's own model and modes: what the
+         * session reports is written onto the thread row, never the reverse.
+         */
+        const emitObservedNativeSettings = (
+          threadId: ThreadId,
+          settings: ClaudeBridgeNativeSettings,
+        ) => {
+          const modes =
+            settings.permissionMode === null
+              ? null
+              : threadModesForClaudePermissionMode(settings.permissionMode);
+          const model =
+            settings.model === null ? null : settings.model.replace(/\[[^\]]*\]\s*$/u, "").trim();
+          if ((model === null || model.length === 0) && modes === null) return Effect.void;
+          return emitProviderEvent({
+            type: "thread_settings.observed",
+            driver: CLAUDE_PROVIDER,
+            threadId,
+            ...(model === null || model.length === 0 ? {} : { model }),
+            ...(settings.model !== null && /\[1m\]\s*$/u.test(settings.model)
+              ? { contextWindow: "1m" }
+              : {}),
+            ...(modes?.runtimeMode === undefined ? {} : { runtimeMode: modes.runtimeMode }),
+            ...(modes === null ? {} : { interactionMode: modes.interactionMode }),
+          });
+        };
+
         const bridgeCanUseTool: CanUseTool = (toolName, toolInput, callbackOptions) =>
           runPromise(canUseToolEffect(toolName, toolInput, callbackOptions, "bridge"));
 
@@ -7222,6 +7261,11 @@ export function makeClaudeAdapterV2(
               providerSessionId: input.providerSessionId,
               options: queryOptions,
               bridgeCanUseTool,
+              bridgeOnNativeSettings: (settings) => {
+                void runPromise(
+                  emitObservedNativeSettings(turnInput.threadId, settings).pipe(Effect.ignore),
+                );
+              },
             })
             .pipe(
               Effect.tapError(() =>
