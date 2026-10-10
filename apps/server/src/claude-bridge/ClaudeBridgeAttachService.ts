@@ -131,12 +131,14 @@ const make = Effect.gen(function* () {
   );
 
   // A turn already running when this server came up (a restart mid-turn).
+  // Whoever started it, the terminal or a prompt sent from T3: recovery has
+  // closed the run that was showing it, and the session is still working.
   // Forked: recovery runs after the layers are built, and the offer waits on it.
   yield* Effect.gen(function* () {
     yield* afterStartupRecovery;
     const live = yield* registry.listLiveProcesses;
     for (const entry of live) {
-      if (entry.session.activeTurn !== null && entry.session.activeTurn.promptUuid === undefined) {
+      if (entry.session.activeTurn !== null) {
         yield* offerTurn(entry, { ...entry.session.activeTurn, text: "" });
       }
     }
