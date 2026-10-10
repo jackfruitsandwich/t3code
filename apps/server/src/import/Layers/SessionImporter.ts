@@ -86,6 +86,7 @@ import {
   parseJsonlLine,
   type ParsedCliSession,
   type ParsedSessionMessage,
+  truncateSessionTitle,
 } from "../sessionImportTypes.ts";
 import { SessionImporter, type SessionImporterShape } from "../Services/SessionImporter.ts";
 
@@ -868,11 +869,20 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         readonly idVariant?: string;
       };
       readonly launchClass?: "human" | "kin" | "automation";
+      /**
+       * Set for a session that is running now: it gets its thread even with no
+       * history yet, dated from this instant.
+       */
+      readonly liveAt?: string;
     }) {
       const { driver, sessionId, parsed } = input;
       const idVariant = input.placement?.idVariant ?? "";
-      const firstMessage = parsed.messages[0];
-      const lastMessage = parsed.messages[parsed.messages.length - 1];
+      const liveMessage: ParsedSessionMessage | undefined =
+        input.liveAt === undefined
+          ? undefined
+          : { role: "user", sourceId: "live", text: "", timestamp: input.liveAt, lineIndex: 0 };
+      const firstMessage = parsed.messages[0] ?? liveMessage;
+      const lastMessage = parsed.messages[parsed.messages.length - 1] ?? liveMessage;
       // Codex sessions without git metadata are project-less "chats": they
       // group into one shared Chats project instead of minting a project
       // per throwaway cwd.
@@ -1642,7 +1652,7 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
       }
     });
 
-    const sweep = Effect.gen(function* () {
+    const buildSweepContext = Effect.gen(function* () {
       const settings = yield* serverSettings.getSettings;
       const claudeProjectsDir = options?.claudeProjectsDir ?? resolveClaudeProjectsDir(settings);
       const codexSessionsDir =
@@ -1698,6 +1708,11 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         sigOwners,
         deferredMachine: [],
       };
+      return { context, claudeProjectsDir, codexSessionsDir };
+    });
+
+    const sweep = Effect.gen(function* () {
+      const { context, claudeProjectsDir, codexSessionsDir } = yield* buildSweepContext;
 
       const sources = [
         { driver: CLAUDE_DRIVER, dir: claudeProjectsDir },
@@ -1781,9 +1796,60 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         });
       });
 
+    const adoptLiveClaudeSession: SessionImporterShape["adoptLiveClaudeSession"] = (input) =>
+      Effect.gen(function* () {
+        if ((yield* lookupOwnedThread(CLAUDE_DRIVER, input.sessionId)) !== undefined) return;
+        const { context } = yield* buildSweepContext;
+        const key = sourceKey(CLAUDE_DRIVER, input.sessionId);
+        if (context.bindingsBySource.has(key) || context.t3NativeSessions.has(key)) return;
+        // Only what the session wrote before the turn in flight is history;
+        // the turn itself reaches the thread through the live attachment.
+        const bytes = yield* fs
+          .readFile(input.transcriptPath)
+          .pipe(Effect.orElseSucceed(() => new Uint8Array(0)));
+        const history = new TextDecoder().decode(
+          bytes.subarray(0, Math.max(0, Math.min(bytes.length, input.turnOffset))),
+        );
+        const parsed = parseClaudeSessionJsonl(history);
+        // Agent plumbing and machine-launched runs keep the sweep's placement rules.
+        if (parsed.launch === "subagent" || isAutomationSession(parsed)) return;
+        const now = DateTime.formatIso(yield* DateTime.now);
+        yield* importFreshSession({
+          driver: CLAUDE_DRIVER,
+          sessionId: input.sessionId,
+          filePath: input.transcriptPath,
+          parsed: {
+            ...parsed,
+            sessionId: parsed.sessionId ?? input.sessionId,
+            cwd: parsed.cwd ?? input.cwd,
+            title:
+              parsed.title ??
+              (input.promptText.trim().length > 0
+                ? truncateSessionTitle(input.promptText.trim())
+                : undefined),
+          },
+          context,
+          liveAt: now,
+        });
+      }).pipe(
+        Effect.catch((error: unknown) =>
+          Effect.logWarning("session.importer.adopt-live-failed", {
+            sessionId: input.sessionId,
+            error,
+          }),
+        ),
+        Effect.catchDefect((defect: unknown) =>
+          Effect.logWarning("session.importer.adopt-live-defect", {
+            sessionId: input.sessionId,
+            defect,
+          }),
+        ),
+      );
+
     return {
       start,
       sweepNow: () => guardedSweep,
+      adoptLiveClaudeSession,
     } satisfies SessionImporterShape;
   });
 

@@ -64,9 +64,14 @@ const make = Effect.gen(function* () {
   // scan and a late event could both name the same turn.
   const offeredTurns = new Set<string>();
 
-  const offerTurn = (sid: string, turnId: string, text: string) =>
+  const offerTurn = (
+    entry: ClaudeBridgeRegistry.ClaudeBridgeProcess,
+    turnId: string,
+    text: string,
+  ) =>
     Effect.gen(function* () {
       yield* afterStartupRecovery;
+      const sid = entry.sid;
       const key = `${sid}:${turnId}`;
       if (offeredTurns.has(key)) return;
       offeredTurns.add(key);
@@ -75,7 +80,32 @@ const make = Effect.gen(function* () {
       }
       let thread = yield* lookupThread(sid);
       if (thread === null) {
-        // A session T3 has not imported yet: sweep now so a thread exists.
+        // A session a person just started in a terminal: it gets its thread
+        // now, so its first turn shows while it runs. What the session wrote
+        // before this turn comes in as history; the turn arrives live.
+        const session = (yield* registry.readSession(entry)) ?? entry.session;
+        if (session.isInteractive) {
+          const turn = session.activeTurn;
+          yield* importer.adoptLiveClaudeSession({
+            sessionId: sid,
+            transcriptPath: session.transcriptPath,
+            cwd: session.cwd,
+            turnOffset: turn === null ? Number.MAX_SAFE_INTEGER : turn.transcriptOffset,
+            promptText: text,
+          });
+          thread = yield* lookupThread(sid);
+          if (thread !== null && turn?.turnId !== turnId) {
+            // The turn ended before the thread existed: it came in as history.
+            yield* Effect.logInfo("claude-bridge.session-adopted", { sid, turnId, live: false });
+            return;
+          }
+          if (thread !== null) {
+            yield* Effect.logInfo("claude-bridge.session-adopted", { sid, turnId, live: true });
+          }
+        }
+      }
+      if (thread === null) {
+        // Anything else T3 has not imported yet: sweep now so a thread exists.
         yield* importer.sweepNow();
         thread = yield* lookupThread(sid);
       }
@@ -100,7 +130,7 @@ const make = Effect.gen(function* () {
     });
 
   yield* registry.onUnattachedEvent((event, entry) =>
-    event.type === "turn.start" ? offerTurn(entry.sid, event.turnId, event.text) : Effect.void,
+    event.type === "turn.start" ? offerTurn(entry, event.turnId, event.text) : Effect.void,
   );
 
   // A turn already running when this server came up (a restart mid-turn).
@@ -110,7 +140,7 @@ const make = Effect.gen(function* () {
     const live = yield* registry.listLiveProcesses;
     for (const entry of live) {
       if (entry.session.activeTurn !== null && entry.session.activeTurn.promptUuid === undefined) {
-        yield* offerTurn(entry.sid, entry.session.activeTurn.turnId, "");
+        yield* offerTurn(entry, entry.session.activeTurn.turnId, "");
       }
     }
   }).pipe(Effect.forkScoped);
