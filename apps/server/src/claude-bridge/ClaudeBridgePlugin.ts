@@ -601,8 +601,36 @@ async function handleCommand($, command) {
     return
   }
   if (command.type === 'interrupt') {
-    if (activeTurn) await $.turn.abort({ turnId: activeTurn.turnId })
+    if (!activeTurn) return
+    const stoppedAt = Date.now()
+    await $.turn.abort({ turnId: activeTurn.turnId })
+    await stopCommandsLeftRunning($, stoppedAt)
     return
+  }
+}
+
+// Ending a turn from a mod moves a command that is still running to the
+// background, where it would finish and then wake the session to carry on.
+// Esc in the terminal kills the command. Stop from T3 means the same: the
+// commands the abort left running are stopped, as /tasks would stop them.
+async function stopCommandsLeftRunning($, stoppedAt) {
+  if (!transcriptPath) return
+  const stopped = new Set()
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    try { await $.clock.sleep(400) } catch { return }
+    let tail = ''
+    try { tail = String((await $.process.run(['tail', '-c', '262144', transcriptPath], { timeoutMs: 5000 })).stdout || '') } catch { continue }
+    for (const line of tail.split('\\n')) {
+      if (line.indexOf('backgroundedByTurnAbort') === -1) continue
+      let row = null
+      try { row = JSON.parse(line) } catch { continue }
+      const result = row && row.toolUseResult
+      if (!result || result.backgroundedByTurnAbort !== true || typeof result.backgroundTaskId !== 'string') continue
+      if (Date.parse(row.timestamp || '') < stoppedAt - 2000 || stopped.has(result.backgroundTaskId)) continue
+      stopped.add(result.backgroundTaskId)
+      try { await $.tool.call({ tool: 'TaskStop', task_id: result.backgroundTaskId }) } catch {}
+    }
+    if (stopped.size > 0 && attempt >= 2) return
   }
 }
 
