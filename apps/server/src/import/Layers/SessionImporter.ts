@@ -39,6 +39,7 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   ThreadId,
+  RunId,
   TurnItemId,
   type OrchestrationV2AppThread,
   type OrchestrationV2ThreadHeldBy,
@@ -1020,12 +1021,14 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
       const { threadId } = input;
       const replies = yield* sql<{
         readonly turn_item_id: string;
+        readonly run_id: string | null;
         readonly ordinal: number;
         readonly text: string | null;
         readonly started_at: string;
       }>`
         SELECT
           turn_item_id,
+          run_id,
           ordinal,
           json_extract(payload_json, '$.text') AS text,
           coalesce(json_extract(payload_json, '$.startedAt'), updated_at) AS started_at
@@ -1082,27 +1085,37 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         taken.add(pair.recorded);
         emptied.add(drawn.turn_item_id);
         if (Math.abs(recorded.ordinal - drawn.ordinal) <= DOUBLED_REPLY_REACH) continue;
-        // A row's place is kept apart from the row and is its own for
-        // good: the two trade places, by way of one nobody holds.
-        const place = (turnItemId: string, ordinal: number) => sql`
-            UPDATE orchestration_v2_turn_item_positions
-            SET ordinal = ${ordinal}
-            WHERE thread_id = ${threadId} AND turn_item_id = ${turnItemId}
-          `;
-        yield* place(drawn.turn_item_id, -drawn.ordinal);
-        yield* place(recorded.turn_item_id, drawn.ordinal);
-        yield* place(drawn.turn_item_id, recorded.ordinal);
+        // A row's place is kept apart from the row, one row to a place. The
+        // emptied copy gives its place up for a new one at the end of the run
+        // the record's row was read into, and that row takes the place it
+        // left. In that order: the events below are what a rebuild of the
+        // thread replays, and two rows never claim one place in it.
+        yield* sql`
+          DELETE FROM orchestration_v2_turn_item_positions
+          WHERE thread_id = ${threadId} AND turn_item_id = ${drawn.turn_item_id}
+        `;
+        const parked = yield* turnItemPositions.allocate({
+          threadId,
+          turnItemId: TurnItemId.make(drawn.turn_item_id),
+          runId: recorded.run_id === null ? null : RunId.make(recorded.run_id),
+        });
+        yield* sql`
+          UPDATE orchestration_v2_turn_item_positions
+          SET ordinal = ${drawn.ordinal}
+          WHERE thread_id = ${threadId} AND turn_item_id = ${recorded.turn_item_id}
+        `;
+        placeOf.set(drawn.turn_item_id, parked);
         placeOf.set(recorded.turn_item_id, drawn.ordinal);
-        placeOf.set(drawn.turn_item_id, recorded.ordinal);
         movedCount += 1;
       }
       const records = yield* threads.getThreadRecords(threadId, ["turnItems"]);
-      const events: Array<OrchestrationV2DomainEvent> = [];
+      const vacated: Array<OrchestrationV2DomainEvent> = [];
+      const placed: Array<OrchestrationV2DomainEvent> = [];
       for (const item of records.turnItems) {
         if (item.type !== "assistant_message") continue;
         const place = placeOf.get(item.id);
         if (!emptied.has(item.id) && place === undefined) continue;
-        events.push({
+        (emptied.has(item.id) ? vacated : placed).push({
           // A row can be given a place more than once: each is its own event.
           id: importEventId(
             threadId,
@@ -1118,6 +1131,8 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
           },
         });
       }
+      // The emptied copies first: each frees the place a record row takes.
+      const events = [...vacated, ...placed];
       if (events.length === 0) return;
       yield* eventSink.write({ events });
       yield* Effect.logInfo("session.importer.doubled-replies-blanked", {
