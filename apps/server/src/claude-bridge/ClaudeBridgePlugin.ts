@@ -349,7 +349,7 @@ async function heartbeat($) {
 
 async function opensPanel($, name) {
   if (KNOWN_PANELS.has(name)) return true
-  try { return (await $.store.get('panel:' + name)) === true } catch { return false }
+  try { return (await $.store.get('panel:' + MOD_VERSION + ':' + name)) === true } catch { return false }
 }
 
 // The model row of /config takes these names; a full model id maps onto one.
@@ -490,7 +490,7 @@ async function runSlashCommand($, command) {
     if (settled || !mine()) return
     settled = true
     pendingCommand = null
-    $.store.set('panel:' + command.name, true).catch(() => {})
+    $.store.set('panel:' + MOD_VERSION + ':' + command.name, true).catch(() => {})
     report({
       ok: false,
       waitingInTerminal: true,

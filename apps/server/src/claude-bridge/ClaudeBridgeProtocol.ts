@@ -158,8 +158,6 @@ export const CLAUDE_BARE_PANEL_COMMANDS: ReadonlyArray<string> = [
   "tasks",
   "workflows",
   "artifacts",
-  "agents",
-  "output-style",
   "resume",
   "rewind",
   "memory",
@@ -181,6 +179,8 @@ export const CLAUDE_BARE_PANEL_COMMANDS: ReadonlyArray<string> = [
   "remote-control",
   "install-github-app",
   "install-slack-app",
+  "release-notes",
+  "skill-doctor",
 ];
 
 /** One slash command of a session, as its own typeahead lists it. */
