@@ -13,6 +13,9 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 
+/** What a continuation run's opening message says when nothing is known of what woke the session. */
+export const CONTINUATION_MESSAGE_TEXT = "Background task completed.";
+
 export interface ProviderContinuationRequest {
   readonly threadId: ThreadId;
   readonly providerThreadId: ProviderThreadId;

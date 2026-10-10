@@ -1547,6 +1547,70 @@ runtimeTest(
     }),
 );
 
+runtimeTest("a stock message T3 once showed as the person's own becomes a notice", (h) =>
+  Effect.gen(function* () {
+    const claudeId = "aaaaaaaa-1111-4111-8111-1111111111f1";
+    const c = claudeSession({ sessionId: claudeId, cwd: h.workspace });
+    const claudePath = h.claudeFile(claudeId);
+    const threadId = importedThreadId(claudeId);
+    yield* h.write(claudePath, [
+      c.user("user-1", "Fix the login bug please", "2026-07-01T10:00:00.000Z"),
+      c.assistant("assistant-1", "I fixed the login bug.", "2026-07-01T10:00:05.000Z"),
+    ]);
+    const bridgeDir = yield* h.makeDir("bridge");
+    const importer = yield* h.importer({ bridgeDir });
+    yield* importer.sweepNow();
+    yield* seedT3Run(h, threadId, CLAUDE, "completed", {
+      ordinal: 1,
+      iso: "2026-07-01T10:01:00.000Z",
+    });
+    // What an earlier build wrote for a turn it picked up after a restart.
+    const at = DateTime.makeUnsafe("2026-07-01T10:01:00.000Z");
+    const stock = seedTimelineRow({
+      threadId,
+      key: "stock",
+      messageId: MessageId.make(`seed-stock:${threadId}`),
+      role: "user",
+      text: "Background task completed.",
+      at,
+      runId: null,
+    });
+    yield* h.eventSink.write({
+      events: [
+        stock.payload.type === "user_message"
+          ? { ...stock, payload: { ...stock.payload, creationSource: "provider" as const } }
+          : stock,
+      ],
+    });
+    const instanceDir = yield* h.makeDir("bridge", "claude", claudeId, "inst-1");
+    yield* h.write(joinPath(instanceDir, "session.json"), [
+      {
+        sid: claudeId,
+        instanceId: "inst-1",
+        heartbeatAt: yield* Clock.currentTimeMillis,
+        activeTurn: null,
+      },
+    ]);
+    const rows = h.threads.getThreadRecords(threadId, ["turnItems"]).pipe(
+      Effect.map((records) =>
+        records.turnItems
+          .filter((item) => item.type === "user_message" || item.type === "notification")
+          .map((item) =>
+            item.type === "user_message" ? `said: ${item.text}` : `notice: ${item.summary}`,
+          )
+          .toSorted(),
+      ),
+    );
+    assert.include(yield* rows, "said: Background task completed.");
+
+    yield* importer.healLiveClaudeSession({ sessionId: claudeId, transcriptPath: claudePath });
+    assert.deepEqual(yield* rows, [
+      "notice: Background activity updated",
+      "said: Fix the login bug please",
+    ]);
+  }),
+);
+
 runtimeTest(
   "does not repeat prompts and command output a running session's thread already shows",
   (h) =>

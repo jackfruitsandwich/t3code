@@ -68,6 +68,7 @@ import { ServerConfig } from "../../config.ts";
 import * as EventSink from "../../orchestration-v2/EventSink.ts";
 import { deriveProviderThread } from "../../orchestration-v2/IdAllocator.ts";
 import * as ProjectStore from "../../orchestration-v2/ProjectStore.ts";
+import { CONTINUATION_MESSAGE_TEXT } from "../../orchestration-v2/ProviderContinuationRequests.ts";
 import * as ThreadManagementService from "../../orchestration-v2/ThreadManagementService.ts";
 import * as TurnItemPositionStore from "../../orchestration-v2/TurnItemPositionStore.ts";
 import { expandHomePath } from "../../pathExpansion.ts";
@@ -923,6 +924,75 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
     };
 
     /**
+     * A turn T3 picked up with nothing known of how it began used to open
+     * with the stock words of a background wake, shown as the person's own
+     * message. Nobody typed them. Where the session's record has no such
+     * prompt, the row becomes the notice a background wake shows.
+     */
+    const retireInventedPrompts = Effect.fn("SessionImporter.retireInventedPrompts")(
+      function* (input: {
+        readonly threadId: ThreadId;
+        readonly rows: ReadonlyArray<ParsedSessionMessage>;
+      }) {
+        const { threadId } = input;
+        const suspects = yield* sql<{ readonly turn_item_id: string }>`
+        SELECT turn_item_id
+        FROM orchestration_v2_projection_turn_items
+        WHERE thread_id = ${threadId}
+          AND type = 'user_message'
+          AND json_extract(payload_json, '$.createdBy') = 'user'
+          AND json_extract(payload_json, '$.creationSource') = 'provider'
+          AND json_extract(payload_json, '$.text') = ${CONTINUATION_MESSAGE_TEXT}
+      `;
+        if (suspects.length === 0) return;
+        // The person can type those very words: then the record has them.
+        if (
+          input.rows.some((row) => row.role === "user" && row.text === CONTINUATION_MESSAGE_TEXT)
+        ) {
+          return;
+        }
+        const ids = new Set(suspects.map((row) => row.turn_item_id));
+        const records = yield* threads.getThreadRecords(threadId, ["turnItems"]);
+        const events: Array<OrchestrationV2DomainEvent> = [];
+        for (const item of records.turnItems) {
+          if (item.type !== "user_message" || !ids.has(item.id)) continue;
+          events.push({
+            id: importEventId(threadId, `invented-prompt-retired:${item.id}`),
+            type: "turn-item.updated",
+            threadId,
+            occurredAt: item.updatedAt,
+            payload: {
+              id: item.id,
+              threadId: item.threadId,
+              runId: item.runId,
+              nodeId: item.nodeId,
+              providerThreadId: item.providerThreadId,
+              providerTurnId: item.providerTurnId,
+              nativeItemRef: item.nativeItemRef,
+              parentItemId: item.parentItemId,
+              ordinal: item.ordinal,
+              status: item.status,
+              title: item.title,
+              startedAt: item.startedAt,
+              completedAt: item.completedAt,
+              updatedAt: item.updatedAt,
+              type: "notification",
+              source: { kind: "background_task" },
+              outcome: "updated",
+              summary: "Background activity updated",
+            },
+          });
+        }
+        if (events.length === 0) return;
+        yield* eventSink.write({ events });
+        yield* Effect.logInfo("session.importer.invented-prompts-retired", {
+          threadId,
+          count: events.length,
+        });
+      },
+    );
+
+    /**
      * A thread that shows a session through a live attachment holds what the
      * session's transcript holds: rows the attachment never delivered are
      * added, each after the run that was the latest when it was written. See
@@ -1044,6 +1114,7 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
           live: input.live,
         });
       }
+      yield* retireInventedPrompts({ threadId, rows: parsed.messages });
       // The cursor says how far the file has been taken in; with a turn in
       // flight its rows have not been, and the pass after it still needs them.
       if (settledBeforeMs === undefined) {

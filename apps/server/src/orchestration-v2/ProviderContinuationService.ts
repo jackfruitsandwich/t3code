@@ -8,8 +8,6 @@ import * as ProviderContinuationRequests from "./ProviderContinuationRequests.ts
 import * as ThreadManagementService from "./ThreadManagementService.ts";
 import { isUndeliveredMailboxSteer } from "./NotificationMailbox.ts";
 
-const CONTINUATION_MESSAGE_TEXT = "Background task completed.";
-
 function delegatedCompletionText(taskIds: ReadonlyArray<string>): string {
   const taskList = taskIds.join(", ");
   return taskIds.length === 1
@@ -157,7 +155,7 @@ export const layer = Layer.effectDiscard(
           commandId,
           threadId: request.threadId,
           messageId,
-          text: request.detail ?? CONTINUATION_MESSAGE_TEXT,
+          text: request.detail ?? ProviderContinuationRequests.CONTINUATION_MESSAGE_TEXT,
           // A prompt the person typed carries no background-activity notice.
           ...(request.createdBy === "user" && request.notification === undefined
             ? {}
