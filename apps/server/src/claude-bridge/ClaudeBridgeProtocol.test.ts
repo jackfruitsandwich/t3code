@@ -202,6 +202,33 @@ describe("ClaudeBridgeProtocol frame translator", () => {
   });
 });
 
+describe("ClaudeBridgeProtocol T3 tools called through the mod", () => {
+  it("shows a call to a tool the mod declares under T3's own name for it", () => {
+    const frames = translator().onTranscriptRow({
+      type: "assistant",
+      uuid: "33333333-3333-4333-8333-333333333333",
+      message: {
+        role: "assistant",
+        content: [
+          {
+            type: "tool_use",
+            id: "toolu_1",
+            name: "mcp__t3bridge__html_render",
+            input: { title: "T" },
+          },
+          { type: "tool_use", id: "toolu_2", name: "Bash", input: { command: "ls" } },
+        ],
+      },
+    });
+    const names = frames.flatMap((frame) =>
+      frame.type === "assistant"
+        ? frame.message.content.flatMap((block) => (block.type === "tool_use" ? [block.name] : []))
+        : [],
+    );
+    assert.deepStrictEqual(names, ["mcp__t3-code__html_render", "Bash"]);
+  });
+});
+
 describe("ClaudeBridgeProtocol record helpers", () => {
   const rowAt = (iso: string) => `${JSON.stringify({ type: "user", uuid: iso, timestamp: iso })}\n`;
   const first = rowAt("2026-07-01T10:00:00.000Z");

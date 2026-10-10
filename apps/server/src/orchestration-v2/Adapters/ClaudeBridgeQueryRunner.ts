@@ -44,7 +44,10 @@ import {
   CLAUDE_BRIDGE_WINDOW_PROTOCOL,
   claudeConfigModelChoice,
   claudeTranscriptCommandText,
+  claudeTranscriptCommandOutput,
   claudeTranscriptPermissionMode,
+  CLAUDE_BRIDGE_UPKEEP_COMMAND,
+  isClaudeBridgeModRow,
   isClaudeTurnEndRow,
   isClaudeTypedMidTurnRow,
   isClaudeBridgeCommandOutputFrame,
@@ -259,6 +262,17 @@ export const layer: Layer.Layer<
         SDKMessage,
         ClaudeAdapterV2.ClaudeAgentSdkQueryRunnerError | Cause.Done
       >();
+      // Where the session's calls to T3's own tools are answered: the tool
+      // server this thread's SDK sessions are given, with its credential.
+      const t3Server: unknown = options.mcpServers?.["t3-code"];
+      const toolEndpoint =
+        isRecord(t3Server) &&
+        t3Server.type === "http" &&
+        typeof t3Server.url === "string" &&
+        isRecord(t3Server.headers) &&
+        typeof t3Server.headers.Authorization === "string"
+          ? { endpoint: t3Server.url, authorization: t3Server.headers.Authorization }
+          : undefined;
       const translator = makeClaudeBridgeFrameTranslator({
         sessionId: sid,
         cwd,
@@ -290,6 +304,8 @@ export const layer: Layer.Layer<
         /** Rows that close a turn in the record, read so far; and the count when the open turn began. */
         turnEndsRead: 0,
         turnEndsAtTurnStart: 0,
+        /** The mod's own reload command was just read: what it printed is skipped too. */
+        upkeepOutputDue: false,
         /** A slash command T3 ran that started no turn, waiting for its output rows. */
         pendingLocal: null as {
           readonly commandId: string;
@@ -484,6 +500,21 @@ export const layer: Layer.Layer<
             typedMidTurn = typedMidTurn || isClaudeTypedMidTurnRow(row);
             transcriptMode = claudeTranscriptPermissionMode(row) ?? transcriptMode;
             const commandText = claudeTranscriptCommandText(row);
+            // The mod loading a newer version of itself: nobody asked for it.
+            if (
+              isClaudeBridgeModRow(row) &&
+              state.pendingPrompt === null &&
+              state.pendingLocal === null
+            ) {
+              if (commandText !== null && commandText.startsWith(CLAUDE_BRIDGE_UPKEEP_COMMAND)) {
+                state.upkeepOutputDue = true;
+                continue;
+              }
+              if (state.upkeepOutputDue && claudeTranscriptCommandOutput(row) !== null) {
+                state.upkeepOutputDue = false;
+                continue;
+              }
+            }
             if (commandText !== null) state.lastCommandText = commandText;
             for (const frame of translator.onTranscriptRow(row)) {
               if (isClaudeBridgeCommandOutputFrame(frame) && !translator.hasOpenTurn()) {
@@ -607,7 +638,7 @@ export const layer: Layer.Layer<
         while (!state.closed) {
           const now = yield* Clock.currentTimeMillis;
           if (now - lastHeartbeat >= CLAUDE_BRIDGE_T3_HEARTBEAT_MS) {
-            yield* registry.heartbeat(bridgeProcess);
+            yield* registry.heartbeat(bridgeProcess, toolEndpoint);
             lastHeartbeat = now;
           }
           const session = yield* registry.readSession(bridgeProcess);

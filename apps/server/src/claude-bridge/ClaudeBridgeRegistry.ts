@@ -88,6 +88,11 @@ export type ClaudeBridgeEventHandler = (
   process: ClaudeBridgeProcess,
 ) => Effect.Effect<void>;
 
+export interface ClaudeBridgeToolEndpoint {
+  readonly endpoint: string;
+  readonly authorization: string;
+}
+
 export type ClaudeBridgeRecordChange = "turn.start" | "turn.complete" | "typed-mid-turn";
 
 export type ClaudeBridgeRecordHandler = (
@@ -130,7 +135,15 @@ export class ClaudeBridgeRegistry extends Context.Service<
       body: ClaudeBridgeCommandBody,
     ) => Effect.Effect<string>;
     /** Renews the attached marker the mod reads before holding an approval for T3. */
-    readonly heartbeat: (process: ClaudeBridgeProcess) => Effect.Effect<void>;
+    /**
+     * Says T3 is attached to the process. `tools` names where T3 answers the
+     * session's calls to T3's own tools, with the credential of the thread
+     * that shows it; the mod reads both from the same file.
+     */
+    readonly heartbeat: (
+      process: ClaudeBridgeProcess,
+      tools?: ClaudeBridgeToolEndpoint,
+    ) => Effect.Effect<void>;
     readonly clearHeartbeat: (process: ClaudeBridgeProcess) => Effect.Effect<void>;
     /** Routes the session's events to `handler` until the scope closes. One subscriber per session. */
     readonly subscribe: (
@@ -554,12 +567,18 @@ const make = Effect.gen(function* () {
       return id;
     });
 
-  const heartbeat = (entry: ClaudeBridgeProcess) =>
+  const heartbeat = (entry: ClaudeBridgeProcess, tools?: ClaudeBridgeToolEndpoint) =>
     Clock.currentTimeMillis.pipe(
       Effect.flatMap((now) =>
         fs.writeFileString(
           path.join(entry.dir, "t3.json"),
-          encodeJson({ heartbeatAt: now, pid: process.pid }),
+          encodeJson({
+            heartbeatAt: now,
+            pid: process.pid,
+            ...(tools === undefined ? {} : { mcp: tools }),
+          }),
+          // It names a credential: the person's eyes only.
+          { mode: 0o600 },
         ),
       ),
       Effect.ignore,

@@ -23,6 +23,7 @@ import {
   CLAUDE_BRIDGE_MOD_VERSION,
   CLAUDE_BRIDGE_PLUGIN_NAME,
 } from "./ClaudeBridgeProtocol.ts";
+import { loadClaudeBridgeToolSpecs, type ClaudeBridgeToolSpec } from "./ClaudeBridgeTools.ts";
 
 const MARKETPLACE_JSON = JSON.stringify(
   {
@@ -71,7 +72,7 @@ const REGISTER_JS = `// t3bridge ${CLAUDE_BRIDGE_MOD_VERSION}: makes T3 Code a w
 //   commands.json      the slash commands this session has, rewritten when they change
 //   inbox.json         requests from T3; inbox-cursor.json marks the last seq handled
 //   events/<seq>.json  events for T3, one file each; T3 deletes what it has read
-//   t3.json            T3's own heartbeat while it is attached
+//   t3.json            T3's own heartbeat while it is attached, with where it answers this session's tool calls
 // <bridge root>/claude/mod-version.json names the mod version the server ships.
 const PROTOCOL = 2
 const MOD_VERSION = '${CLAUDE_BRIDGE_MOD_VERSION}'
@@ -80,6 +81,12 @@ const INBOX_POLL_MS = 500
 const COMMANDS_REFRESH_MS = 60000
 const T3_LIVE_MS = 12000
 const PROMPT_MATCH_WINDOW_MS = 20000
+// T3's own tools, declared here so the session has them whatever started it;
+// each call is answered from T3's tool endpoint (see t3.json).
+const T3_TOOLS = __T3_TOOLS__
+const T3_TOOL_PREFIX = 'mcp__${CLAUDE_BRIDGE_PLUGIN_NAME}__'
+const MCP_PROTOCOL = '2025-06-18'
+const T3_TOOL_ATTACH_WAIT = 20
 const COMMAND_TURN_WAIT_MS = 1500
 const COMMAND_PANEL_WAIT_MS = 6000
 // Built-in commands that, typed with no argument, open a panel in the terminal
@@ -106,6 +113,9 @@ let eventSeq = 0
 let ended = null
 let timersStarted = false
 let permissionMode = null
+let toolsDeclared = false
+let mcpSession = null
+let mcpRequestId = 0
 let effort = null
 let commandsBody = ''
 let commandsRev = 0
@@ -178,11 +188,132 @@ async function transcriptOffset($) {
   try { return (await $.fs.stat(transcriptPath)).size } catch { return 0 }
 }
 
-// What the classic hook payloads say about the session right now.
-function noteClassic(e) {
+// What the classic hook payloads say about the session right now. Each names
+// the session's record file, which a mod loaded mid-session (/reload-plugins)
+// is told by nothing else; it is kept so the next load starts knowing it.
+function noteClassic($, e) {
   if (!e) return
   if (typeof e.permission_mode === 'string') permissionMode = e.permission_mode
   if (e.effort && typeof e.effort.level === 'string') effort = e.effort.level
+  if (typeof e.transcript_path === 'string' && e.transcript_path && e.transcript_path !== transcriptPath) {
+    transcriptPath = e.transcript_path
+    if (sid) $.store.set('transcript:' + sid, transcriptPath).catch(() => {})
+  }
+}
+
+// Declares T3's tools in this session. The engine refuses until the session
+// has bound, so it is tried again from the heartbeat until it holds.
+async function declareT3Tools($) {
+  if (toolsDeclared || passive) return
+  try {
+    for (const tool of T3_TOOLS) {
+      await $.tool.register({ name: tool.name, description: tool.description, inputSchema: tool.inputSchema, isDeferred: tool.isDeferred })
+    }
+    toolsDeclared = true
+  } catch {}
+}
+
+function isT3ReadOnlyTool(name) {
+  for (const tool of T3_TOOLS) {
+    if (tool.isReadOnly && name === T3_TOOL_PREFIX + tool.name) return true
+  }
+  return false
+}
+
+// Where T3 answers tool calls for this session and the credential of the
+// thread that shows it: T3 writes both into t3.json while it is attached. A
+// turn typed here is attached to a moment after it starts.
+async function t3ToolEndpoint($) {
+  for (let attempt = 0; attempt < T3_TOOL_ATTACH_WAIT; attempt += 1) {
+    try {
+      const t3 = JSON.parse(await $.fs.read(dir + '/t3.json'))
+      const live = t3 && typeof t3.heartbeatAt === 'number' && Date.now() - t3.heartbeatAt < T3_LIVE_MS
+      if (live && t3.mcp && typeof t3.mcp.endpoint === 'string' && typeof t3.mcp.authorization === 'string') return t3.mcp
+    } catch {}
+    await sleepOutsideBudget($)
+  }
+  return null
+}
+
+// One JSON-RPC message, or server-sent events whose data lines carry them.
+function parseMcpBody(text) {
+  const body = String(text || '').trim()
+  if (!body) return null
+  if (body[0] === '{') {
+    try { return JSON.parse(body) } catch { return null }
+  }
+  let answer = null
+  for (const line of body.split('\\n')) {
+    if (line.indexOf('data:') !== 0) continue
+    try {
+      const message = JSON.parse(line.slice(5).trim())
+      if (message && (message.result !== undefined || message.error !== undefined)) answer = message
+    } catch {}
+  }
+  return answer
+}
+
+async function mcpRequest($, mcp, method, params, isNotification) {
+  const headers = {
+    accept: 'application/json, text/event-stream',
+    authorization: mcp.authorization,
+    'content-type': 'application/json',
+    'mcp-protocol-version': MCP_PROTOCOL,
+  }
+  if (mcpSession && mcpSession.id) headers['mcp-session-id'] = mcpSession.id
+  mcpRequestId += 1
+  const message = isNotification
+    ? { jsonrpc: '2.0', method: method, params: params }
+    : { jsonrpc: '2.0', id: mcpRequestId, method: method, params: params }
+  const response = await $.http.fetch(mcp.endpoint, { method: 'POST', headers: headers, body: JSON.stringify(message) })
+  const responseHeaders = response.headers || {}
+  const sessionId = responseHeaders['mcp-session-id'] || responseHeaders['Mcp-Session-Id']
+  if (sessionId) mcpSession = { endpoint: mcp.endpoint, authorization: mcp.authorization, id: String(sessionId) }
+  if (isNotification) return null
+  if (!response.ok) throw new Error('T3 Code answered ' + response.status + ': ' + String(response.text || '').slice(0, 300))
+  const answer = parseMcpBody(response.text)
+  if (!answer) throw new Error('T3 Code sent no answer')
+  if (answer.error) throw new Error(answer.error.message || 'T3 Code refused the call')
+  return answer.result
+}
+
+// A tool's answer as the engine takes one from a mod: text, or blocks.
+function t3ToolAnswer(result) {
+  const blocks = []
+  for (const block of (result && Array.isArray(result.content) ? result.content : [])) {
+    if (block && block.type === 'text' && typeof block.text === 'string') {
+      blocks.push({ type: 'text', text: block.text })
+    } else if (block && block.type === 'image' && typeof block.data === 'string') {
+      blocks.push({ type: 'image', source: { type: 'base64', media_type: block.mimeType || 'image/png', data: block.data } })
+    }
+  }
+  if (result && result.isError) {
+    const reason = blocks.filter((block) => block.type === 'text').map((block) => block.text).join('\\n')
+    return { deny: reason || 'The tool reported an error.' }
+  }
+  if (blocks.length === 1 && blocks[0].type === 'text') return { result: blocks[0].text }
+  return { result: blocks.length > 0 ? blocks : '' }
+}
+
+async function callT3Tool($, name, input) {
+  const mcp = await t3ToolEndpoint($)
+  if (!mcp) {
+    return { deny: 'T3 Code is not showing this session right now, so its ' + name + ' tool cannot run. It works while T3 Code is running and has this session open as a thread.' }
+  }
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const sameServer = mcpSession && mcpSession.endpoint === mcp.endpoint && mcpSession.authorization === mcp.authorization
+      if (!sameServer || attempt > 0) {
+        mcpSession = null
+        await mcpRequest($, mcp, 'initialize', { protocolVersion: MCP_PROTOCOL, capabilities: {}, clientInfo: { name: 't3bridge', version: MOD_VERSION } }, false)
+        await mcpRequest($, mcp, 'notifications/initialized', {}, true).catch(() => {})
+      }
+      return t3ToolAnswer(await mcpRequest($, mcp, 'tools/call', { name: name, arguments: input }, false))
+    } catch (err) {
+      if (attempt === 1) return { deny: String((err && err.message) || err) }
+    }
+  }
+  return { deny: 'T3 Code did not answer.' }
 }
 
 function terminalPresent() {
@@ -275,6 +406,9 @@ async function openSessionDir($) {
   activeTurn = null
   pendingCommand = null
   commandsBody = ''
+  if (!transcriptPath) {
+    try { transcriptPath = String((await $.store.get('transcript:' + sid)) || '') } catch {}
+  }
   await heartbeat($)
   await refreshCommands($)
   await heartbeat($)
@@ -434,7 +568,7 @@ function startTimers($) {
   if (timersStarted || passive) return
   timersStarted = true
   $.clock.every(HEARTBEAT_MS, () => {
-    openSessionDir($).then(() => heartbeat($)).then(() => reloadIfOutdated($)).catch(() => {})
+    openSessionDir($).then(() => heartbeat($)).then(() => declareT3Tools($)).then(() => reloadIfOutdated($)).catch(() => {})
   })
   $.clock.every(INBOX_POLL_MS, () => {
     pollInbox($).catch(() => {})
@@ -480,31 +614,42 @@ export function register(on) {
     } catch {}
     await openSessionDir($)
     startTimers($)
+    await declareT3Tools($)
     return next(e)
   })
+
+  for (const tool of T3_TOOLS) {
+    on('tool.call', { tool: T3_TOOL_PREFIX + tool.name }, async ($, e) => {
+      const input = {}
+      for (const key of Object.keys(e || {})) {
+        if (key !== 'tool' && key !== 'tool_use_id' && key !== 'consent') input[key] = e[key]
+      }
+      return callT3Tool($, tool.name, input)
+    })
+  }
 
   // Only the guard baseline here: whether this process bridges at all is
   // known at session.start, which may come after this event.
   on('classic.SessionStart', async ($, e, next) => {
     transcriptPath = String(e.transcript_path || transcriptPath)
-    noteClassic(e)
+    noteClassic($, e)
     await takeBaseline($)
     await heartbeat($)
     return next(e)
   })
 
   on('classic.UserPromptSubmit', async ($, e, next) => {
-    noteClassic(e)
+    noteClassic($, e)
     return next(e)
   })
 
   on('classic.PreToolUse', async ($, e, next) => {
-    noteClassic(e)
+    noteClassic($, e)
     return next(e)
   })
 
   on('classic.Stop', async ($, e, next) => {
-    noteClassic(e)
+    noteClassic($, e)
     return next(e)
   })
 
@@ -603,6 +748,8 @@ export function register(on) {
   on('tool.check', async ($, e, next) => {
     const verdict = await next(e)
     if (!verdict || verdict.decision !== 'ask' || !e.tool_use_id || e.agentId) return verdict
+    // T3's display tools change nothing in the workspace; T3 allows them wherever it attaches them.
+    if (isT3ReadOnlyTool(e.tool)) return { decision: 'allow', reason: 'T3 Code display tool' }
     if (isGranted(e)) return { decision: 'allow', reason: 'Allowed for this session in T3 Code' }
     if (!(await heldForT3($))) return verdict
     const toolUseId = e.tool_use_id
@@ -651,11 +798,19 @@ export const materializeClaudeBridgePlugin = Effect.fn("materializeClaudeBridgeP
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const pluginDir = path.join(dir, "plugins", CLAUDE_BRIDGE_PLUGIN_NAME);
+  // Without the tool definitions the mod still bridges; it declares none.
+  const tools = yield* Effect.promise(loadClaudeBridgeToolSpecs).pipe(
+    Effect.catchDefect((defect) =>
+      Effect.logWarning("claude-bridge.tool-specs-unavailable", { defect }).pipe(
+        Effect.as([] as ReadonlyArray<ClaudeBridgeToolSpec>),
+      ),
+    ),
+  );
   const files: ReadonlyArray<readonly [string, string]> = [
     [path.join(dir, ".claude-plugin", "marketplace.json"), MARKETPLACE_JSON + "\n"],
     [path.join(pluginDir, ".claude-plugin", "plugin.json"), PLUGIN_JSON + "\n"],
     [path.join(pluginDir, "hooks", "hooks.json"), HOOKS_JSON + "\n"],
-    [path.join(pluginDir, "hooks", "register.js"), REGISTER_JS],
+    [path.join(pluginDir, "hooks", "register.js"), claudeBridgeRegisterJs(tools)],
   ];
   for (const [file, content] of files) {
     yield* fs.makeDirectory(path.dirname(file), { recursive: true });
@@ -667,5 +822,6 @@ export const materializeClaudeBridgePlugin = Effect.fn("materializeClaudeBridgeP
   return { marketplaceDir: dir, pluginDir } satisfies ClaudeBridgePluginFiles;
 });
 
-/** The mod source, for tests that load it into a real process. */
-export const CLAUDE_BRIDGE_REGISTER_JS = REGISTER_JS;
+/** The mod's source, with the tools it declares filled in. */
+export const claudeBridgeRegisterJs = (tools: ReadonlyArray<ClaudeBridgeToolSpec>) =>
+  REGISTER_JS.replace("__T3_TOOLS__", () => JSON.stringify(tools));

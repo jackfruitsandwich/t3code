@@ -30,7 +30,7 @@ import type {
 import { isRecord, parseJsonlLine } from "../import/sessionImportTypes.ts";
 
 export const CLAUDE_BRIDGE_PROTOCOL_VERSION = 2;
-export const CLAUDE_BRIDGE_MOD_VERSION = "0.2.0";
+export const CLAUDE_BRIDGE_MOD_VERSION = "0.3.0";
 /**
  * The first protocol whose mod runs slash commands, answers questions with
  * their answers and reports the session's own commands. A process still on an
@@ -555,6 +555,31 @@ export function claudeTranscriptCommandText(row: unknown): string | null {
   return args.length === 0 ? name : `${name} ${args}`;
 }
 
+/** Whether the row came into the session through the mod (a prompt or command T3 sent, or the mod's own). */
+export function isClaudeBridgeModRow(row: unknown): boolean {
+  return (
+    isRecord(row) &&
+    isRecord(row.origin) &&
+    row.origin.kind === "plugin" &&
+    row.origin.name === CLAUDE_BRIDGE_PLUGIN_NAME
+  );
+}
+
+/** What a slash command printed, when the row is Claude Code's record of that, else null. */
+export function claudeTranscriptCommandOutput(row: unknown): string | null {
+  if (!isRecord(row)) return null;
+  const text = commandRowText(row);
+  return text === null ? null : (LOCAL_COMMAND_STDOUT.exec(text)?.[1] ?? null);
+}
+
+/**
+ * The command the mod runs in a session to load a newer version of itself.
+ * That is the bridge's own upkeep, not something the person did, so its rows
+ * are not shown. (When the person sends the same command from T3, T3 shows
+ * what they sent and what came back by its own means.)
+ */
+export const CLAUDE_BRIDGE_UPKEEP_COMMAND = "/reload-plugins";
+
 /** The session's permission mode as a transcript bookkeeping row records a change of it. */
 export function claudeTranscriptPermissionMode(row: unknown): string | null {
   if (!isRecord(row) || row.type !== "permission-mode") return null;
@@ -802,11 +827,13 @@ export function makeClaudeBridgeFrameTranslator(
       if (row.isSidechain === true || typeof row.uuid !== "string") return [];
       if (row.type === "assistant" && isRecord(row.message)) {
         const message = row.message;
-        const content = Array.isArray(message.content)
-          ? message.content
-          : typeof message.content === "string"
-            ? [{ type: "text", text: message.content }]
-            : [];
+        const content = (
+          Array.isArray(message.content)
+            ? message.content
+            : typeof message.content === "string"
+              ? [{ type: "text", text: message.content }]
+              : []
+        ).map(asT3ToolCall);
         const current = turn;
         const stamp =
           current !== null && current.promptUuid !== null && !current.assistantStamped
@@ -963,6 +990,22 @@ export function makeClaudeBridgeFrameTranslator(
     hasOpenTurn: () => turn !== null,
   };
 }
+
+/**
+ * The session calls T3's own tools under the mod's name, since the mod is
+ * what declares them there (`mcp__t3bridge__html_render`). They are the same
+ * tools T3 attaches to a session it starts, so the thread shows them under
+ * T3's name for them: every client already knows what to draw for those.
+ */
+const BRIDGED_T3_TOOL_PREFIX = `mcp__${CLAUDE_BRIDGE_PLUGIN_NAME}__`;
+const T3_TOOL_PREFIX = "mcp__t3-code__";
+const asT3ToolCall = (block: unknown): unknown =>
+  isRecord(block) &&
+  block.type === "tool_use" &&
+  typeof block.name === "string" &&
+  block.name.startsWith(BRIDGED_T3_TOOL_PREFIX)
+    ? { ...block, name: T3_TOOL_PREFIX + block.name.slice(BRIDGED_T3_TOOL_PREFIX.length) }
+    : block;
 
 /** The row Claude Code writes when a turn is over: every row of that turn is before it. */
 export function isClaudeTurnEndRow(row: unknown): boolean {

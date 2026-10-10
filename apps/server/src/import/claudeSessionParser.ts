@@ -59,6 +59,7 @@ export function parseClaudeSessionJsonl(content: string): ParsedCliSession {
   let customTitle: string | undefined;
   /** Rows that are slash commands: never a session's title. */
   const commandSourceIds = new Set<string>();
+  let bridgeUpkeepOutputDue = false;
   let startedAt: string | undefined;
   let entrypoint: string | undefined;
   let malformedLineCount = 0;
@@ -163,6 +164,18 @@ export function parseClaudeSessionJsonl(content: string): ParsedCliSession {
       continue;
     }
     if (rawText.startsWith("<local-command-caveat>")) {
+      continue;
+    }
+    // The bridge mod loading a newer version of itself is its own upkeep, not
+    // something the person did: neither the command nor what it printed.
+    const fromBridgeMod =
+      isRecord(entry.origin) && entry.origin.kind === "plugin" && entry.origin.name === "t3bridge";
+    if (fromBridgeMod && commandText !== null && commandText.startsWith("/reload-plugins")) {
+      bridgeUpkeepOutputDue = true;
+      continue;
+    }
+    if (fromBridgeMod && bridgeUpkeepOutputDue && commandOutput !== undefined) {
+      bridgeUpkeepOutputDue = false;
       continue;
     }
     if (commandText !== null) commandSourceIds.add(sourceId);

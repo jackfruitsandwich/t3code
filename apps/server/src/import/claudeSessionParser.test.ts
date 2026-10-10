@@ -184,6 +184,49 @@ describe("parseClaudeSessionJsonl", () => {
     );
   });
 
+  it("leaves out the bridge mod reloading itself, and what that printed", () => {
+    const origin = { kind: "plugin", name: "t3bridge" };
+    const parsed = parseClaudeSessionJsonl(
+      line(userEntry()) +
+        line(assistantEntry()) +
+        line(
+          userEntry({
+            uuid: "reload-1",
+            origin,
+            message: {
+              role: "user",
+              content:
+                "<command-name>/reload-plugins</command-name>\n<command-message>reload-plugins</command-message>\n<command-args></command-args>",
+            },
+          }),
+        ) +
+        line(
+          userEntry({
+            uuid: "reload-2",
+            origin,
+            message: {
+              role: "user",
+              content: "<local-command-stdout>Reloaded: 1 plugin</local-command-stdout>",
+            },
+          }),
+        ) +
+        line(
+          userEntry({
+            uuid: "rename-1",
+            message: {
+              role: "user",
+              content:
+                "<command-name>/rename</command-name>\n<command-message>rename</command-message>\n<command-args>kept</command-args>",
+            },
+          }),
+        ),
+    );
+    assert.deepEqual(
+      parsed.messages.map((message) => message.text),
+      ["Fix the login bug", "I found the bug.", "/rename kept"],
+    );
+  });
+
   it("is ineligible without at least one user and one assistant message", () => {
     assert.isFalse(isEligibleCliSession(parseClaudeSessionJsonl(line(userEntry()))));
     assert.isFalse(isEligibleCliSession(parseClaudeSessionJsonl(line(assistantEntry()))));
