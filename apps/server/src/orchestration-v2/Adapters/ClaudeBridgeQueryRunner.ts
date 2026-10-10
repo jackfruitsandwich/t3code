@@ -44,6 +44,7 @@ import {
   CLAUDE_BRIDGE_WINDOW_PROTOCOL,
   claudeBridgeModAtLeast,
   CLAUDE_BRIDGE_BASH_MOD_VERSION,
+  CLAUDE_BRIDGE_DIALOG_REFUSAL_MOD_VERSION,
   claudeConfigModelChoice,
   claudeTranscriptCommandText,
   claudeTranscriptCommandOutput,
@@ -348,6 +349,12 @@ export const layer: Layer.Layer<
         }>,
         /** Calls T3 is asking the person about right now, by tool call. */
         asking: new Set<string>(),
+        /**
+         * Those of them a subagent made. A subagent sent to the background
+         * can still be waiting for its answer when the turn that started it
+         * has ended.
+         */
+        agentAsks: new Set<string>(),
         /** Drawn messages already shown: the record's own copy, arriving later, is the same row. */
         shownDrawn: [] as Array<{ readonly messageId: string; readonly text: string }>,
         /** Texts of the record's recent replies, to tell a drawn message it already holds. */
@@ -731,6 +738,9 @@ export const layer: Layer.Layer<
         if (pending === null) return;
         const now = yield* Clock.currentTimeMillis;
         if (
+          // The run stays open while a background subagent's request waits in
+          // it: the request can only be answered from a run that is open.
+          state.agentAsks.size === 0 &&
           state.byteOffset >= pending.event.transcriptOffset &&
           now - state.lastRowAt >= COMPLETE_QUIET_MS &&
           now - pending.seenAt >= COMPLETE_QUIET_MS
@@ -863,6 +873,7 @@ export const layer: Layer.Layer<
                   ...(event.reason === undefined ? {} : { decisionReason: event.reason }),
                   ...(event.alsoInTerminal === true ? { alsoInTerminal: true } : {}),
                   ...(event.suggestions === undefined ? {} : { suggestions: event.suggestions }),
+                  ...(event.agentType === undefined ? {} : { askedByAgent: event.agentType }),
                 } as Parameters<CanUseTool>[2]),
               catch: (cause) => runnerError(cause, "canUseTool"),
             }),
@@ -905,14 +916,26 @@ export const layer: Layer.Layer<
             });
             return;
           }
+          // Where Claude Code's own dialog is open, a refusal from T3 is that
+          // dialog's "No": the call is refused and the turn ends, whichever
+          // of T3's two refusals it was. The session then holds the rows the
+          // terminal's answer leaves.
+          const live = (yield* registry.readSession(bridgeProcess)) ?? bridgeProcess.session;
+          // (A subagent's request is refused as before: what the dialog's
+          // "No" stops there, the subagent or the turn, is not measured.)
+          const throughDialog =
+            event.alsoInTerminal === true &&
+            event.agentType === undefined &&
+            claudeBridgeModAtLeast(live.modVersion, CLAUDE_BRIDGE_DIALOG_REFUSAL_MOD_VERSION);
           yield* registry.send(bridgeProcess, {
             type: "approval",
             toolUseId: event.toolUseId,
             decision: "deny",
             reason: decision.message,
+            ...(throughDialog ? { stopTurn: true } : {}),
           });
-          // Cancel is more than a refusal: in the terminal it stops the turn.
-          if (decision.interrupt === true) {
+          // With no dialog to answer, cancel is a refusal and then a stop.
+          if (!throughDialog && decision.interrupt === true) {
             yield* registry.send(bridgeProcess, { type: "interrupt" });
           }
         });
@@ -1005,6 +1028,11 @@ export const layer: Layer.Layer<
                 state.pendingComplete !== null &&
                 state.pendingComplete.event.turnId !== event.turnId
               ) {
+                // A subagent's request still waiting in the turn that ended
+                // closes with it; the mod asks again, into the new turn.
+                for (const toolUseId of state.agentAsks) {
+                  yield* settleElsewhere(toolUseId);
+                }
                 // Claude Code reports the next turn before the last rows of
                 // this one are on disk: read up to the row that closes it.
                 for (
@@ -1038,9 +1066,9 @@ export const layer: Layer.Layer<
               return;
             }
             case "turn.complete": {
-              // Whatever this turn still asked is over with it.
+              // Whatever this turn's own loop still asked is over with it.
               for (const toolUseId of state.approvals.keys()) {
-                yield* settleElsewhere(toolUseId);
+                if (!state.agentAsks.has(toolUseId)) yield* settleElsewhere(toolUseId);
               }
               state.pendingComplete = { event, seenAt: yield* Clock.currentTimeMillis };
               return;
@@ -1101,8 +1129,14 @@ export const layer: Layer.Layer<
               // request the person sees stands, and its answer still goes.
               if (state.asking.has(event.toolUseId)) return;
               state.asking.add(event.toolUseId);
+              if (event.agentType !== undefined) state.agentAsks.add(event.toolUseId);
               yield* resolveApproval(event).pipe(
-                Effect.ensuring(Effect.sync(() => state.asking.delete(event.toolUseId))),
+                Effect.ensuring(
+                  Effect.sync(() => {
+                    state.asking.delete(event.toolUseId);
+                    state.agentAsks.delete(event.toolUseId);
+                  }),
+                ),
                 Effect.forkIn(sessionScope),
               );
               return;

@@ -276,6 +276,92 @@ describe("ClaudeBridgeQueryRunner permissions", () => {
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
+  // Claude Code's dialog has one refusal, "No": the call is refused and the
+  // turn ends. Either refusal from T3 is that answer when the dialog is open.
+  it.effect.each([
+    { name: "declined", result: { behavior: "deny", message: "User declined tool execution." } },
+    {
+      name: "cancelled",
+      result: { behavior: "deny", message: "User cancelled tool execution.", interrupt: true },
+    },
+  ] satisfies ReadonlyArray<{ name: string; result: PermissionResult }>)(
+    "refuses through Claude Code's own dialog when one is open ($name)",
+    (testCase) =>
+      Effect.gen(function* () {
+        const bridge = yield* attach({
+          protocol: 2,
+          modVersion: "0.3.7",
+          bridgeCanUseTool: () => testCase.result,
+        });
+        yield* bridge.handler(
+          {
+            type: "approval.request",
+            seq: 1,
+            at: bridge.now,
+            toolUseId: "tool-1",
+            tool: "Bash",
+            input: { command: "pwd" },
+            alsoInTerminal: true,
+          },
+          bridge.process,
+        );
+        assert.deepStrictEqual(yield* Queue.take(bridge.commands), {
+          type: "approval",
+          toolUseId: "tool-1",
+          decision: "deny",
+          reason: testCase.result.message,
+          stopTurn: true,
+        });
+        // No separate stop follows: the dialog's answer already ended the turn.
+        yield* bridge.handler(
+          {
+            type: "approval.request",
+            seq: 2,
+            at: bridge.now,
+            toolUseId: "tool-2",
+            tool: "Bash",
+            input: { command: "ls" },
+            alsoInTerminal: true,
+          },
+          bridge.process,
+        );
+        assert.strictEqual((yield* Queue.take(bridge.commands)).type, "approval");
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("refuses and then stops, as before, for a session whose mod cannot do that", () =>
+    Effect.gen(function* () {
+      const bridge = yield* attach({
+        protocol: 2,
+        modVersion: "0.3.6",
+        bridgeCanUseTool: () => ({
+          behavior: "deny",
+          message: "User cancelled tool execution.",
+          interrupt: true,
+        }),
+      });
+      yield* bridge.handler(
+        {
+          type: "approval.request",
+          seq: 1,
+          at: bridge.now,
+          toolUseId: "tool-1",
+          tool: "Bash",
+          input: { command: "pwd" },
+          alsoInTerminal: true,
+        },
+        bridge.process,
+      );
+      assert.deepStrictEqual(yield* Queue.take(bridge.commands), {
+        type: "approval",
+        toolUseId: "tool-1",
+        decision: "deny",
+        reason: "User cancelled tool execution.",
+      });
+      assert.deepStrictEqual(yield* Queue.take(bridge.commands), { type: "interrupt" });
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
   it.effect("sends nothing back for a request the session settled without T3", () =>
     Effect.gen(function* () {
       const bridge = yield* attach({
@@ -377,6 +463,65 @@ describe("ClaudeBridgeQueryRunner permissions", () => {
       assert.deepStrictEqual(yield* Queue.take(bridge.commands), {
         type: "approval",
         toolUseId: "tool-1",
+        decision: "allow",
+      });
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  // A subagent sent to the background outlives the turn that started it, and
+  // its request with it. The main loop's own request cannot.
+  it.effect("keeps a subagent's request open when the turn that started it ends", () =>
+    Effect.gen(function* () {
+      let answerNow: (result: PermissionResult) => void = () => {};
+      const answered = new Promise<PermissionResult>((resolve) => {
+        answerNow = resolve;
+      });
+      const aborted: Array<string> = [];
+      const bridge = yield* attach({
+        protocol: 2,
+        bridgeCanUseTool: (_tool, _input, toolUseId, signal) => {
+          signal.addEventListener("abort", () => {
+            aborted.push(toolUseId);
+          });
+          return toolUseId === "agent-tool" ? answered : new Promise(() => {});
+        },
+      });
+      const ask = (seq: number, toolUseId: string, agentType?: string) =>
+        bridge.handler(
+          {
+            type: "approval.request",
+            seq,
+            at: bridge.now,
+            toolUseId,
+            tool: "Bash",
+            input: { command: toolUseId },
+            alsoInTerminal: true,
+            ...(agentType === undefined ? {} : { agentType }),
+          },
+          bridge.process,
+        );
+      yield* ask(1, "main-tool");
+      yield* ask(2, "agent-tool", "general-purpose");
+      yield* Effect.yieldNow;
+      yield* bridge.handler(
+        {
+          type: "turn.complete",
+          seq: 3,
+          at: bridge.now,
+          turnId: "turn-1",
+          reason: "answer",
+          answer: "The subagent is still running.",
+          isAborted: false,
+          durationMs: 1,
+          transcriptOffset: 0,
+        },
+        bridge.process,
+      );
+      assert.deepStrictEqual(aborted, ["main-tool"]);
+      answerNow({ behavior: "allow" });
+      assert.deepStrictEqual(yield* Queue.take(bridge.commands), {
+        type: "approval",
+        toolUseId: "agent-tool",
         decision: "allow",
       });
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),

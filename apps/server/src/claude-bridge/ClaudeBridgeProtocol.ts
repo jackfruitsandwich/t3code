@@ -30,7 +30,7 @@ import type {
 import { isRecord, parseJsonlLine } from "../import/sessionImportTypes.ts";
 
 export const CLAUDE_BRIDGE_PROTOCOL_VERSION = 2;
-export const CLAUDE_BRIDGE_MOD_VERSION = "0.3.6";
+export const CLAUDE_BRIDGE_MOD_VERSION = "0.3.7";
 /**
  * The first protocol whose mod runs slash commands, answers questions with
  * their answers and reports the session's own commands. A process still on an
@@ -122,6 +122,12 @@ export type ClaudeBridgeCommandBody =
        * again" option would add), applied by Claude Code itself.
        */
       readonly updatedPermissions?: ReadonlyArray<unknown>;
+      /**
+       * A refusal given through Claude Code's own dialog, where one is open:
+       * it refuses the call and ends the turn, as the dialog's "No" does, and
+       * leaves the rows that leaves.
+       */
+      readonly stopTurn?: boolean;
     }
   /** The person's answers to a question Claude asked, keyed by question text. */
   | {
@@ -250,6 +256,8 @@ export type ClaudeBridgeEvent = { readonly seq: number; readonly at: number } & 
       readonly alsoInTerminal?: boolean;
       /** The rules that dialog's "don't ask again" option would add, as Claude Code suggests them. */
       readonly suggestions?: ReadonlyArray<unknown>;
+      /** The kind of subagent whose call this is (`general-purpose`), when a subagent asks. */
+      readonly agentType?: string;
     }
   | {
       readonly type: "approval.resolved";
@@ -444,6 +452,9 @@ export function parseClaudeBridgeEvent(value: unknown): ClaudeBridgeEvent | null
         ...(Array.isArray(value.suggestions) && value.suggestions.length > 0
           ? { suggestions: value.suggestions }
           : {}),
+        ...(typeof value.agentType === "string" && value.agentType.length > 0
+          ? { agentType: value.agentType }
+          : {}),
       };
     case "approval.resolved":
       if (typeof value.toolUseId !== "string") return null;
@@ -563,8 +574,17 @@ const BASH_OUTPUT =
  */
 export const claudeBridgeAlsoInTerminal = (options: unknown): boolean =>
   isRecord(options) && options.alsoInTerminal === true;
+/**
+ * The kind of subagent a permission callback's call belongs to, when a bridged
+ * session says a subagent asks. Its calls are kept in a record of its own, so
+ * the thread holds no row for them: the request is all T3 shows of the call.
+ */
+export const claudeBridgeAskingAgent = (options: unknown): string | null =>
+  isRecord(options) && typeof options.askedByAgent === "string" ? options.askedByAgent : null;
 /** The first mod that runs `!` commands sent from T3. */
 export const CLAUDE_BRIDGE_BASH_MOD_VERSION = "0.3.4";
+/** The first mod that refuses a call through Claude Code's own dialog (`stopTurn`). */
+export const CLAUDE_BRIDGE_DIALOG_REFUSAL_MOD_VERSION = "0.3.7";
 /** Whether a mod version is at least `wanted` (`major.minor.patch`). */
 export function claudeBridgeModAtLeast(
   version: string | null | undefined,

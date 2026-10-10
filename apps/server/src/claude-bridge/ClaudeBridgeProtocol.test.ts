@@ -2,6 +2,7 @@ import { assert, describe, it } from "@effect/vitest";
 
 import {
   claudeBridgeAlsoInTerminal,
+  claudeBridgeAskingAgent,
   claudeBridgeModAtLeast,
   claudeBridgeWakeDetail,
   claudeTranscriptCommandOutput,
@@ -317,6 +318,28 @@ describe("ClaudeBridgeProtocol record helpers", () => {
     ]);
     assert.isTrue(claudeBridgeAlsoInTerminal({ signal: null, alsoInTerminal: true }));
     assert.isFalse(claudeBridgeAlsoInTerminal({ signal: null }));
+  });
+
+  it("keeps which kind of subagent a request comes from", () => {
+    const event = parseClaudeBridgeEvent({
+      seq: 5,
+      at: 1,
+      type: "approval.request",
+      toolUseId: "toolu_2",
+      tool: "Bash",
+      input: { command: "echo hi" },
+      alsoInTerminal: true,
+      agentType: "general-purpose",
+    });
+    assert.strictEqual(
+      event?.type === "approval.request" ? event.agentType : null,
+      "general-purpose",
+    );
+    assert.strictEqual(
+      claudeBridgeAskingAgent({ signal: null, askedByAgent: "general-purpose" }),
+      "general-purpose",
+    );
+    assert.isNull(claudeBridgeAskingAgent({ signal: null }));
   });
 
   it("compares bridge mod versions by number", () => {

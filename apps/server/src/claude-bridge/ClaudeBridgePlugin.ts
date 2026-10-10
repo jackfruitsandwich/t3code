@@ -90,6 +90,13 @@ const T3_TOOLS = __T3_TOOLS__
 const T3_TOOL_PREFIX = 'mcp__${CLAUDE_BRIDGE_PLUGIN_NAME}__'
 const MCP_PROTOCOL = '2025-06-18'
 const T3_TOOL_ATTACH_WAIT = 20
+const T3_ATTACH_GRACE_S = 15
+const T3_FOLLOW_MS = 60000
+const T3_RECENT_MS = 300000
+// A request still waiting is told to T3 again this often. T3 shows a request
+// inside a run of its thread; one that outlives that run (a background
+// subagent's) is picked up by the next. T3 ignores what it is already asking.
+const T3_RETELL_MS = 20000
 const SHELL_COMMAND_TIMEOUT_MS = 120000
 const SHELL_INPUT_ROW = /^\\s*<bash-input>([\\s\\S]*)<\\/bash-input>\\s*$/
 const SHELL_OUTPUT_ROW = /^\\s*<bash-stdout>/
@@ -117,6 +124,8 @@ let pendingCommand = null
 // The last "!" command the record took: the turn that follows it is started
 // with what the command printed, and is shown as the command.
 let lastShellInput = null
+// Whether the latest turn was sent from T3 (else typed here, or a wake).
+let lastTurnFromT3 = false
 let inboxSeq = 0
 let eventSeq = 0
 let ended = null
@@ -450,6 +459,28 @@ async function t3Attached($) {
   return Date.now() - t3HeartbeatSeen < T3_LIVE_MS
 }
 
+// Whether T3 has been around lately: this mod was loaded a moment ago (T3
+// follows a reloaded mod after a few seconds), or T3's heartbeat was seen in
+// the last few minutes. Not so when T3 is simply not running.
+const LOADED_AT = Date.now()
+function t3Expected() {
+  const now = Date.now()
+  return now - LOADED_AT < T3_FOLLOW_MS || (t3HeartbeatSeen > 0 && now - t3HeartbeatSeen < T3_RECENT_MS)
+}
+
+// Whether T3 is in sight, waiting a few seconds for it where it has been
+// around lately. isOver ends the wait when the thing asked about settled.
+async function t3InSightSoon($, isOver) {
+  if (await t3Attached($)) return true
+  if (!t3Expected()) return false
+  for (let waited = 0; waited < T3_ATTACH_GRACE_S; waited += 1) {
+    if (isOver()) return false
+    await sleepOutsideBudget($)
+    if (await t3Attached($)) return true
+  }
+  return false
+}
+
 // Keeps T3 informed of a request that is waiting for an answer. Called once
 // a second by the wait: it says so when T3 goes out of sight, and asks again
 // when T3 is back or another T3 process has taken its place (a restart quick
@@ -458,14 +489,16 @@ async function t3Attached($) {
 function t3Teller($, announce, retire) {
   let isTold = true
   let pid = t3PidSeen
+  let toldAt = Date.now()
   return async () => {
     const attachedNow = await t3Attached($)
     if (!attachedNow && isTold) {
       isTold = false
       await retire()
-    } else if (attachedNow && (!isTold || t3PidSeen !== pid)) {
+    } else if (attachedNow && (!isTold || t3PidSeen !== pid || Date.now() - toldAt > T3_RETELL_MS)) {
       isTold = true
       pid = t3PidSeen
+      toldAt = Date.now()
       await announce()
     }
     return attachedNow
@@ -880,6 +913,7 @@ export function register(on) {
       pendingCommand = null
     }
     activeTurn = { turnId: e.turnId, startedAt: Date.now(), transcriptOffset: offset, commandId: commandId, promptUuid: promptUuid }
+    lastTurnFromT3 = commandId !== undefined
     // A turn that follows a "!" command starts with what the command printed.
     // What the person did was type the command: the turn is named by that.
     let text = e.text
@@ -916,7 +950,8 @@ export function register(on) {
   // themselves, as the terminal dialog would return them; a bare approval
   // cannot answer a question.
   on('tool.call', { tool: 'AskUserQuestion' }, async ($, e, next) => {
-    if (!e.tool_use_id || e.agentId || !(await t3Attached($))) return next(e)
+    if (!e.tool_use_id || e.agentId) return next(e)
+    if (!(await t3Attached($)) && !(terminalPresent() && t3Expected())) return next(e)
     const toolUseId = e.tool_use_id
     const request = { toolUseId: toolUseId, questions: e.questions, turnId: activeTurn ? activeTurn.turnId : undefined }
     const fromT3 = (answer) => (answer.decision === 'deny'
@@ -935,6 +970,8 @@ export function register(on) {
         return beneath.value
       }
       const ask = () => emit($, 'question.request', Object.assign({ alsoInTerminal: true }, request))
+      // The dialog is open meanwhile; T3 can be a moment behind.
+      if (!(await t3InSightSoon($, () => beneath !== null))) return settled()
       await ask()
       const keepT3Told = t3Teller($, ask, () => emit($, 'question.resolved', { toolUseId: toolUseId, by: 'detached' }))
       for (;;) {
@@ -977,25 +1014,32 @@ export function register(on) {
   // budget.
   on('tool.check', async ($, e, next) => {
     const verdict = await next(e)
-    if (!verdict || verdict.decision !== 'ask' || !e.tool_use_id || e.agentId) return verdict
+    if (!verdict || verdict.decision !== 'ask' || !e.tool_use_id) return verdict
     // T3's display tools change nothing in the workspace; T3 allows them wherever it attaches them.
     if (isT3ReadOnlyTool(e.tool)) return { decision: 'allow', reason: 'T3 Code display tool' }
     if (isGranted(e)) return { decision: 'allow', reason: 'Allowed for this session in T3 Code' }
-    if (!(await t3Attached($))) return verdict
     // A question is asked and answered through its own hook (tool.call).
     if (e.tool === 'AskUserQuestion') return verdict
+    // A subagent's call can be asked in one place only: Claude Code draws its
+    // dialog for it once this mod is done with the request, not beside it
+    // (measured). It is asked where the person last spoke from: in T3 when
+    // the turn was sent from there, else in the terminal's own dialog.
+    if (e.agentId && terminalPresent() && !lastTurnFromT3) return verdict
     // With a terminal on the session, Claude Code's own dialog opens there
     // and T3 shows the same request; whichever is answered first settles it
-    // (see classic.PermissionRequest). The call is remembered until then.
+    // (see classic.PermissionRequest). The call is remembered until then,
+    // whether or not T3 is in sight at this instant: it can be a moment
+    // behind, and the dialog's hook is where that is waited out.
     if (terminalPresent()) {
       asks.push({ toolUseId: e.tool_use_id, tool: e.tool, key: grantKey(e), at: Date.now() })
       if (asks.length > 16) asks.shift()
       return verdict
     }
+    if (!(await t3Attached($))) return verdict
     // A background session nobody has open: its dialog would be shown to no
     // one, so the request is held for T3 alone.
     const toolUseId = e.tool_use_id
-    const askT3 = () => emit($, 'approval.request', { toolUseId: toolUseId, tool: e.tool, input: e.input, reason: verdict.reason, turnId: activeTurn ? activeTurn.turnId : undefined })
+    const askT3 = () => emit($, 'approval.request', { toolUseId: toolUseId, tool: e.tool, input: e.input, reason: verdict.reason, turnId: activeTurn ? activeTurn.turnId : undefined, agentType: e.agentId ? 'subagent' : undefined })
     await askT3()
     const keepT3Told = t3Teller($, askT3, () => emit($, 'approval.resolved', { toolUseId: toolUseId, decision: 'ask', by: 'detached' }))
     for (;;) {
@@ -1022,18 +1066,25 @@ export function register(on) {
   on('classic.PermissionRequest', async ($, e, next) => {
     noteClassic($, e)
     const ask = takeAsk(e.tool_name, e.tool_input)
-    if (!ask || !(await t3Attached($))) return next(e)
+    if (!ask) return next(e)
     const toolUseId = ask.toolUseId
-    const request = { toolUseId: toolUseId, tool: e.tool_name, input: e.tool_input, turnId: activeTurn ? activeTurn.turnId : undefined, alsoInTerminal: true, suggestions: Array.isArray(e.permission_suggestions) ? e.permission_suggestions : undefined }
+    // The dialog is open in the terminal either way. T3 is told once it is in
+    // sight, which can take a few seconds after this mod was reloaded.
+    if (!(await t3InSightSoon($, () => settledCalls.has(toolUseId)))) return next(e)
+    const request = { toolUseId: toolUseId, tool: e.tool_name, input: e.tool_input, turnId: activeTurn ? activeTurn.turnId : undefined, alsoInTerminal: true, suggestions: Array.isArray(e.permission_suggestions) ? e.permission_suggestions : undefined, agentType: e.agent_id ? String(e.agent_type || 'subagent') : undefined }
     const askT3 = () => emit($, 'approval.request', request)
     await askT3()
     const keepT3Told = t3Teller($, askT3, () => emit($, 'approval.resolved', { toolUseId: toolUseId, decision: 'ask', by: 'detached' }))
+    let unseenFor = 0
     for (;;) {
       const decision = decisions.get(toolUseId)
       if (decision) {
         decisions.delete(toolUseId)
         if (decision.decision === 'ask') return next(e)
         await emit($, 'approval.resolved', { toolUseId: toolUseId, decision: decision.decision, by: 't3' })
+        // A refusal from T3 is the dialog's own "No": the call is refused and
+        // the turn ends, with the rows the terminal's answer leaves.
+        if (decision.decision !== 'allow' && decision.stopTurn === true) return { decision: { behavior: 'deny', interrupt: true } }
         if (decision.decision !== 'allow') return { decision: { behavior: 'deny', message: decision.reason || 'Denied in T3 Code' } }
         // The input goes back with the answer, as an SDK host's does: a
         // dialog that asks more than yes or no (a plan's "Ready to code?")
@@ -1053,7 +1104,13 @@ export function register(on) {
         await emit($, 'approval.resolved', { toolUseId: toolUseId, decision: 'ask', by: 'terminal' })
         return next(e)
       }
-      await keepT3Told()
+      // A subagent's request has no dialog anywhere while it is held here.
+      // With T3 out of sight for good it goes to the terminal's own.
+      unseenFor = (await keepT3Told()) ? 0 : unseenFor + 1
+      if (e.agent_id && unseenFor > T3_ATTACH_GRACE_S) {
+        await emit($, 'approval.resolved', { toolUseId: toolUseId, decision: 'ask', by: 'terminal' })
+        return next(e)
+      }
       await sleepOutsideBudget($)
     }
   })

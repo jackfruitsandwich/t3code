@@ -92,6 +92,7 @@ import { discoverClaudeSkills } from "../../provider/Drivers/ClaudeSkills.ts";
 import { compileClaudeModelSelection } from "../../claudeModelOptions.ts";
 import {
   claudeBridgeAlsoInTerminal,
+  claudeBridgeAskingAgent,
   claudeBridgeWakeDetail,
   isClaudeHarnessPrompt,
   threadModesForClaudePermissionMode,
@@ -6820,9 +6821,12 @@ export function makeClaudeAdapterV2(
           // the held tool_use frame starts the tool (and projects an
           // ExitPlanMode plan) in whichever run it is released to.
           const heldForEcho = context.heldRootFrames.length > 0;
+          // A bridged session's subagent keeps its calls in a record of its
+          // own. The thread shows the request and no tool row beside it.
+          const askingAgent = origin === "bridge" ? claudeBridgeAskingAgent(callbackOptions) : null;
           if (toolName === "Agent") {
             rememberClaudeSubagentLaunch(context, nativeRequestId, nativeToolInput, null);
-          } else if (!heldForEcho) {
+          } else if (!heldForEcho && askingAgent === null) {
             yield* ensureToolCallStarted({
               context,
               nativeItemId: nativeRequestId,
@@ -6843,7 +6847,7 @@ export function makeClaudeAdapterV2(
             // did before this turn was held. ExitPlanMode is answered at once
             // below, so its frames stay held.
             yield* releaseHeldRootFrames(context);
-            if (toolName !== "Agent") {
+            if (toolName !== "Agent" && askingAgent === null) {
               yield* ensureToolCallStarted({
                 context,
                 nativeItemId: nativeRequestId,
@@ -6957,11 +6961,15 @@ export function makeClaudeAdapterV2(
           }
 
           const requestKind = providerRequestKindFromClaudeTool(toolName);
-          const prompt =
+          const summary =
             callbackOptions.title ??
             callbackOptions.description ??
             callbackOptions.decisionReason ??
             summarizeClaudeToolRequest(toolName, nativeToolInput);
+          const prompt =
+            askingAgent === null
+              ? summary
+              : `${summary} (asked by ${askingAgent === "subagent" ? "a subagent" : `the ${askingAgent} subagent`})`;
           const artifacts = yield* buildApprovalRequestArtifacts({
             context,
             nativeItemId: nativeRequestId,
@@ -7013,6 +7021,38 @@ export function makeClaudeAdapterV2(
               }),
             ),
           );
+
+          // The session settled a subagent's request without T3 (its turn
+          // was stopped, or ended). The call has no row in this thread whose
+          // result would put the request away, so it is put away here.
+          if (askingAgent !== null && callbackOptions.signal.aborted) {
+            const now = yield* DateTime.now;
+            yield* Effect.all(
+              [
+                emitProviderEvent({
+                  type: "runtime_request.updated",
+                  driver: CLAUDE_PROVIDER,
+                  runtimeRequest: { ...artifacts.request, status: "cancelled", resolvedAt: now },
+                }),
+                emitProviderEvent({
+                  type: "node.updated",
+                  driver: CLAUDE_PROVIDER,
+                  node: { ...artifacts.node, status: "cancelled", completedAt: now },
+                }),
+                emitProviderEvent({
+                  type: "turn_item.updated",
+                  driver: CLAUDE_PROVIDER,
+                  turnItem: {
+                    ...artifacts.turnItem,
+                    status: "cancelled",
+                    completedAt: now,
+                    updatedAt: now,
+                  },
+                }),
+              ],
+              { concurrency: 1 },
+            );
+          }
 
           return permissionResultFromDecision({
             toolName,
