@@ -350,6 +350,11 @@ export interface ClaudeBridgeNativeSettings {
 
 export interface ClaudeAgentSdkQuerySession {
   /**
+   * Set on a process that serves one turn and then closes. A later prompt
+   * never reuses it: it waits for the process to let go of the session.
+   */
+  readonly singleTurn?: boolean;
+  /**
    * Present on a session attached to a process T3 did not start and must not
    * replace. Offers that process the thread's current model and permission
    * mode: a change the person made in T3 is applied there, anything else
@@ -7189,16 +7194,30 @@ export function makeClaudeAdapterV2(
           const queryPolicyKey = claudeEffectiveQueryPolicyKey(queryPolicy, mcpOverrides);
           const compiledSelection = compileClaudeModelSelection(turnInput.modelSelection);
           const resumeSessionAt = yield* getNativeConversationHeadId(turnInput.providerThread);
-          const existing = yield* Ref.get(queryContext);
+          const found = yield* Ref.get(queryContext);
           // A continuation prompts nothing: it drains output the live process
           // already produced, so it keeps that process whatever its selection.
           if (
-            existing !== null &&
-            existing.nativeThreadId === nativeThreadId &&
+            found !== null &&
+            found.nativeThreadId === nativeThreadId &&
             isClaudeProviderContinuationTurn(turnInput)
           ) {
-            return existing;
+            return found;
           }
+          // A single-turn process is closing or about to: its stream ended
+          // with the turn it served. A prompt offered to it would be failed
+          // by that exit, so wait until it has let go of the session and open
+          // the session's own process as if none were live.
+          const spent =
+            found !== null &&
+            found.nativeThreadId === nativeThreadId &&
+            found.query.singleTurn === true;
+          if (spent) {
+            yield* found.query.close.pipe(Effect.ignore);
+            yield* Deferred.await(found.closed).pipe(Effect.timeoutOption("10 seconds"));
+            yield* Ref.update(queryContext, (current) => (current === found ? null : current));
+          }
+          const existing = spent ? null : found;
           // A bridged process is the person's own session, not a process to
           // close and reopen for a new selection: the selection is offered to
           // it and the attachment stays.

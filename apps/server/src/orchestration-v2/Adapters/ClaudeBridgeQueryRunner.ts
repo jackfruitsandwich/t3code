@@ -154,6 +154,7 @@ export const layer: Layer.Layer<
         });
         return {
           ...sdk,
+          singleTurn: true,
           messages: sdk.messages.pipe(
             Stream.takeUntil((message) => message.type === "result"),
             Stream.ensuring(closeOnce.pipe(Effect.ignore)),
