@@ -101,6 +101,11 @@ export function parseClaudeSessionJsonl(content: string): ParsedCliSession {
     if (entry.type !== "user" && entry.type !== "assistant" && !localCommand) {
       continue;
     }
+    // A compaction summary is context for the model; the terminal does not
+    // show it as something the person said.
+    if (entry.isCompactSummary === true || entry.isVisibleInTranscriptOnly === true) {
+      continue;
+    }
     if (entry.isSidechain === true || entry.isMeta === true) {
       continue;
     }

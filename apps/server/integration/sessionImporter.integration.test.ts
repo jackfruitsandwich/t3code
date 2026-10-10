@@ -46,6 +46,7 @@ import { deriveProviderThread } from "../src/orchestration-v2/IdAllocator.ts";
 import * as ProjectStore from "../src/orchestration-v2/ProjectStore.ts";
 import * as RuntimeLayer from "../src/orchestration-v2/runtimeLayer.ts";
 import * as ThreadManagementService from "../src/orchestration-v2/ThreadManagementService.ts";
+import * as TurnItemPositionStore from "../src/orchestration-v2/TurnItemPositionStore.ts";
 import * as ProviderSessionRuntime from "../src/persistence/ProviderSessionRuntime.ts";
 import * as SqlitePersistence from "../src/persistence/Sqlite.ts";
 import * as ProjectEnrichmentService from "../src/project/ProjectEnrichmentService.ts";
@@ -77,6 +78,7 @@ const layerRuntime = Layer.mergeAll(
   RuntimeLayer.layerEventSink,
   ProjectStore.layer,
   ProviderSessionRuntime.layer,
+  TurnItemPositionStore.layer,
 ).pipe(
   Layer.provide(
     Layer.succeed(ProjectEnrichmentService.ProjectEnrichmentService, {
@@ -355,9 +357,15 @@ const seedRunPayload = (
   threadId: ThreadId,
   driver: ProviderDriverKind,
   status: "running" | "completed",
+  when: { readonly ordinal: number; readonly iso: string } = {
+    ordinal: 1,
+    iso: "2026-07-20T00:00:00.000Z",
+  },
 ) => {
-  const at = DateTime.makeUnsafe("2026-07-20T00:00:00.000Z");
-  const runId = RunId.make(`seed-run:${threadId}`);
+  const at = DateTime.makeUnsafe(when.iso);
+  const runId = RunId.make(
+    when.ordinal === 1 ? `seed-run:${threadId}` : `seed-run:${threadId}:${when.ordinal}`,
+  );
   const instanceId = defaultInstanceIdForDriver(driver);
   return {
     runId,
@@ -367,11 +375,11 @@ const seedRunPayload = (
     payload: {
       id: runId,
       threadId,
-      ordinal: 1,
+      ordinal: when.ordinal,
       providerInstanceId: instanceId,
       modelSelection: { instanceId, model: "test-model" },
       providerThreadId: null,
-      userMessageId: MessageId.make(`seed-run-message:${threadId}`),
+      userMessageId: MessageId.make(`seed-run-message:${threadId}:${when.ordinal}`),
       rootNodeId: null,
       activeAttemptId: null,
       status,
@@ -390,12 +398,13 @@ const seedT3Run = (
   threadId: ThreadId,
   driver: ProviderDriverKind,
   status: "running" | "completed" = "completed",
+  when?: { readonly ordinal: number; readonly iso: string },
 ) => {
-  const seed = seedRunPayload(threadId, driver, status);
+  const seed = seedRunPayload(threadId, driver, status, when);
   return h.eventSink.write({
     events: [
       {
-        id: EventId.make(`seed:${threadId}:run`),
+        id: EventId.make(`seed:${threadId}:run:${when?.ordinal ?? 1}`),
         type: "run.created",
         threadId,
         runId: seed.runId,
@@ -450,6 +459,42 @@ const seedNativeReply = (
           runId: null,
           nodeId: null,
           role: "assistant",
+          text,
+          attachments: [],
+          streaming: false,
+          createdAt: at,
+          updatedAt: at,
+        },
+      },
+    ],
+  });
+};
+
+/** A prompt sent from T3: its message carries T3's id, not the transcript row's. */
+const seedT3Prompt = (
+  h: Harness,
+  threadId: ThreadId,
+  runOrdinal: number,
+  text: string,
+  iso: string,
+) => {
+  const at = DateTime.makeUnsafe(iso);
+  const seed = seedRunPayload(threadId, CLAUDE, "completed", { ordinal: runOrdinal, iso });
+  return h.eventSink.write({
+    events: [
+      {
+        id: EventId.make(`seed:${threadId}:prompt:${runOrdinal}`),
+        type: "message.updated",
+        threadId,
+        occurredAt: at,
+        payload: {
+          createdBy: "user",
+          creationSource: "web",
+          id: MessageId.make(`seed-run-message:${threadId}:${runOrdinal}`),
+          threadId,
+          runId: seed.runId,
+          nodeId: null,
+          role: "user",
           text,
           attachments: [],
           streaming: false,
@@ -1179,7 +1224,7 @@ runtimeTest(
 );
 
 runtimeTest(
-  "leaves an owned Claude thread alone while a T3 run is active or a mod process holds it",
+  "leaves an owned Claude thread alone while a T3 run or a bridged turn is writing it",
   (h) =>
     Effect.gen(function* () {
       const claudeId = "aaaaaaaa-1111-4111-8111-1111111111b1";
@@ -1203,7 +1248,8 @@ runtimeTest(
       assert.notInclude(yield* h.texts(threadId), "Streaming through T3.");
 
       // The turn settles with T3's own copy of that reply. A live mod process
-      // now holds the session: the bridge adopts its terminal turns, not the importer.
+      // now holds the session and a turn is running in it: the attachment is
+      // streaming that turn, so the importer stays out.
       yield* settleSeedT3Run(h, threadId, CLAUDE);
       yield* seedNativeReply(
         h,
@@ -1215,7 +1261,12 @@ runtimeTest(
       const fs = yield* FileSystem.FileSystem;
       const instanceDir = yield* h.makeDir("bridge", "claude", claudeId, "inst-1");
       yield* h.write(joinPath(instanceDir, "session.json"), [
-        { sid: claudeId, instanceId: "inst-1", heartbeatAt: yield* Clock.currentTimeMillis },
+        {
+          sid: claudeId,
+          instanceId: "inst-1",
+          heartbeatAt: yield* Clock.currentTimeMillis,
+          activeTurn: { turnId: "turn-3", startedAt: 0, transcriptOffset: 0 },
+        },
       ]);
       yield* h.append(claudePath, [
         c.user("user-3", "Typed while bridged", "2026-07-01T10:06:00.000Z"),
@@ -1234,6 +1285,139 @@ runtimeTest(
       assert.include(texts, "Typed while bridged");
       assert.include(texts, "Reply after the process ended.");
       assert.equal(texts.filter((text) => text === "Streaming through T3.").length, 1);
+    }),
+);
+
+runtimeTest(
+  "shows a running session's missed rows where they happened, and moves misplaced ones",
+  (h) =>
+    Effect.gen(function* () {
+      const claudeId = "aaaaaaaa-1111-4111-8111-1111111111c1";
+      const c = claudeSession({ sessionId: claudeId, cwd: h.workspace });
+      const claudePath = h.claudeFile(claudeId);
+      const threadId = importedThreadId(claudeId);
+      const fs = yield* FileSystem.FileSystem;
+      const timeline = h.threads.getThreadRecords(threadId, ["turnItems"]).pipe(
+        Effect.map((records) =>
+          records.turnItems
+            .filter((item) => item.type === "user_message" || item.type === "assistant_message")
+            .toSorted((left, right) => left.ordinal - right.ordinal)
+            .map((item) => ({ text: item.text, run: Math.floor(item.ordinal / 1_000_000) })),
+        ),
+      );
+      yield* h.write(claudePath, [
+        c.user("user-1", "Fix the login bug please", "2026-07-01T10:00:00.000Z"),
+        c.assistant("assistant-1", "I fixed the login bug.", "2026-07-01T10:00:05.000Z"),
+      ]);
+      const bridgeDir = yield* h.makeDir("bridge");
+      const importer = yield* h.importer({ bridgeDir });
+      yield* importer.sweepNow();
+
+      // Rows from after T3's first run that an earlier build imported above
+      // it: they are in the thread before the run is.
+      yield* h.append(claudePath, [
+        c.assistant("assistant-2", "Streaming through T3.", "2026-07-01T10:05:02.000Z"),
+        c.user("user-3", "Typed with no process attached", "2026-07-01T10:06:00.000Z"),
+        c.assistant("assistant-3", "Answered with no process.", "2026-07-01T10:06:05.000Z"),
+      ]);
+      yield* importer.sweepNow();
+      yield* seedT3Run(h, threadId, CLAUDE, "completed", {
+        ordinal: 1,
+        iso: "2026-07-01T10:05:00.000Z",
+      });
+      assert.deepEqual(
+        (yield* timeline).map((item) => item.run),
+        [0, 0, 0, 0, 0],
+      );
+
+      // The session's process is gone when its next rows land: they go after
+      // the run, and the misplaced ones move there too.
+      yield* h.append(claudePath, [
+        c.user("user-4", "Typed later, still no process", "2026-07-01T10:07:00.000Z"),
+      ]);
+      yield* importer.sweepNow();
+      assert.deepEqual(yield* timeline, [
+        { text: "Fix the login bug please", run: 0 },
+        { text: "I fixed the login bug.", run: 0 },
+        { text: "Streaming through T3.", run: 1 },
+        { text: "Typed with no process attached", run: 1 },
+        { text: "Answered with no process.", run: 1 },
+        { text: "Typed later, still no process", run: 1 },
+      ]);
+
+      // A process with the mod holds the session again and is idle. T3 ran a
+      // second turn, then missed a terminal turn entirely.
+      const instanceDir = yield* h.makeDir("bridge", "claude", claudeId, "inst-1");
+      yield* h.write(joinPath(instanceDir, "session.json"), [
+        { sid: claudeId, instanceId: "inst-1", heartbeatAt: yield* Clock.currentTimeMillis },
+      ]);
+      yield* seedT3Run(h, threadId, CLAUDE, "completed", {
+        ordinal: 2,
+        iso: "2026-07-01T10:10:00.000Z",
+      });
+      yield* h.append(claudePath, [
+        c.user("user-5", "Typed in the terminal", "2026-07-01T10:12:00.000Z"),
+        c.assistant("assistant-5", "Terminal reply.", "2026-07-01T10:12:05.000Z"),
+      ]);
+      yield* importer.sweepNow();
+      assert.deepEqual((yield* timeline).slice(-2), [
+        { text: "Typed in the terminal", run: 2 },
+        { text: "Terminal reply.", run: 2 },
+      ]);
+      assert.equal((yield* timeline).length, 8);
+
+      // The transcript changes without a new message: a later sweep writes nothing.
+      const settled = yield* h.sequence;
+      yield* h.append(claudePath, [{ type: "permission-mode", permissionMode: "default" }]);
+      yield* importer.sweepNow();
+      assert.equal(yield* h.sequence, settled);
+    }),
+);
+
+runtimeTest(
+  "does not repeat prompts and command output a running session's thread already shows",
+  (h) =>
+    Effect.gen(function* () {
+      const claudeId = "aaaaaaaa-1111-4111-8111-1111111111d1";
+      const c = claudeSession({ sessionId: claudeId, cwd: h.workspace });
+      const claudePath = h.claudeFile(claudeId);
+      const threadId = importedThreadId(claudeId);
+      yield* h.write(claudePath, [
+        c.user("user-1", "Fix the login bug please", "2026-07-01T10:00:00.000Z"),
+        c.assistant("assistant-1", "I fixed the login bug.", "2026-07-01T10:00:05.000Z"),
+      ]);
+      const bridgeDir = yield* h.makeDir("bridge");
+      const importer = yield* h.importer({ bridgeDir });
+      yield* importer.sweepNow();
+      const instanceDir = yield* h.makeDir("bridge", "claude", claudeId, "inst-1");
+      yield* h.write(joinPath(instanceDir, "session.json"), [
+        { sid: claudeId, instanceId: "inst-1", heartbeatAt: yield* Clock.currentTimeMillis },
+      ]);
+
+      // T3 showed this turn live: the prompt under its own id, the reply under
+      // the transcript row's. The harness's own rows are not conversation.
+      yield* seedT3Run(h, threadId, CLAUDE, "completed", {
+        ordinal: 1,
+        iso: "2026-07-01T10:05:00.000Z",
+      });
+      yield* seedT3Prompt(h, threadId, 1, "Now add a test", "2026-07-01T10:05:00.000Z");
+      yield* seedNativeReply(h, threadId, "assistant-2", "Test added.", "2026-07-01T10:05:04.000Z");
+      yield* h.append(claudePath, [
+        c.user("user-2", "Now add a test", "2026-07-01T10:05:01.000Z"),
+        c.assistant("assistant-2", "Test added.", "2026-07-01T10:05:04.000Z"),
+        c.user("user-3", "<task-notification>done</task-notification>", "2026-07-01T10:06:00.000Z"),
+        c.user("user-4", "[Request interrupted by user]", "2026-07-01T10:06:30.000Z"),
+      ]);
+      yield* importer.sweepNow();
+      assert.deepEqual(
+        (yield* h.texts(threadId)).toSorted(),
+        [
+          "Fix the login bug please",
+          "I fixed the login bug.",
+          "Now add a test",
+          "Test added.",
+        ].toSorted(),
+      );
     }),
 );
 

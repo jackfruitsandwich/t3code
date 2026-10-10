@@ -252,6 +252,7 @@ const layerSessionImporterProvided = SessionImporter.SessionImporterLive.pipe(
       layerEventSinkProvided,
       ProjectStore.layer,
       ProviderSessionRuntime.layer,
+      TurnItemPositionStore.layer,
     ),
   ),
 );

@@ -69,6 +69,7 @@ import * as EventSink from "../../orchestration-v2/EventSink.ts";
 import { deriveProviderThread } from "../../orchestration-v2/IdAllocator.ts";
 import * as ProjectStore from "../../orchestration-v2/ProjectStore.ts";
 import * as ThreadManagementService from "../../orchestration-v2/ThreadManagementService.ts";
+import * as TurnItemPositionStore from "../../orchestration-v2/TurnItemPositionStore.ts";
 import { expandHomePath } from "../../pathExpansion.ts";
 import {
   ProviderSessionRuntimeRepository,
@@ -89,6 +90,13 @@ import {
   truncateSessionTitle,
 } from "../sessionImportTypes.ts";
 import { SessionImporter, type SessionImporterShape } from "../Services/SessionImporter.ts";
+import {
+  bandForTime,
+  type HealingPlacement,
+  type HealingRun,
+  planImportedRowReseating,
+  planTranscriptHealing,
+} from "../transcriptHealing.ts";
 
 const DEFAULT_SWEEP_INTERVAL_MS = 30 * 1000;
 
@@ -252,6 +260,9 @@ const heldByForOriginator = (
 ): OrchestrationV2ThreadHeldBy | undefined =>
   originator === "Codex Desktop" ? "codex-desktop" : undefined;
 
+const importedTurnItemId = (threadId: ThreadId, sourceId: string) =>
+  TurnItemId.make(`cli-import:v2:${threadId}:${sourceId}`);
+
 const importEventId = (threadId: ThreadId, facet: string) =>
   EventId.make(`cli-import:v2:${threadId}:${facet}`);
 
@@ -333,7 +344,7 @@ function messageEvents(input: {
   const { threadId, message } = input;
   const messageId = importedMessageId(input.sessionId, message.sourceId);
   const at = dateTime(message.timestamp);
-  const turnItemId = TurnItemId.make(`cli-import:v2:${threadId}:${message.sourceId}`);
+  const turnItemId = importedTurnItemId(threadId, message.sourceId);
   const base = {
     id: turnItemId,
     threadId,
@@ -406,6 +417,7 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
     const projectStore = yield* ProjectStore.ProjectStoreV2;
     const projects = yield* ProjectService;
     const threads = yield* ThreadManagementService.ThreadManagementService;
+    const turnItemPositions = yield* TurnItemPositionStore.TurnItemPositionStoreV2;
     const runtimes = yield* ProviderSessionRuntimeRepository;
     const serverSettings = yield* ServerSettingsService;
     const sql = yield* SqlClient.SqlClient;
@@ -501,10 +513,10 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
           Effect.map((records) => records.runs.some((run) => ACTIVE_RUN_STATUSES.has(run.status))),
         );
 
-    /** Whether a Claude Code process with the T3 mod holds the session now. */
-    const hasLiveBridgeProcess = (sessionId: string) =>
+    /** What the Claude Code process holding the session now reports, if one with the T3 mod does. */
+    const liveBridgeSession = (sessionId: string) =>
       Effect.gen(function* () {
-        if (bridgeDir === undefined) return false;
+        if (bridgeDir === undefined) return null;
         const dir = path.join(bridgeDir, "claude", sessionId);
         const instances = yield* fs
           .readDirectory(dir)
@@ -515,9 +527,9 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
             .readFileString(path.join(dir, instanceId, "session.json"))
             .pipe(Effect.orElseSucceed(() => ""));
           const session = parseClaudeBridgeSessionFile(parseJsonlLine(raw) ?? null);
-          if (session !== null && isClaudeBridgeSessionLive(session, now)) return true;
+          if (session !== null && isClaudeBridgeSessionLive(session, now)) return session;
         }
-        return false;
+        return null;
       });
 
     /**
@@ -699,6 +711,83 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
      * moves the thread's recency to its newest message. Messages the thread
      * already holds (an interrupted earlier append) are skipped.
      */
+    const threadRuns = (threadId: ThreadId) =>
+      sql<{ readonly run_id: string; readonly ordinal: number; readonly requested_at: string }>`
+        SELECT run_id, ordinal, requested_at
+        FROM orchestration_v2_projection_runs
+        WHERE thread_id = ${threadId}
+      `.pipe(
+        Effect.map((rows) =>
+          rows.map((run): HealingRun => ({
+            id: run.run_id,
+            ordinal: run.ordinal,
+            startedAtMs: DateTime.toEpochMillis(dateTime(run.requested_at)),
+          })),
+        ),
+      );
+
+    /** Gives an imported row its place in the thread before its events are written. */
+    const placeImportedRow = (threadId: ThreadId, placement: HealingPlacement) =>
+      turnItemPositions.allocate({
+        threadId,
+        turnItemId: importedTurnItemId(threadId, placement.message.sourceId),
+        runId: null,
+        runOrdinal: placement.band,
+      });
+
+    /**
+     * Imported rows used to be put above the thread's first run whenever they
+     * were written. Moves each such row after the run that was the latest at
+     * its time, so the thread reads in the order things happened.
+     */
+    const reseatImportedRows = Effect.fn("SessionImporter.reseatImportedRows")(function* (input: {
+      readonly driver: ProviderDriverKind;
+      readonly sessionId: string;
+      readonly threadId: ThreadId;
+      readonly parsed: ParsedCliSession;
+      readonly runs: ReadonlyArray<HealingRun>;
+    }) {
+      const { threadId, sessionId } = input;
+      if (input.runs.length === 0) return;
+      const itemPrefix = importedTurnItemId(threadId, "");
+      const imported = (yield* sql<{ readonly turn_item_id: string; readonly ordinal: number }>`
+        SELECT turn_item_id, ordinal
+        FROM orchestration_v2_projection_turn_items
+        WHERE thread_id = ${threadId} AND run_id IS NULL
+      `).flatMap((item) =>
+        item.turn_item_id.startsWith(itemPrefix)
+          ? [{ sourceId: item.turn_item_id.slice(itemPrefix.length), ordinal: item.ordinal }]
+          : [],
+      );
+      const reseats = planImportedRowReseating({
+        rows: input.parsed.messages,
+        imported,
+        runs: input.runs,
+      });
+      if (reseats.length === 0) return;
+      const events: Array<OrchestrationV2DomainEvent> = [];
+      for (const reseat of reseats) {
+        yield* sql`
+          DELETE FROM orchestration_v2_turn_item_positions
+          WHERE thread_id = ${threadId}
+            AND turn_item_id = ${importedTurnItemId(threadId, reseat.message.sourceId)}
+        `;
+        yield* placeImportedRow(threadId, reseat);
+        const item = messageEvents({ threadId, sessionId, message: reseat.message })[1]!;
+        events.push({
+          ...item,
+          id: importEventId(threadId, `turn-item-reseat:${reseat.band}:${reseat.message.sourceId}`),
+        });
+      }
+      yield* eventSink.write({ events });
+      yield* Effect.logInfo("session.importer.thread-reordered", {
+        provider: input.driver,
+        sessionId,
+        threadId,
+        movedCount: reseats.length,
+      });
+    });
+
     const appendMessages = Effect.fn("SessionImporter.appendMessages")(function* (input: {
       readonly sessionId: string;
       readonly threadId: ThreadId;
@@ -706,6 +795,8 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
       readonly fromLineIndex: number;
       /** Only rows after this instant; the rest are T3's own turns. */
       readonly afterMs?: number;
+      /** The thread's runs: each row goes after the one that was the latest when it was written. */
+      readonly runs?: ReadonlyArray<HealingRun>;
     }) {
       const candidates = input.parsed.messages.filter(
         (message) =>
@@ -736,6 +827,14 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
           !knownNative.has(message.sourceId),
       );
       if (fresh.length === 0) return 0;
+      if (input.runs !== undefined && input.runs.length > 0) {
+        for (const message of fresh) {
+          yield* placeImportedRow(input.threadId, {
+            message,
+            band: bandForTime(input.runs, DateTime.toEpochMillis(dateTime(message.timestamp))),
+          });
+        }
+      }
       const records = yield* threads.getThreadRecords(input.threadId, []);
       const thread = records.thread;
       const newest = dateTime(fresh[fresh.length - 1]!.timestamp);
@@ -810,6 +909,88 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
     };
 
     /**
+     * The thread of a session that is running now shows what the session's
+     * transcript holds: rows the live attachment never delivered are added,
+     * each after the run that was the latest when it was written. See
+     * `transcriptHealing`.
+     */
+    const healLiveThread = Effect.fn("SessionImporter.healLiveThread")(function* (input: {
+      readonly driver: ProviderDriverKind;
+      readonly sessionId: string;
+      readonly filePath: string;
+      readonly parsed: ParsedCliSession;
+      readonly threadId: ThreadId;
+      readonly runs: ReadonlyArray<HealingRun>;
+      readonly context: SweepContext;
+    }) {
+      const { threadId, sessionId, parsed } = input;
+      yield* threads.ensureLegacyTranscript(threadId);
+      const known = yield* sql<{
+        readonly message_id: string;
+        readonly role: string;
+        readonly created_at: string;
+        readonly run_id: string | null;
+        readonly text: string | null;
+      }>`
+        SELECT message_id, role, created_at, run_id, json_extract(payload_json, '$.text') AS text
+        FROM orchestration_v2_projection_messages
+        WHERE thread_id = ${threadId}
+      `;
+      const missing = planTranscriptHealing({
+        rows: parsed.messages,
+        known: known.flatMap((message) =>
+          message.role === "user" || message.role === "assistant"
+            ? [
+                {
+                  messageId: message.message_id,
+                  role: message.role,
+                  text: message.text ?? "",
+                  atMs: DateTime.toEpochMillis(dateTime(message.created_at)),
+                  runId: message.run_id,
+                },
+              ]
+            : [],
+        ),
+        runs: input.runs,
+        importedMessageId: (sourceId) => importedMessageId(sessionId, sourceId),
+      });
+      if (missing.length > 0) {
+        for (const placement of missing) yield* placeImportedRow(threadId, placement);
+        const records = yield* threads.getThreadRecords(threadId, []);
+        const thread = records.thread;
+        const newest = dateTime(missing[missing.length - 1]!.message.timestamp);
+        const events: Array<OrchestrationV2DomainEvent> = missing.flatMap((placement) =>
+          messageEvents({ threadId, sessionId, message: placement.message }),
+        );
+        if (DateTime.toEpochMillis(newest) > DateTime.toEpochMillis(thread.updatedAt)) {
+          events.push({
+            id: importEventId(threadId, `recency:${missing[missing.length - 1]!.message.sourceId}`),
+            type: "thread.metadata-updated",
+            threadId,
+            providerInstanceId: thread.providerInstanceId,
+            occurredAt: newest,
+            payload: { ...thread, updatedAt: newest },
+          });
+        }
+        yield* eventSink.write({ events });
+        input.context.stats.updatedCount += 1;
+        yield* Effect.logInfo("session.importer.live-thread-healed", {
+          provider: input.driver,
+          sessionId,
+          threadId,
+          addedCount: missing.length,
+        });
+      }
+      yield* upsertImportBinding({
+        driver: input.driver,
+        sessionId,
+        threadId,
+        parsed,
+        filePath: input.filePath,
+      });
+    });
+
+    /**
      * A thread T3 owns whose native session kept going without T3 (a terminal
      * process without the mod, or from before the mod existed) gets the
      * transcript rows T3 never saw, as imported history, so the thread reads
@@ -826,15 +1007,30 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
       readonly fromLineIndex: number;
       readonly context: SweepContext;
     }) {
-      if (input.parsed.lineCount <= input.fromLineIndex) return;
       if (yield* hasActiveRun(input.threadId)) return;
-      if (yield* hasLiveBridgeProcess(input.sessionId)) return;
+      const live = yield* liveBridgeSession(input.sessionId);
+      // The attachment is streaming a turn: its rows are still arriving.
+      if (live !== null && live.activeTurn !== null) return;
+      const runs = yield* threadRuns(input.threadId);
+      yield* reseatImportedRows({
+        driver: input.driver,
+        sessionId: input.sessionId,
+        threadId: input.threadId,
+        parsed: input.parsed,
+        runs,
+      });
+      if (live !== null) {
+        yield* healLiveThread({ ...input, runs });
+        return;
+      }
+      if (input.parsed.lineCount <= input.fromLineIndex) return;
       const afterMs = yield* ownedWatermarkMs(input.threadId);
       const appendedCount = yield* appendMessages({
         sessionId: input.sessionId,
         threadId: input.threadId,
         parsed: input.parsed,
         fromLineIndex: input.fromLineIndex,
+        runs,
         ...(afterMs === undefined ? {} : { afterMs }),
       });
       yield* upsertImportBinding({
