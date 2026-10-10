@@ -1296,7 +1296,6 @@ runtimeTest(
       const c = claudeSession({ sessionId: claudeId, cwd: h.workspace });
       const claudePath = h.claudeFile(claudeId);
       const threadId = importedThreadId(claudeId);
-      const fs = yield* FileSystem.FileSystem;
       const timeline = h.threads.getThreadRecords(threadId, ["turnItems"]).pipe(
         Effect.map((records) =>
           records.turnItems
