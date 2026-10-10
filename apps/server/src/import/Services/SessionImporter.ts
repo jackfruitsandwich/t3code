@@ -31,6 +31,16 @@ export interface SessionImporterShape {
     /** Names the thread when the session has no earlier prompt to name it. */
     readonly promptText: string;
   }) => Effect.Effect<void>;
+
+  /**
+   * Compare a running Claude Code session's record with its thread now and
+   * add what the thread does not show, instead of waiting for the sweep to
+   * reach the file. Rows of the turn in flight are left to the attachment.
+   */
+  readonly healLiveClaudeSession: (input: {
+    readonly sessionId: string;
+    readonly transcriptPath: string;
+  }) => Effect.Effect<void>;
 }
 
 export class SessionImporter extends Context.Service<SessionImporter, SessionImporterShape>()(

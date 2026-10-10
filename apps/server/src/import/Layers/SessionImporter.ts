@@ -110,6 +110,8 @@ const IMPORT_EPOCH = 2;
 
 const CLAUDE_DRIVER = ProviderDriverKind.make("claudeAgent");
 /** Run statuses under which T3 is writing the thread's rows itself. */
+/** A turn's first row is written a moment either side of the instant the turn is reported. */
+const IN_FLIGHT_MARGIN_MS = 2_000;
 const ACTIVE_RUN_STATUSES: ReadonlySet<string> = new Set([
   "preparing",
   "starting",
@@ -505,13 +507,21 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         .getThreadRecords(threadId, ["runs"])
         .pipe(Effect.map((records) => records.runs.length > 0));
 
-    /** Whether T3 is driving a turn on the thread right now. */
-    const hasActiveRun = (threadId: ThreadId) =>
-      threads
-        .getThreadRecords(threadId, ["runs"])
-        .pipe(
-          Effect.map((records) => records.runs.some((run) => ACTIVE_RUN_STATUSES.has(run.status))),
-        );
+    /** When each run T3 is driving on the thread right now was asked for. */
+    const activeRunStartsMs = (threadId: ThreadId) =>
+      sql<{ readonly status: string; readonly requested_at: string }>`
+        SELECT status, requested_at
+        FROM orchestration_v2_projection_runs
+        WHERE thread_id = ${threadId}
+      `.pipe(
+        Effect.map((rows) =>
+          rows.flatMap((run) =>
+            ACTIVE_RUN_STATUSES.has(run.status)
+              ? [DateTime.toEpochMillis(dateTime(run.requested_at))]
+              : [],
+          ),
+        ),
+      );
 
     /** What the Claude Code process holding the session now reports, if one with the T3 mod does. */
     const liveBridgeSession = (sessionId: string) =>
@@ -926,22 +936,52 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
       readonly parsed: ParsedCliSession;
       readonly threadId: ThreadId;
       readonly runs: ReadonlyArray<HealingRun>;
-      readonly context: SweepContext;
+      readonly context: Pick<SweepContext, "stats">;
       readonly live: boolean;
+      /**
+       * Set while a turn is running: its rows are still arriving through the
+       * attachment, so only rows written before this moment are compared,
+       * and what the person typed into the turn, which the attachment never
+       * carries.
+       */
+      readonly settledBeforeMs?: number;
     }) {
       const { threadId, sessionId, parsed } = input;
       yield* threads.ensureLegacyTranscript(threadId);
+      // What the thread shows: its timeline rows. A message the timeline has
+      // no row for is not shown, whatever else T3 holds about it.
       const known = yield* sql<{
-        readonly message_id: string;
+        readonly message_id: string | null;
         readonly role: string;
         readonly created_at: string;
         readonly run_id: string | null;
         readonly text: string | null;
       }>`
-        SELECT message_id, role, created_at, run_id, json_extract(payload_json, '$.text') AS text
-        FROM orchestration_v2_projection_messages
+        SELECT
+          json_extract(payload_json, '$.messageId') AS message_id,
+          CASE type WHEN 'user_message' THEN 'user' ELSE 'assistant' END AS role,
+          coalesce(json_extract(payload_json, '$.startedAt'), updated_at) AS created_at,
+          run_id,
+          json_extract(payload_json, '$.text') AS text
+        FROM orchestration_v2_projection_turn_items
         WHERE thread_id = ${threadId}
-      `;
+          AND type IN ('user_message', 'assistant_message')
+      `.pipe(
+        Effect.map((rows) =>
+          rows.flatMap((row) =>
+            row.message_id === null ? [] : [{ ...row, message_id: row.message_id }],
+          ),
+        ),
+      );
+      const settledBeforeMs = input.settledBeforeMs;
+      const rows =
+        settledBeforeMs === undefined
+          ? parsed.messages
+          : parsed.messages.filter(
+              (message) =>
+                message.midTurn === true ||
+                DateTime.toEpochMillis(dateTime(message.timestamp)) < settledBeforeMs,
+            );
       if (!input.live) {
         const rowIds = new Set(parsed.messages.map((message) => message.sourceId));
         const holdsTranscriptReply = known.some((message) => {
@@ -955,7 +995,7 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         if (!holdsTranscriptReply) return false;
       }
       const missing = planTranscriptHealing({
-        rows: parsed.messages,
+        rows,
         known: known.flatMap((message) =>
           message.role === "user" || message.role === "assistant"
             ? [
@@ -1000,13 +1040,17 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
           live: input.live,
         });
       }
-      yield* upsertImportBinding({
-        driver: input.driver,
-        sessionId,
-        threadId,
-        parsed,
-        filePath: input.filePath,
-      });
+      // The cursor says how far the file has been taken in; with a turn in
+      // flight its rows have not been, and the pass after it still needs them.
+      if (settledBeforeMs === undefined) {
+        yield* upsertImportBinding({
+          driver: input.driver,
+          sessionId,
+          threadId,
+          parsed,
+          filePath: input.filePath,
+        });
+      }
       return true;
     });
 
@@ -1025,12 +1069,21 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
       readonly parsed: ParsedCliSession;
       readonly threadId: ThreadId;
       readonly fromLineIndex: number;
-      readonly context: SweepContext;
+      readonly context: Pick<SweepContext, "stats">;
     }) {
-      if (yield* hasActiveRun(input.threadId)) return;
       const live = yield* liveBridgeSession(input.sessionId);
-      // The attachment is streaming a turn: its rows are still arriving.
-      if (live !== null && live.activeTurn !== null) return;
+      const activeRuns = yield* activeRunStartsMs(input.threadId);
+      // No mod process holds the session: a run of T3's own is writing the
+      // thread, and what it writes is T3's to show.
+      if (live === null && activeRuns.length > 0) return;
+      // A session that is always working is never idle: everything from
+      // before the turn in flight is compared now, not when it stops.
+      const turnInFlight = [
+        ...activeRuns,
+        ...(live !== null && live.activeTurn !== null ? [live.activeTurn.startedAt] : []),
+      ];
+      const settledBeforeMs =
+        turnInFlight.length === 0 ? undefined : Math.min(...turnInFlight) - IN_FLIGHT_MARGIN_MS;
       const runs = yield* threadRuns(input.threadId);
       yield* reseatImportedRows({
         driver: input.driver,
@@ -1039,7 +1092,19 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         parsed: input.parsed,
         runs,
       });
-      if (yield* healBridgedThread({ ...input, runs, live: live !== null })) return;
+      if (
+        yield* healBridgedThread({
+          ...input,
+          runs,
+          live: live !== null,
+          ...(settledBeforeMs === undefined ? {} : { settledBeforeMs }),
+        })
+      ) {
+        return;
+      }
+      // Catching up by time takes whatever T3's record does not reach yet,
+      // which a turn in flight is still adding to.
+      if (settledBeforeMs !== undefined) return;
       if (input.parsed.lineCount <= input.fromLineIndex) return;
       const afterMs = yield* ownedWatermarkMs(input.threadId);
       const appendedCount = yield* appendMessages({
@@ -2059,10 +2124,46 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         ),
       );
 
+    const healLiveClaudeSession: SessionImporterShape["healLiveClaudeSession"] = (input) =>
+      Effect.gen(function* () {
+        const threadId = yield* lookupOwnedThread(CLAUDE_DRIVER, input.sessionId);
+        // A thread no run has touched is plain history: the sweep tails it.
+        if (threadId === undefined || !(yield* hasT3Runs(threadId))) return;
+        const bytes = yield* fs
+          .readFile(input.transcriptPath)
+          .pipe(Effect.orElseSucceed(() => new Uint8Array(0)));
+        if (bytes.length === 0) return;
+        const parsed = parseClaudeSessionJsonl(new TextDecoder().decode(bytes));
+        yield* catchUpOwnedThread({
+          driver: CLAUDE_DRIVER,
+          sessionId: input.sessionId,
+          filePath: input.transcriptPath,
+          parsed,
+          threadId,
+          // Only the comparison by row applies to a session a mod holds.
+          fromLineIndex: parsed.lineCount,
+          context: { stats: { importedCount: 0, updatedCount: 0 } },
+        });
+      }).pipe(
+        Effect.catch((error: unknown) =>
+          Effect.logWarning("session.importer.heal-live-failed", {
+            sessionId: input.sessionId,
+            error,
+          }),
+        ),
+        Effect.catchDefect((defect: unknown) =>
+          Effect.logWarning("session.importer.heal-live-defect", {
+            sessionId: input.sessionId,
+            defect,
+          }),
+        ),
+      );
+
     return {
       start,
       sweepNow: () => guardedSweep,
       adoptLiveClaudeSession,
+      healLiveClaudeSession,
     } satisfies SessionImporterShape;
   });
 

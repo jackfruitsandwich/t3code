@@ -2,6 +2,8 @@ import { assert, describe, it } from "@effect/vitest";
 
 import {
   claudeBridgeWakeDetail,
+  claudeTranscriptOffsetAt,
+  isClaudeTypedMidTurnRow,
   makeClaudeBridgeFrameTranslator,
   parseClaudeBridgeEvent,
   parseClaudeBridgeSessionFile,
@@ -197,6 +199,51 @@ describe("ClaudeBridgeProtocol frame translator", () => {
     assert.equal(frame.subtype, "error_during_execution");
     assert.isTrue(frame.is_error);
     assert.equal(frame.user_message_uuid, PROMPT_UUID);
+  });
+});
+
+describe("ClaudeBridgeProtocol record helpers", () => {
+  const rowAt = (iso: string) => `${JSON.stringify({ type: "user", uuid: iso, timestamp: iso })}\n`;
+  const first = rowAt("2026-07-01T10:00:00.000Z");
+  const second = rowAt("2026-07-01T10:05:00.000Z");
+  const third = rowAt("2026-07-01T10:06:00.000Z");
+  const bytes = new TextEncoder().encode(first + second + third);
+
+  it("finds where a turn starts in a record from the time it began", () => {
+    assert.strictEqual(
+      claudeTranscriptOffsetAt(bytes, 0, Date.parse("2026-07-01T10:04:59.000Z")),
+      first.length,
+    );
+    assert.strictEqual(
+      claudeTranscriptOffsetAt(bytes, 0, Date.parse("2026-07-01T09:00:00.000Z")),
+      0,
+    );
+    assert.strictEqual(
+      claudeTranscriptOffsetAt(bytes, 0, Date.parse("2026-07-01T11:00:00.000Z")),
+      null,
+    );
+  });
+
+  it("starts at the first whole row of a tail that begins mid-row", () => {
+    const cut = 10;
+    assert.strictEqual(
+      claudeTranscriptOffsetAt(
+        bytes.subarray(cut),
+        1_000 + cut,
+        Date.parse("2026-07-01T09:00:00.000Z"),
+      ),
+      1_000 + first.length,
+    );
+  });
+
+  it("tells the person's mid-turn message from the harness's notices", () => {
+    const queued = (origin: unknown) => ({
+      type: "attachment",
+      attachment: { type: "queued_command", prompt: "x", origin },
+    });
+    assert.isTrue(isClaudeTypedMidTurnRow(queued({ kind: "human" })));
+    assert.isFalse(isClaudeTypedMidTurnRow(queued({ kind: "task-notification" })));
+    assert.isFalse(isClaudeTypedMidTurnRow({ type: "user", message: { content: "x" } }));
   });
 });
 

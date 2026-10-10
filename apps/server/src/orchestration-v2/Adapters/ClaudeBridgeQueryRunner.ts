@@ -45,6 +45,8 @@ import {
   claudeConfigModelChoice,
   claudeTranscriptCommandText,
   claudeTranscriptPermissionMode,
+  isClaudeTurnEndRow,
+  isClaudeTypedMidTurnRow,
   isClaudeBridgeCommandOutputFrame,
   isClaudeBridgeSessionLive,
   makeClaudeBridgeFrameTranslator,
@@ -52,7 +54,7 @@ import {
   readTranscriptRows,
   type ClaudeBridgeEvent,
 } from "../../claude-bridge/ClaudeBridgeProtocol.ts";
-import { isRecord } from "../../import/sessionImportTypes.ts";
+import { isRecord, parseJsonlLine } from "../../import/sessionImportTypes.ts";
 import * as ProviderEventLoggers from "../../provider/ProviderEventLoggers.ts";
 import * as ClaudeAdapterV2 from "./ClaudeAdapterV2.ts";
 
@@ -60,6 +62,9 @@ export const CLAUDE_TRANSPORT_ENV = "T3CODE_CLAUDE_TRANSPORT";
 const TAIL_INTERVAL_MS = 300;
 /** A turn's result waits this long after the last transcript row, so a late row cannot land after it. */
 const COMPLETE_QUIET_MS = 400;
+/** How long a turn's closing row is waited for when the next turn has already begun. */
+const TURN_END_ROW_POLL_MS = 50;
+const TURN_END_ROW_ATTEMPTS = 30;
 /**
  * How recently a turn nobody was attached for must have ended to be shown
  * from its start by the next attachment. Shorter than the importer's settle
@@ -282,6 +287,9 @@ export const layer: Layer.Layer<
         heldOutput: [] as Array<SDKMessage>,
         heldAt: 0,
         lastCommandText: null as string | null,
+        /** Rows that close a turn in the record, read so far; and the count when the open turn began. */
+        turnEndsRead: 0,
+        turnEndsAtTurnStart: 0,
         /** A slash command T3 ran that started no turn, waiting for its output rows. */
         pendingLocal: null as {
           readonly commandId: string;
@@ -448,34 +456,52 @@ export const layer: Layer.Layer<
         bridgeProcess.session,
       );
 
-      const readNewRows = Effect.gen(function* () {
-        if (state.transcriptPath.length === 0) return;
-        const size = yield* transcriptSize(state.transcriptPath);
-        if (size <= state.byteOffset) return;
-        const bytes = yield* readTranscriptBytes(
-          state.transcriptPath,
-          state.byteOffset,
-          size - state.byteOffset,
-        );
-        const lastNewline = bytes.lastIndexOf(0x0a);
-        if (lastNewline === -1) return;
-        const text = new TextDecoder().decode(bytes.subarray(0, lastNewline + 1));
-        state.byteOffset += lastNewline + 1;
-        state.lastRowAt = yield* Clock.currentTimeMillis;
-        for (const row of readTranscriptRows(text).rows) {
-          transcriptMode = claudeTranscriptPermissionMode(row) ?? transcriptMode;
-          const commandText = claudeTranscriptCommandText(row);
-          if (commandText !== null) state.lastCommandText = commandText;
-          for (const frame of translator.onTranscriptRow(row)) {
-            if (isClaudeBridgeCommandOutputFrame(frame) && !translator.hasOpenTurn()) {
-              state.heldOutput.push(frame);
-              state.heldAt = state.lastRowAt;
-            } else {
-              yield* emit([frame]);
+      /**
+       * Translates the record's new rows. With `untilTurnEnd` it stops after
+       * the row that closes a turn, leaving the next turn's rows unread.
+       */
+      const readRows = (untilTurnEnd: boolean) =>
+        Effect.gen(function* () {
+          if (state.transcriptPath.length === 0) return;
+          const size = yield* transcriptSize(state.transcriptPath);
+          if (size <= state.byteOffset) return;
+          const bytes = yield* readTranscriptBytes(
+            state.transcriptPath,
+            state.byteOffset,
+            size - state.byteOffset,
+          );
+          const decoder = new TextDecoder();
+          let typedMidTurn = false;
+          let lineStart = 0;
+          for (;;) {
+            const newline = bytes.indexOf(0x0a, lineStart);
+            if (newline === -1) break;
+            const row = parseJsonlLine(decoder.decode(bytes.subarray(lineStart, newline)));
+            state.byteOffset += newline + 1 - lineStart;
+            lineStart = newline + 1;
+            state.lastRowAt = yield* Clock.currentTimeMillis;
+            if (row === undefined) continue;
+            typedMidTurn = typedMidTurn || isClaudeTypedMidTurnRow(row);
+            transcriptMode = claudeTranscriptPermissionMode(row) ?? transcriptMode;
+            const commandText = claudeTranscriptCommandText(row);
+            if (commandText !== null) state.lastCommandText = commandText;
+            for (const frame of translator.onTranscriptRow(row)) {
+              if (isClaudeBridgeCommandOutputFrame(frame) && !translator.hasOpenTurn()) {
+                state.heldOutput.push(frame);
+                state.heldAt = state.lastRowAt;
+              } else {
+                yield* emit([frame]);
+              }
+            }
+            if (isClaudeTurnEndRow(row)) {
+              state.turnEndsRead += 1;
+              if (untilTurnEnd) break;
             }
           }
-        }
-      });
+          // What the person typed into the running turn is in the record only.
+          if (typedMidTurn) yield* registry.noteRecordChange(bridgeProcess, "typed-mid-turn");
+        });
+      const readNewRows = readRows(false);
 
       /** A turn's worth of frames for a slash command that started no model turn. */
       const emitCommandTurn = (input: {
@@ -762,6 +788,33 @@ export const layer: Layer.Layer<
           });
           switch (event.type) {
             case "turn.start": {
+              // The turn before this one has ended and its end is still
+              // waiting for its last rows (a message queued behind it starts
+              // the next at once). It is closed first: otherwise the two run
+              // together and the new turn is lost when the old one closes.
+              if (
+                state.pendingComplete !== null &&
+                state.pendingComplete.event.turnId !== event.turnId
+              ) {
+                // Claude Code reports the next turn before the last rows of
+                // this one are on disk: read up to the row that closes it.
+                for (
+                  let attempt = 0;
+                  attempt < TURN_END_ROW_ATTEMPTS &&
+                  state.turnEndsRead === state.turnEndsAtTurnStart;
+                  attempt += 1
+                ) {
+                  yield* readRows(true).pipe(Effect.ignore);
+                  if (state.turnEndsRead !== state.turnEndsAtTurnStart) break;
+                  yield* Effect.sleep(`${TURN_END_ROW_POLL_MS} millis`);
+                }
+                const ended = state.pendingComplete;
+                if (ended !== null) {
+                  state.pendingComplete = null;
+                  yield* emit(translator.onTurnComplete(ended.event));
+                }
+              }
+              state.turnEndsAtTurnStart = state.turnEndsRead;
               if (
                 state.pendingPrompt !== null &&
                 event.commandId === state.pendingPrompt.commandId

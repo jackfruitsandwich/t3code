@@ -153,6 +153,37 @@ describe("parseClaudeSessionJsonl", () => {
     assert.lengthOf(parsed.messages, 1);
   });
 
+  it("reads what the person typed into a running turn, and not the harness's own notices", () => {
+    const queued = (uuid: string, origin: Record<string, unknown>, prompt: string) => ({
+      type: "attachment",
+      uuid,
+      sessionId: SESSION_ID,
+      timestamp: "2026-07-01T10:00:03.000Z",
+      isSidechain: false,
+      attachment: { type: "queued_command", commandMode: "prompt", origin, prompt },
+    });
+    const parsed = parseClaudeSessionJsonl(
+      line(userEntry()) +
+        line(queued("queued-1", { kind: "human" }, "also check the logs")) +
+        line(
+          queued(
+            "queued-2",
+            { kind: "task-notification", producer: "session-task" },
+            "<task-notification>done</task-notification>",
+          ),
+        ) +
+        line(assistantEntry()),
+    );
+    assert.deepEqual(
+      parsed.messages.map((message) => [message.role, message.text, message.midTurn === true]),
+      [
+        ["user", "Fix the login bug", false],
+        ["user", "also check the logs", true],
+        ["assistant", "I found the bug.", false],
+      ],
+    );
+  });
+
   it("is ineligible without at least one user and one assistant message", () => {
     assert.isFalse(isEligibleCliSession(parseClaudeSessionJsonl(line(userEntry()))));
     assert.isFalse(isEligibleCliSession(parseClaudeSessionJsonl(line(assistantEntry()))));

@@ -19,6 +19,7 @@ import {
   ProviderThreadId,
   RunId,
   ThreadId,
+  TurnItemId,
   type OrchestrationV2AppThread,
   type OrchestrationV2DomainEvent,
 } from "@t3tools/contracts";
@@ -436,6 +437,59 @@ const settleSeedT3Run = (h: Harness, threadId: ThreadId, driver: ProviderDriverK
 };
 
 /** A reply T3's own adapter wrote for a turn it drove. */
+/** The timeline row that shows a seeded message: a thread shows what its timeline holds. */
+const seedTimelineRow = (input: {
+  readonly threadId: ThreadId;
+  readonly key: string;
+  readonly messageId: MessageId;
+  readonly role: "user" | "assistant";
+  readonly text: string;
+  readonly at: DateTime.Utc;
+  readonly runId: RunId | null;
+}) => {
+  const base = {
+    id: TurnItemId.make(`seed-item:${input.threadId}:${input.key}`),
+    threadId: input.threadId,
+    runId: input.runId,
+    nodeId: null,
+    providerThreadId: null,
+    providerTurnId: null,
+    nativeItemRef: null,
+    parentItemId: null,
+    ordinal: 0,
+    status: "completed" as const,
+    title: null,
+    startedAt: input.at,
+    completedAt: input.at,
+    updatedAt: input.at,
+  };
+  return {
+    id: EventId.make(`seed:${input.threadId}:item:${input.key}`),
+    type: "turn-item.updated" as const,
+    threadId: input.threadId,
+    occurredAt: input.at,
+    payload:
+      input.role === "user"
+        ? {
+            ...base,
+            createdBy: "user" as const,
+            creationSource: "web" as const,
+            type: "user_message" as const,
+            messageId: input.messageId,
+            inputIntent: "turn_start" as const,
+            text: input.text,
+            attachments: [],
+          }
+        : {
+            ...base,
+            type: "assistant_message" as const,
+            messageId: input.messageId,
+            text: input.text,
+            streaming: false,
+          },
+  };
+};
+
 const seedNativeReply = (
   h: Harness,
   threadId: ThreadId,
@@ -466,6 +520,15 @@ const seedNativeReply = (
           updatedAt: at,
         },
       },
+      seedTimelineRow({
+        threadId,
+        key: `native:${uuid}`,
+        messageId: MessageId.make(`message:provider:claudeAgent:native-item:${uuid}`),
+        role: "assistant",
+        text,
+        at,
+        runId: null,
+      }),
     ],
   });
 };
@@ -502,6 +565,15 @@ const seedT3Prompt = (
           updatedAt: at,
         },
       },
+      seedTimelineRow({
+        threadId,
+        key: `prompt:${runOrdinal}`,
+        messageId: MessageId.make(`seed-run-message:${threadId}:${runOrdinal}`),
+        role: "user",
+        text,
+        at,
+        runId: seed.runId,
+      }),
     ],
   });
 };
@@ -1370,6 +1442,82 @@ runtimeTest(
       yield* h.append(claudePath, [{ type: "permission-mode", permissionMode: "default" }]);
       yield* importer.sweepNow();
       assert.equal(yield* h.sequence, settled);
+    }),
+);
+
+runtimeTest(
+  "a session that keeps working still gets what its thread lacks, and what was typed into its running turn",
+  (h) =>
+    Effect.gen(function* () {
+      const claudeId = "aaaaaaaa-1111-4111-8111-1111111111e1";
+      const c = claudeSession({ sessionId: claudeId, cwd: h.workspace });
+      const claudePath = h.claudeFile(claudeId);
+      const threadId = importedThreadId(claudeId);
+      yield* h.write(claudePath, [
+        c.user("user-1", "Fix the login bug please", "2026-07-01T10:00:00.000Z"),
+        c.assistant("assistant-1", "I fixed the login bug.", "2026-07-01T10:00:05.000Z"),
+      ]);
+      const bridgeDir = yield* h.makeDir("bridge");
+      const importer = yield* h.importer({ bridgeDir });
+      yield* importer.sweepNow();
+
+      // T3 ran the thread once. Since then the session went on in its
+      // terminal: one turn nothing was attached for, and one running now.
+      yield* seedT3Run(h, threadId, CLAUDE, "completed", {
+        ordinal: 1,
+        iso: "2026-07-01T10:01:00.000Z",
+      });
+      const turnStartedAt = "2026-07-01T10:10:00.000Z";
+      yield* h.append(claudePath, [
+        c.user("user-2", "A turn nothing was attached for", "2026-07-01T10:05:00.000Z"),
+        c.assistant("assistant-2", "Its reply.", "2026-07-01T10:05:05.000Z"),
+        c.user("user-3", "The turn running now", turnStartedAt),
+        {
+          type: "attachment",
+          uuid: "queued-1",
+          sessionId: claudeId,
+          timestamp: "2026-07-01T10:10:30.000Z",
+          isSidechain: false,
+          attachment: {
+            type: "queued_command",
+            commandMode: "prompt",
+            origin: { kind: "human" },
+            prompt: "Typed into the running turn",
+          },
+        },
+        c.assistant(
+          "assistant-3",
+          "Still arriving through the attachment.",
+          "2026-07-01T10:10:40.000Z",
+        ),
+      ]);
+      const instanceDir = yield* h.makeDir("bridge", "claude", claudeId, "inst-1");
+      yield* h.write(joinPath(instanceDir, "session.json"), [
+        {
+          sid: claudeId,
+          instanceId: "inst-1",
+          heartbeatAt: yield* Clock.currentTimeMillis,
+          activeTurn: {
+            turnId: "turn-3",
+            startedAt: DateTime.toEpochMillis(DateTime.makeUnsafe(turnStartedAt)),
+            transcriptOffset: 0,
+          },
+        },
+      ]);
+
+      yield* importer.healLiveClaudeSession({ sessionId: claudeId, transcriptPath: claudePath });
+      const texts = yield* h.texts(threadId);
+      assert.include(texts, "A turn nothing was attached for");
+      assert.include(texts, "Its reply.");
+      assert.include(texts, "Typed into the running turn");
+      // The turn in flight is the attachment's to show.
+      assert.notInclude(texts, "The turn running now");
+      assert.notInclude(texts, "Still arriving through the attachment.");
+
+      // Asking again adds nothing, and neither does the sweep.
+      yield* importer.healLiveClaudeSession({ sessionId: claudeId, transcriptPath: claudePath });
+      yield* importer.sweepNow();
+      assert.deepEqual(yield* h.texts(threadId), texts);
     }),
 );
 

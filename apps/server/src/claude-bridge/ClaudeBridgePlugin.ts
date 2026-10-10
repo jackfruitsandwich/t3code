@@ -178,11 +178,17 @@ async function transcriptOffset($) {
   try { return (await $.fs.stat(transcriptPath)).size } catch { return 0 }
 }
 
-// What the classic hook payloads say about the session right now.
-function noteClassic(e) {
+// What the classic hook payloads say about the session right now. Each names
+// the session's record file, which a mod loaded mid-session (/reload-plugins)
+// is told by nothing else; it is kept so the next load starts knowing it.
+function noteClassic($, e) {
   if (!e) return
   if (typeof e.permission_mode === 'string') permissionMode = e.permission_mode
   if (e.effort && typeof e.effort.level === 'string') effort = e.effort.level
+  if (typeof e.transcript_path === 'string' && e.transcript_path && e.transcript_path !== transcriptPath) {
+    transcriptPath = e.transcript_path
+    if (sid) $.store.set('transcript:' + sid, transcriptPath).catch(() => {})
+  }
 }
 
 function terminalPresent() {
@@ -275,6 +281,9 @@ async function openSessionDir($) {
   activeTurn = null
   pendingCommand = null
   commandsBody = ''
+  if (!transcriptPath) {
+    try { transcriptPath = String((await $.store.get('transcript:' + sid)) || '') } catch {}
+  }
   await heartbeat($)
   await refreshCommands($)
   await heartbeat($)
@@ -487,24 +496,24 @@ export function register(on) {
   // known at session.start, which may come after this event.
   on('classic.SessionStart', async ($, e, next) => {
     transcriptPath = String(e.transcript_path || transcriptPath)
-    noteClassic(e)
+    noteClassic($, e)
     await takeBaseline($)
     await heartbeat($)
     return next(e)
   })
 
   on('classic.UserPromptSubmit', async ($, e, next) => {
-    noteClassic(e)
+    noteClassic($, e)
     return next(e)
   })
 
   on('classic.PreToolUse', async ($, e, next) => {
-    noteClassic(e)
+    noteClassic($, e)
     return next(e)
   })
 
   on('classic.Stop', async ($, e, next) => {
-    noteClassic(e)
+    noteClassic($, e)
     return next(e)
   })
 

@@ -30,7 +30,7 @@ import type {
 import { isRecord, parseJsonlLine } from "../import/sessionImportTypes.ts";
 
 export const CLAUDE_BRIDGE_PROTOCOL_VERSION = 2;
-export const CLAUDE_BRIDGE_MOD_VERSION = "0.2.0";
+export const CLAUDE_BRIDGE_MOD_VERSION = "0.2.1";
 /**
  * The first protocol whose mod runs slash commands, answers questions with
  * their answers and reports the session's own commands. A process still on an
@@ -962,6 +962,52 @@ export function makeClaudeBridgeFrameTranslator(
     },
     hasOpenTurn: () => turn !== null,
   };
+}
+
+/** The row Claude Code writes when a turn is over: every row of that turn is before it. */
+export function isClaudeTurnEndRow(row: unknown): boolean {
+  return isRecord(row) && row.type === "system" && row.subtype === "turn_duration";
+}
+
+/**
+ * A message the person typed while a turn was running. Claude Code hands it
+ * to the model inside that turn; the record holds it as this row and no user
+ * row. The harness delivers its own notices the same way, with another origin.
+ */
+export function isClaudeTypedMidTurnRow(row: unknown): boolean {
+  if (!isRecord(row) || row.type !== "attachment" || !isRecord(row.attachment)) return false;
+  const attachment = row.attachment;
+  return (
+    attachment.type === "queued_command" &&
+    isRecord(attachment.origin) &&
+    attachment.origin.kind === "human"
+  );
+}
+
+/**
+ * Where a turn that began at `sinceMs` starts in a transcript, for a mod that
+ * could not say: the byte offset of the first complete row in `bytes` written
+ * at or after that moment. `bytes` is the tail of the file from `chunkStart`;
+ * `null` when no such row is in it.
+ */
+export function claudeTranscriptOffsetAt(
+  bytes: Uint8Array,
+  chunkStart: number,
+  sinceMs: number,
+): number | null {
+  const decoder = new TextDecoder();
+  // The chunk may begin mid-row: the first complete row starts after its first newline.
+  let lineStart = chunkStart === 0 ? 0 : bytes.indexOf(0x0a) + 1;
+  if (chunkStart !== 0 && lineStart === 0) return null;
+  while (lineStart < bytes.length) {
+    const newline = bytes.indexOf(0x0a, lineStart);
+    if (newline === -1) return null;
+    const stamp = /"timestamp":"([^"]+)"/u.exec(decoder.decode(bytes.subarray(lineStart, newline)));
+    const at = stamp === null ? Number.NaN : Date.parse(stamp[1]!);
+    if (!Number.isNaN(at) && at >= sinceMs) return chunkStart + lineStart;
+    lineStart = newline + 1;
+  }
+  return null;
 }
 
 /** Parses the complete JSONL lines in `chunk`, returning the rows and the bytes consumed. */

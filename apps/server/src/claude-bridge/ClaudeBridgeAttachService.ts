@@ -121,10 +121,52 @@ const make = Effect.gen(function* () {
         driver: CLAUDE_PROVIDER,
         detail: text.trim().length > 0 ? text : null,
         // A turn the person typed is theirs on every client; one the harness
-        // injected (a task notice, a hook's feedback) is not their message.
-        createdBy: isHarnessPrompt(text) ? "agent" : "user",
+        // injected (a task notice, a hook's feedback) is not their message,
+        // and neither is a turn picked up with nothing known of how it began.
+        createdBy: text.trim().length === 0 || isHarnessPrompt(text) ? "agent" : "user",
       });
     });
+
+  // The attachment carries a turn's replies and tools. What it does not carry
+  // (a message typed into a running turn, a turn nothing was attached for) is
+  // in the session's record: the two are compared whenever the record moves
+  // on, not when the importer's sweep next reaches the file.
+  const scope = yield* Effect.scope;
+  const comparing = new Map<string, { passes: number; running: boolean }>();
+  yield* registry.onRecordChange((entry, change) =>
+    Effect.gen(function* () {
+      const sid = entry.sid;
+      const state = comparing.get(sid) ?? { passes: 0, running: false };
+      comparing.set(sid, state);
+      // A turn's own run is still closing just after it ends: once now for
+      // what came before it, once more when the run is over.
+      state.passes = Math.max(state.passes, change === "turn.complete" ? 2 : 1);
+      if (state.running) return;
+      state.running = true;
+      yield* Effect.gen(function* () {
+        let first = true;
+        while (state.passes > 0) {
+          state.passes -= 1;
+          yield* Effect.sleep(first ? "1500 millis" : "6 seconds");
+          first = false;
+          const session = (yield* registry.readSession(entry)) ?? entry.session;
+          if (session.transcriptPath.length === 0) continue;
+          yield* importer.healLiveClaudeSession({
+            sessionId: sid,
+            transcriptPath: session.transcriptPath,
+          });
+        }
+      }).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            state.running = false;
+            if (state.passes === 0) comparing.delete(sid);
+          }),
+        ),
+        Effect.forkIn(scope),
+      );
+    }),
+  );
 
   yield* registry.onUnattachedEvent((event, entry) =>
     event.type === "turn.start" ? offerTurn(entry, event) : Effect.void,

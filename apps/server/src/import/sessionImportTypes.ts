@@ -24,6 +24,8 @@ export interface ParsedSessionMessage {
   readonly lineIndex: number;
   /** A slash command or what it printed: shown, but not conversation. */
   readonly command?: true;
+  /** Typed while a turn was running and delivered inside it: it started no turn of its own. */
+  readonly midTurn?: true;
 }
 
 export interface ParsedCliSession {

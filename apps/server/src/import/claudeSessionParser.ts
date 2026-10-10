@@ -94,6 +94,32 @@ export function parseClaudeSessionJsonl(content: string): ParsedCliSession {
       continue;
     }
 
+    // What the person typed while a turn was running is handed to the model
+    // inside that turn and has no user row of its own. The harness delivers
+    // its own notices the same way; only the person's are conversation.
+    if (entry.type === "attachment" && entry.isSidechain !== true && isRecord(entry.attachment)) {
+      const attachment = entry.attachment;
+      const timestamp = readString(entry.timestamp);
+      const text =
+        attachment.type === "queued_command" &&
+        isRecord(attachment.origin) &&
+        attachment.origin.kind === "human"
+          ? extractTextContent(attachment.prompt).trim()
+          : "";
+      if (timestamp !== undefined && text.length > 0) {
+        startedAt ??= timestamp;
+        messages.push({
+          role: "user",
+          sourceId: readString(entry.uuid) ?? `line-${lineIndex}`,
+          text,
+          timestamp,
+          lineIndex,
+          midTurn: true,
+        });
+      }
+      continue;
+    }
+
     // A slash command that acts only locally (/rename, /model) leaves system
     // rows; shown the way the terminal shows them, like the ones below.
     const localCommand =

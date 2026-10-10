@@ -92,6 +92,8 @@ const attach = (input: {
       clearHeartbeat: () => Effect.void,
       subscribe: (_sid, handler) => Deferred.succeed(subscribed, handler).pipe(Effect.asVoid),
       onUnattachedEvent: () => Effect.void,
+      onRecordChange: () => Effect.void,
+      noteRecordChange: () => Effect.void,
       peekMissedTurn: () => Effect.sync(() => missedTurn),
       takeMissedTurn: () =>
         Effect.sync(() => {
@@ -381,6 +383,50 @@ describe("ClaudeBridgeQueryRunner slash commands", () => {
       );
       assert.strictEqual(result._tag, "Failure");
       assert.strictEqual(yield* Queue.size(bridge.commands), 0);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+});
+
+describe("ClaudeBridgeQueryRunner turns that follow at once", () => {
+  // A message queued behind a turn starts the next one the instant the first
+  // ends, before the first has been closed out.
+  it.live("closes the turn that ended before starting the one that follows it", () =>
+    Effect.gen(function* () {
+      const bridge = yield* attach({ protocol: 2, bridgeCanUseTool: () => null, transcript: "" });
+      const base = { seq: 1, at: bridge.now, transcriptOffset: 0 };
+      yield* bridge.handler(
+        { ...base, type: "turn.start", turnId: "turn-a", text: "first" },
+        bridge.process,
+      );
+      yield* bridge.handler(
+        {
+          ...base,
+          seq: 2,
+          type: "turn.complete",
+          turnId: "turn-a",
+          reason: "answer",
+          answer: "first done",
+          isAborted: false,
+          durationMs: 10,
+        },
+        bridge.process,
+      );
+      yield* bridge.handler(
+        { ...base, seq: 3, type: "turn.start", turnId: "turn-b", text: "second" },
+        bridge.process,
+      );
+      const frames = Array.from(
+        yield* bridge.session.messages.pipe(Stream.take(5), Stream.runCollect),
+      );
+      assert.deepStrictEqual(
+        frames.map((frame) => frame.type),
+        ["user", "system", "result", "user", "system"],
+      );
+      const result = frames[2];
+      assert.strictEqual(
+        result?.type === "result" && result.subtype === "success" ? result.result : null,
+        "first done",
+      );
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 });

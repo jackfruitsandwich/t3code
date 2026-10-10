@@ -152,7 +152,8 @@ export function planTranscriptHealing(input: {
       // A prompt T3 shows in other words: the turn it started ran in T3, and
       // that run has its prompt. Only a run known to have none (one that
       // picked the turn up after it began) leaves the prompt to be added.
-      for (let next = index + 1; next < rows.length; next += 1) {
+      // What was typed into a running turn started none, so it has no such run.
+      for (let next = index + 1; row.midTurn !== true && next < rows.length; next += 1) {
         const later = rows[next]!;
         if (later.role === "user" && later.command !== true) break;
         const live = later.role === "assistant" ? knownByNative.get(later.sourceId) : undefined;

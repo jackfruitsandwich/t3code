@@ -118,6 +118,40 @@ describe("planTranscriptHealing", () => {
   });
 });
 
+describe("planTranscriptHealing: a message typed into a running turn", () => {
+  it("is added although the turn it was typed into ran in T3 with its own prompt", () => {
+    const typed: ParsedSessionMessage = {
+      ...row("user", "q1", "also check the logs", 11),
+      midTurn: true,
+    };
+    const rows = [
+      row("user", "u1", "fix the bug", 10),
+      typed,
+      row("assistant", "a1", "fixed, and the logs are clean", 12),
+    ];
+    const known = [
+      shown("message:run-1:prompt", "user", "fix the bug", 10, "run-1"),
+      shown(
+        "message:provider:claudeAgent:native-item:a1",
+        "assistant",
+        "fixed, and the logs are clean",
+        12,
+        "run-1",
+      ),
+    ];
+    assert.deepEqual(plan(rows, known, [{ id: "run-1", ordinal: 1, minute: 10 }]), ["1:q1"]);
+  });
+
+  it("is not added twice", () => {
+    const typed: ParsedSessionMessage = {
+      ...row("user", "q1", "also check the logs", 11),
+      midTurn: true,
+    };
+    const known = [shown("cli-import-s-q1", "user", "also check the logs", 11)];
+    assert.deepEqual(plan([typed], known, [{ id: "run-1", ordinal: 1, minute: 10 }]), []);
+  });
+});
+
 describe("planImportedRowReseating", () => {
   it("moves imported rows that sit above the run they followed", () => {
     const rows = [

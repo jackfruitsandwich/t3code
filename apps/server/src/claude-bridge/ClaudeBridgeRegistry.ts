@@ -15,6 +15,7 @@ import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import type * as Scope from "effect/Scope";
@@ -31,6 +32,7 @@ import {
 import {
   CLAUDE_BRIDGE_DIR_ENV,
   CLAUDE_BRIDGE_PLUGIN_ID,
+  claudeTranscriptOffsetAt,
   isClaudeBridgeSessionLive,
   parseClaudeBridgeEvent,
   parseClaudeBridgeSessionFile,
@@ -49,6 +51,10 @@ const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 /** A process dir whose heartbeat is this old is removed. */
 const DEAD_PROCESS_SWEEP_MS = 120_000;
 const INBOX_HISTORY = 64;
+/** How often a session whose record was not found is looked for again. */
+const TRANSCRIPT_LOOKUP_RETRY_MS = 5_000;
+/** How far back from the end of a record a turn's first row is searched for. */
+const TURN_START_SCAN_BYTES = 8 * 1024 * 1024;
 const LAUNCH_ATTACH_TIMEOUT_MS = 45_000;
 
 export class ClaudeBridgeLaunchError extends Schema.TaggedError<ClaudeBridgeLaunchError>()(
@@ -80,6 +86,13 @@ export interface ClaudeBridgeProcess {
 export type ClaudeBridgeEventHandler = (
   event: ClaudeBridgeEvent,
   process: ClaudeBridgeProcess,
+) => Effect.Effect<void>;
+
+export type ClaudeBridgeRecordChange = "turn.start" | "turn.complete" | "typed-mid-turn";
+
+export type ClaudeBridgeRecordHandler = (
+  process: ClaudeBridgeProcess,
+  change: ClaudeBridgeRecordChange,
 ) => Effect.Effect<void>;
 
 export interface ClaudeBridgeLaunchInput {
@@ -128,6 +141,17 @@ export class ClaudeBridgeRegistry extends Context.Service<
     readonly onUnattachedEvent: (
       handler: ClaudeBridgeEventHandler,
     ) => Effect.Effect<void, never, Scope.Scope>;
+    /**
+     * Told when a session's record may hold something its attachment does not
+     * carry: a turn began or ended, or the person typed into a running turn.
+     */
+    readonly onRecordChange: (
+      handler: ClaudeBridgeRecordHandler,
+    ) => Effect.Effect<void, never, Scope.Scope>;
+    readonly noteRecordChange: (
+      process: ClaudeBridgeProcess,
+      change: ClaudeBridgeRecordChange,
+    ) => Effect.Effect<void>;
     /**
      * The last turn the session began while nobody was subscribed, with its
      * end if that came too: a short turn can be over before the run offered
@@ -326,6 +350,13 @@ const make = Effect.gen(function* () {
       return missed;
     });
   const unattachedHandlers = new Set<ClaudeBridgeEventHandler>();
+  const recordHandlers = new Set<ClaudeBridgeRecordHandler>();
+  const noteRecordChange = (entry: ClaudeBridgeProcess, change: ClaudeBridgeRecordChange) =>
+    Effect.forEach(recordHandlers, (handler) => handler(entry, change), { discard: true }).pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("claude-bridge.record-handler-failed", { sid: entry.sid, cause }),
+      ),
+    );
 
   const readJson = (file: string) =>
     fs.readFileString(file).pipe(
@@ -350,11 +381,105 @@ const make = Effect.gen(function* () {
       Effect.map((entries) => entries.filter((entry): entry is string => entry !== null)),
     );
 
+  // A mod loaded into a session that was already running (/reload-plugins) is
+  // not told where the session's record is, and counts its offsets from zero
+  // until a hook names the file. The record is still where Claude Code keeps
+  // it: the session's own file under one of that home's projects.
+  const knownTranscripts = new Map<string, { readonly file: string; readonly lookedAt: number }>();
+  const recordUnknownToMod = new Set<string>();
+  const turnOffsets = new Map<string, number>();
+
+  const findTranscript = (session: ClaudeBridgeSessionFile) =>
+    Effect.gen(function* () {
+      const now = yield* Clock.currentTimeMillis;
+      const known = knownTranscripts.get(session.sid);
+      if (
+        known !== undefined &&
+        (known.file.length > 0 || now - known.lookedAt < TRANSCRIPT_LOOKUP_RETRY_MS)
+      ) {
+        return known.file;
+      }
+      const projects = path.join(
+        session.configDir.length > 0 ? session.configDir : defaultHomeFor(hostEnvironment),
+        "projects",
+      );
+      const folders = yield* fs
+        .readDirectory(projects)
+        .pipe(Effect.orElseSucceed((): ReadonlyArray<string> => []));
+      let file = "";
+      for (const folder of folders) {
+        const candidate = path.join(projects, folder, `${session.sid}.jsonl`);
+        if (yield* fs.exists(candidate).pipe(Effect.orElseSucceed(() => false))) {
+          file = candidate;
+          break;
+        }
+      }
+      knownTranscripts.set(session.sid, { file, lookedAt: now });
+      return file;
+    });
+
+  /** Where in the record a turn that began at `startedAt` starts. */
+  const turnOffset = (sid: string, turnId: string, file: string, startedAt: number) =>
+    Effect.gen(function* () {
+      const key = `${sid}:${turnId}`;
+      const cached = turnOffsets.get(key);
+      if (cached !== undefined) return cached;
+      const size = yield* fs.stat(file).pipe(
+        Effect.map((info) => Number(info.size)),
+        Effect.orElseSucceed(() => 0),
+      );
+      const from = Math.max(0, size - TURN_START_SCAN_BYTES);
+      const bytes = yield* Effect.scoped(
+        Effect.gen(function* () {
+          const handle = yield* fs.open(file, { flag: "r" });
+          yield* handle.seek(BigInt(from), "start");
+          return Option.getOrElse(yield* handle.readAlloc(size - from), () => new Uint8Array(0));
+        }),
+      ).pipe(Effect.orElseSucceed(() => new Uint8Array(0)));
+      // The prompt's row is written a moment either side of the mod's report.
+      const offset = claudeTranscriptOffsetAt(bytes, from, startedAt - 1_500) ?? size;
+      if (turnOffsets.size > 256) turnOffsets.delete(turnOffsets.keys().next().value!);
+      turnOffsets.set(key, offset);
+      return offset;
+    });
+
+  /** The session as its mod reports it, with the record found when the mod could not name it. */
+  const locateRecord = (session: ClaudeBridgeSessionFile) =>
+    Effect.gen(function* () {
+      if (session.transcriptPath.length > 0) {
+        recordUnknownToMod.delete(session.sid);
+        return session;
+      }
+      const file = yield* findTranscript(session);
+      if (file.length === 0) return session;
+      recordUnknownToMod.add(session.sid);
+      const active = session.activeTurn;
+      return {
+        ...session,
+        transcriptPath: file,
+        activeTurn:
+          active === null
+            ? null
+            : {
+                ...active,
+                transcriptOffset: yield* turnOffset(
+                  session.sid,
+                  active.turnId,
+                  file,
+                  active.startedAt,
+                ),
+              },
+      } satisfies ClaudeBridgeSessionFile;
+    });
+
   const readProcess = (sid: string, instanceId: string) =>
     Effect.gen(function* () {
       const dir = path.join(claudeDir, sid, instanceId);
-      const session = parseClaudeBridgeSessionFile(yield* readJson(path.join(dir, "session.json")));
-      if (session === null) return null;
+      const reported = parseClaudeBridgeSessionFile(
+        yield* readJson(path.join(dir, "session.json")),
+      );
+      if (reported === null) return null;
+      const session = yield* locateRecord(reported);
       return { sid, instanceId, dir, session } satisfies ClaudeBridgeProcess;
     });
 
@@ -392,7 +517,12 @@ const make = Effect.gen(function* () {
     });
 
   const readSession = (entry: ClaudeBridgeProcess) =>
-    readJson(path.join(entry.dir, "session.json")).pipe(Effect.map(parseClaudeBridgeSessionFile));
+    readJson(path.join(entry.dir, "session.json")).pipe(
+      Effect.map(parseClaudeBridgeSessionFile),
+      Effect.flatMap((session) =>
+        session === null ? Effect.succeed(null) : locateRecord(session),
+      ),
+    );
 
   const readCommands = (entry: ClaudeBridgeProcess) =>
     readJson(path.join(entry.dir, "commands.json")).pipe(
@@ -440,6 +570,9 @@ const make = Effect.gen(function* () {
 
   const dispatch = (event: ClaudeBridgeEvent, entry: ClaudeBridgeProcess) =>
     Effect.gen(function* () {
+      if (event.type === "turn.start" || event.type === "turn.complete") {
+        yield* noteRecordChange(entry, event.type);
+      }
       const subscriber = subscribers.get(entry.sid);
       if (subscriber !== undefined) {
         yield* subscriber(event, entry);
@@ -481,13 +614,30 @@ const make = Effect.gen(function* () {
         if (event === null) continue;
         // A dead process's leftovers are history the transcript already holds.
         if (!live && event.type !== "ended") continue;
-        yield* dispatch(event, entry);
+        // A mod that does not know the record yet reports every turn from 0.
+        const located =
+          event.type === "turn.start" &&
+          recordUnknownToMod.has(entry.sid) &&
+          entry.session.transcriptPath.length > 0
+            ? {
+                ...event,
+                transcriptOffset: yield* turnOffset(
+                  entry.sid,
+                  event.turnId,
+                  entry.session.transcriptPath,
+                  event.at,
+                ),
+              }
+            : event;
+        yield* dispatch(located, entry);
       }
     });
 
   const sweepDead = (entry: ClaudeBridgeProcess) =>
     Effect.gen(function* () {
       missedTurns.delete(entry.sid);
+      knownTranscripts.delete(entry.sid);
+      recordUnknownToMod.delete(entry.sid);
       yield* fs.remove(entry.dir, { recursive: true }).pipe(Effect.ignore);
       const sidDir = path.join(claudeDir, entry.sid);
       const remaining = yield* listDirectories(sidDir);
@@ -531,6 +681,17 @@ const make = Effect.gen(function* () {
       () =>
         Effect.sync(() => {
           unattachedHandlers.delete(handler);
+        }),
+    ).pipe(Effect.asVoid);
+
+  const onRecordChange = (handler: ClaudeBridgeRecordHandler) =>
+    Effect.acquireRelease(
+      Effect.sync(() => {
+        recordHandlers.add(handler);
+      }),
+      () =>
+        Effect.sync(() => {
+          recordHandlers.delete(handler);
         }),
     ).pipe(Effect.asVoid);
 
@@ -798,6 +959,8 @@ const make = Effect.gen(function* () {
     clearHeartbeat,
     subscribe,
     onUnattachedEvent,
+    onRecordChange,
+    noteRecordChange,
     peekMissedTurn,
     takeMissedTurn,
     launch,
@@ -832,6 +995,8 @@ export const layerTest = Layer.succeed(
     clearHeartbeat: () => Effect.void,
     subscribe: () => Effect.void,
     onUnattachedEvent: () => Effect.void,
+    onRecordChange: () => Effect.void,
+    noteRecordChange: () => Effect.void,
     peekMissedTurn: () => Effect.succeed(null),
     takeMissedTurn: () => Effect.succeed(null),
     launch: (input) =>
