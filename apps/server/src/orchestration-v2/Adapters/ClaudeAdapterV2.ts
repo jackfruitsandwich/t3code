@@ -330,6 +330,13 @@ export interface ClaudeAgentSdkQueryOpenInput {
   /** Unlike the SDK callback, null delegates to the live process's native permission handling. */
   readonly bridgeCanUseTool?: CanUseTool;
   /**
+   * The same callback for a process still on a mod older than the window
+   * protocol. That mod hands T3 every question its session asks while T3 is
+   * attached, whoever started the turn, so T3's runtime mode keeps answering
+   * for it as it did; otherwise a terminal turn would wait on T3 unseen.
+   */
+  readonly bridgeCanUseToolLegacy?: CanUseTool;
+  /**
    * Called with what a bridged session reports as its own model and
    * permission mode, at attach and whenever either changes there.
    */
@@ -342,6 +349,16 @@ export interface ClaudeBridgeNativeSettings {
 }
 
 export interface ClaudeAgentSdkQuerySession {
+  /**
+   * Present on a session attached to a process T3 did not start and must not
+   * replace. Offers that process the thread's current model and permission
+   * mode: a change the person made in T3 is applied there, anything else
+   * follows what the process reports.
+   */
+  readonly applySelection?: (selection: {
+    readonly model: string;
+    readonly permissionMode: PermissionMode;
+  }) => Effect.Effect<void>;
   readonly messages: Stream.Stream<SDKMessage, ClaudeAgentSdkQueryRunnerError>;
   readonly offer: (message: SDKUserMessage) => Effect.Effect<void, ClaudeAgentSdkQueryRunnerError>;
   readonly setModel: (model: string) => Effect.Effect<void, ClaudeAgentSdkQueryRunnerError>;
@@ -2833,8 +2850,9 @@ interface ActiveClaudeSubagent {
 interface ClaudeLiveQueryContext {
   readonly nativeThreadId: string;
   readonly query: ClaudeAgentSdkQuerySession;
-  readonly queryPolicyKey: string;
-  readonly selectionKey: string;
+  // Fixed for a process T3 opened; a bridged attachment follows the thread.
+  queryPolicyKey: string;
+  selectionKey: string;
   readonly closed: Deferred.Deferred<void, never>;
   // Whether this CLI process echoes a prompt's uuid on the first frame of
   // the turn answering it ("early") or only on its result. Learned from the
@@ -7027,6 +7045,9 @@ export function makeClaudeAdapterV2(
         const bridgeCanUseTool: CanUseTool = (toolName, toolInput, callbackOptions) =>
           runPromise(canUseToolEffect(toolName, toolInput, callbackOptions, "bridge"));
 
+        const bridgeCanUseToolLegacy: CanUseTool = (toolName, toolInput, callbackOptions) =>
+          runPromise(canUseToolEffect(toolName, toolInput, callbackOptions, "sdk"));
+
         const canUseTool: CanUseTool = (toolName, toolInput, callbackOptions) =>
           runPromise(
             canUseToolEffect(toolName, toolInput, callbackOptions).pipe(
@@ -7178,6 +7199,27 @@ export function makeClaudeAdapterV2(
           ) {
             return existing;
           }
+          // A bridged process is the person's own session, not a process to
+          // close and reopen for a new selection: the selection is offered to
+          // it and the attachment stays.
+          if (
+            existing !== null &&
+            existing.nativeThreadId === nativeThreadId &&
+            existing.query.applySelection !== undefined
+          ) {
+            if (
+              existing.queryPolicyKey !== queryPolicyKey ||
+              existing.selectionKey !== compiledSelection.queryIdentity
+            ) {
+              yield* existing.query.applySelection({
+                model: compiledSelection.apiModelId,
+                permissionMode: queryPolicy.permissionMode,
+              });
+              existing.queryPolicyKey = queryPolicyKey;
+              existing.selectionKey = compiledSelection.queryIdentity;
+            }
+            return existing;
+          }
           if (
             existing !== null &&
             existing.nativeThreadId === nativeThreadId &&
@@ -7261,6 +7303,7 @@ export function makeClaudeAdapterV2(
               providerSessionId: input.providerSessionId,
               options: queryOptions,
               bridgeCanUseTool,
+              bridgeCanUseToolLegacy,
               bridgeOnNativeSettings: (settings) => {
                 void runPromise(
                   emitObservedNativeSettings(turnInput.threadId, settings).pipe(Effect.ignore),

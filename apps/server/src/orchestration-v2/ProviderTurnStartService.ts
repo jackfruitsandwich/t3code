@@ -54,15 +54,14 @@ import {
   restartCancelledBackgroundWorkNote,
 } from "./RestartBackgroundNote.ts";
 
-/**
+/*
  * A thread bound to a native session keeps that session. Upstream answers a
  * failed or unconfirmed resume by binding a fresh native session and handing it
- * a summary of the thread; here the thread is a window onto a session that
- * also lives in a terminal, so a silent replacement forks the conversation
- * (and a later prompt can run in both). The run fails with the resume error
- * instead, and the person decides what to do next.
+ * a summary of the thread. Here a thread is a window onto a session that also
+ * lives in a terminal, so on a plain next turn a silent replacement forks the
+ * conversation (and a later prompt can run in both). That turn fails with the
+ * resume error instead, and the person decides what to do next.
  */
-const REPLACE_NATIVE_SESSION_ON_RESUME_FAILURE: boolean = false;
 
 export class ProviderTurnStartError extends Schema.TaggedError<ProviderTurnStartError>()(
   "ProviderTurnStartError",
@@ -667,6 +666,12 @@ export const layer: Layer.Layer<
             }),
           );
         }
+        // A plain next turn carries nothing into the thread: the native session
+        // it resumes is the conversation itself, also open in a terminal, and
+        // is never swapped for a fresh one (see the note at the top). A run
+        // that follows a provider switch or a fork brings its own handoff and
+        // keeps upstream's fallback.
+        const keepsNativeSession = handoffs.length === 0;
         const uncertainDelivery = projection.contextHandoffs.some(
           (handoff) =>
             handoff.toProviderThreadId === providerThread.id &&
@@ -674,7 +679,7 @@ export const layer: Layer.Layer<
             handoff.delivery?.status === "pending",
         );
         const resumed = yield* Effect.result(
-          uncertainDelivery && REPLACE_NATIVE_SESSION_ON_RESUME_FAILURE
+          uncertainDelivery && !keepsNativeSession
             ? Effect.fail(
                 new ProviderAdapterTurnStartError({
                   driver: session.driver,
@@ -695,7 +700,7 @@ export const layer: Layer.Layer<
           return resumed.success;
         }
 
-        if (!REPLACE_NATIVE_SESSION_ON_RESUME_FAILURE) {
+        if (keepsNativeSession) {
           yield* Effect.logWarning("Provider resume failed; the native session is kept", {
             driver: session.driver,
             providerThreadId: providerThread.id,

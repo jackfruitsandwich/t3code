@@ -1060,7 +1060,7 @@ describe("orchestration v2 provider switching", () => {
   );
 
   it.live.each(["native", "legacy"] as const)(
-    "starts a replacement native thread as new after the resume fallback with %s attempts",
+    "keeps the native thread when a plain resume fails, with %s attempts",
     (attempts) =>
       Effect.scoped(
         Effect.gen(function* () {
@@ -1156,19 +1156,18 @@ describe("orchestration v2 provider switching", () => {
               });
             }
             yield* Ref.set(failResumeOnce, true);
+            // The thread is a window onto this native thread. A resume that
+            // fails is retried against the same native thread, never answered
+            // by binding a fresh one behind the person's back.
             yield* runToCompletion(2);
             yield* runToCompletion(3);
 
             const turns = yield* Ref.get(capturedTurns);
             assert.equal(turns.length, 3);
-            assert.equal(yield* Ref.get(generation), 2);
-            // The fallback binds a new native thread to a provider thread that
-            // already has a turn, so the provider must not resume it.
-            assert.notEqual(turns[1]?.nativeThreadId, turns[0]?.nativeThreadId);
-            assert.isAbove(turns[1]?.providerTurnOrdinal ?? 0, 1);
-            assert.isFalse(turns[1]?.nativeThreadHasTurns);
-            assert.equal(turns[2]?.nativeThreadId, turns[1]?.nativeThreadId);
-            assert.isTrue(turns[2]?.nativeThreadHasTurns);
+            assert.equal(yield* Ref.get(generation), 1);
+            assert.equal(turns[1]?.nativeThreadId, turns[0]?.nativeThreadId);
+            assert.isTrue(turns[1]?.nativeThreadHasTurns);
+            assert.equal(turns[2]?.nativeThreadId, turns[0]?.nativeThreadId);
           }).pipe(
             Effect.provide(
               ProviderReplayHarness.layerWithRegistry(

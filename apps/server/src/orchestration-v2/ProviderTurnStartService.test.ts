@@ -770,7 +770,7 @@ effectIt.effect("keeps a thread-load failure retryable when terminal persistence
 );
 
 effectIt.effect(
-  "keeps a store failure after the provider loaded the thread typed and retryable",
+  "keeps a failed resume of a plain turn typed and retryable, without a fallback session",
   () =>
     Effect.gen(function* () {
       const harness = makeLocalCommandHarness({
@@ -780,10 +780,13 @@ effectIt.effect(
 
       const error = yield* harness.start.pipe(Effect.flip);
 
-      // The provider succeeded; the failing stage is the projection read, so
-      // the run is not failed as a provider error on the last attempt.
+      // A plain next turn keeps its native session: the resume failure is the
+      // turn's error and can be retried. No fresh session is bound, so the
+      // fallback's history read is never reached.
       expect(error._tag).toBe("ProviderTurnStartError");
-      expect((error.cause as { _tag?: string } | undefined)?._tag).toBe("ProjectionStoreReadError");
+      expect((error.cause as { _tag?: string } | undefined)?._tag).toBe(
+        "ProviderAdapterEventStreamError",
+      );
       expect(harness.writeIfRunCurrent).not.toHaveBeenCalled();
       expect(harness.projection().runs.at(-1)?.status).toBe("starting");
       expect(harness.events).toEqual([]);

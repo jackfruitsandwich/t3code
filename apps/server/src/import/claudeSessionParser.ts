@@ -2,8 +2,10 @@
  * claudeSessionParser - Pure parser for Claude Code session transcripts.
  *
  * Claude Code stores one JSONL file per session under
- * `<config dir>/projects/<encoded-cwd>/<session uuid>.jsonl`. Only "user" and
- * "assistant" entries carry conversation text; everything else (mode changes,
+ * `<config dir>/projects/<encoded-cwd>/<session uuid>.jsonl`. "user" and
+ * "assistant" entries carry the conversation, and slash commands are read the
+ * way the terminal shows them (`/name args`, then what they printed), whether
+ * they wrote user rows or local system rows; everything else (mode changes,
  * file-history snapshots, attachments, system lines, unknown future types) is
  * skipped silently so a format drift never breaks the importer. Sidechain and
  * meta entries are agent plumbing, not the human conversation, and are
@@ -11,6 +13,7 @@
  *
  * @module import/claudeSessionParser
  */
+import { claudeTranscriptCommandText } from "../claude-bridge/ClaudeBridgeProtocol.ts";
 import {
   isCommandNoiseText,
   isRecord,
@@ -23,6 +26,7 @@ import {
 } from "./sessionImportTypes.ts";
 
 const FORK_SIGNATURE_LENGTH = 5;
+const LOCAL_COMMAND_STDOUT = /^\s*<local-command-stdout>([\s\S]*)<\/local-command-stdout>\s*$/u;
 
 /**
  * Extract the concatenated text-block content from a Claude message
@@ -52,6 +56,9 @@ export function parseClaudeSessionJsonl(content: string): ParsedCliSession {
   let sessionId: string | undefined;
   let cwd: string | undefined;
   let aiTitle: string | undefined;
+  let customTitle: string | undefined;
+  /** Rows that are slash commands: never a session's title. */
+  const commandSourceIds = new Set<string>();
   let startedAt: string | undefined;
   let entrypoint: string | undefined;
   let malformedLineCount = 0;
@@ -72,13 +79,26 @@ export function parseClaudeSessionJsonl(content: string): ParsedCliSession {
 
     if (entry.type === "ai-title") {
       const title = readString(entry.aiTitle);
+      if (title !== undefined && customTitle === undefined) {
+        aiTitle = title;
+      }
+      continue;
+    }
+    // The name the person gave the session with /rename outranks a generated one.
+    if (entry.type === "custom-title") {
+      const title = readString(entry.customTitle);
       if (title !== undefined) {
+        customTitle = title;
         aiTitle = title;
       }
       continue;
     }
 
-    if (entry.type !== "user" && entry.type !== "assistant") {
+    // A slash command that acts only locally (/rename, /model) leaves system
+    // rows; shown the way the terminal shows them, like the ones below.
+    const localCommand =
+      entry.type === "system" && entry.subtype === "local_command" && entry.isSidechain !== true;
+    if (entry.type !== "user" && entry.type !== "assistant" && !localCommand) {
       continue;
     }
     if (entry.isSidechain === true || entry.isMeta === true) {
@@ -91,27 +111,55 @@ export function parseClaudeSessionJsonl(content: string): ParsedCliSession {
 
     const timestamp = readString(entry.timestamp);
     const message = isRecord(entry.message) ? entry.message : undefined;
-    if (timestamp === undefined || message === undefined) {
+    if (timestamp === undefined || (message === undefined && !localCommand)) {
       continue;
     }
-    const text = extractTextContent(message.content).trim();
-    if (text.length === 0) {
+    const rawText = (
+      localCommand ? (readString(entry.content) ?? "") : extractTextContent(message?.content)
+    ).trim();
+    if (rawText.length === 0) {
       continue;
     }
+    const sourceId = readString(entry.uuid) ?? `line-${lineIndex}`;
+    // The terminal shows a slash command as `/name args` and what it printed
+    // as output, not as the markup the transcript wraps them in.
+    const commandText = claudeTranscriptCommandText(entry);
+    const commandOutput = LOCAL_COMMAND_STDOUT.exec(rawText)?.[1]?.trim();
+    if (commandText === null && commandOutput === undefined && localCommand) {
+      continue;
+    }
+    if (commandOutput !== undefined && commandOutput.length === 0) {
+      continue;
+    }
+    if (rawText.startsWith("<local-command-caveat>")) {
+      continue;
+    }
+    if (commandText !== null) commandSourceIds.add(sourceId);
 
     startedAt ??= timestamp;
     messages.push({
-      role: entry.type,
-      sourceId: readString(entry.uuid) ?? `line-${lineIndex}`,
-      text,
+      role:
+        commandOutput !== undefined
+          ? "assistant"
+          : commandText !== null
+            ? "user"
+            : entry.type === "assistant"
+              ? "assistant"
+              : "user",
+      sourceId,
+      text: commandOutput ?? commandText ?? rawText,
       timestamp,
       lineIndex,
     });
   }
 
   const firstUserText =
-    messages.find((message) => message.role === "user" && !isCommandNoiseText(message.text))
-      ?.text ?? messages.find((message) => message.role === "user")?.text;
+    messages.find(
+      (message) =>
+        message.role === "user" &&
+        !commandSourceIds.has(message.sourceId) &&
+        !isCommandNoiseText(message.text),
+    )?.text ?? messages.find((message) => message.role === "user")?.text;
   const title =
     (aiTitle !== undefined ? truncateSessionTitle(aiTitle) : undefined) ??
     (firstUserText !== undefined ? truncateSessionTitle(firstUserText) : undefined);

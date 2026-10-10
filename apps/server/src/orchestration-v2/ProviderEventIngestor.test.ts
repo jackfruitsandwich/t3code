@@ -734,7 +734,7 @@ layer("ProviderEventIngestorV2", (it) => {
   );
 
   it.effect.each(["completed", "interrupted", "failed", "cancelled", "control"] as const)(
-    "dismisses only native questions when a provider turn ends with %s",
+    "dismisses the native questions and approvals of a provider turn that ends with %s",
     (terminal) =>
       Effect.gen(function* () {
         const now = yield* DateTime.now;
@@ -880,7 +880,10 @@ layer("ProviderEventIngestorV2", (it) => {
         const stored = yield* ingestor.ingestNormalized(input);
         const projection = yield* projectionStore.getThreadProjection(threadId);
         for (const fixture of fixtures) {
-          const closed = fixture.key === "native" || fixture.key === "unavailable";
+          // An ended turn asks nothing any more: its questions and its
+          // approvals are retired, whoever answered or abandoned them natively.
+          const closed =
+            fixture.key === "native" || fixture.key === "unavailable" || fixture.key === "approval";
           const request = projection.runtimeRequests.find(
             (item) => item.id === fixture.request.id,
           )!;
@@ -901,7 +904,7 @@ layer("ProviderEventIngestorV2", (it) => {
         }
         assert.equal(
           stored.filter((entry) => entry.event.type === "runtime-request.updated").length,
-          2,
+          3,
         );
         assert.isEmpty(
           (yield* projectionStore.getPendingNativeUserInputs(threadId, providerTurnId))
@@ -914,7 +917,7 @@ layer("ProviderEventIngestorV2", (it) => {
               entry.event.type === "runtime-request.updated" &&
               entry.event.payload.status === "cancelled",
           ).length,
-          2,
+          3,
         );
         const repeated = yield* ingestor.ingestNormalized(input);
         assert.isFalse(repeated.some((entry) => entry.event.type === "runtime-request.updated"));

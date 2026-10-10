@@ -232,7 +232,7 @@ async function modelChoice($, wanted) {
   if (options.includes(text)) return text
   const family = /(opus|sonnet|haiku|fable)/.exec(text.toLowerCase())
   if (!family) return null
-  const wide = /\[1m\]\s*$/.test(text) ? family[1] + '[1m]' : null
+  const wide = /\\[1m\\]\\s*$/.test(text) ? family[1] + '[1m]' : null
   if (wide && options.includes(wide)) return wide
   return options.includes(family[1]) ? family[1] : null
 }

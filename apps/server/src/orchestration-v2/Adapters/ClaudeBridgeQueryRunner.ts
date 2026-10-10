@@ -362,41 +362,58 @@ export const layer: Layer.Layer<
       // A setting changed in T3 since it last showed the session's value is
       // the person's change: apply it in the session, where the mod confirms
       // it and the next heartbeat shows it. Anything else follows the session.
-      {
-        const native = nativeSettings(bridgeProcess.session);
-        const shown = shownNativeSettings.get(sid);
-        const canForward =
-          shown !== undefined && bridgeProcess.session.protocol >= CLAUDE_BRIDGE_WINDOW_PROTOCOL;
-        const wantedModel = claudeConfigModelChoice(options.model);
-        const nativeModel = native.model === null ? null : claudeConfigModelChoice(native.model);
-        if (
-          canForward &&
-          shown.model === native.model &&
-          wantedModel !== null &&
-          nativeModel !== null &&
-          wantedModel !== nativeModel
-        ) {
-          yield* registry.send(bridgeProcess, { type: "config", key: "model", value: wantedModel });
-          yield* Effect.logInfo("claude-bridge.model-forwarded", { sid, model: wantedModel });
-        }
-        if (
-          canForward &&
-          shown.permissionMode === native.permissionMode &&
-          options.permissionMode === "plan" &&
-          native.permissionMode !== null &&
-          native.permissionMode !== "plan"
-        ) {
-          const promptUuid = yield* crypto.randomUUIDv4.pipe(Effect.orDie);
-          yield* registry.send(bridgeProcess, {
-            type: "command",
-            name: "plan",
-            args: "",
-            promptUuid,
-          });
-          yield* Effect.logInfo("claude-bridge.plan-mode-forwarded", { sid });
-        }
-        yield* showNativeSettings(native);
-      }
+      const offerSelection = (
+        selection: { readonly model: string; readonly permissionMode: string },
+        session: ClaudeBridgeRegistry.ClaudeBridgeProcess["session"],
+      ) =>
+        Effect.gen(function* () {
+          const native = nativeSettings(session);
+          const shown = shownNativeSettings.get(sid);
+          const canForward =
+            shown !== undefined && session.protocol >= CLAUDE_BRIDGE_WINDOW_PROTOCOL;
+          const wantedModel = claudeConfigModelChoice(selection.model);
+          const nativeModel = native.model === null ? null : claudeConfigModelChoice(native.model);
+          // An account can resolve a family name to its wide-context variant
+          // by itself; only a different family, or an asked-for wide variant
+          // the session lacks, is a change to apply.
+          const family = (choice: string) => choice.replace(/\[1m\]$/u, "");
+          if (
+            canForward &&
+            shown.model === native.model &&
+            wantedModel !== null &&
+            nativeModel !== null &&
+            (family(wantedModel) !== family(nativeModel) ||
+              (wantedModel.endsWith("[1m]") && !nativeModel.endsWith("[1m]")))
+          ) {
+            yield* registry.send(bridgeProcess, {
+              type: "config",
+              key: "model",
+              value: wantedModel,
+            });
+            yield* Effect.logInfo("claude-bridge.model-forwarded", { sid, model: wantedModel });
+          }
+          if (
+            canForward &&
+            shown.permissionMode === native.permissionMode &&
+            selection.permissionMode === "plan" &&
+            native.permissionMode !== null &&
+            native.permissionMode !== "plan"
+          ) {
+            const promptUuid = yield* crypto.randomUUIDv4.pipe(Effect.orDie);
+            yield* registry.send(bridgeProcess, {
+              type: "command",
+              name: "plan",
+              args: "",
+              promptUuid,
+            });
+            yield* Effect.logInfo("claude-bridge.plan-mode-forwarded", { sid });
+          }
+          yield* showNativeSettings(native);
+        });
+      yield* offerSelection(
+        { model: options.model, permissionMode: options.permissionMode },
+        bridgeProcess.session,
+      );
 
       const readNewRows = Effect.gen(function* () {
         if (state.transcriptPath.length === 0) return;
@@ -558,7 +575,12 @@ export const layer: Layer.Layer<
 
       const resolveApproval = (event: Extract<ClaudeBridgeEvent, { type: "approval.request" }>) =>
         Effect.gen(function* () {
-          const canUseTool = input.bridgeCanUseTool ?? options.canUseTool;
+          const canUseTool =
+            (bridgeProcess.session.protocol < CLAUDE_BRIDGE_WINDOW_PROTOCOL
+              ? input.bridgeCanUseToolLegacy
+              : undefined) ??
+            input.bridgeCanUseTool ??
+            options.canUseTool;
           if (canUseTool === undefined) {
             yield* registry.send(bridgeProcess, {
               type: "approval",
@@ -722,7 +744,7 @@ export const layer: Layer.Layer<
             }
             case "turn.complete": {
               // Whatever this turn still asked is over with it.
-              for (const toolUseId of [...state.approvals.keys()]) {
+              for (const toolUseId of state.approvals.keys()) {
                 yield* settleElsewhere(toolUseId);
               }
               state.pendingComplete = { event, seenAt: yield* Clock.currentTimeMillis };
@@ -875,6 +897,11 @@ export const layer: Layer.Layer<
               stage: "decoded",
               payload: { type: "prompt.offer", message },
             });
+          }),
+        applySelection: (selection) =>
+          Effect.gen(function* () {
+            const live = (yield* registry.readSession(bridgeProcess)) ?? bridgeProcess.session;
+            yield* offerSelection(selection, live);
           }),
         setModel: (model) => Effect.sync(() => translator.setModel(model)),
         // The process keeps its own mode; a T3 mode change applies to the
