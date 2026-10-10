@@ -12,6 +12,7 @@ import {
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
@@ -65,6 +66,12 @@ export class ProviderRuntimeRecoveryService extends Context.Service<
     ) => Effect.Effect<ProviderRuntimeReconciliationSummary, ProviderRuntimeRecoveryError>;
     readonly prepareForShutdown: Effect.Effect<void, ProviderRuntimeRecoveryError>;
     readonly recover: Effect.Effect<ProviderRuntimeRecoverySummary, ProviderRuntimeRecoveryError>;
+    /**
+     * Completes once startup recovery has run. Recovery closes every run the
+     * last server process left open, so a run created before it finishes is
+     * closed with them: whatever starts runs at boot waits on this first.
+     */
+    readonly awaitStartupRecovery: Effect.Effect<void>;
   }
 >()("t3/orchestration-v2/ProviderRuntimeRecoveryService") {}
 
@@ -814,11 +821,17 @@ export const make = Effect.gen(function* () {
     Effect.mapError((cause) => new ProviderRuntimeRecoveryError({ operation: "reconcile", cause })),
   );
 
+  const startupRecovered = yield* Deferred.make<void>();
   const recover = Effect.gen(function* () {
     return (yield* reconcile("startup")) satisfies ProviderRuntimeRecoverySummary;
-  });
+  }).pipe(Effect.ensuring(Deferred.succeed(startupRecovered, undefined)));
 
-  return ProviderRuntimeRecoveryService.of({ reconcile, prepareForShutdown, recover });
+  return ProviderRuntimeRecoveryService.of({
+    reconcile,
+    prepareForShutdown,
+    recover,
+    awaitStartupRecovery: Deferred.await(startupRecovered),
+  });
 });
 
 export const layer = Layer.effect(ProviderRuntimeRecoveryService, make);

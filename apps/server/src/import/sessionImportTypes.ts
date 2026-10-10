@@ -22,6 +22,8 @@ export interface ParsedSessionMessage {
   readonly timestamp: string;
   /** Zero-based raw line index in the source file, for incremental cursors. */
   readonly lineIndex: number;
+  /** A slash command or what it printed: shown, but not conversation. */
+  readonly command?: true;
 }
 
 export interface ParsedCliSession {
@@ -87,12 +89,14 @@ export function isCommandNoiseText(text: string): boolean {
 
 /**
  * A session is worth importing only when a human actually conversed in it:
- * at least one user message and one assistant reply after filtering.
+ * at least one user message and one assistant reply after filtering. A slash
+ * command and its output are neither: a session that only ran `/login` is not
+ * a conversation.
  */
 export function isEligibleCliSession(session: ParsedCliSession): boolean {
   return (
-    session.messages.some((message) => message.role === "user") &&
-    session.messages.some((message) => message.role === "assistant")
+    session.messages.some((message) => message.role === "user" && message.command !== true) &&
+    session.messages.some((message) => message.role === "assistant" && message.command !== true)
   );
 }
 

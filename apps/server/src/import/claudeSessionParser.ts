@@ -150,6 +150,7 @@ export function parseClaudeSessionJsonl(content: string): ParsedCliSession {
       text: commandOutput ?? commandText ?? rawText,
       timestamp,
       lineIndex,
+      ...(commandOutput !== undefined || commandText !== null ? { command: true as const } : {}),
     });
   }
 

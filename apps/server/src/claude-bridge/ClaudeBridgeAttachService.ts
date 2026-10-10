@@ -17,6 +17,7 @@ import * as SqlClient from "effect/sql/SqlClient";
 import * as SessionImporter from "../import/Services/SessionImporter.ts";
 import { CLAUDE_PROVIDER } from "../orchestration-v2/Adapters/ClaudeAdapterV2.ts";
 import * as ProviderContinuationRequests from "../orchestration-v2/ProviderContinuationRequests.ts";
+import * as ProviderRuntimeRecoveryService from "../orchestration-v2/ProviderRuntimeRecoveryService.ts";
 import { isClaudeHarnessPrompt } from "./ClaudeBridgeProtocol.ts";
 import * as ClaudeBridgeRegistry from "./ClaudeBridgeRegistry.ts";
 
@@ -25,6 +26,14 @@ const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   const continuations = yield* ProviderContinuationRequests.ProviderContinuationRequests;
   const importer = yield* SessionImporter.SessionImporter;
+  const recovery = yield* ProviderRuntimeRecoveryService.ProviderRuntimeRecoveryService;
+  // Startup recovery closes every run the last server process left open. A
+  // run offered before it has finished would be closed with them, and the
+  // turn it was for would go unshown, so every offer waits for recovery.
+  const afterStartupRecovery = recovery.awaitStartupRecovery.pipe(
+    Effect.timeoutOption("60 seconds"),
+    Effect.asVoid,
+  );
 
   const lookupThread = (sid: string) =>
     sql<{ readonly thread_id: string | null; readonly provider_thread_id: string }>`
@@ -57,6 +66,7 @@ const make = Effect.gen(function* () {
 
   const offerTurn = (sid: string, turnId: string, text: string) =>
     Effect.gen(function* () {
+      yield* afterStartupRecovery;
       const key = `${sid}:${turnId}`;
       if (offeredTurns.has(key)) return;
       offeredTurns.add(key);
@@ -94,12 +104,16 @@ const make = Effect.gen(function* () {
   );
 
   // A turn already running when this server came up (a restart mid-turn).
-  const live = yield* registry.listLiveProcesses;
-  for (const entry of live) {
-    if (entry.session.activeTurn !== null && entry.session.activeTurn.promptUuid === undefined) {
-      yield* offerTurn(entry.sid, entry.session.activeTurn.turnId, "");
+  // Forked: recovery runs after the layers are built, and the offer waits on it.
+  yield* Effect.gen(function* () {
+    yield* afterStartupRecovery;
+    const live = yield* registry.listLiveProcesses;
+    for (const entry of live) {
+      if (entry.session.activeTurn !== null && entry.session.activeTurn.promptUuid === undefined) {
+        yield* offerTurn(entry.sid, entry.session.activeTurn.turnId, "");
+      }
     }
-  }
+  }).pipe(Effect.forkScoped);
 });
 
 /** Kept under this name for its callers; see `isClaudeHarnessPrompt`. */

@@ -288,17 +288,6 @@ const layerScheduledTaskProvided = ScheduledTaskService.layer.pipe(
     ),
   ),
 );
-// Personal fork: a turn typed into a bridged Claude Code session becomes a
-// continuation run on its thread (claude-bridge/ClaudeBridgeAttachService.ts).
-const layerClaudeBridgeAttachProvided = ClaudeBridgeAttachService.layer.pipe(
-  Layer.provide(
-    Layer.mergeAll(
-      ProviderContinuationRequests.layer,
-      ClaudeBridgeRegistry.layer,
-      layerSessionImporterProvided,
-    ),
-  ),
-);
 const layerProviderContinuationWorkerProvided = ProviderContinuationService.layer.pipe(
   Layer.provide(
     Layer.mergeAll(
@@ -342,6 +331,18 @@ const layerProviderRuntimeRecoveryProvided = ProviderRuntimeRecoveryService.laye
   ),
 );
 
+// Personal fork: a turn typed into a bridged Claude Code session becomes a
+// continuation run on its thread (claude-bridge/ClaudeBridgeAttachService.ts).
+const layerClaudeBridgeAttachProvided = ClaudeBridgeAttachService.layer.pipe(
+  Layer.provide(
+    Layer.mergeAll(
+      ProviderContinuationRequests.layer,
+      ClaudeBridgeRegistry.layer,
+      layerSessionImporterProvided,
+      layerProviderRuntimeRecoveryProvided.pipe(Layer.provide(layerProjectService)),
+    ),
+  ),
+);
 export const layer = Layer.mergeAll(
   layerOrchestratorProvided,
   layerThreadManagementProvided,
