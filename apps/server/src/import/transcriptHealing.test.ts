@@ -119,6 +119,27 @@ describe("planTranscriptHealing", () => {
   });
 });
 
+describe("planTranscriptHealing: a prompt followed by a turn the harness started", () => {
+  it("is added: the later run and its prompt are not this prompt's", () => {
+    const rows = [
+      row("user", "u1", "/compact", 10),
+      // The harness started the next turn (a task notice): it leaves no row here.
+      row("assistant", "a1", "picking up after the notice", 16),
+    ];
+    const known = [
+      shown("message:run-2:prompt", "user", "an unrelated prompt", 15, "run-2"),
+      shown(
+        "message:provider:claudeAgent:native-item:a1",
+        "assistant",
+        "picking up after the notice",
+        16,
+        "run-2",
+      ),
+    ];
+    assert.deepEqual(plan(rows, known, [{ id: "run-2", ordinal: 2, minute: 15 }]), ["0:u1"]);
+  });
+});
+
 describe("planTranscriptHealing: a message typed into a running turn", () => {
   it("is added although the turn it was typed into ran in T3 with its own prompt", () => {
     const typed: ParsedSessionMessage = {

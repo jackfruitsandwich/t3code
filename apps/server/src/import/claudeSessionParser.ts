@@ -182,6 +182,21 @@ export function parseClaudeSessionJsonl(content: string): ParsedCliSession {
     if (commandText !== null) commandSourceIds.add(sourceId);
 
     startedAt ??= timestamp;
+    // /compact leaves the typed line as a row of its own and then the
+    // command's row: one thing the person did, shown once.
+    const previous = messages[messages.length - 1];
+    if (
+      commandText !== null &&
+      previous !== undefined &&
+      previous.role === "user" &&
+      previous.command !== true &&
+      previous.text.trim() === commandText &&
+      Math.abs(Date.parse(timestamp) - Date.parse(previous.timestamp)) <= 2_000
+    ) {
+      messages[messages.length - 1] = { ...previous, command: true };
+      commandSourceIds.add(previous.sourceId);
+      continue;
+    }
     messages.push({
       role:
         commandOutput !== undefined

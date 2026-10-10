@@ -48,6 +48,8 @@ export interface HealingImportedItem {
 
 /** A reply T3 streamed and the transcript row for it are written within moments of each other. */
 const SAME_REPLY_WINDOW_MS = 120_000;
+/** A run T3 starts for a prompt and that prompt's row in the record are this close in time. */
+const SAME_TURN_WINDOW_MS = 90_000;
 /** Shorter texts ("yes", "continue") only match whole. */
 const MIN_PARTIAL_MATCH_LENGTH = 16;
 
@@ -135,6 +137,7 @@ export function planTranscriptHealing(input: {
     shown[pair.row] = true;
     taken.add(pair.candidate);
   }
+  const runStartsById = new Map(runs.map((run) => [run.id, run.startedAtMs]));
   const runsWithPrompt = new Set(
     known.flatMap((message) =>
       message.role === "user" && message.runId !== null ? [message.runId] : [],
@@ -153,11 +156,24 @@ export function planTranscriptHealing(input: {
       // that run has its prompt. Only a run known to have none (one that
       // picked the turn up after it began) leaves the prompt to be added.
       // What was typed into a running turn started none, so it has no such run.
+      // The run must be the one this prompt started: a turn the harness
+      // started later (a task notice) has no row here to end the search, and
+      // its replies belong to another run with another prompt.
+      const promptAtMs = timeMs(row.timestamp);
       for (let next = index + 1; row.midTurn !== true && next < rows.length; next += 1) {
         const later = rows[next]!;
         if (later.role === "user" && later.command !== true) break;
         const live = later.role === "assistant" ? knownByNative.get(later.sourceId) : undefined;
-        if (live !== undefined && (live.runId === null || runsWithPrompt.has(live.runId))) return;
+        if (live === undefined) continue;
+        if (live.runId === null) return;
+        const startedAtMs = runStartsById.get(live.runId);
+        if (
+          runsWithPrompt.has(live.runId) &&
+          startedAtMs !== undefined &&
+          Math.abs(startedAtMs - promptAtMs) <= SAME_TURN_WINDOW_MS
+        ) {
+          return;
+        }
       }
     } else {
       if (shown[index]) return;

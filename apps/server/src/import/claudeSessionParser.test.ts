@@ -226,6 +226,39 @@ describe("parseClaudeSessionJsonl", () => {
     );
   });
 
+  it("shows a command once when the record keeps both the typed line and the command's row", () => {
+    const parsed = parseClaudeSessionJsonl(
+      line(userEntry()) +
+        line(assistantEntry()) +
+        line(
+          userEntry({
+            uuid: "typed-compact",
+            timestamp: "2026-07-01T10:05:00.000Z",
+            message: { role: "user", content: "/compact" },
+          }),
+        ) +
+        line(
+          userEntry({
+            uuid: "command-compact",
+            timestamp: "2026-07-01T10:05:00.000Z",
+            message: {
+              role: "user",
+              content:
+                "<command-name>/compact</command-name>\n<command-message>compact</command-message>\n<command-args></command-args>",
+            },
+          }),
+        ),
+    );
+    assert.deepEqual(
+      parsed.messages.map((message) => [message.text, message.command === true]),
+      [
+        ["Fix the login bug", false],
+        ["I found the bug.", false],
+        ["/compact", true],
+      ],
+    );
+  });
+
   it("is ineligible without at least one user and one assistant message", () => {
     assert.isFalse(isEligibleCliSession(parseClaudeSessionJsonl(line(userEntry()))));
     assert.isFalse(isEligibleCliSession(parseClaudeSessionJsonl(line(assistantEntry()))));
