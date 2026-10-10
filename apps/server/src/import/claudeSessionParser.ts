@@ -174,7 +174,8 @@ export function parseClaudeSessionJsonl(content: string): ParsedCliSession {
       bridgeUpkeepOutputDue = true;
       continue;
     }
-    if (fromBridgeMod && bridgeUpkeepOutputDue && commandOutput !== undefined) {
+    // What it printed is the row after it, with nothing on it to say who ran the command.
+    if (bridgeUpkeepOutputDue && commandOutput !== undefined) {
       bridgeUpkeepOutputDue = false;
       continue;
     }

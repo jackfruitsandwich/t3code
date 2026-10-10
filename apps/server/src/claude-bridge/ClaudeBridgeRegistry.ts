@@ -88,6 +88,11 @@ export type ClaudeBridgeEventHandler = (
   process: ClaudeBridgeProcess,
 ) => Effect.Effect<void>;
 
+export interface ClaudeBridgeClientSelection {
+  readonly model: string;
+  readonly permissionMode: string;
+}
+
 export interface ClaudeBridgeToolEndpoint {
   readonly endpoint: string;
   readonly authorization: string;
@@ -145,6 +150,20 @@ export class ClaudeBridgeRegistry extends Context.Service<
       tools?: ClaudeBridgeToolEndpoint,
     ) => Effect.Effect<void>;
     readonly clearHeartbeat: (process: ClaudeBridgeProcess) => Effect.Effect<void>;
+    /**
+     * The model and mode a client last sent with a message to this session,
+     * kept beside the session's bridge files so it outlives this server
+     * process. A client keeps its own copy of a thread's settings and sends
+     * it with every message: the same choice arriving again is that copy,
+     * not the person choosing again.
+     */
+    readonly readClientSelection: (
+      sid: string,
+    ) => Effect.Effect<ClaudeBridgeClientSelection | null>;
+    readonly writeClientSelection: (
+      sid: string,
+      selection: ClaudeBridgeClientSelection,
+    ) => Effect.Effect<void>;
     /** Routes the session's events to `handler` until the scope closes. One subscriber per session. */
     readonly subscribe: (
       sid: string,
@@ -584,6 +603,20 @@ const make = Effect.gen(function* () {
       Effect.ignore,
     );
 
+  const clientSelectionFile = (sid: string) => path.join(claudeDir, sid, "client-selection.json");
+  const readClientSelection = (sid: string) =>
+    readJson(clientSelectionFile(sid)).pipe(
+      Effect.map((value) =>
+        isRecord(value) &&
+        typeof value.model === "string" &&
+        typeof value.permissionMode === "string"
+          ? { model: value.model, permissionMode: value.permissionMode }
+          : null,
+      ),
+    );
+  const writeClientSelection = (sid: string, selection: ClaudeBridgeClientSelection) =>
+    fs.writeFileString(clientSelectionFile(sid), encodeJson(selection)).pipe(Effect.ignore);
+
   const clearHeartbeat = (entry: ClaudeBridgeProcess) =>
     fs.remove(path.join(entry.dir, "t3.json")).pipe(Effect.ignore);
 
@@ -980,6 +1013,8 @@ const make = Effect.gen(function* () {
     onUnattachedEvent,
     onRecordChange,
     noteRecordChange,
+    readClientSelection,
+    writeClientSelection,
     peekMissedTurn,
     takeMissedTurn,
     launch,
@@ -1016,6 +1051,8 @@ export const layerTest = Layer.succeed(
     onUnattachedEvent: () => Effect.void,
     onRecordChange: () => Effect.void,
     noteRecordChange: () => Effect.void,
+    readClientSelection: () => Effect.succeed(null),
+    writeClientSelection: () => Effect.void,
     peekMissedTurn: () => Effect.succeed(null),
     takeMissedTurn: () => Effect.succeed(null),
     launch: (input) =>

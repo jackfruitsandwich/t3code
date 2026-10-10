@@ -200,16 +200,15 @@ describe("parseClaudeSessionJsonl", () => {
             },
           }),
         ) +
-        line(
-          userEntry({
-            uuid: "reload-2",
-            origin,
-            message: {
-              role: "user",
-              content: "<local-command-stdout>Reloaded: 1 plugin</local-command-stdout>",
-            },
-          }),
-        ) +
+        line({
+          type: "system",
+          subtype: "local_command",
+          uuid: "reload-2",
+          sessionId: SESSION_ID,
+          timestamp: "2026-07-01T10:00:06.000Z",
+          isSidechain: false,
+          content: "<local-command-stdout>Reloaded: 1 plugin</local-command-stdout>",
+        }) +
         line(
           userEntry({
             uuid: "rename-1",

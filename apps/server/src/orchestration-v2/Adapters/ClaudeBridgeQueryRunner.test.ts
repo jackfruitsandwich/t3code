@@ -94,6 +94,8 @@ const attach = (input: {
       onUnattachedEvent: () => Effect.void,
       onRecordChange: () => Effect.void,
       noteRecordChange: () => Effect.void,
+      readClientSelection: () => Effect.succeed(null),
+      writeClientSelection: () => Effect.void,
       peekMissedTurn: () => Effect.sync(() => missedTurn),
       takeMissedTurn: () =>
         Effect.sync(() => {

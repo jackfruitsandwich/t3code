@@ -55,6 +55,7 @@ import {
   makeClaudeBridgeFrameTranslator,
   parseClaudeSlashCommandText,
   readTranscriptRows,
+  type ClaudeBridgeCommandBody,
   type ClaudeBridgeEvent,
 } from "../../claude-bridge/ClaudeBridgeProtocol.ts";
 import { isRecord, parseJsonlLine } from "../../import/sessionImportTypes.ts";
@@ -63,6 +64,12 @@ import * as ClaudeAdapterV2 from "./ClaudeAdapterV2.ts";
 
 export const CLAUDE_TRANSPORT_ENV = "T3CODE_CLAUDE_TRANSPORT";
 const TAIL_INTERVAL_MS = 300;
+/**
+ * How far ahead another instance's heartbeat must be before the attachment
+ * moves to it: more than two of the mod's own beats, so two processes holding
+ * one session do not pull it back and forth.
+ */
+const RELOADED_MOD_LEAD_MS = 6_500;
 /** A turn's result waits this long after the last transcript row, so a late row cannot land after it. */
 const COMPLETE_QUIET_MS = 400;
 /** How long a turn's closing row is waited for when the next turn has already begun. */
@@ -244,7 +251,10 @@ export const layer: Layer.Layer<
           })
           .pipe(Effect.mapError((cause) => runnerError(cause, "launch")));
       }
-      const bridgeProcess = entry;
+      // The session's process as the mod reports it. The mod loads a newer
+      // version of itself when the session is idle and then reports under a
+      // new set of bridge files: the attachment follows it there.
+      let bridgeProcess = entry;
       yield* logProtocolEvent({
         direction: "outgoing",
         stage: "decoded",
@@ -293,6 +303,8 @@ export const layer: Layer.Layer<
           readonly promptUuid: string;
           /** `/name args` when the prompt is a slash command. */
           readonly label: string | null;
+          /** What was put in the session's inbox, to put again if the mod is reloaded before taking it. */
+          readonly body: ClaudeBridgeCommandBody;
         } | null,
         approvals: new Map<string, AbortController>(),
         /** Requests the session settled without T3: nothing is sent back for them. */
@@ -306,6 +318,8 @@ export const layer: Layer.Layer<
         turnEndsAtTurnStart: 0,
         /** The mod's own reload command was just read: what it printed is skipped too. */
         upkeepOutputDue: false,
+        /** The model and mode this attachment was last asked for. */
+        selection: null as { readonly model: string; readonly permissionMode: string } | null,
         /** A slash command T3 ran that started no turn, waiting for its output rows. */
         pendingLocal: null as {
           readonly commandId: string;
@@ -424,10 +438,19 @@ export const layer: Layer.Layer<
         session: ClaudeBridgeRegistry.ClaudeBridgeProcess["session"],
       ) =>
         Effect.gen(function* () {
+          state.selection = selection;
           const native = nativeSettings(session);
           const shown = shownNativeSettings.get(sid);
           const canForward =
             shown !== undefined && session.protocol >= CLAUDE_BRIDGE_WINDOW_PROTOCOL;
+          // A client keeps its own copy of the thread's model and mode and
+          // sends it with every message. The same value it sent before, sent
+          // again after the session has moved on, is that copy and would
+          // switch the session back; only a value it has not sent is a choice.
+          const sentBefore = yield* registry.readClientSelection(sid);
+          const isNewModelChoice = sentBefore === null || sentBefore.model !== selection.model;
+          const isNewModeChoice =
+            sentBefore === null || sentBefore.permissionMode !== selection.permissionMode;
           const wantedModel = claudeConfigModelChoice(selection.model);
           const nativeModel = native.model === null ? null : claudeConfigModelChoice(native.model);
           // An account can resolve a family name to its wide-context variant
@@ -436,6 +459,7 @@ export const layer: Layer.Layer<
           const family = (choice: string) => choice.replace(/\[1m\]$/u, "");
           if (
             canForward &&
+            isNewModelChoice &&
             shown.model === native.model &&
             wantedModel !== null &&
             nativeModel !== null &&
@@ -451,6 +475,7 @@ export const layer: Layer.Layer<
           }
           if (
             canForward &&
+            isNewModeChoice &&
             shown.permissionMode === native.permissionMode &&
             selection.permissionMode === "plan" &&
             native.permissionMode !== null &&
@@ -501,19 +526,25 @@ export const layer: Layer.Layer<
             transcriptMode = claudeTranscriptPermissionMode(row) ?? transcriptMode;
             const commandText = claudeTranscriptCommandText(row);
             // The mod loading a newer version of itself: nobody asked for it.
+            // (The person sending that same command from T3 is another
+            // matter, and T3 is then waiting on it by name.)
+            const reloadSentFromT3 =
+              state.pendingPrompt?.label?.startsWith(CLAUDE_BRIDGE_UPKEEP_COMMAND) === true ||
+              state.pendingLocal?.label.startsWith(CLAUDE_BRIDGE_UPKEEP_COMMAND) === true;
+            // What the reload printed is a row of its own, with nothing on it
+            // to say who ran the command: it is the row after the command's.
+            if (state.upkeepOutputDue && claudeTranscriptCommandOutput(row) !== null) {
+              state.upkeepOutputDue = false;
+              continue;
+            }
             if (
               isClaudeBridgeModRow(row) &&
-              state.pendingPrompt === null &&
-              state.pendingLocal === null
+              !reloadSentFromT3 &&
+              commandText !== null &&
+              commandText.startsWith(CLAUDE_BRIDGE_UPKEEP_COMMAND)
             ) {
-              if (commandText !== null && commandText.startsWith(CLAUDE_BRIDGE_UPKEEP_COMMAND)) {
-                state.upkeepOutputDue = true;
-                continue;
-              }
-              if (state.upkeepOutputDue && claudeTranscriptCommandOutput(row) !== null) {
-                state.upkeepOutputDue = false;
-                continue;
-              }
+              state.upkeepOutputDue = true;
+              continue;
             }
             if (commandText !== null) state.lastCommandText = commandText;
             for (const frame of translator.onTranscriptRow(row)) {
@@ -633,10 +664,38 @@ export const layer: Layer.Layer<
           yield* finish;
         });
 
+      /**
+       * Moves the attachment to the session's newer mod instance when the
+       * one it holds has stopped reporting. A prompt put in the old
+       * instance's inbox and never taken up is put in the new one.
+       */
+      const followReloadedMod = Effect.gen(function* () {
+        const newest = yield* registry.findLiveProcess(sid);
+        if (newest === null || newest.instanceId === bridgeProcess.instanceId) return false;
+        const held = yield* registry.readSession(bridgeProcess);
+        if (newest.session.heartbeatAt - (held?.heartbeatAt ?? 0) < RELOADED_MOD_LEAD_MS) {
+          return false;
+        }
+        const previous = bridgeProcess;
+        bridgeProcess = newest;
+        yield* registry.clearHeartbeat(previous);
+        yield* registry.heartbeat(newest, toolEndpoint);
+        yield* Effect.logInfo("claude-bridge.followed-reloaded-mod", {
+          sid,
+          from: previous.instanceId,
+          to: newest.instanceId,
+          modVersion: newest.session.modVersion,
+        });
+        const pending = state.pendingPrompt;
+        if (pending !== null) pending.commandId = yield* registry.send(newest, pending.body);
+        return true;
+      });
+
       const tail = Effect.gen(function* () {
         let lastHeartbeat = 0;
         while (!state.closed) {
           const now = yield* Clock.currentTimeMillis;
+          yield* followReloadedMod;
           if (now - lastHeartbeat >= CLAUDE_BRIDGE_T3_HEARTBEAT_MS) {
             yield* registry.heartbeat(bridgeProcess, toolEndpoint);
             lastHeartbeat = now;
@@ -976,6 +1035,10 @@ export const layer: Layer.Layer<
               typeof message.uuid === "string"
                 ? message.uuid
                 : yield* crypto.randomUUIDv4.pipe(Effect.orDie);
+            // A message from a client carries the client's copy of the settings.
+            if (state.selection !== null)
+              yield* registry.writeClientSelection(sid, state.selection);
+            yield* followReloadedMod;
             // A slash command runs as a command in the session, exactly as if
             // typed there: Claude Code refuses one sent as prompt text.
             const slash = parseClaudeSlashCommandText(text);
@@ -993,14 +1056,15 @@ export const layer: Layer.Layer<
               if (commands === null || commands.some((command) => command.name === slash.name)) {
                 const label =
                   slash.args.length === 0 ? `/${slash.name}` : `/${slash.name} ${slash.args}`;
-                const pending = { commandId: "", promptUuid, label };
-                state.pendingPrompt = pending;
-                pending.commandId = yield* registry.send(bridgeProcess, {
+                const body: ClaudeBridgeCommandBody = {
                   type: "command",
                   name: slash.name,
                   args: slash.args,
                   promptUuid,
-                });
+                };
+                const pending = { commandId: "", promptUuid, label, body };
+                state.pendingPrompt = pending;
+                pending.commandId = yield* registry.send(bridgeProcess, body);
                 yield* logProtocolEvent({
                   direction: "outgoing",
                   stage: "decoded",
@@ -1009,16 +1073,17 @@ export const layer: Layer.Layer<
                 return;
               }
             }
-            const pending = { commandId: "", promptUuid, label: null };
-            state.pendingPrompt = pending;
-            pending.commandId = yield* registry.send(bridgeProcess, {
+            const body: ClaudeBridgeCommandBody = {
               type: "prompt",
               // Text that only looks like a command (a path, an unknown name)
               // goes to the model as written; the leading space keeps Claude
               // Code from refusing it as a command.
               text: text.startsWith("/") ? ` ${text}` : text,
               promptUuid,
-            });
+            };
+            const pending = { commandId: "", promptUuid, label: null, body };
+            state.pendingPrompt = pending;
+            pending.commandId = yield* registry.send(bridgeProcess, body);
             yield* logProtocolEvent({
               direction: "outgoing",
               stage: "decoded",
