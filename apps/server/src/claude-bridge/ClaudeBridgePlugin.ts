@@ -352,6 +352,41 @@ async function opensPanel($, name) {
   try { return (await $.store.get('panel:' + MOD_VERSION + ':' + name)) === true } catch { return false }
 }
 
+function settingLine(row) {
+  const choices = Array.isArray(row.options) && row.options.length > 0 ? '   (' + row.options.join(', ') + ')' : ''
+  return row.key + ' = ' + JSON.stringify(row.value) + choices + (row.isLocked ? '   [locked]' : '')
+}
+
+// The settings panel as text: every row, one row, or a row set to a value.
+async function settingsByText($, args) {
+  let rows = []
+  try { rows = await $.config.list() } catch (err) { return { ok: false, text: String(err) } }
+  const text = String(args).trim()
+  if (!text) {
+    return { ok: true, text: 'Settings of this session. Change one with /config <key> <value>.\\n\\n' + rows.map(settingLine).join('\\n') }
+  }
+  const space = text.indexOf(' ')
+  const key = space === -1 ? text : text.slice(0, space)
+  const row = rows.find((entry) => entry.key === key)
+  if (!row) return { ok: false, text: 'No setting named ' + key + '. /config lists them.' }
+  if (space === -1) {
+    return { ok: true, text: settingLine(row) + (key === 'model' ? '\\n\\nChange it with /model <name>.' : '\\n\\nChange it with /config ' + key + ' <value>.') }
+  }
+  const raw = text.slice(space + 1).trim()
+  let value = raw
+  if (raw === 'true') value = true
+  else if (raw === 'false') value = false
+  else if (Array.isArray(row.options)) {
+    const match = row.options.find((option) => String(option).toLowerCase() === raw.toLowerCase())
+    if (match !== undefined) value = match
+  }
+  let outcome
+  try { outcome = await $.config.set({ key: key, value: value }) } catch (err) { outcome = { deny: String(err) } }
+  if (outcome && outcome.deny) return { ok: false, text: String(outcome.deny) }
+  await heartbeat($)
+  return { ok: true, text: 'Set ' + key + ' to ' + JSON.stringify(value) }
+}
+
 // The model row of /config takes these names; a full model id maps onto one.
 async function modelChoice($, wanted) {
   let options = []
@@ -465,6 +500,13 @@ async function sleepOutsideBudget($) {
 async function runSlashCommand($, command) {
   const label = '/' + command.name + (command.args ? ' ' + command.args : '')
   const report = (data) => emit($, 'command.result', Object.assign({ commandId: command.id, promptUuid: command.promptUuid, startedTurn: false }, data))
+  // /config is a panel in the terminal. Its rows are the session's own list,
+  // so from T3 it is text: bare lists them, a key and a value sets that row,
+  // as picking it in the panel does. /model bare lists the model row.
+  if (command.name === 'config' || (command.name === 'model' && !command.args)) {
+    await report(await settingsByText($, command.name === 'model' ? 'model' : (command.args || '')))
+    return
+  }
   if (!command.args && (await opensPanel($, command.name))) {
     await report({ ok: true, text: 'Not run: ' + label + ' opens a panel in the Claude Code terminal, which only that terminal can show and close. Run it there, or give it an argument here (for example /model sonnet, /effort high, /goal <condition>).' })
     return
