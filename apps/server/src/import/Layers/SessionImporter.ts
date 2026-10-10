@@ -94,6 +94,7 @@ import {
   bandForTime,
   type HealingPlacement,
   type HealingRun,
+  planImportedRowOrdering,
   planImportedRowReseating,
   planTranscriptHealing,
 } from "../transcriptHealing.ts";
@@ -756,6 +757,7 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
       readonly threadId: ThreadId;
       readonly parsed: ParsedCliSession;
       readonly runs: ReadonlyArray<HealingRun>;
+      readonly pass: "bands" | "order";
     }) {
       const { threadId, sessionId } = input;
       if (input.runs.length === 0) return;
@@ -769,11 +771,12 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
           ? [{ sourceId: item.turn_item_id.slice(itemPrefix.length), ordinal: item.ordinal }]
           : [],
       );
-      const reseats = planImportedRowReseating({
-        rows: input.parsed.messages,
-        imported,
-        runs: input.runs,
-      });
+      // Rows in the wrong band move to theirs; within a band, rows that sit
+      // above rows written before them go back in the order they were written.
+      const reseats =
+        input.pass === "bands"
+          ? planImportedRowReseating({ rows: input.parsed.messages, imported, runs: input.runs })
+          : planImportedRowOrdering({ rows: input.parsed.messages, imported });
       if (reseats.length === 0) return;
       const events: Array<OrchestrationV2DomainEvent> = [];
       for (const reseat of reseats) {
@@ -782,11 +785,12 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
           WHERE thread_id = ${threadId}
             AND turn_item_id = ${importedTurnItemId(threadId, reseat.message.sourceId)}
         `;
-        yield* placeImportedRow(threadId, reseat);
+        const position = yield* placeImportedRow(threadId, reseat);
         const item = messageEvents({ threadId, sessionId, message: reseat.message })[1]!;
         events.push({
           ...item,
-          id: importEventId(threadId, `turn-item-reseat:${reseat.band}:${reseat.message.sourceId}`),
+          // A row can be moved more than once: each place it is given is its own event.
+          id: importEventId(threadId, `turn-item-reseat:${position}:${reseat.message.sourceId}`),
         });
       }
       yield* eventSink.write({ events });
@@ -1085,23 +1089,23 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
       const settledBeforeMs =
         turnInFlight.length === 0 ? undefined : Math.min(...turnInFlight) - IN_FLIGHT_MARGIN_MS;
       const runs = yield* threadRuns(input.threadId);
-      yield* reseatImportedRows({
+      const reseat = {
         driver: input.driver,
         sessionId: input.sessionId,
         threadId: input.threadId,
         parsed: input.parsed,
         runs,
+      };
+      yield* reseatImportedRows({ ...reseat, pass: "bands" });
+      const compared = yield* healBridgedThread({
+        ...input,
+        runs,
+        live: live !== null,
+        ...(settledBeforeMs === undefined ? {} : { settledBeforeMs }),
       });
-      if (
-        yield* healBridgedThread({
-          ...input,
-          runs,
-          live: live !== null,
-          ...(settledBeforeMs === undefined ? {} : { settledBeforeMs }),
-        })
-      ) {
-        return;
-      }
+      // What was just added went to the end of its band.
+      yield* reseatImportedRows({ ...reseat, pass: "order" });
+      if (compared) return;
       // Catching up by time takes whatever T3's record does not reach yet,
       // which a turn in flight is still adding to.
       if (settledBeforeMs !== undefined) return;

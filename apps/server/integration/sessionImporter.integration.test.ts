@@ -1518,6 +1518,32 @@ runtimeTest(
       yield* importer.healLiveClaudeSession({ sessionId: claudeId, transcriptPath: claudePath });
       yield* importer.sweepNow();
       assert.deepEqual(yield* h.texts(threadId), texts);
+
+      // The turn ends with nothing having shown it. Its rows are added below
+      // rows added on the earlier pass, and the thread still reads in the
+      // order things were written.
+      yield* h.write(joinPath(instanceDir, "session.json"), [
+        {
+          sid: claudeId,
+          instanceId: "inst-1",
+          heartbeatAt: yield* Clock.currentTimeMillis,
+          activeTurn: null,
+        },
+      ]);
+      yield* importer.healLiveClaudeSession({ sessionId: claudeId, transcriptPath: claudePath });
+      const timeline = (yield* h.threads.getThreadRecords(threadId, ["turnItems"])).turnItems
+        .filter((item) => item.type === "user_message" || item.type === "assistant_message")
+        .toSorted((left, right) => left.ordinal - right.ordinal)
+        .map((item) => item.text);
+      assert.deepEqual(timeline, [
+        "Fix the login bug please",
+        "I fixed the login bug.",
+        "A turn nothing was attached for",
+        "Its reply.",
+        "The turn running now",
+        "Typed into the running turn",
+        "Still arriving through the attachment.",
+      ]);
     }),
 );
 

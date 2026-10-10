@@ -3,6 +3,7 @@ import { assert, describe, it } from "@effect/vitest";
 import type { ParsedSessionMessage } from "./sessionImportTypes.ts";
 import {
   type HealingKnownMessage,
+  planImportedRowOrdering,
   planImportedRowReseating,
   planTranscriptHealing,
 } from "./transcriptHealing.ts";
@@ -175,6 +176,46 @@ describe("planImportedRowReseating", () => {
     assert.deepEqual(
       moved.map((placement) => `${placement.band}:${placement.message.sourceId}`),
       ["1:u2"],
+    );
+  });
+});
+
+describe("planImportedRowOrdering", () => {
+  it("puts a band's imported rows back in the order they were written", () => {
+    const rows = [
+      row("user", "u1", "first", 10),
+      row("assistant", "a1", "reply to first", 11),
+      row("user", "u2", "second, added on a later pass", 12),
+      row("assistant", "a2", "reply to second, added earlier", 13),
+      row("user", "u3", "another band", 30),
+    ];
+    const moves = planImportedRowOrdering({
+      rows,
+      imported: [
+        { sourceId: "u1", ordinal: 1_000_010 },
+        { sourceId: "a1", ordinal: 1_000_011 },
+        { sourceId: "a2", ordinal: 1_000_012 },
+        { sourceId: "u2", ordinal: 1_000_013 },
+        { sourceId: "u3", ordinal: 2_000_004 },
+      ],
+    });
+    assert.deepEqual(
+      moves.map((placement) => `${placement.band}:${placement.message.sourceId}`),
+      ["1:u2", "1:a2"],
+    );
+  });
+
+  it("leaves a band alone when its imported rows already read in order", () => {
+    const rows = [row("user", "u1", "first", 10), row("assistant", "a1", "reply", 11)];
+    assert.deepEqual(
+      planImportedRowOrdering({
+        rows,
+        imported: [
+          { sourceId: "u1", ordinal: 1_000_010 },
+          { sourceId: "a1", ordinal: 1_000_020 },
+        ],
+      }),
+      [],
     );
   });
 });

@@ -188,3 +188,47 @@ export function planImportedRowReseating(input: {
     return Math.floor(ordinal / RUN_BAND) === band ? [] : [{ message: row, band }];
   });
 }
+
+/**
+ * Imported rows that sit above rows written before them in the same band. A
+ * row added now goes to the end of its band, below rows added on an earlier
+ * pass, whatever their times. Returns, for each such band, the rows from the
+ * first one out of order to the last, oldest first: put back at the band's
+ * end in that order, the band's imported rows read in the order they were
+ * written.
+ */
+export function planImportedRowOrdering(input: {
+  readonly rows: ReadonlyArray<ParsedSessionMessage>;
+  readonly imported: ReadonlyArray<HealingImportedItem>;
+}): ReadonlyArray<HealingPlacement> {
+  const rowsById = new Map(input.rows.map((row) => [row.sourceId, row]));
+  const bands = new Map<
+    number,
+    Array<{ readonly row: ParsedSessionMessage; readonly ordinal: number; readonly atMs: number }>
+  >();
+  for (const item of input.imported) {
+    const row = rowsById.get(item.sourceId);
+    if (row === undefined) continue;
+    const band = Math.floor(item.ordinal / RUN_BAND);
+    const items = bands.get(band) ?? [];
+    items.push({ row, ordinal: item.ordinal, atMs: timeMs(row.timestamp) });
+    bands.set(band, items);
+  }
+  const moves: Array<HealingPlacement> = [];
+  for (const [band, items] of bands) {
+    const placed = items.toSorted((left, right) => left.ordinal - right.ordinal);
+    let earliestBelow = Number.POSITIVE_INFINITY;
+    let firstOutOfOrder = -1;
+    for (let index = placed.length - 1; index >= 0; index -= 1) {
+      if (placed[index]!.atMs > earliestBelow) firstOutOfOrder = index;
+      earliestBelow = Math.min(earliestBelow, placed[index]!.atMs);
+    }
+    if (firstOutOfOrder === -1) continue;
+    for (const item of placed
+      .slice(firstOutOfOrder)
+      .toSorted((left, right) => left.atMs - right.atMs || left.ordinal - right.ordinal)) {
+      moves.push({ message: item.row, band });
+    }
+  }
+  return moves;
+}
