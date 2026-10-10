@@ -192,6 +192,33 @@ function makeTestInstance(input: MakeInstanceInput) {
   return instance.pipe(Effect.provide(layerServices));
 }
 
+describe("DesktopBackendManager attached backend liveness", () => {
+  const probe = (
+    handler: (
+      request: HttpClientRequest.HttpClientRequest,
+    ) => Effect.Effect<HttpClientResponse.HttpClientResponse>,
+  ) =>
+    DesktopBackendManager.probeAttachedBackendOnce(new URL("http://127.0.0.1:3773/")).pipe(
+      Effect.provide(layerHttpClient(handler)),
+    );
+
+  it.live("takes a backend that answers in a few milliseconds as alive", () =>
+    Effect.gen(function* () {
+      const alive = yield* probe((request) =>
+        Effect.sleep(Duration.millis(25)).pipe(Effect.as(responseForRequest(request, 200))),
+      );
+      assert.isTrue(alive);
+    }),
+  );
+
+  it.live("takes a backend that does not answer, or answers with an error, as not alive", () =>
+    Effect.gen(function* () {
+      assert.isFalse(yield* probe(() => Effect.never));
+      assert.isFalse(yield* probe((request) => Effect.succeed(responseForRequest(request, 503))));
+    }),
+  );
+});
+
 describe("DesktopBackendManager", () => {
   it.effect("spawns the backend with fd3 bootstrap and fd4 telemetry", () =>
     Effect.scoped(

@@ -452,17 +452,24 @@ const decodeDesktopTelemetryControlLine = Schema.decodeUnknownEffect(
 // declared dead. Generous so a quick `t3serve` restart reads as a blip.
 const ATTACHED_LIVENESS_INTERVAL = Duration.seconds(2);
 const ATTACHED_LIVENESS_FAILURES_BEFORE_EXIT = 5;
+const ATTACHED_LIVENESS_PROBE_TIMEOUT_MS = Duration.toMillis(
+  DEFAULT_BACKEND_READINESS_REQUEST_TIMEOUT,
+);
 
-const probeAttachedBackendOnce = (
+/** One liveness probe of an attached backend: true when it answers in time. */
+export const probeAttachedBackendOnce = (
   httpBaseUrl: URL,
 ): Effect.Effect<boolean, never, HttpClient.HttpClient> =>
   waitForHttpReadyShared({
     baseUrl: httpBaseUrl.href,
     path: BACKEND_READINESS_PATH,
-    // One attempt only: timeoutMs < intervalMs collapses the retry policy.
-    timeoutMs: 1,
-    intervalMs: 1_000,
-    probeTimeoutMs: Duration.toMillis(DEFAULT_BACKEND_READINESS_REQUEST_TIMEOUT),
+    // One attempt, given the whole of its own timeout: the overall bound sits
+    // just past it and the retry spacing past that, so no second attempt
+    // starts. (An overall bound of 1 ms failed every probe, the server
+    // answering in about 2, and the run was declared dead every ten seconds.)
+    timeoutMs: ATTACHED_LIVENESS_PROBE_TIMEOUT_MS + 250,
+    intervalMs: ATTACHED_LIVENESS_PROBE_TIMEOUT_MS + 1_000,
+    probeTimeoutMs: ATTACHED_LIVENESS_PROBE_TIMEOUT_MS,
     makeError: () => ({ _tag: "AttachedBackendProbeFailed" }) as const,
   }).pipe(
     Effect.as(true),
