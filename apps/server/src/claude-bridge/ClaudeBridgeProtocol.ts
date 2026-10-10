@@ -30,7 +30,7 @@ import type {
 import { isRecord, parseJsonlLine } from "../import/sessionImportTypes.ts";
 
 export const CLAUDE_BRIDGE_PROTOCOL_VERSION = 2;
-export const CLAUDE_BRIDGE_MOD_VERSION = "0.3.5";
+export const CLAUDE_BRIDGE_MOD_VERSION = "0.3.6";
 /**
  * The first protocol whose mod runs slash commands, answers questions with
  * their answers and reports the session's own commands. A process still on an
@@ -116,6 +116,12 @@ export type ClaudeBridgeCommandBody =
       readonly reason?: string;
       /** `session`: the same call is not asked again in this process. */
       readonly scope?: "session";
+      /**
+       * The permission rules that go with an allow for the session: Claude
+       * Code's own suggestion for the call (what its dialog's "don't ask
+       * again" option would add), applied by Claude Code itself.
+       */
+      readonly updatedPermissions?: ReadonlyArray<unknown>;
     }
   /** The person's answers to a question Claude asked, keyed by question text. */
   | {
@@ -242,6 +248,8 @@ export type ClaudeBridgeEvent = { readonly seq: number; readonly at: number } & 
       readonly turnId?: string;
       /** Claude Code's own dialog for this call is open in a terminal as well. */
       readonly alsoInTerminal?: boolean;
+      /** The rules that dialog's "don't ask again" option would add, as Claude Code suggests them. */
+      readonly suggestions?: ReadonlyArray<unknown>;
     }
   | {
       readonly type: "approval.resolved";
@@ -433,6 +441,9 @@ export function parseClaudeBridgeEvent(value: unknown): ClaudeBridgeEvent | null
         ...(typeof value.reason === "string" ? { reason: value.reason } : {}),
         ...(typeof value.turnId === "string" ? { turnId: value.turnId } : {}),
         ...(value.alsoInTerminal === true ? { alsoInTerminal: true } : {}),
+        ...(Array.isArray(value.suggestions) && value.suggestions.length > 0
+          ? { suggestions: value.suggestions }
+          : {}),
       };
     case "approval.resolved":
       if (typeof value.toolUseId !== "string") return null;

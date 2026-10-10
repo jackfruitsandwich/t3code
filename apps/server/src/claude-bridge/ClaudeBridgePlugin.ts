@@ -79,7 +79,10 @@ const MOD_VERSION = '${CLAUDE_BRIDGE_MOD_VERSION}'
 const HEARTBEAT_MS = 3000
 const INBOX_POLL_MS = 500
 const COMMANDS_REFRESH_MS = 60000
-const T3_LIVE_MS = 12000
+// How old T3's heartbeat (one every 3 s) may be before T3 counts as gone. A
+// server busy starting up can miss several beats; a prompt handed back or
+// asked twice over a lapse is worse than one held a little longer.
+const T3_LIVE_MS = 30000
 const PROMPT_MATCH_WINDOW_MS = 20000
 // T3's own tools, declared here so the session has them whatever started it;
 // each call is answered from T3's tool endpoint (see t3.json).
@@ -426,13 +429,46 @@ async function refreshCommands($) {
   try { await $.fs.write(dir + '/commands.json', body) } catch {}
 }
 
+// T3's last heartbeat as last read whole. The file is read every second while
+// a prompt waits: one read that fails or does not parse says nothing, and the
+// file being gone says T3 let go.
+let t3HeartbeatSeen = 0
+let t3PidSeen = 0
+let t3SeenIn = null
 async function t3Attached($) {
   if (!dir) return false
+  if (t3SeenIn !== dir) { t3SeenIn = dir; t3HeartbeatSeen = 0; t3PidSeen = 0 }
   try {
     const t3 = JSON.parse(await $.fs.read(dir + '/t3.json'))
-    return typeof t3.heartbeatAt === 'number' && Date.now() - t3.heartbeatAt < T3_LIVE_MS
+    if (typeof t3.heartbeatAt === 'number') t3HeartbeatSeen = t3.heartbeatAt
+    if (typeof t3.pid === 'number') t3PidSeen = t3.pid
   } catch {
-    return false
+    let exists = true
+    try { exists = await $.fs.exists(dir + '/t3.json') } catch {}
+    if (!exists) t3HeartbeatSeen = 0
+  }
+  return Date.now() - t3HeartbeatSeen < T3_LIVE_MS
+}
+
+// Keeps T3 informed of a request that is waiting for an answer. Called once
+// a second by the wait: it says so when T3 goes out of sight, and asks again
+// when T3 is back or another T3 process has taken its place (a restart quick
+// enough that the heartbeat never looked stale: the new process knows nothing
+// of what the old one was asked). Resolves to whether T3 is in sight.
+function t3Teller($, announce, retire) {
+  let isTold = true
+  let pid = t3PidSeen
+  return async () => {
+    const attachedNow = await t3Attached($)
+    if (!attachedNow && isTold) {
+      isTold = false
+      await retire()
+    } else if (attachedNow && (!isTold || t3PidSeen !== pid)) {
+      isTold = true
+      pid = t3PidSeen
+      await announce()
+    }
+    return attachedNow
   }
 }
 
@@ -898,8 +934,9 @@ export function register(on) {
         if (beneath.error) throw beneath.error
         return beneath.value
       }
-      await emit($, 'question.request', Object.assign({ alsoInTerminal: true }, request))
-      let told = true
+      const ask = () => emit($, 'question.request', Object.assign({ alsoInTerminal: true }, request))
+      await ask()
+      const keepT3Told = t3Teller($, ask, () => emit($, 'question.resolved', { toolUseId: toolUseId, by: 'detached' }))
       for (;;) {
         if (beneath) {
           await emit($, 'question.resolved', { toolUseId: toolUseId, by: 'terminal' })
@@ -913,19 +950,16 @@ export function register(on) {
           await emit($, 'question.resolved', { toolUseId: toolUseId, by: 't3' })
           return fromT3(answer)
         }
-        const attachedNow = await t3Attached($)
-        if (!attachedNow && told) {
-          told = false
-          await emit($, 'question.resolved', { toolUseId: toolUseId, by: 'detached' })
-        } else if (attachedNow && !told) {
-          told = true
-          await emit($, 'question.request', Object.assign({ alsoInTerminal: true }, request))
-        }
+        await keepT3Told()
         await sleepOutsideBudget($)
       }
     }
-    // A background session nobody has open: asked in T3 alone.
-    await emit($, 'question.request', request)
+    // A background session nobody has open: asked in T3 alone. While T3 is
+    // out of sight the question waits for it (the dialog would be shown to no
+    // one), unless a terminal has been opened on the session meanwhile.
+    const askT3 = () => emit($, 'question.request', request)
+    await askT3()
+    const keepT3Told = t3Teller($, askT3, () => emit($, 'question.resolved', { toolUseId: toolUseId, by: 'detached' }))
     for (;;) {
       const answer = answers.get(toolUseId)
       if (answer) {
@@ -934,10 +968,7 @@ export function register(on) {
         await emit($, 'question.resolved', { toolUseId: toolUseId, by: 't3' })
         return fromT3(answer)
       }
-      if (!(await t3Attached($))) {
-        await emit($, 'question.resolved', { toolUseId: toolUseId, by: 'detached' })
-        return next(e)
-      }
+      if (!(await keepT3Told()) && terminalPresent()) return next(e)
       await sleepOutsideBudget($)
     }
   })
@@ -964,7 +995,9 @@ export function register(on) {
     // A background session nobody has open: its dialog would be shown to no
     // one, so the request is held for T3 alone.
     const toolUseId = e.tool_use_id
-    await emit($, 'approval.request', { toolUseId: toolUseId, tool: e.tool, input: e.input, reason: verdict.reason, turnId: activeTurn ? activeTurn.turnId : undefined })
+    const askT3 = () => emit($, 'approval.request', { toolUseId: toolUseId, tool: e.tool, input: e.input, reason: verdict.reason, turnId: activeTurn ? activeTurn.turnId : undefined })
+    await askT3()
+    const keepT3Told = t3Teller($, askT3, () => emit($, 'approval.resolved', { toolUseId: toolUseId, decision: 'ask', by: 'detached' }))
     for (;;) {
       const decision = decisions.get(toolUseId)
       if (decision) {
@@ -975,10 +1008,9 @@ export function register(on) {
         if (decision.scope === 'session') grants.push({ tool: e.tool, key: grantKey(e), wholeTool: decision.wholeTool === true })
         return { decision: 'allow', reason: 'Approved in T3 Code' }
       }
-      if (!(await t3Attached($))) {
-        await emit($, 'approval.resolved', { toolUseId: toolUseId, decision: 'ask', by: 'detached' })
-        return verdict
-      }
+      // T3 out of sight: the request waits for it, unless a terminal has
+      // been opened on the session meanwhile, whose dialog can take it.
+      if (!(await keepT3Told()) && terminalPresent()) return verdict
       await sleepOutsideBudget($)
     }
   })
@@ -992,9 +1024,10 @@ export function register(on) {
     const ask = takeAsk(e.tool_name, e.tool_input)
     if (!ask || !(await t3Attached($))) return next(e)
     const toolUseId = ask.toolUseId
-    const request = { toolUseId: toolUseId, tool: e.tool_name, input: e.tool_input, turnId: activeTurn ? activeTurn.turnId : undefined, alsoInTerminal: true }
-    await emit($, 'approval.request', request)
-    let told = true
+    const request = { toolUseId: toolUseId, tool: e.tool_name, input: e.tool_input, turnId: activeTurn ? activeTurn.turnId : undefined, alsoInTerminal: true, suggestions: Array.isArray(e.permission_suggestions) ? e.permission_suggestions : undefined }
+    const askT3 = () => emit($, 'approval.request', request)
+    await askT3()
+    const keepT3Told = t3Teller($, askT3, () => emit($, 'approval.resolved', { toolUseId: toolUseId, decision: 'ask', by: 'detached' }))
     for (;;) {
       const decision = decisions.get(toolUseId)
       if (decision) {
@@ -1002,10 +1035,15 @@ export function register(on) {
         if (decision.decision === 'ask') return next(e)
         await emit($, 'approval.resolved', { toolUseId: toolUseId, decision: decision.decision, by: 't3' })
         if (decision.decision !== 'allow') return { decision: { behavior: 'deny', message: decision.reason || 'Denied in T3 Code' } }
-        if (decision.scope === 'session') grants.push({ tool: ask.tool, key: ask.key, wholeTool: decision.wholeTool === true })
         // The input goes back with the answer, as an SDK host's does: a
         // dialog that asks more than yes or no (a plan's "Ready to code?")
         // takes an allow without it as no answer at all.
+        // "For this session" with Claude Code's own suggested rules is the
+        // dialog's "don't ask again" option: Claude Code adds the rules.
+        if (Array.isArray(decision.updatedPermissions) && decision.updatedPermissions.length > 0) {
+          return { decision: { behavior: 'allow', updatedInput: e.tool_input, updatedPermissions: decision.updatedPermissions } }
+        }
+        if (decision.scope === 'session') grants.push({ tool: ask.tool, key: ask.key, wholeTool: decision.wholeTool === true })
         return { decision: { behavior: 'allow', updatedInput: e.tool_input } }
       }
       // Answered in the terminal. Nothing says so while the tool it allowed
@@ -1015,14 +1053,7 @@ export function register(on) {
         await emit($, 'approval.resolved', { toolUseId: toolUseId, decision: 'ask', by: 'terminal' })
         return next(e)
       }
-      const attachedNow = await t3Attached($)
-      if (!attachedNow && told) {
-        told = false
-        await emit($, 'approval.resolved', { toolUseId: toolUseId, decision: 'ask', by: 'detached' })
-      } else if (attachedNow && !told) {
-        told = true
-        await emit($, 'approval.request', request)
-      }
+      await keepT3Told()
       await sleepOutsideBudget($)
     }
   })

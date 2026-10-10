@@ -354,6 +354,8 @@ export const layer: Layer.Layer<
           readonly text: string;
           readonly at: number;
         }>,
+        /** Calls T3 is asking the person about right now, by tool call. */
+        asking: new Set<string>(),
         /** Drawn messages already shown: the record's own copy, arriving later, is the same row. */
         shownDrawn: [] as Array<{ readonly messageId: string; readonly text: string }>,
         /** Texts of the record's recent replies, to tell a drawn message it already holds. */
@@ -863,6 +865,7 @@ export const layer: Layer.Layer<
                   requestId: event.toolUseId,
                   ...(event.reason === undefined ? {} : { decisionReason: event.reason }),
                   ...(event.alsoInTerminal === true ? { alsoInTerminal: true } : {}),
+                  ...(event.suggestions === undefined ? {} : { suggestions: event.suggestions }),
                 } as Parameters<CanUseTool>[2]),
               catch: (cause) => runnerError(cause, "canUseTool"),
             }),
@@ -890,14 +893,18 @@ export const layer: Layer.Layer<
             return;
           }
           if (decision.behavior === "allow") {
-            // "Allow for this session" arrives as permission updates; the mod
-            // keeps the grant for the life of the process.
+            // "Allow for this session" arrives as permission updates. Where
+            // Claude Code suggested rules for the call (its dialog's "don't
+            // ask again" option), those go back and Claude Code applies them
+            // itself; otherwise the mod keeps the grant for the same call.
             const forSession = (decision.updatedPermissions?.length ?? 0) > 0;
+            const ownRules = forSession && event.suggestions !== undefined;
             yield* registry.send(bridgeProcess, {
               type: "approval",
               toolUseId: event.toolUseId,
               decision: "allow",
               ...(forSession ? { scope: "session" as const } : {}),
+              ...(ownRules ? { updatedPermissions: decision.updatedPermissions ?? [] } : {}),
             });
             return;
           }
@@ -1057,11 +1064,18 @@ export const layer: Layer.Layer<
               return;
             }
             case "question.request": {
-              yield* resolveQuestion(event).pipe(Effect.forkIn(sessionScope));
+              if (state.asking.has(event.toolUseId)) return;
+              state.asking.add(event.toolUseId);
+              yield* resolveQuestion(event).pipe(
+                Effect.ensuring(Effect.sync(() => state.asking.delete(event.toolUseId))),
+                Effect.forkIn(sessionScope),
+              );
               return;
             }
             case "question.resolved": {
-              if (event.by !== "t3") yield* settleElsewhere(event.toolUseId);
+              if (event.by !== "t3" && event.by !== "detached") {
+                yield* settleElsewhere(event.toolUseId);
+              }
               return;
             }
             case "prompt.dropped": {
@@ -1085,7 +1099,15 @@ export const layer: Layer.Layer<
               return;
             }
             case "approval.request": {
-              yield* resolveApproval(event).pipe(Effect.forkIn(sessionScope));
+              // Asked again for a call T3 is already asking about (the mod
+              // lost sight of T3 for a moment and found it again): the
+              // request the person sees stands, and its answer still goes.
+              if (state.asking.has(event.toolUseId)) return;
+              state.asking.add(event.toolUseId);
+              yield* resolveApproval(event).pipe(
+                Effect.ensuring(Effect.sync(() => state.asking.delete(event.toolUseId))),
+                Effect.forkIn(sessionScope),
+              );
               return;
             }
             case "ended": {
@@ -1093,7 +1115,12 @@ export const layer: Layer.Layer<
               return;
             }
             case "approval.resolved": {
-              if (event.by !== "t3") yield* settleElsewhere(event.toolUseId);
+              // "detached" is the mod no longer seeing T3's heartbeat. This
+              // process is here to read that, so it was a lapse: the request
+              // stays, and the mod asks again when it sees T3.
+              if (event.by !== "t3" && event.by !== "detached") {
+                yield* settleElsewhere(event.toolUseId);
+              }
               return;
             }
             case "message.display": {
@@ -1146,6 +1173,15 @@ export const layer: Layer.Layer<
         ),
         Effect.forkIn(sessionScope),
       );
+      // The heartbeat is what tells the session T3 is here, and a prompt
+      // waiting for T3 is handed back when it stops. It beats on its own, so
+      // slow work in the loop above (a large record, a repair) cannot stop it.
+      yield* Effect.gen(function* () {
+        while (!state.closed) {
+          yield* Effect.sleep(`${CLAUDE_BRIDGE_T3_HEARTBEAT_MS} millis`);
+          if (!state.closed) yield* registry.heartbeat(bridgeProcess, toolEndpoint);
+        }
+      }).pipe(Effect.forkIn(sessionScope));
 
       const session: ClaudeAdapterV2.ClaudeAgentSdkQuerySession = {
         messages: Stream.fromQueue(messages),

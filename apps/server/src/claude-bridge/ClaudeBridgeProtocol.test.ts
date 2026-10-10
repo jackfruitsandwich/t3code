@@ -309,8 +309,12 @@ describe("ClaudeBridgeProtocol record helpers", () => {
       tool: "ExitPlanMode",
       input: { plan: "1. do it" },
       alsoInTerminal: true,
+      suggestions: [{ type: "setMode", mode: "acceptEdits", destination: "session" }],
     });
     assert.isTrue(event?.type === "approval.request" && event.alsoInTerminal === true);
+    assert.deepStrictEqual(event?.type === "approval.request" ? event.suggestions : null, [
+      { type: "setMode", mode: "acceptEdits", destination: "session" },
+    ]);
     assert.isTrue(claudeBridgeAlsoInTerminal({ signal: null, alsoInTerminal: true }));
     assert.isFalse(claudeBridgeAlsoInTerminal({ signal: null }));
   });

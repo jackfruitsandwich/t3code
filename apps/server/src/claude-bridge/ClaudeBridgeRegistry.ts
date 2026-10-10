@@ -586,20 +586,27 @@ const make = Effect.gen(function* () {
       return id;
     });
 
+  // Written beside the file and moved over it: the mod reads this file every
+  // second while a prompt waits for T3, and a read that fell between the
+  // truncation and the write of an in-place rewrite looked like T3 leaving.
   const heartbeat = (entry: ClaudeBridgeProcess, tools?: ClaudeBridgeToolEndpoint) =>
     Clock.currentTimeMillis.pipe(
-      Effect.flatMap((now) =>
-        fs.writeFileString(
-          path.join(entry.dir, "t3.json"),
-          encodeJson({
-            heartbeatAt: now,
-            pid: process.pid,
-            ...(tools === undefined ? {} : { mcp: tools }),
-          }),
-          // It names a credential: the person's eyes only.
-          { mode: 0o600 },
-        ),
-      ),
+      Effect.flatMap((now) => {
+        const file = path.join(entry.dir, "t3.json");
+        const next = `${file}.${process.pid}.next`;
+        return fs
+          .writeFileString(
+            next,
+            encodeJson({
+              heartbeatAt: now,
+              pid: process.pid,
+              ...(tools === undefined ? {} : { mcp: tools }),
+            }),
+            // It names a credential: the person's eyes only.
+            { mode: 0o600 },
+          )
+          .pipe(Effect.andThen(fs.rename(next, file)));
+      }),
       Effect.ignore,
     );
 
@@ -618,7 +625,14 @@ const make = Effect.gen(function* () {
     fs.writeFileString(clientSelectionFile(sid), encodeJson(selection)).pipe(Effect.ignore);
 
   const clearHeartbeat = (entry: ClaudeBridgeProcess) =>
-    fs.remove(path.join(entry.dir, "t3.json")).pipe(Effect.ignore);
+    fs
+      .remove(path.join(entry.dir, "t3.json"))
+      .pipe(
+        Effect.ignore,
+        Effect.andThen(
+          fs.remove(path.join(entry.dir, `t3.json.${process.pid}.next`)).pipe(Effect.ignore),
+        ),
+      );
 
   const dispatch = (event: ClaudeBridgeEvent, entry: ClaudeBridgeProcess) =>
     Effect.gen(function* () {

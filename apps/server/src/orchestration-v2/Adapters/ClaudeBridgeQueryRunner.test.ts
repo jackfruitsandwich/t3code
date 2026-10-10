@@ -233,6 +233,45 @@ describe("ClaudeBridgeQueryRunner permissions", () => {
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
+  it.effect("hands Claude Code's own suggested rules back with an approval for the session", () =>
+    Effect.gen(function* () {
+      const suggested = {
+        type: "addRules" as const,
+        rules: [{ toolName: "Bash", ruleContent: "echo:*" }],
+        behavior: "allow" as const,
+        destination: "localSettings" as const,
+      };
+      const forSession = { ...suggested, destination: "session" as const };
+      const bridge = yield* attach({
+        protocol: 2,
+        bridgeCanUseTool: () => ({
+          behavior: "allow",
+          updatedPermissions: [forSession],
+        }),
+      });
+      yield* bridge.handler(
+        {
+          type: "approval.request",
+          seq: 1,
+          at: bridge.now,
+          toolUseId: "tool-1",
+          tool: "Bash",
+          input: { command: "echo hi" },
+          alsoInTerminal: true,
+          suggestions: [suggested],
+        },
+        bridge.process,
+      );
+      assert.deepStrictEqual(yield* Queue.take(bridge.commands), {
+        type: "approval",
+        toolUseId: "tool-1",
+        decision: "allow",
+        scope: "session",
+        updatedPermissions: [forSession],
+      });
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
   it.effect("sends nothing back for a request the session settled without T3", () =>
     Effect.gen(function* () {
       const bridge = yield* attach({
@@ -276,6 +315,61 @@ describe("ClaudeBridgeQueryRunner permissions", () => {
       assert.deepStrictEqual(yield* Queue.take(bridge.commands), {
         type: "approval",
         toolUseId: "tool-2",
+        decision: "allow",
+      });
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("keeps its one request when the mod loses sight of T3 for a moment", () =>
+    Effect.gen(function* () {
+      // The person answers in T3 only when the test says so.
+      const answer = yield* Deferred.make<PermissionResult>();
+      let asked = 0;
+      let aborted = false;
+      const bridge = yield* attach({
+        protocol: 2,
+        bridgeCanUseTool: (_tool, _input, _toolUseId, signal) => {
+          asked += 1;
+          signal.addEventListener("abort", () => {
+            aborted = true;
+          });
+          return Effect.runPromise(Deferred.await(answer));
+        },
+      });
+      const request = bridge.handler(
+        {
+          type: "approval.request",
+          seq: 1,
+          at: bridge.now,
+          toolUseId: "tool-1",
+          tool: "Bash",
+          input: { command: "pwd" },
+          alsoInTerminal: true,
+        },
+        bridge.process,
+      );
+      yield* request;
+      // The mod's heartbeat read failed once: it says T3 is gone, then asks again.
+      yield* bridge.handler(
+        {
+          type: "approval.resolved",
+          seq: 2,
+          at: bridge.now,
+          toolUseId: "tool-1",
+          decision: "ask",
+          by: "detached",
+        },
+        bridge.process,
+      );
+      yield* request;
+      yield* Effect.yieldNow;
+      assert.strictEqual(asked, 1);
+      assert.isFalse(aborted);
+      // The answer given to that one request still reaches the session.
+      yield* Deferred.succeed(answer, { behavior: "allow" });
+      assert.deepStrictEqual(yield* Queue.take(bridge.commands), {
+        type: "approval",
+        toolUseId: "tool-1",
         decision: "allow",
       });
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
