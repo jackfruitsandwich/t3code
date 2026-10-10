@@ -323,7 +323,10 @@ describe("ClaudeBridgeQueryRunner permissions", () => {
   it.effect("keeps its one request when the mod loses sight of T3 for a moment", () =>
     Effect.gen(function* () {
       // The person answers in T3 only when the test says so.
-      const answer = yield* Deferred.make<PermissionResult>();
+      let answerNow: (result: PermissionResult) => void = () => {};
+      const answered = new Promise<PermissionResult>((resolve) => {
+        answerNow = resolve;
+      });
       let asked = 0;
       let aborted = false;
       const bridge = yield* attach({
@@ -333,7 +336,7 @@ describe("ClaudeBridgeQueryRunner permissions", () => {
           signal.addEventListener("abort", () => {
             aborted = true;
           });
-          return Effect.runPromise(Deferred.await(answer));
+          return answered;
         },
       });
       const request = bridge.handler(
@@ -366,7 +369,7 @@ describe("ClaudeBridgeQueryRunner permissions", () => {
       assert.strictEqual(asked, 1);
       assert.isFalse(aborted);
       // The answer given to that one request still reaches the session.
-      yield* Deferred.succeed(answer, { behavior: "allow" });
+      answerNow({ behavior: "allow" });
       assert.deepStrictEqual(yield* Queue.take(bridge.commands), {
         type: "approval",
         toolUseId: "tool-1",
