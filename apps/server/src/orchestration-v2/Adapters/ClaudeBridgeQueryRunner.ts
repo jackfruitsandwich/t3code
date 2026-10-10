@@ -22,7 +22,7 @@
  */
 import * as NodeOS from "node:os";
 
-import type { SDKMessage, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+import type { CanUseTool, SDKMessage, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import { HostProcessEnvironment, HostProcessWorkingDirectory } from "@t3tools/shared/hostProcess";
 import type * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
@@ -862,7 +862,8 @@ export const layer: Layer.Layer<
                   toolUseID: event.toolUseId,
                   requestId: event.toolUseId,
                   ...(event.reason === undefined ? {} : { decisionReason: event.reason }),
-                }),
+                  ...(event.alsoInTerminal === true ? { alsoInTerminal: true } : {}),
+                } as Parameters<CanUseTool>[2]),
               catch: (cause) => runnerError(cause, "canUseTool"),
             }),
           );

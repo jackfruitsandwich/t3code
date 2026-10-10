@@ -91,6 +91,7 @@ import { planClaudeSkillDispatch } from "../../provider/Drivers/ClaudeSkillDispa
 import { discoverClaudeSkills } from "../../provider/Drivers/ClaudeSkills.ts";
 import { compileClaudeModelSelection } from "../../claudeModelOptions.ts";
 import {
+  claudeBridgeAlsoInTerminal,
   claudeBridgeWakeDetail,
   isClaudeHarnessPrompt,
   threadModesForClaudePermissionMode,
@@ -6934,12 +6935,17 @@ export function makeClaudeAdapterV2(
                 markdown,
               });
             }
-            return {
-              behavior: "deny",
-              message:
-                "The client captured your proposed plan. Stop here and wait for the user's feedback or implementation request in a later turn.",
-              toolUseID: callbackOptions.toolUseID,
-            } satisfies PermissionResult;
+            // A session with a terminal is asking the person there whether
+            // to go ahead ("Ready to code?"). T3 shows the plan and asks the
+            // same beside it; it does not answer in the person's place.
+            if (!(origin === "bridge" && claudeBridgeAlsoInTerminal(callbackOptions))) {
+              return {
+                behavior: "deny",
+                message:
+                  "The client captured your proposed plan. Stop here and wait for the user's feedback or implementation request in a later turn.",
+                toolUseID: callbackOptions.toolUseID,
+              } satisfies PermissionResult;
+            }
           }
 
           if (origin === "sdk" && !requiresClaudeApproval(context)) {

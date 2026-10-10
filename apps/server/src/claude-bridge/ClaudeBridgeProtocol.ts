@@ -30,7 +30,7 @@ import type {
 import { isRecord, parseJsonlLine } from "../import/sessionImportTypes.ts";
 
 export const CLAUDE_BRIDGE_PROTOCOL_VERSION = 2;
-export const CLAUDE_BRIDGE_MOD_VERSION = "0.3.4";
+export const CLAUDE_BRIDGE_MOD_VERSION = "0.3.5";
 /**
  * The first protocol whose mod runs slash commands, answers questions with
  * their answers and reports the session's own commands. A process still on an
@@ -240,6 +240,8 @@ export type ClaudeBridgeEvent = { readonly seq: number; readonly at: number } & 
       readonly input: unknown;
       readonly reason?: string;
       readonly turnId?: string;
+      /** Claude Code's own dialog for this call is open in a terminal as well. */
+      readonly alsoInTerminal?: boolean;
     }
   | {
       readonly type: "approval.resolved";
@@ -430,6 +432,7 @@ export function parseClaudeBridgeEvent(value: unknown): ClaudeBridgeEvent | null
         input: value.input,
         ...(typeof value.reason === "string" ? { reason: value.reason } : {}),
         ...(typeof value.turnId === "string" ? { turnId: value.turnId } : {}),
+        ...(value.alsoInTerminal === true ? { alsoInTerminal: true } : {}),
       };
     case "approval.resolved":
       if (typeof value.toolUseId !== "string") return null;
@@ -542,6 +545,13 @@ const COMMAND_NAME = /<command-name>\s*(\/[^<\s]+)\s*<\/command-name>/u;
 const BASH_INPUT = /^\s*<bash-input>([\s\S]*)<\/bash-input>\s*$/u;
 const BASH_OUTPUT =
   /^\s*<bash-stdout>([\s\S]*?)<\/bash-stdout>(?:\s*<bash-stderr>([\s\S]*?)<\/bash-stderr>)?\s*$/u;
+/**
+ * Whether a permission callback's options say that Claude Code's own dialog
+ * for the call is open in a terminal as well: T3 then asks the same thing
+ * beside it and never answers in the person's place.
+ */
+export const claudeBridgeAlsoInTerminal = (options: unknown): boolean =>
+  isRecord(options) && options.alsoInTerminal === true;
 /** The first mod that runs `!` commands sent from T3. */
 export const CLAUDE_BRIDGE_BASH_MOD_VERSION = "0.3.4";
 /** Whether a mod version is at least `wanted` (`major.minor.patch`). */

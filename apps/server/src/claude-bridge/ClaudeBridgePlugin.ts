@@ -705,14 +705,19 @@ function isGranted(e) {
   return false
 }
 
-// While T3 is attached, the surface that started the turn answers it: a turn
-// T3 started is held for T3, and a turn typed in the terminal keeps Claude
-// Code's own dialog. A background session nobody has open is held for T3 too,
-// since its dialog would be shown to no one.
-async function heldForT3($) {
-  if (!(await t3Attached($))) return false
-  if (activeTurn && activeTurn.commandId) return true
-  return !terminalPresent()
+// Claude Code's dialog for a call names the tool and its input, not the call.
+// The calls left to ask are matched to it: the one with that input, else the
+// oldest call of that tool still waiting (dialogs open in the order the calls
+// were made). A call that already has its result is no longer waiting.
+function takeAsk(tool, input) {
+  for (let index = asks.length - 1; index >= 0; index -= 1) {
+    if (settledCalls.has(asks[index].toolUseId)) asks.splice(index, 1)
+  }
+  let key = null
+  try { key = tool + ':' + JSON.stringify(input) } catch {}
+  let index = asks.findIndex((ask) => ask.key === key)
+  if (index === -1) index = asks.findIndex((ask) => ask.tool === tool)
+  return index === -1 ? null : asks.splice(index, 1)[0]
 }
 
 export function register(on) {
@@ -871,21 +876,63 @@ export function register(on) {
     return next(e)
   })
 
-  // A question Claude asks the person. Held for T3 it is answered with the
-  // answers themselves, as the terminal dialog would return them; a bare
-  // approval cannot answer a question.
+  // A question Claude asks the person. T3 answers it with the answers
+  // themselves, as the terminal dialog would return them; a bare approval
+  // cannot answer a question.
   on('tool.call', { tool: 'AskUserQuestion' }, async ($, e, next) => {
-    if (!e.tool_use_id || e.agentId || !(await heldForT3($))) return next(e)
+    if (!e.tool_use_id || e.agentId || !(await t3Attached($))) return next(e)
     const toolUseId = e.tool_use_id
-    await emit($, 'question.request', { toolUseId: toolUseId, questions: e.questions, turnId: activeTurn ? activeTurn.turnId : undefined })
+    const request = { toolUseId: toolUseId, questions: e.questions, turnId: activeTurn ? activeTurn.turnId : undefined }
+    const fromT3 = (answer) => (answer.decision === 'deny'
+      ? { deny: answer.reason || 'The user declined to answer.' }
+      : { result: { questions: e.questions, answers: answer.answers || {} } })
+    if (terminalPresent()) {
+      // With a terminal on the session the question is asked in both places:
+      // Claude Code's own dialog runs beneath this hook, and T3 shows the same
+      // question. An answer from T3 returns here while the dialog is still
+      // open, which closes it; an answer in the terminal ends the wait.
+      let beneath = null
+      const running = next(e).then((value) => { beneath = { value: value } }, (error) => { beneath = { error: error } })
+      const settled = async () => {
+        await running
+        if (beneath.error) throw beneath.error
+        return beneath.value
+      }
+      await emit($, 'question.request', Object.assign({ alsoInTerminal: true }, request))
+      let told = true
+      for (;;) {
+        if (beneath) {
+          await emit($, 'question.resolved', { toolUseId: toolUseId, by: 'terminal' })
+          return settled()
+        }
+        const answer = answers.get(toolUseId)
+        if (answer) {
+          answers.delete(toolUseId)
+          // Nobody in T3 took it: it stays with the terminal.
+          if (answer.decision === 'ask') return settled()
+          await emit($, 'question.resolved', { toolUseId: toolUseId, by: 't3' })
+          return fromT3(answer)
+        }
+        const attachedNow = await t3Attached($)
+        if (!attachedNow && told) {
+          told = false
+          await emit($, 'question.resolved', { toolUseId: toolUseId, by: 'detached' })
+        } else if (attachedNow && !told) {
+          told = true
+          await emit($, 'question.request', Object.assign({ alsoInTerminal: true }, request))
+        }
+        await sleepOutsideBudget($)
+      }
+    }
+    // A background session nobody has open: asked in T3 alone.
+    await emit($, 'question.request', request)
     for (;;) {
       const answer = answers.get(toolUseId)
       if (answer) {
         answers.delete(toolUseId)
         if (answer.decision === 'ask') return next(e)
         await emit($, 'question.resolved', { toolUseId: toolUseId, by: 't3' })
-        if (answer.decision === 'deny') return { deny: answer.reason || 'The user declined to answer.' }
-        return { result: { questions: e.questions, answers: answer.answers || {} } }
+        return fromT3(answer)
       }
       if (!(await t3Attached($))) {
         await emit($, 'question.resolved', { toolUseId: toolUseId, by: 'detached' })
@@ -904,6 +951,8 @@ export function register(on) {
     if (isT3ReadOnlyTool(e.tool)) return { decision: 'allow', reason: 'T3 Code display tool' }
     if (isGranted(e)) return { decision: 'allow', reason: 'Allowed for this session in T3 Code' }
     if (!(await t3Attached($))) return verdict
+    // A question is asked and answered through its own hook (tool.call).
+    if (e.tool === 'AskUserQuestion') return verdict
     // With a terminal on the session, Claude Code's own dialog opens there
     // and T3 shows the same request; whichever is answered first settles it
     // (see classic.PermissionRequest). The call is remembered until then.
@@ -940,16 +989,7 @@ export function register(on) {
   // goes away and comes back while the dialog is still open, it is told again.
   on('classic.PermissionRequest', async ($, e, next) => {
     noteClassic($, e)
-    let ask = null
-    try {
-      const key = e.tool_name + ':' + JSON.stringify(e.tool_input)
-      for (let index = asks.length - 1; index >= 0; index -= 1) {
-        if (asks[index].key === key && Date.now() - asks[index].at < 20000) {
-          ask = asks.splice(index, 1)[0]
-          break
-        }
-      }
-    } catch {}
+    const ask = takeAsk(e.tool_name, e.tool_input)
     if (!ask || !(await t3Attached($))) return next(e)
     const toolUseId = ask.toolUseId
     const request = { toolUseId: toolUseId, tool: e.tool_name, input: e.tool_input, turnId: activeTurn ? activeTurn.turnId : undefined, alsoInTerminal: true }
@@ -963,8 +1003,14 @@ export function register(on) {
         await emit($, 'approval.resolved', { toolUseId: toolUseId, decision: decision.decision, by: 't3' })
         if (decision.decision !== 'allow') return { decision: { behavior: 'deny', message: decision.reason || 'Denied in T3 Code' } }
         if (decision.scope === 'session') grants.push({ tool: ask.tool, key: ask.key, wholeTool: decision.wholeTool === true })
-        return { decision: { behavior: 'allow' } }
+        // The input goes back with the answer, as an SDK host's does: a
+        // dialog that asks more than yes or no (a plan's "Ready to code?")
+        // takes an allow without it as no answer at all.
+        return { decision: { behavior: 'allow', updatedInput: e.tool_input } }
       }
+      // Answered in the terminal. Nothing says so while the tool it allowed
+      // is still running (measured: neither the chain beneath this hook nor
+      // its signal moves before the tool is over); the call's result does.
       if (settledCalls.has(toolUseId)) {
         await emit($, 'approval.resolved', { toolUseId: toolUseId, decision: 'ask', by: 'terminal' })
         return next(e)

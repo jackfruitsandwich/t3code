@@ -1,6 +1,7 @@
 import { assert, describe, it } from "@effect/vitest";
 
 import {
+  claudeBridgeAlsoInTerminal,
   claudeBridgeModAtLeast,
   claudeBridgeWakeDetail,
   claudeTranscriptCommandOutput,
@@ -297,6 +298,21 @@ describe("ClaudeBridgeProtocol record helpers", () => {
       }),
       "Compacted (ctrl+o to see full summary)",
     );
+  });
+
+  it("keeps the note that a request is also being asked in the terminal", () => {
+    const event = parseClaudeBridgeEvent({
+      seq: 4,
+      at: 1,
+      type: "approval.request",
+      toolUseId: "toolu_1",
+      tool: "ExitPlanMode",
+      input: { plan: "1. do it" },
+      alsoInTerminal: true,
+    });
+    assert.isTrue(event?.type === "approval.request" && event.alsoInTerminal === true);
+    assert.isTrue(claudeBridgeAlsoInTerminal({ signal: null, alsoInTerminal: true }));
+    assert.isFalse(claudeBridgeAlsoInTerminal({ signal: null }));
   });
 
   it("compares bridge mod versions by number", () => {
