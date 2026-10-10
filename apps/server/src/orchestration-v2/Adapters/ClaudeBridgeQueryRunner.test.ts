@@ -75,6 +75,7 @@ const attach = (input: {
       },
     };
     const commands = yield* Queue.unbounded<ClaudeBridgeCommandBody>();
+    const recordChanges: Array<ClaudeBridgeRegistry.ClaudeBridgeRecordChange> = [];
     const subscribed = yield* Deferred.make<ClaudeBridgeRegistry.ClaudeBridgeEventHandler>();
     const registry = ClaudeBridgeRegistry.ClaudeBridgeRegistry.of({
       bridgeDir: root,
@@ -95,7 +96,10 @@ const attach = (input: {
       subscribe: (_sid, handler) => Deferred.succeed(subscribed, handler).pipe(Effect.asVoid),
       onUnattachedEvent: () => Effect.void,
       onRecordChange: () => Effect.void,
-      noteRecordChange: () => Effect.void,
+      noteRecordChange: (_process, change) =>
+        Effect.sync(() => {
+          recordChanges.push(change);
+        }),
       readClientSelection: () => Effect.succeed(null),
       writeClientSelection: () => Effect.void,
       peekMissedTurn: () => Effect.sync(() => missedTurn),
@@ -148,7 +152,7 @@ const attach = (input: {
     });
     yield* Effect.addFinalizer(() => session.close.pipe(Effect.orDie));
     const handler = yield* Deferred.await(subscribed);
-    return { session, handler, commands, process, bridgeCalls, counts, now };
+    return { session, handler, commands, process, bridgeCalls, counts, now, recordChanges };
   });
 
 describe("ClaudeBridgeQueryRunner permissions", () => {
@@ -700,10 +704,14 @@ describe("ClaudeBridgeQueryRunner messages the terminal drew", () => {
         row(TEXT_ROW, [{ type: "text", text: "About to list the files." }]) + toolUse,
         { flag: "a" },
       );
+      // The record's row is the reply: it is shown under its own id, which is
+      // what a restarted T3 would read again, and the drawn copy is left to
+      // the repair the runner asks for.
       const next = Array.from(
-        yield* bridge.session.messages.pipe(Stream.take(1), Stream.runCollect),
+        yield* bridge.session.messages.pipe(Stream.take(2), Stream.runCollect),
       );
-      assert.deepStrictEqual(shape(next), [`${TOOL_ROW}:tool_use`]);
+      assert.deepStrictEqual(shape(next), [`${TEXT_ROW}:text`, `${TOOL_ROW}:tool_use`]);
+      assert.include(bridge.recordChanges, "reply-recorded");
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 });

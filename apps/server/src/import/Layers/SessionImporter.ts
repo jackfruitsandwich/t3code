@@ -115,10 +115,17 @@ const CLAUDE_DRIVER = ProviderDriverKind.make("claudeAgent");
 /** A turn's first row is written a moment either side of the instant the turn is reported. */
 const IN_FLIGHT_MARGIN_MS = 2_000;
 /**
- * How many rows after a drawn reply its record copy can sit: the thinking row
- * the record puts before the text, and little else.
+ * How many rows from a drawn reply its record copy normally sits: the
+ * thinking row the record puts before the text, and little else. A copy
+ * farther away was read in again later and is put back beside it.
  */
 const DOUBLED_REPLY_REACH = 4;
+/**
+ * How far apart a reply's drawing in the terminal and its row's writing in
+ * the record can be and still be one reply: the record runs seconds behind,
+ * never minutes.
+ */
+const DOUBLED_REPLY_WINDOW_MS = 5 * 60_000;
 const ACTIVE_RUN_STATUSES: ReadonlySet<string> = new Set([
   "preparing",
   "starting",
@@ -998,11 +1005,13 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
     );
 
     /**
-     * Builds before 0.0.65 showed a reply twice when the session's record was
-     * seconds behind its terminal: once from what the terminal drew, under
-     * that message's own id, and again when the record's row arrived. T3
-     * cannot take a row out of a thread, so the earlier copy is emptied (a
-     * reply with nothing in it draws nothing) and the record's row stays.
+     * A reply can reach a thread twice: once from what the terminal drew,
+     * under that message's own id, and once as the record's row for it (the
+     * record can be seconds behind, and a restarted T3 reads a running turn
+     * again from its start). The record's row is the reply. T3 cannot take a
+     * row out of a thread, so the drawn copy is emptied (a reply with nothing
+     * in it draws nothing), and where the record's row landed far from it
+     * (re-read into a later run) that row takes the drawn copy's place.
      */
     const blankDoubledReplies = Effect.fn("SessionImporter.blankDoubledReplies")(function* (input: {
       readonly threadId: ThreadId;
@@ -1011,22 +1020,31 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
       const { threadId } = input;
       const replies = yield* sql<{
         readonly turn_item_id: string;
-        readonly run_id: string | null;
         readonly ordinal: number;
         readonly text: string | null;
+        readonly started_at: string;
       }>`
-        SELECT turn_item_id, run_id, ordinal, json_extract(payload_json, '$.text') AS text
+        SELECT
+          turn_item_id,
+          ordinal,
+          json_extract(payload_json, '$.text') AS text,
+          coalesce(json_extract(payload_json, '$.startedAt'), updated_at) AS started_at
         FROM orchestration_v2_projection_turn_items
         WHERE thread_id = ${threadId}
           AND type = 'assistant_message'
         ORDER BY ordinal
       `;
       if (replies.length < 2) return;
-      const recordIds = new Set(
-        input.rows.flatMap((row) => (row.role === "assistant" ? [row.sourceId] : [])),
+      const normalize = (text: string | null) => (text ?? "").replace(/\s+/gu, " ").trim();
+      const writtenAtById = new Map(
+        input.rows.flatMap((row) =>
+          row.role === "assistant"
+            ? [[row.sourceId, DateTime.toEpochMillis(dateTime(row.timestamp))] as const]
+            : [],
+        ),
       );
       // T3's own copy of a record row carries the row's id after the last colon.
-      const isRecordRow = (id: string) => {
+      const recordRowOf = (id: string) => {
         let plain = id;
         for (let pass = 0; pass < 3 && plain.includes("%"); pass += 1) {
           try {
@@ -1035,42 +1053,77 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
             break;
           }
         }
-        return recordIds.has(plain.slice(plain.lastIndexOf(":") + 1));
+        const rowId = plain.slice(plain.lastIndexOf(":") + 1);
+        return writtenAtById.has(rowId) ? rowId : null;
       };
-      const normalize = (text: string | null) => (text ?? "").replace(/\s+/gu, " ").trim();
-      const doubled = new Set<string>();
-      replies.forEach((reply, index) => {
+      // Each drawn copy pairs with the record's row of the same text written
+      // closest to when it was drawn; each row stands for one copy.
+      const pairs: Array<{ drawn: number; recorded: number; apartMs: number }> = [];
+      replies.forEach((reply, drawn) => {
         const text = normalize(reply.text);
-        if (text.length === 0 || isRecordRow(reply.turn_item_id)) return;
-        const twin = replies
-          .slice(index + 1)
-          .find(
-            (later) =>
-              later.run_id === reply.run_id &&
-              later.ordinal - reply.ordinal <= DOUBLED_REPLY_REACH &&
-              isRecordRow(later.turn_item_id) &&
-              normalize(later.text) === text,
-          );
-        if (twin !== undefined) doubled.add(reply.turn_item_id);
+        if (text.length === 0 || recordRowOf(reply.turn_item_id) !== null) return;
+        const drawnAtMs = DateTime.toEpochMillis(dateTime(reply.started_at));
+        replies.forEach((other, recorded) => {
+          const rowId = recordRowOf(other.turn_item_id);
+          if (rowId === null || normalize(other.text) !== text) return;
+          const apartMs = Math.abs((writtenAtById.get(rowId) ?? 0) - drawnAtMs);
+          if (apartMs <= DOUBLED_REPLY_WINDOW_MS) pairs.push({ drawn, recorded, apartMs });
+        });
       });
-      if (doubled.size === 0) return;
+      if (pairs.length === 0) return;
+      const emptied = new Set<string>();
+      const placeOf = new Map<string, number>();
+      const taken = new Set<number>();
+      let movedCount = 0;
+      for (const pair of pairs.toSorted((left, right) => left.apartMs - right.apartMs)) {
+        const drawn = replies[pair.drawn]!;
+        const recorded = replies[pair.recorded]!;
+        if (emptied.has(drawn.turn_item_id) || taken.has(pair.recorded)) continue;
+        taken.add(pair.recorded);
+        emptied.add(drawn.turn_item_id);
+        if (Math.abs(recorded.ordinal - drawn.ordinal) <= DOUBLED_REPLY_REACH) continue;
+        // A row's place is kept apart from the row and is its own for
+        // good: the two trade places, by way of one nobody holds.
+        const place = (turnItemId: string, ordinal: number) => sql`
+            UPDATE orchestration_v2_turn_item_positions
+            SET ordinal = ${ordinal}
+            WHERE thread_id = ${threadId} AND turn_item_id = ${turnItemId}
+          `;
+        yield* place(drawn.turn_item_id, -drawn.ordinal);
+        yield* place(recorded.turn_item_id, drawn.ordinal);
+        yield* place(drawn.turn_item_id, recorded.ordinal);
+        placeOf.set(recorded.turn_item_id, drawn.ordinal);
+        placeOf.set(drawn.turn_item_id, recorded.ordinal);
+        movedCount += 1;
+      }
       const records = yield* threads.getThreadRecords(threadId, ["turnItems"]);
       const events: Array<OrchestrationV2DomainEvent> = [];
       for (const item of records.turnItems) {
-        if (item.type !== "assistant_message" || !doubled.has(item.id)) continue;
+        if (item.type !== "assistant_message") continue;
+        const place = placeOf.get(item.id);
+        if (!emptied.has(item.id) && place === undefined) continue;
         events.push({
-          id: importEventId(threadId, `doubled-reply-blanked:${item.id}`),
+          // A row can be given a place more than once: each is its own event.
+          id: importEventId(
+            threadId,
+            `doubled-reply:${emptied.has(item.id) ? "emptied" : "kept"}:${place ?? "in-place"}:${item.id}`,
+          ),
           type: "turn-item.updated",
           threadId,
           occurredAt: item.updatedAt,
-          payload: { ...item, text: "" },
+          payload: {
+            ...item,
+            ...(emptied.has(item.id) ? { text: "" } : {}),
+            ...(place === undefined ? {} : { ordinal: place }),
+          },
         });
       }
       if (events.length === 0) return;
       yield* eventSink.write({ events });
       yield* Effect.logInfo("session.importer.doubled-replies-blanked", {
         threadId,
-        count: events.length,
+        emptied: emptied.size,
+        moved: movedCount,
       });
     });
 

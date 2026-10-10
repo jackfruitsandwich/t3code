@@ -72,14 +72,6 @@ const DRAWN_MESSAGE_WAIT_MS = 2_500;
 const RECORDED_TEXT_MEMORY_MS = 60_000;
 const normalizeDrawn = (text: string) => text.replace(/\s+/gu, " ").trim();
 /** The text blocks of a reply row of the record. */
-/** An assistant row without its text blocks, or null when text is all it holds. */
-const withoutTextBlocks = (row: Record<string, unknown>): Record<string, unknown> | null => {
-  const message = isRecord(row.message) ? row.message : null;
-  const content = message !== null && Array.isArray(message.content) ? message.content : [];
-  const rest = content.filter((block) => !(isRecord(block) && block.type === "text"));
-  return rest.length === 0 ? null : { ...row, message: { ...message, content: rest } };
-};
-
 const assistantRowText = (row: Record<string, unknown>): string => {
   const content = isRecord(row.message) ? row.message.content : null;
   if (typeof content === "string") return content;
@@ -581,7 +573,8 @@ export const layer: Layer.Layer<
           for (;;) {
             const newline = bytes.indexOf(0x0a, lineStart);
             if (newline === -1) break;
-            let row = parseJsonlLine(decoder.decode(bytes.subarray(lineStart, newline)));
+            const row = parseJsonlLine(decoder.decode(bytes.subarray(lineStart, newline)));
+            let replyRecorded = false;
             state.byteOffset += newline + 1 - lineStart;
             lineStart = newline + 1;
             state.lastRowAt = yield* Clock.currentTimeMillis;
@@ -621,15 +614,15 @@ export const layer: Layer.Layer<
             if (isRecord(row) && row.type === "assistant" && row.isSidechain !== true) {
               const recorded = normalizeDrawn(assistantRowText(row));
               if (recorded.length > 0) {
-                // The record can be seconds behind the terminal. A message
-                // already shown from what the terminal drew is this row's
-                // text: it is not shown a second time.
+                // The record can be seconds behind the terminal, and this
+                // row's text is already showing from what the terminal drew.
+                // The record's row is the reply and takes its place under
+                // its own id (what a restarted T3 would read again); the
+                // drawn copy is emptied by the repair this asks for.
                 const shown = state.shownDrawn.findIndex((drawn) => drawn.text === recorded);
                 if (shown !== -1) {
                   state.shownDrawn.splice(shown, 1);
-                  const rest = withoutTextBlocks(row);
-                  if (rest === null) continue;
-                  row = rest;
+                  replyRecorded = true;
                 }
                 state.recordedTexts.push({ text: recorded, at: state.lastRowAt });
                 if (state.recordedTexts.length > 24) state.recordedTexts.shift();
@@ -647,6 +640,10 @@ export const layer: Layer.Layer<
               } else {
                 yield* emit([frame]);
               }
+            }
+            if (replyRecorded) {
+              replyRecorded = false;
+              yield* registry.noteRecordChange(bridgeProcess, "reply-recorded");
             }
             if (isClaudeTurnEndRow(row)) {
               state.turnEndsRead += 1;

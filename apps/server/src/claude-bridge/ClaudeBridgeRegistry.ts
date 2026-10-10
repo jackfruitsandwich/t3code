@@ -98,7 +98,12 @@ export interface ClaudeBridgeToolEndpoint {
   readonly authorization: string;
 }
 
-export type ClaudeBridgeRecordChange = "turn.start" | "turn.complete" | "typed-mid-turn";
+export type ClaudeBridgeRecordChange =
+  | "turn.start"
+  | "turn.complete"
+  | "typed-mid-turn"
+  /** The record's row arrived for a reply already shown from what the terminal drew. */
+  | "reply-recorded";
 
 export type ClaudeBridgeRecordHandler = (
   process: ClaudeBridgeProcess,

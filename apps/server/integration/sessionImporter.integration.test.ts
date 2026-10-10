@@ -1611,57 +1611,148 @@ runtimeTest("a stock message T3 once showed as the person's own becomes a notice
   }),
 );
 
-runtimeTest("a reply an earlier build showed twice is left showing once", (h) =>
+runtimeTest("a reply shown from the terminal and again from the record is left showing once", (h) =>
   Effect.gen(function* () {
     const claudeId = "aaaaaaaa-1111-4111-8111-1111111111f2";
     const c = claudeSession({ sessionId: claudeId, cwd: h.workspace });
     const claudePath = h.claudeFile(claudeId);
     const threadId = importedThreadId(claudeId);
-    yield* h.write(claudePath, [
+    const history = [
       c.user("user-1", "Fix the login bug please", "2026-07-01T10:00:00.000Z"),
       c.assistant("assistant-1", "I fixed the login bug.", "2026-07-01T10:00:05.000Z"),
+    ];
+    yield* h.write(claudePath, history);
+    const bridgeDir = yield* h.makeDir("bridge");
+    const importer = yield* h.importer({ bridgeDir });
+    yield* importer.sweepNow();
+    // The session goes on from here with T3 attached: these rows reach the
+    // thread through the attachment, not through the import.
+    yield* h.write(claudePath, [
+      ...history,
       c.user("user-2", "And the logout bug", "2026-07-01T10:01:00.000Z"),
       c.assistant("assistant-2", "Looking at logout now.", "2026-07-01T10:01:05.000Z"),
       c.assistant("assistant-3", "Done.", "2026-07-01T10:01:30.000Z"),
       c.assistant("assistant-4", "Done.", "2026-07-01T10:01:40.000Z"),
+      c.assistant("assistant-5", "Checking the tests.", "2026-07-01T10:02:00.000Z"),
+      c.assistant("assistant-6", "All green.", "2026-07-01T10:30:00.000Z"),
     ]);
-    const bridgeDir = yield* h.makeDir("bridge");
-    const importer = yield* h.importer({ bridgeDir });
-    yield* importer.sweepNow();
     yield* seedT3Run(h, threadId, CLAUDE, "completed", {
       ordinal: 1,
       iso: "2026-07-01T10:01:00.000Z",
     });
-    const runId = RunId.make(`seed-run:${threadId}`);
-    const at = DateTime.makeUnsafe("2026-07-01T10:01:05.000Z");
-    // The live attachment's rows for the second turn: the reply as the
-    // terminal drew it, then the record's row for the same reply, then two
-    // replies that say the same thing and are both the record's own.
-    const live = (key: string, nativeId: string, text: string, ordinal: number) => {
+    yield* seedT3Run(h, threadId, CLAUDE, "running", {
+      ordinal: 2,
+      iso: "2026-07-01T10:03:00.000Z",
+    });
+    const firstRun = RunId.make(`seed-run:${threadId}`);
+    const laterRun = RunId.make(`seed-run:${threadId}:2`);
+    // What the live attachment left: `drawn` rows carry the terminal's own
+    // message ids, the others the record's row ids.
+    const live = (input: {
+      readonly key: string;
+      readonly nativeId: string;
+      readonly text: string;
+      readonly ordinal: number;
+      readonly iso: string;
+      readonly runId: RunId;
+    }) => {
       const seed = seedTimelineRow({
         threadId,
-        key,
-        messageId: MessageId.make(`seed-${key}:${threadId}`),
+        key: input.key,
+        // As the live attachment names a reply: by the id of what it came from.
+        messageId: MessageId.make(`message:provider:claudeAgent:native-item:${input.nativeId}`),
         role: "assistant",
-        text,
-        at,
-        runId,
+        text: input.text,
+        at: DateTime.makeUnsafe(input.iso),
+        runId: input.runId,
       });
       return {
         ...seed,
         payload: {
           ...seed.payload,
-          id: TurnItemId.make(`turn-item:provider:claudeAgent:native-item:${nativeId}`),
-          ordinal,
+          id: TurnItemId.make(`turn-item:provider:claudeAgent:native-item:${input.nativeId}`),
+          ordinal: input.ordinal,
         },
       };
     };
+    const rowA = {
+      key: "row-a",
+      nativeId: "assistant-2",
+      text: "Looking at  logout now.",
+      ordinal: 0,
+      iso: "2026-07-01T10:01:07.000Z",
+    };
     yield* h.eventSink.write({
       events: [
-        live("drawn", "drawn-message-1", "Looking at logout now.", 1_000_001),
-        live("recorded", "assistant-2", "Looking at  logout now.", 1_000_003),
-        live("done-1", "assistant-3", "Done.", 1_000_004),
-        live("done-2", "assistant-4", "Done.", 1_000_005),
+        // Drawn, then its row right after it. A restart since has read the
+        // row again and tagged it with the later run: its place is the same,
+        // its run no longer is.
+        live({
+          key: "drawn-a",
+          nativeId: "drawn-message-a",
+          text: "Looking at logout now.",
+          ordinal: 0,
+          iso: "2026-07-01T10:01:07.000Z",
+          runId: firstRun,
+        }),
+        live({ ...rowA, runId: firstRun }),
+        {
+          ...live({ ...rowA, runId: laterRun }),
+          id: EventId.make(`seed:${threadId}:item:row-a:read-again`),
+        },
+        // Two replies that say the same thing, both the record's own.
+        live({
+          key: "done-1",
+          nativeId: "assistant-3",
+          text: "Done.",
+          ordinal: 0,
+          iso: "2026-07-01T10:01:30.000Z",
+          runId: firstRun,
+        }),
+        live({
+          key: "done-2",
+          nativeId: "assistant-4",
+          text: "Done.",
+          ordinal: 0,
+          iso: "2026-07-01T10:01:40.000Z",
+          runId: firstRun,
+        }),
+        // Drawn in the first run; its row was first read after a restart and
+        // landed at the top of the later run.
+        live({
+          key: "drawn-b",
+          nativeId: "drawn-message-b",
+          text: "Checking the tests.",
+          ordinal: 0,
+          iso: "2026-07-01T10:02:02.000Z",
+          runId: firstRun,
+        }),
+        // The same words drawn half an hour before a row of the record: two
+        // replies, not one.
+        live({
+          key: "drawn-c",
+          nativeId: "drawn-message-c",
+          text: "All green.",
+          ordinal: 0,
+          iso: "2026-07-01T10:02:10.000Z",
+          runId: firstRun,
+        }),
+        live({
+          key: "row-b",
+          nativeId: "assistant-5",
+          text: "Checking the tests.",
+          ordinal: 0,
+          iso: "2026-07-01T10:03:01.000Z",
+          runId: laterRun,
+        }),
+        live({
+          key: "row-c",
+          nativeId: "assistant-6",
+          text: "All green.",
+          ordinal: 0,
+          iso: "2026-07-01T10:30:00.000Z",
+          runId: laterRun,
+        }),
       ],
     });
     const instanceDir = yield* h.makeDir("bridge", "claude", claudeId, "inst-1");
@@ -1676,20 +1767,45 @@ runtimeTest("a reply an earlier build showed twice is left showing once", (h) =>
     const shown = h.threads.getThreadRecords(threadId, ["turnItems"]).pipe(
       Effect.map((records) =>
         records.turnItems
-          .filter((item) => item.type === "assistant_message" && item.runId === runId)
-          .toSorted((left, right) => left.ordinal - right.ordinal)
-          .map((item) => (item.type === "assistant_message" ? item.text : "")),
+          .flatMap((item) =>
+            item.type === "assistant_message" && item.id.includes(":native-item:")
+              ? [
+                  {
+                    id: item.id.slice(item.id.lastIndexOf(":") + 1),
+                    at: item.ordinal,
+                    text: item.text,
+                  },
+                ]
+              : [],
+          )
+          .toSorted((left, right) => left.at - right.at || left.id.localeCompare(right.id))
+          .filter((item) => item.text.length > 0)
+          .map((item) => `${item.at} ${item.id}: ${item.text}`),
       ),
     );
-    assert.deepEqual(yield* shown, [
-      "Looking at logout now.",
-      "Looking at  logout now.",
-      "Done.",
-      "Done.",
-    ]);
 
     yield* importer.healLiveClaudeSession({ sessionId: claudeId, transcriptPath: claudePath });
-    assert.deepEqual(yield* shown, ["", "Looking at  logout now.", "Done.", "Done."]);
+    // Places are the thread's own: five rows in the first run's band in the
+    // order they arrived (the drawn copy of the first reply holds the first),
+    // then the later run's.
+    assert.deepEqual(yield* shown, [
+      "1000002 assistant-2: Looking at  logout now.",
+      "1000003 assistant-3: Done.",
+      "1000004 assistant-4: Done.",
+      "1000005 assistant-5: Checking the tests.",
+      "1000006 drawn-message-c: All green.",
+      "2000002 assistant-6: All green.",
+    ]);
+    // Each reply the record holds is in the thread once, whatever its row is called.
+    const replies = (yield* h.threads.getThreadRecords(threadId, ["turnItems"])).turnItems.flatMap(
+      (item) => (item.type === "assistant_message" && item.text.length > 0 ? [item.text] : []),
+    );
+    assert.strictEqual(replies.filter((text) => text.includes("logout now")).length, 1);
+    assert.strictEqual(replies.filter((text) => text === "Checking the tests.").length, 1);
+    assert.strictEqual(replies.filter((text) => text === "Done.").length, 2);
+    // A second pass changes nothing.
+    yield* importer.healLiveClaudeSession({ sessionId: claudeId, transcriptPath: claudePath });
+    assert.strictEqual((yield* shown).length, 6);
   }),
 );
 
