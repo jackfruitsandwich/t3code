@@ -64,6 +64,24 @@ import * as ClaudeAdapterV2 from "./ClaudeAdapterV2.ts";
 
 export const CLAUDE_TRANSPORT_ENV = "T3CODE_CLAUDE_TRANSPORT";
 const TAIL_INTERVAL_MS = 300;
+/** How long a message the terminal drew waits for the record's row before it is shown without one. */
+const DRAWN_MESSAGE_WAIT_MS = 2_500;
+/** How long a reply row's text is remembered, for a drawn copy that arrives after it. */
+const RECORDED_TEXT_MEMORY_MS = 60_000;
+const normalizeDrawn = (text: string) => text.replace(/\s+/gu, " ").trim();
+/** The text blocks of a reply row of the record. */
+const assistantRowText = (row: Record<string, unknown>): string => {
+  const content = isRecord(row.message) ? row.message.content : null;
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .flatMap((block) =>
+      isRecord(block) && block.type === "text" && typeof block.text === "string"
+        ? [block.text]
+        : [],
+    )
+    .join("");
+};
 /**
  * How far ahead another instance's heartbeat must be before the attachment
  * moves to it: more than two of the mod's own beats, so two processes holding
@@ -320,6 +338,14 @@ export const layer: Layer.Layer<
         upkeepOutputDue: false,
         /** The model and mode this attachment was last asked for. */
         selection: null as { readonly model: string; readonly permissionMode: string } | null,
+        /** Messages the terminal drew that no row of the record has shown yet. */
+        drawnMessages: [] as Array<{
+          readonly messageId: string;
+          readonly text: string;
+          readonly at: number;
+        }>,
+        /** Texts of the record's recent replies, to tell a drawn message it already holds. */
+        recordedTexts: [] as Array<{ readonly text: string; readonly at: number }>,
         /** A slash command T3 ran that started no turn, waiting for its output rows. */
         pendingLocal: null as {
           readonly commandId: string;
@@ -498,6 +524,29 @@ export const layer: Layer.Layer<
       );
 
       /**
+       * Shows the messages the terminal drew at least `olderThanMs` ago and
+       * the record has not shown: as a reply row would be, in the open turn.
+       */
+      const showDrawnMessages = (olderThanMs: number) =>
+        Effect.gen(function* () {
+          if (state.drawnMessages.length === 0) return;
+          const now = yield* Clock.currentTimeMillis;
+          const due = state.drawnMessages.filter((drawn) => now - drawn.at >= olderThanMs);
+          if (due.length === 0) return;
+          state.drawnMessages = state.drawnMessages.filter((drawn) => !due.includes(drawn));
+          if (!translator.hasOpenTurn()) return;
+          for (const drawn of due) {
+            yield* emit(
+              translator.onTranscriptRow({
+                type: "assistant",
+                uuid: drawn.messageId,
+                message: { role: "assistant", content: [{ type: "text", text: drawn.text }] },
+              }),
+            );
+          }
+        });
+
+      /**
        * Translates the record's new rows. With `untilTurnEnd` it stops after
        * the row that closes a turn, leaving the next turn's rows unread.
        */
@@ -547,6 +596,20 @@ export const layer: Layer.Layer<
               continue;
             }
             if (commandText !== null) state.lastCommandText = commandText;
+            // A reply row settles what the terminal drew before it: the same
+            // text is the record's own copy, anything else was written first.
+            if (isRecord(row) && row.type === "assistant" && row.isSidechain !== true) {
+              const recorded = normalizeDrawn(assistantRowText(row));
+              if (recorded.length > 0) {
+                state.recordedTexts.push({ text: recorded, at: state.lastRowAt });
+                if (state.recordedTexts.length > 24) state.recordedTexts.shift();
+                state.drawnMessages = state.drawnMessages.filter(
+                  (drawn) => normalizeDrawn(drawn.text) !== recorded,
+                );
+              } else {
+                yield* showDrawnMessages(0);
+              }
+            }
             for (const frame of translator.onTranscriptRow(row)) {
               if (isClaudeBridgeCommandOutputFrame(frame) && !translator.hasOpenTurn()) {
                 state.heldOutput.push(frame);
@@ -716,6 +779,8 @@ export const layer: Layer.Layer<
               Effect.logWarning("claude-bridge.transcript-read-failed", { sid, cause }),
             ),
           );
+          // A drawn message no reply row followed (a long tool run comes next).
+          yield* showDrawnMessages(DRAWN_MESSAGE_WAIT_MS);
           yield* settlePendingComplete;
           yield* settleLocalCommands;
           yield* Effect.sleep(`${TAIL_INTERVAL_MS} millis`);
@@ -979,6 +1044,18 @@ export const layer: Layer.Layer<
             }
             case "approval.resolved": {
               if (event.by !== "t3") yield* settleElsewhere(event.toolUseId);
+              return;
+            }
+            case "message.display": {
+              const drawn = normalizeDrawn(event.text);
+              const now = yield* Clock.currentTimeMillis;
+              // The record's row for it can be read before this arrives.
+              const recorded = state.recordedTexts.some(
+                (row) => row.text === drawn && now - row.at < RECORDED_TEXT_MEMORY_MS,
+              );
+              if (drawn.length > 0 && !recorded) {
+                state.drawnMessages.push({ messageId: event.messageId, text: event.text, at: now });
+              }
               return;
             }
             case "config.result": {

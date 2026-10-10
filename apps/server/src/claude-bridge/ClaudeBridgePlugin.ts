@@ -114,6 +114,7 @@ let ended = null
 let timersStarted = false
 let permissionMode = null
 let toolsDeclared = false
+const drawing = new Map()
 let mcpSession = null
 let mcpRequestId = 0
 let effort = null
@@ -720,6 +721,24 @@ export function register(on) {
 
   on('classic.Stop', async ($, e, next) => {
     noteClassic($, e)
+    return next(e)
+  })
+
+  // Each message as the terminal draws it, whole once it is finished. The
+  // session's record does not keep every one, and T3 shows what it lacks.
+  on('classic.MessageDisplay', async ($, e, next) => {
+    try {
+      if (e && typeof e.message_id === 'string' && !e.agent_id) {
+        const drawn = (drawing.get(e.message_id) || '') + (typeof e.delta === 'string' ? e.delta : '')
+        if (e.final === true) {
+          drawing.delete(e.message_id)
+          if (drawn.trim()) await emit($, 'message.display', { turnId: e.turn_id, messageId: e.message_id, text: drawn })
+        } else {
+          drawing.set(e.message_id, drawn)
+          if (drawing.size > 32) drawing.delete(drawing.keys().next().value)
+        }
+      }
+    } catch {}
     return next(e)
   })
 

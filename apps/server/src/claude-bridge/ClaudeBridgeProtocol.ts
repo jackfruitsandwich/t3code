@@ -30,7 +30,7 @@ import type {
 import { isRecord, parseJsonlLine } from "../import/sessionImportTypes.ts";
 
 export const CLAUDE_BRIDGE_PROTOCOL_VERSION = 2;
-export const CLAUDE_BRIDGE_MOD_VERSION = "0.3.2";
+export const CLAUDE_BRIDGE_MOD_VERSION = "0.3.3";
 /**
  * The first protocol whose mod runs slash commands, answers questions with
  * their answers and reports the session's own commands. A process still on an
@@ -271,6 +271,18 @@ export type ClaudeBridgeEvent = { readonly seq: number; readonly at: number } & 
     }
   | { readonly type: "ended"; readonly reason: string; readonly sessionId: string }
   | { readonly type: "error"; readonly message: string; readonly commandId?: string }
+  /**
+   * A message Claude finished writing, as the terminal drew it. The record
+   * does not keep every one (text written before a tool call in a turn that
+   * also thinks is shown and not stored), so the thread takes it from here
+   * when the record has none.
+   */
+  | {
+      readonly type: "message.display";
+      readonly turnId: string;
+      readonly messageId: string;
+      readonly text: string;
+    }
 );
 
 const readNumber = (value: unknown): number | undefined =>
@@ -464,6 +476,15 @@ export function parseClaudeBridgeEvent(value: unknown): ClaudeBridgeEvent | null
         key: readOptionalString(value.key) ?? "",
         ok: value.ok === true,
         text: readOptionalString(value.text) ?? "",
+      };
+    case "message.display":
+      if (typeof value.messageId !== "string" || typeof value.text !== "string") return null;
+      return {
+        ...base,
+        type: "message.display",
+        turnId: readOptionalString(value.turnId) ?? "",
+        messageId: value.messageId,
+        text: value.text,
       };
     case "ended":
       return {

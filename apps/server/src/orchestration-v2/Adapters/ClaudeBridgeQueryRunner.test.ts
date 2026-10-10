@@ -1,4 +1,4 @@
-import type { PermissionResult, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+import type { PermissionResult, SDKMessage, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import { ProviderSessionId, ThreadId } from "@t3tools/contracts";
@@ -429,6 +429,124 @@ describe("ClaudeBridgeQueryRunner turns that follow at once", () => {
         result?.type === "result" && result.subtype === "success" ? result.result : null,
         "first done",
       );
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+});
+
+describe("ClaudeBridgeQueryRunner messages the terminal drew", () => {
+  // Claude Code shows text written before a tool call and, in a turn that
+  // also thinks, does not keep it in the record. The mod reports each message
+  // as drawn; the thread takes it from there when the record has none.
+  const row = (uuid: string, content: ReadonlyArray<Record<string, unknown>>) =>
+    `${JSON.stringify({
+      type: "assistant",
+      uuid,
+      parentUuid: null,
+      isSidechain: false,
+      timestamp: "2026-07-01T10:00:01.000Z",
+      message: {
+        id: "msg_1",
+        type: "message",
+        role: "assistant",
+        model: "claude-sonnet-4-6",
+        content,
+        stop_reason: "tool_use",
+        usage: { input_tokens: 1, output_tokens: 1 },
+      },
+    })}\n`;
+  const TEXT_ROW = "00000000-0000-4000-8000-0000000000b1";
+  const TOOL_ROW = "00000000-0000-4000-8000-0000000000b2";
+  const DRAWN = "44444444-4444-4444-8444-444444444444";
+  const toolUse = row(TOOL_ROW, [
+    { type: "tool_use", id: "toolu_1", name: "Bash", input: { command: "ls" } },
+  ]);
+  const start = (bridge: { readonly now: number }) => ({
+    seq: 1,
+    at: bridge.now,
+    type: "turn.start" as const,
+    turnId: "turn-a",
+    text: "go",
+    transcriptOffset: 0,
+  });
+  const drawn = (bridge: { readonly now: number }, text: string) => ({
+    seq: 2,
+    at: bridge.now,
+    type: "message.display" as const,
+    turnId: "turn-a",
+    messageId: DRAWN,
+    text,
+  });
+  const shape = (frames: ReadonlyArray<SDKMessage>) =>
+    frames.map((frame) =>
+      frame.type === "assistant"
+        ? `${frame.uuid}:${frame.message.content.map((block) => block.type).join("+")}`
+        : frame.type,
+    );
+
+  it.live("shows one the record does not hold, before the tool call it was written before", () =>
+    Effect.gen(function* () {
+      const bridge = yield* attach({ protocol: 2, bridgeCanUseTool: () => null, transcript: "" });
+      const fs = yield* FileSystem.FileSystem;
+      yield* bridge.handler(start(bridge), bridge.process);
+      yield* bridge.handler(drawn(bridge, "About to list the files."), bridge.process);
+      yield* fs.writeFileString(bridge.process.session.transcriptPath, toolUse, { flag: "a" });
+      const frames = Array.from(
+        yield* bridge.session.messages.pipe(Stream.take(4), Stream.runCollect),
+      );
+      assert.deepStrictEqual(shape(frames), [
+        "user",
+        "system",
+        `${DRAWN}:text`,
+        `${TOOL_ROW}:tool_use`,
+      ]);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.live("leaves one the record holds to the record, whichever arrives first", () =>
+    Effect.gen(function* () {
+      const bridge = yield* attach({ protocol: 2, bridgeCanUseTool: () => null, transcript: "" });
+      const fs = yield* FileSystem.FileSystem;
+      const file = bridge.process.session.transcriptPath;
+      yield* bridge.handler(start(bridge), bridge.process);
+      // Drawn first, then its row.
+      yield* bridge.handler(drawn(bridge, "About to list the files."), bridge.process);
+      yield* fs.writeFileString(
+        file,
+        row(TEXT_ROW, [{ type: "text", text: "About to list the files." }]) + toolUse,
+        { flag: "a" },
+      );
+      const frames = Array.from(
+        yield* bridge.session.messages.pipe(Stream.take(4), Stream.runCollect),
+      );
+      assert.deepStrictEqual(shape(frames), [
+        "user",
+        "system",
+        `${TEXT_ROW}:text`,
+        `${TOOL_ROW}:tool_use`,
+      ]);
+      // Its row first, then drawn: nothing more before the turn ends.
+      yield* bridge.handler(
+        { ...drawn(bridge, "About to list the files."), seq: 3 },
+        bridge.process,
+      );
+      yield* bridge.handler(
+        {
+          seq: 4,
+          at: bridge.now,
+          type: "turn.complete",
+          turnId: "turn-a",
+          reason: "answer",
+          answer: "",
+          isAborted: false,
+          durationMs: 10,
+          transcriptOffset: 0,
+        },
+        bridge.process,
+      );
+      const next = Array.from(
+        yield* bridge.session.messages.pipe(Stream.take(1), Stream.runCollect),
+      );
+      assert.deepStrictEqual(shape(next), ["result"]);
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 });
