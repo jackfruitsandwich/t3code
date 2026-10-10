@@ -114,6 +114,11 @@ const CLAUDE_DRIVER = ProviderDriverKind.make("claudeAgent");
 /** Run statuses under which T3 is writing the thread's rows itself. */
 /** A turn's first row is written a moment either side of the instant the turn is reported. */
 const IN_FLIGHT_MARGIN_MS = 2_000;
+/**
+ * How many rows after a drawn reply its record copy can sit: the thinking row
+ * the record puts before the text, and little else.
+ */
+const DOUBLED_REPLY_REACH = 4;
 const ACTIVE_RUN_STATUSES: ReadonlySet<string> = new Set([
   "preparing",
   "starting",
@@ -993,6 +998,83 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
     );
 
     /**
+     * Builds before 0.0.65 showed a reply twice when the session's record was
+     * seconds behind its terminal: once from what the terminal drew, under
+     * that message's own id, and again when the record's row arrived. T3
+     * cannot take a row out of a thread, so the earlier copy is emptied (a
+     * reply with nothing in it draws nothing) and the record's row stays.
+     */
+    const blankDoubledReplies = Effect.fn("SessionImporter.blankDoubledReplies")(function* (input: {
+      readonly threadId: ThreadId;
+      readonly rows: ReadonlyArray<ParsedSessionMessage>;
+    }) {
+      const { threadId } = input;
+      const replies = yield* sql<{
+        readonly turn_item_id: string;
+        readonly run_id: string | null;
+        readonly ordinal: number;
+        readonly text: string | null;
+      }>`
+        SELECT turn_item_id, run_id, ordinal, json_extract(payload_json, '$.text') AS text
+        FROM orchestration_v2_projection_turn_items
+        WHERE thread_id = ${threadId}
+          AND type = 'assistant_message'
+        ORDER BY ordinal
+      `;
+      if (replies.length < 2) return;
+      const recordIds = new Set(
+        input.rows.flatMap((row) => (row.role === "assistant" ? [row.sourceId] : [])),
+      );
+      // T3's own copy of a record row carries the row's id after the last colon.
+      const isRecordRow = (id: string) => {
+        let plain = id;
+        for (let pass = 0; pass < 3 && plain.includes("%"); pass += 1) {
+          try {
+            plain = decodeURIComponent(plain);
+          } catch {
+            break;
+          }
+        }
+        return recordIds.has(plain.slice(plain.lastIndexOf(":") + 1));
+      };
+      const normalize = (text: string | null) => (text ?? "").replace(/\s+/gu, " ").trim();
+      const doubled = new Set<string>();
+      replies.forEach((reply, index) => {
+        const text = normalize(reply.text);
+        if (text.length === 0 || isRecordRow(reply.turn_item_id)) return;
+        const twin = replies
+          .slice(index + 1)
+          .find(
+            (later) =>
+              later.run_id === reply.run_id &&
+              later.ordinal - reply.ordinal <= DOUBLED_REPLY_REACH &&
+              isRecordRow(later.turn_item_id) &&
+              normalize(later.text) === text,
+          );
+        if (twin !== undefined) doubled.add(reply.turn_item_id);
+      });
+      if (doubled.size === 0) return;
+      const records = yield* threads.getThreadRecords(threadId, ["turnItems"]);
+      const events: Array<OrchestrationV2DomainEvent> = [];
+      for (const item of records.turnItems) {
+        if (item.type !== "assistant_message" || !doubled.has(item.id)) continue;
+        events.push({
+          id: importEventId(threadId, `doubled-reply-blanked:${item.id}`),
+          type: "turn-item.updated",
+          threadId,
+          occurredAt: item.updatedAt,
+          payload: { ...item, text: "" },
+        });
+      }
+      if (events.length === 0) return;
+      yield* eventSink.write({ events });
+      yield* Effect.logInfo("session.importer.doubled-replies-blanked", {
+        threadId,
+        count: events.length,
+      });
+    });
+
+    /**
      * A thread that shows a session through a live attachment holds what the
      * session's transcript holds: rows the attachment never delivered are
      * added, each after the run that was the latest when it was written. See
@@ -1115,6 +1197,7 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         });
       }
       yield* retireInventedPrompts({ threadId, rows: parsed.messages });
+      yield* blankDoubledReplies({ threadId, rows: parsed.messages });
       // The cursor says how far the file has been taken in; with a turn in
       // flight its rows have not been, and the pass after it still needs them.
       if (settledBeforeMs === undefined) {

@@ -1046,6 +1046,28 @@ describe("native provider presentation in the v2 timeline", () => {
     ).toBe("message");
   });
 
+  it("draws nothing for a finished reply with nothing in it, and keeps one still being written", () => {
+    const reply = (id: string, text: string, streaming: boolean): OrchestrationV2TurnItem => ({
+      ...base,
+      id: TurnItemId.make(id),
+      type: "assistant_message",
+      messageId: MessageId.make(id),
+      text,
+      streaming,
+    });
+    const entries = deriveTimelineEntriesFromVisibleTurnItems({
+      visibleTurnItems: [
+        visible(reply("emptied", "", false)),
+        visible(reply("kept", "Looking at logout now.", false)),
+        visible(reply("starting", "", true)),
+      ],
+      optimisticMessages: [],
+    });
+    expect(
+      entries.flatMap((entry) => (entry.kind === "message" ? [entry.message.id] : [])),
+    ).toEqual(["kept", "starting"]);
+  });
+
   it("excludes checkpoint-only work from the timeline", () => {
     const message: OrchestrationV2TurnItem = {
       ...base,

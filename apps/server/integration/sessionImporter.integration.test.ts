@@ -1611,6 +1611,88 @@ runtimeTest("a stock message T3 once showed as the person's own becomes a notice
   }),
 );
 
+runtimeTest("a reply an earlier build showed twice is left showing once", (h) =>
+  Effect.gen(function* () {
+    const claudeId = "aaaaaaaa-1111-4111-8111-1111111111f2";
+    const c = claudeSession({ sessionId: claudeId, cwd: h.workspace });
+    const claudePath = h.claudeFile(claudeId);
+    const threadId = importedThreadId(claudeId);
+    yield* h.write(claudePath, [
+      c.user("user-1", "Fix the login bug please", "2026-07-01T10:00:00.000Z"),
+      c.assistant("assistant-1", "I fixed the login bug.", "2026-07-01T10:00:05.000Z"),
+      c.user("user-2", "And the logout bug", "2026-07-01T10:01:00.000Z"),
+      c.assistant("assistant-2", "Looking at logout now.", "2026-07-01T10:01:05.000Z"),
+      c.assistant("assistant-3", "Done.", "2026-07-01T10:01:30.000Z"),
+      c.assistant("assistant-4", "Done.", "2026-07-01T10:01:40.000Z"),
+    ]);
+    const bridgeDir = yield* h.makeDir("bridge");
+    const importer = yield* h.importer({ bridgeDir });
+    yield* importer.sweepNow();
+    yield* seedT3Run(h, threadId, CLAUDE, "completed", {
+      ordinal: 1,
+      iso: "2026-07-01T10:01:00.000Z",
+    });
+    const runId = RunId.make(`seed-run:${threadId}`);
+    const at = DateTime.makeUnsafe("2026-07-01T10:01:05.000Z");
+    // The live attachment's rows for the second turn: the reply as the
+    // terminal drew it, then the record's row for the same reply, then two
+    // replies that say the same thing and are both the record's own.
+    const live = (key: string, nativeId: string, text: string, ordinal: number) => {
+      const seed = seedTimelineRow({
+        threadId,
+        key,
+        messageId: MessageId.make(`seed-${key}:${threadId}`),
+        role: "assistant",
+        text,
+        at,
+        runId,
+      });
+      return {
+        ...seed,
+        payload: {
+          ...seed.payload,
+          id: TurnItemId.make(`turn-item:provider:claudeAgent:native-item:${nativeId}`),
+          ordinal,
+        },
+      };
+    };
+    yield* h.eventSink.write({
+      events: [
+        live("drawn", "drawn-message-1", "Looking at logout now.", 1_000_001),
+        live("recorded", "assistant-2", "Looking at  logout now.", 1_000_003),
+        live("done-1", "assistant-3", "Done.", 1_000_004),
+        live("done-2", "assistant-4", "Done.", 1_000_005),
+      ],
+    });
+    const instanceDir = yield* h.makeDir("bridge", "claude", claudeId, "inst-1");
+    yield* h.write(joinPath(instanceDir, "session.json"), [
+      {
+        sid: claudeId,
+        instanceId: "inst-1",
+        heartbeatAt: yield* Clock.currentTimeMillis,
+        activeTurn: null,
+      },
+    ]);
+    const shown = h.threads.getThreadRecords(threadId, ["turnItems"]).pipe(
+      Effect.map((records) =>
+        records.turnItems
+          .filter((item) => item.type === "assistant_message" && item.runId === runId)
+          .toSorted((left, right) => left.ordinal - right.ordinal)
+          .map((item) => (item.type === "assistant_message" ? item.text : "")),
+      ),
+    );
+    assert.deepEqual(yield* shown, [
+      "Looking at logout now.",
+      "Looking at  logout now.",
+      "Done.",
+      "Done.",
+    ]);
+
+    yield* importer.healLiveClaudeSession({ sessionId: claudeId, transcriptPath: claudePath });
+    assert.deepEqual(yield* shown, ["", "Looking at  logout now.", "Done.", "Done."]);
+  }),
+);
+
 runtimeTest(
   "does not repeat prompts and command output a running session's thread already shows",
   (h) =>

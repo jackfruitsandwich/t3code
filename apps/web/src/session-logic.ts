@@ -637,6 +637,15 @@ export function deriveTimelineEntriesFromVisibleTurnItems(
       continue;
     }
     if (item.type === "user_message" || item.type === "assistant_message") {
+      // A finished reply with nothing in it has nothing to draw.
+      if (
+        item.type === "assistant_message" &&
+        !item.streaming &&
+        item.text.trim().length === 0 &&
+        (item.attachments?.length ?? 0) === 0
+      ) {
+        continue;
+      }
       const message: ChatMessage = {
         id: item.messageId,
         role: item.type === "user_message" ? "user" : "assistant",
