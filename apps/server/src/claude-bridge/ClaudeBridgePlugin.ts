@@ -98,6 +98,8 @@ const T3_RECENT_MS = 300000
 // subagent's) is picked up by the next. T3 ignores what it is already asking.
 const T3_RETELL_MS = 20000
 const SHELL_COMMAND_TIMEOUT_MS = 120000
+// What Claude Code writes before a local command's rows, for the model.
+const LOCAL_COMMAND_CAVEAT = "The command below was run directly in Claude Code, not sent to you as a request, and its output goes straight to the user. It's recorded here as context for later messages."
 const SHELL_INPUT_ROW = /^\\s*<bash-input>([\\s\\S]*)<\\/bash-input>\\s*$/
 const SHELL_OUTPUT_ROW = /^\\s*<bash-stdout>/
 const COMMAND_TURN_WAIT_MS = 1500
@@ -107,6 +109,8 @@ const COMMAND_PANEL_WAIT_MS = 6000
 // closed by the person at that terminal and everything queued behind it waits,
 // so these are not run from T3 without an argument. Commands found to behave
 // this way later are remembered in the plugin store.
+// Commands that ask in a dialog even when typed with their argument (observed).
+const ARGUMENT_PANELS = new Set(['add-dir'])
 const KNOWN_PANELS = new Set([${CLAUDE_BARE_PANEL_COMMANDS.map((name) => `'${name}'`).join(", ")}])
 
 const instanceId = Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8)
@@ -124,6 +128,10 @@ let pendingCommand = null
 // The last "!" command the record took: the turn that follows it is started
 // with what the command printed, and is shown as the command.
 let lastShellInput = null
+// Commands sent while a turn was running, run when it ends.
+const afterTurn = []
+// Panels commands sent from T3 have opened in the terminal and that are still open.
+let panelsOpen = 0
 // Whether the latest turn was sent from T3 (else typed here, or a wake).
 let lastTurnFromT3 = false
 let inboxSeq = 0
@@ -152,6 +160,8 @@ const decisions = new Map()
 const answers = new Map()
 // Tool calls the person allowed for the rest of this session from T3.
 const grants = []
+// Files T3 saved for a prompt it sent here (what the person attached).
+const t3Files = new Set()
 // Stale-tip guard state: message rows present when this process started, and
 // the rows it appended itself. Any other row means another process moved the
 // conversation on.
@@ -368,6 +378,18 @@ async function heartbeat($) {
     modVersion: MOD_VERSION,
     ended: ended,
   })
+}
+
+// Whether a dialog or panel is open in the terminal right now. Claude Code
+// refuses to touch the prompt box under one and says so; appending nothing
+// asks that without changing what the person has typed (measured).
+async function dialogOpen($) {
+  try {
+    const box = await $.prompt.fill({ text: '', mode: 'append' })
+    return !!box && box.isFilled === false && box.refusal === 'dialog'
+  } catch {
+    return false
+  }
 }
 
 async function opensPanel($, name) {
@@ -587,39 +609,89 @@ async function runSlashCommand($, command) {
     await report(await settingsByText($, command.name === 'model' ? 'model' : (command.args || '')))
     return
   }
+  if (ARGUMENT_PANELS.has(command.name)) {
+    await report({ ok: true, text: 'Not run: ' + label + ' asks in a dialog in the Claude Code terminal even when given its argument, and only that terminal can show and answer it. Run it there.' })
+    return
+  }
   if (!command.args && (await opensPanel($, command.name))) {
     await report({ ok: true, text: 'Not run: ' + label + ' opens a panel in the Claude Code terminal, which only that terminal can show and close. Run it there, or give it an argument here (for example /model sonnet, /effort high, /goal <condition>).' })
     return
   }
   // Mid-conversation, /model <name> asks the terminal to confirm. The same
-  // change through the settings row applies at once, as picking it in /config does.
+  // change through the settings row applies at once, as picking it in /config
+  // does, and leaves nothing in the record; the terminal's /model leaves the
+  // command and what it printed, so those rows are written here.
   if (command.name === 'model' && command.args) {
     const choice = await modelChoice($, command.args)
     if (choice !== null) {
+      // Typed while a turn runs, a command waits for the turn's end.
+      if (activeTurn) {
+        afterTurn.push(command)
+        return
+      }
       let outcome
       try { outcome = await $.config.set({ key: 'model', value: choice }) } catch (err) { outcome = { deny: String(err) } }
       let model = choice
       try { model = await $.session.model() } catch {}
       await heartbeat($)
-      await report(outcome && outcome.deny ? { ok: false, text: String(outcome.deny) } : { ok: true, text: 'Set model to ' + model })
+      if (outcome && outcome.deny) {
+        await report({ ok: false, text: String(outcome.deny) })
+        return
+      }
+      const text = 'Set model to ' + model
+      // Before the report: T3 shows the record's own row for what was printed.
+      await appendCommandRows($, 'model', command.args, text)
+      await report({ ok: true, text: text })
       return
     }
   }
+  // A command that has not come back after a few seconds is one of three
+  // things. It waits behind what holds the terminal (a running turn, a dialog,
+  // a panel an earlier command opened); or it opened a panel itself, which
+  // only the person at that terminal can close; or it is simply still working
+  // (a compaction takes minutes). Claude Code says whether a dialog is open,
+  // so the three are told apart and only the second is remembered as a panel.
+  const blockedAtSend = activeTurn !== null || panelsOpen > 0 || (await dialogOpen($))
   pendingCommand = { id: command.id, text: label, promptUuid: command.promptUuid, at: Date.now() }
   let settled = false
+  let holdsPanel = false
+  const panelClosed = () => {
+    if (!holdsPanel) return
+    holdsPanel = false
+    panelsOpen = Math.max(0, panelsOpen - 1)
+  }
   const mine = () => pendingCommand !== null && pendingCommand.id === command.id
-  $.clock.after(COMMAND_PANEL_WAIT_MS, () => {
+  const lookAgain = () => $.clock.after(COMMAND_PANEL_WAIT_MS, () => { stillOut().catch(() => {}) })
+  const stillOut = async () => {
     if (settled || !mine()) return
+    if (blockedAtSend || activeTurn !== null) {
+      settled = true
+      pendingCommand = null
+      await report({
+        ok: true,
+        waitingInTerminal: true,
+        text: label + ' is waiting in the Claude Code terminal behind what is running or open there, and runs when that is done.',
+      })
+      return
+    }
+    if (!(await dialogOpen($))) {
+      lookAgain()
+      return
+    }
     settled = true
     pendingCommand = null
+    holdsPanel = true
+    panelsOpen += 1
     $.store.set('panel:' + MOD_VERSION + ':' + command.name, true).catch(() => {})
-    report({
-      ok: false,
+    await report({
+      ok: true,
       waitingInTerminal: true,
       text: label + ' opened a panel in the Claude Code terminal and is waiting there. Close it in that terminal (Esc); nothing else runs in this session until then.',
-    }).catch(() => {})
-  })
+    })
+  }
+  lookAgain()
   $.command.run({ command: command.name, args: command.args || '' }).then(async (result) => {
+    panelClosed()
     if (settled) return
     const deadline = Date.now() + COMMAND_TURN_WAIT_MS
     while (Date.now() < deadline && mine()) {
@@ -639,11 +711,23 @@ async function runSlashCommand($, command) {
     await refreshCommands($)
     await heartbeat($)
   }).catch(async (err) => {
+    panelClosed()
     if (settled) return
     settled = true
     if (mine()) pendingCommand = null
     await emit($, 'command.result', { commandId: command.id, promptUuid: command.promptUuid, ok: false, startedTurn: false, text: String(err) })
   })
+}
+
+// The rows Claude Code writes when a slash command that only acts locally is
+// typed: a note for the model, the command, what it printed.
+async function appendCommandRows($, name, args, printed) {
+  const row = (text) => $.session.append({ message: { type: 'user', content: [{ type: 'text', text: text }] } })
+  try {
+    await row('<local-command-caveat>' + LOCAL_COMMAND_CAVEAT + '</local-command-caveat>')
+    await row('<command-name>/' + name + '</command-name>\\n            <command-message>' + name + '</command-message>\\n            <command-args>' + args + '</command-args>')
+    await row('<local-command-stdout>' + printed + '</local-command-stdout>')
+  } catch {}
 }
 
 // "!" in the terminal runs a shell command with no permission prompt, writes
@@ -675,6 +759,13 @@ async function runShellCommand($, command) {
 
 async function handleCommand($, command) {
   if (command.type === 'prompt') {
+    // Files T3 saved for this prompt, under its own attachments folder.
+    const bridge = await resolveRoot($)
+    const folder = (bridge.slice(-7) === '/bridge' ? bridge.slice(0, -7) : bridge) + '/attachments/'
+    for (const file of (Array.isArray(command.attachments) ? command.attachments : [])) {
+      if (typeof file === 'string' && file.indexOf(folder) === 0 && file.indexOf('/../') === -1) t3Files.add(file)
+      if (t3Files.size > 64) t3Files.delete(t3Files.values().next().value)
+    }
     pendingCommand = { id: command.id, text: command.text, promptUuid: command.promptUuid, at: Date.now() }
     // The person's half-typed draft stays where it is: a submit does not touch it.
     $.prompt.submit({ text: command.text, asUser: true }).then(async (result) => {
@@ -943,6 +1034,9 @@ export function register(on) {
       promptUuid: turn ? turn.promptUuid : undefined,
     })
     await heartbeat($)
+    for (const command of afterTurn.splice(0)) {
+      runSlashCommand($, command).catch(() => {})
+    }
     return next(e)
   })
 
@@ -1018,6 +1112,11 @@ export function register(on) {
     // T3's display tools change nothing in the workspace; T3 allows them wherever it attaches them.
     if (isT3ReadOnlyTool(e.tool)) return { decision: 'allow', reason: 'T3 Code display tool' }
     if (isGranted(e)) return { decision: 'allow', reason: 'Allowed for this session in T3 Code' }
+    // An image the person attached in T3 reaches the session as a file T3
+    // saved and a line saying where: reading that file is what they asked.
+    if (e.tool === 'Read' && e.input && typeof e.input.file_path === 'string' && t3Files.has(e.input.file_path)) {
+      return { decision: 'allow', reason: 'Attached in T3 Code' }
+    }
     // A question is asked and answered through its own hook (tool.call).
     if (e.tool === 'AskUserQuestion') return verdict
     // A subagent's call can be asked in one place only: Claude Code draws its

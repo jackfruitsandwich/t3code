@@ -10,6 +10,7 @@
  * continuation's `detail`, so the run shows what was asked.
  */
 import { ProviderThreadId, ThreadId } from "@t3tools/contracts";
+import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as SqlClient from "effect/sql/SqlClient";
@@ -134,6 +135,21 @@ const make = Effect.gen(function* () {
   // on, not when the importer's sweep next reaches the file.
   const scope = yield* Effect.scope;
   const comparing = new Map<string, { passes: number; running: boolean }>();
+  // A short turn can be over before the run offered for it has attached, and
+  // that run then shows it from its start. Compared before then, the turn
+  // would be taken in as history and be there twice.
+  const heal = (sid: string, transcriptPath: string) =>
+    Effect.gen(function* () {
+      const awaitingRunSinceMs = ClaudeBridgeRegistry.claudeBridgeTurnAwaitingRunSince(
+        yield* registry.peekMissedTurn(sid),
+        yield* Clock.currentTimeMillis,
+      );
+      yield* importer.healLiveClaudeSession({
+        sessionId: sid,
+        transcriptPath,
+        ...(awaitingRunSinceMs === undefined ? {} : { turnAwaitingRunSinceMs: awaitingRunSinceMs }),
+      });
+    });
   yield* registry.onRecordChange((entry, change) =>
     Effect.gen(function* () {
       const sid = entry.sid;
@@ -142,10 +158,7 @@ const make = Effect.gen(function* () {
       if (change === "typed-mid-turn") {
         const session = (yield* registry.readSession(entry)) ?? entry.session;
         if (session.transcriptPath.length > 0) {
-          yield* importer.healLiveClaudeSession({
-            sessionId: sid,
-            transcriptPath: session.transcriptPath,
-          });
+          yield* heal(sid, session.transcriptPath);
         }
         return;
       }
@@ -165,10 +178,7 @@ const make = Effect.gen(function* () {
           first = false;
           const session = (yield* registry.readSession(entry)) ?? entry.session;
           if (session.transcriptPath.length === 0) continue;
-          yield* importer.healLiveClaudeSession({
-            sessionId: sid,
-            transcriptPath: session.transcriptPath,
-          });
+          yield* heal(sid, session.transcriptPath);
         }
       }).pipe(
         Effect.ensuring(

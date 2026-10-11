@@ -594,6 +594,52 @@ describe("ClaudeBridgeQueryRunner slash commands", () => {
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
+  // /clear, /resume, /branch move the terminal on to another conversation; a
+  // thread is one conversation. Sent from T3 they are not run, and say so.
+  const describe = (frame: unknown) => JSON.stringify(frame).slice(0, 300);
+
+  it.live(
+    "does not run a command that moves the session to another conversation, and says why",
+    () =>
+      Effect.gen(function* () {
+        const bridge = yield* attach({
+          protocol: 2,
+          slashCommands: ["clear", "model"],
+          bridgeCanUseTool: () => null,
+        });
+        yield* bridge.session.offer({
+          ...userMessage("/clear"),
+          uuid: "00000000-0000-4000-8000-000000000031",
+        });
+        const frames = Array.from(
+          yield* bridge.session.messages.pipe(Stream.take(2), Stream.runCollect),
+        );
+        const result = frames[1];
+        // The thread already holds what the person sent: the turn opens and ends.
+        assert.deepStrictEqual(
+          frames.map((frame) => frame.type),
+          ["system", "result"],
+        );
+        assert.strictEqual(
+          result?.type === "result" && result.subtype === "success"
+            ? result.result.slice(0, 46)
+            : describe(result),
+          "Not run: /clear moves this Claude Code session",
+        );
+        // Nothing went to the session; the next command does.
+        yield* bridge.session.offer({
+          ...userMessage("/model sonnet"),
+          uuid: "00000000-0000-4000-8000-000000000032",
+        });
+        assert.deepStrictEqual(yield* Queue.take(bridge.commands), {
+          type: "command",
+          name: "model",
+          args: "sonnet",
+          promptUuid: "00000000-0000-4000-8000-000000000032",
+        });
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
   it.effect("runs a line that starts with ! as a shell command in the session", () =>
     Effect.gen(function* () {
       const bridge = yield* attach({
@@ -668,6 +714,87 @@ describe("ClaudeBridgeQueryRunner slash commands", () => {
       );
       assert.strictEqual(result._tag, "Failure");
       assert.strictEqual(yield* Queue.size(bridge.commands), 0);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+});
+
+describe("ClaudeBridgeQueryRunner commands the mod writes into the record", () => {
+  // `/model` sent from T3 is applied through the session's settings row,
+  // which leaves no rows; the mod writes the rows the terminal's own /model
+  // leaves, then reports. The thread shows the command once, and what it
+  // printed is the record's own row.
+  const holds = (shown: unknown, text: string) => JSON.stringify(shown).includes(text);
+
+  it.live("shows /model sent from T3 once, with the record's row for what it printed", () =>
+    Effect.gen(function* () {
+      const bridge = yield* attach({
+        protocol: 2,
+        slashCommands: ["model"],
+        bridgeCanUseTool: () => null,
+        transcript: "",
+      });
+      const fs = yield* FileSystem.FileSystem;
+      const promptUuid = "00000000-0000-4000-8000-000000000021";
+      yield* bridge.session.offer({ ...userMessage("/model sonnet"), uuid: promptUuid });
+      yield* Queue.take(bridge.commands);
+      const modRow = (uuid: string, text: string) =>
+        `${JSON.stringify({
+          type: "user",
+          uuid,
+          parentUuid: null,
+          isSidechain: false,
+          isMeta: true,
+          origin: { kind: "plugin", name: "t3bridge" },
+          timestamp: "2026-07-01T10:00:01.000Z",
+          message: { role: "user", content: [{ type: "text", text }] },
+        })}\n`;
+      yield* fs.writeFileString(
+        bridge.process.session.transcriptPath,
+        modRow(
+          "00000000-0000-4000-8000-0000000000c0",
+          "<local-command-caveat>The command below was run directly in Claude Code.</local-command-caveat>",
+        ) +
+          modRow(
+            "00000000-0000-4000-8000-0000000000c1",
+            "<command-name>/model</command-name>\n            <command-message>model</command-message>\n            <command-args>sonnet</command-args>",
+          ) +
+          modRow(
+            "00000000-0000-4000-8000-0000000000c2",
+            "<local-command-stdout>Set model to claude-sonnet-5-5</local-command-stdout>",
+          ),
+        { flag: "a" },
+      );
+      yield* bridge.handler(
+        {
+          seq: 1,
+          at: bridge.now,
+          type: "command.result",
+          commandId: "command-1",
+          promptUuid,
+          ok: true,
+          startedTurn: false,
+          waitingInTerminal: false,
+          text: "Set model to claude-sonnet-5-5",
+        },
+        bridge.process,
+      );
+      // Everything the thread is given in the next seconds: one turn.
+      const frames: Array<SDKMessage> = [];
+      yield* bridge.session.messages.pipe(
+        Stream.runForEach((frame) =>
+          Effect.sync(() => {
+            frames.push(frame);
+          }),
+        ),
+        Effect.forkScoped,
+      );
+      yield* Effect.sleep("3500 millis");
+      assert.strictEqual(frames.filter((frame) => frame.type === "result").length, 1);
+      const printed = frames.filter((frame) => holds(frame, "Set model to claude-sonnet-5-5"));
+      assert.strictEqual(printed.length, 1);
+      // The note for the model and the command's markup are not shown.
+      assert.isFalse(holds(frames, "local-command-caveat"));
+      assert.isFalse(holds(frames, "command-name"));
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 });

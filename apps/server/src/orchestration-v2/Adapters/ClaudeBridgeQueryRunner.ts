@@ -42,7 +42,9 @@ import * as ClaudeBridgeRegistry from "../../claude-bridge/ClaudeBridgeRegistry.
 import {
   CLAUDE_BRIDGE_T3_HEARTBEAT_MS,
   CLAUDE_BRIDGE_WINDOW_PROTOCOL,
+  claudeBridgeAttachmentPaths,
   claudeBridgeModAtLeast,
+  claudeSessionMovingNotice,
   CLAUDE_BRIDGE_BASH_MOD_VERSION,
   CLAUDE_BRIDGE_DIALOG_REFUSAL_MOD_VERSION,
   claudeConfigModelChoice,
@@ -753,6 +755,20 @@ export const layer: Layer.Layer<
       const endSession = (reason: string) =>
         Effect.gen(function* () {
           yield* readNewRows.pipe(Effect.ignore);
+          // A command sent from T3 that ended the session (/exit, /background)
+          // did what it was sent to do: it is shown as done, not as a turn
+          // that failed.
+          const sent = state.pendingPrompt;
+          if (sent !== null && sent.label !== null && sent.body.type === "command") {
+            state.pendingPrompt = null;
+            yield* emitCommandTurn({
+              turnId: `command-${sent.commandId}`,
+              text: sent.label,
+              promptUuid: sent.promptUuid,
+              ok: true,
+              answer: "The Claude Code session ended.",
+            });
+          }
           const pending = state.pendingComplete;
           if (pending !== null) {
             state.pendingComplete = null;
@@ -1264,6 +1280,17 @@ export const layer: Layer.Layer<
               if (commands === null || commands.some((command) => command.name === slash.name)) {
                 const label =
                   slash.args.length === 0 ? `/${slash.name}` : `/${slash.name} ${slash.args}`;
+                const moving = claudeSessionMovingNotice(slash.name);
+                if (moving !== null) {
+                  yield* emitCommandTurn({
+                    turnId: `not-run-${promptUuid}`,
+                    text: label,
+                    promptUuid,
+                    ok: true,
+                    answer: moving,
+                  });
+                  return;
+                }
                 const body: ClaudeBridgeCommandBody = {
                   type: "command",
                   name: slash.name,
@@ -1281,6 +1308,9 @@ export const layer: Layer.Layer<
                 return;
               }
             }
+            // What the person attached was saved by T3 and the prompt says
+            // where: the session may read those files without asking.
+            const savedForPrompt = claudeBridgeAttachmentPaths(text);
             const body: ClaudeBridgeCommandBody = {
               type: "prompt",
               // Text that only looks like a command (a path, an unknown name)
@@ -1288,6 +1318,7 @@ export const layer: Layer.Layer<
               // Code from refusing it as a command.
               text: text.startsWith("/") ? ` ${text}` : text,
               promptUuid,
+              ...(savedForPrompt.length === 0 ? {} : { attachments: savedForPrompt }),
             };
             const pending = { commandId: "", promptUuid, label: null, body };
             state.pendingPrompt = pending;

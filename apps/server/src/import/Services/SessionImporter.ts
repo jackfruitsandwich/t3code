@@ -21,25 +21,37 @@ export interface SessionImporterShape {
    * to hold a full exchange, which hides a new session for its whole first
    * turn. Rows written before `turnOffset` (the transcript size when the turn
    * in flight began) come in as history; the turn itself arrives through the
-   * live attachment. Does nothing when the session already has a thread.
+   * live attachment, its own prompt included when that was written before the
+   * size was read. Does nothing when the session already has a thread.
    */
   readonly adoptLiveClaudeSession: (input: {
     readonly sessionId: string;
     readonly transcriptPath: string;
     readonly cwd: string;
     readonly turnOffset: number;
-    /** Names the thread when the session has no earlier prompt to name it. */
+    /**
+     * The turn's prompt: it names the thread when the session has no earlier
+     * prompt to name it, and tells the turn's own row from history.
+     */
     readonly promptText: string;
   }) => Effect.Effect<void>;
 
   /**
    * Compare a running Claude Code session's record with its thread now and
    * add what the thread does not show, instead of waiting for the sweep to
-   * reach the file. Rows of the turn in flight are left to the attachment.
+   * reach the file. Rows of the turn in flight are left to the attachment,
+   * and so are a command's while it runs.
    */
   readonly healLiveClaudeSession: (input: {
     readonly sessionId: string;
     readonly transcriptPath: string;
+    /**
+     * When a turn began that ended with nothing attached and that the run
+     * offered for it is still to show from its start: its rows are left to
+     * that run. Absent once an attachment has taken the turn, or once it is
+     * too old for one to show it.
+     */
+    readonly turnAwaitingRunSinceMs?: number;
   }) => Effect.Effect<void>;
 }
 

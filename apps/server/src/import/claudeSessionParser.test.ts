@@ -261,6 +261,66 @@ describe("parseClaudeSessionJsonl", () => {
     );
   });
 
+  it("shows /model sent from T3 as the command and what it printed, not the note for the model", () => {
+    // As the bridge mod writes them: Claude Code writes none for a model set
+    // through the settings row.
+    const fromMod = { isMeta: true, origin: { kind: "plugin", name: "t3bridge" } };
+    const parsed = parseClaudeSessionJsonl(
+      line(userEntry()) +
+        line(assistantEntry()) +
+        line(
+          userEntry({
+            uuid: "model-0",
+            ...fromMod,
+            message: {
+              role: "user",
+              content:
+                "<local-command-caveat>The command below was run directly in Claude Code.</local-command-caveat>",
+            },
+          }),
+        ) +
+        line(
+          userEntry({
+            uuid: "model-1",
+            ...fromMod,
+            message: {
+              role: "user",
+              content:
+                "<command-name>/model</command-name>\n            <command-message>model</command-message>\n            <command-args>sonnet</command-args>",
+            },
+          }),
+        ) +
+        line(
+          userEntry({
+            uuid: "model-2",
+            ...fromMod,
+            message: {
+              role: "user",
+              content:
+                "<local-command-stdout>Set model to claude-sonnet-5-5</local-command-stdout>",
+            },
+          }),
+        ) +
+        // Any other row the mod or the harness hides stays hidden.
+        line(
+          userEntry({
+            uuid: "hidden-1",
+            ...fromMod,
+            message: { role: "user", content: "a note only the model reads" },
+          }),
+        ),
+    );
+    assert.deepEqual(
+      parsed.messages.map((message) => [message.role, message.text]),
+      [
+        ["user", "Fix the login bug"],
+        ["assistant", "I found the bug."],
+        ["user", "/model sonnet"],
+        ["assistant", "Set model to claude-sonnet-5-5"],
+      ],
+    );
+  });
+
   it("shows a command once when the record keeps both the typed line and the command's row", () => {
     const parsed = parseClaudeSessionJsonl(
       line(userEntry()) +

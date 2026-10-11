@@ -1547,6 +1547,338 @@ runtimeTest(
     }),
 );
 
+/** What the thread shows of the conversation, in the order it shows it. */
+const conversation = (h: Harness, threadId: ThreadId) =>
+  h.threads.getThreadRecords(threadId, ["turnItems"]).pipe(
+    Effect.map((records) =>
+      records.turnItems
+        .filter((item) => item.type === "user_message" || item.type === "assistant_message")
+        .toSorted((left, right) => left.ordinal - right.ordinal)
+        .map((item) => item.text),
+    ),
+  );
+
+/**
+ * What a run that showed a turn leaves in the thread: the prompt under T3's
+ * own id, and each reply under the id of the record's row.
+ */
+const seedShownTurn = (
+  h: Harness,
+  threadId: ThreadId,
+  input: {
+    readonly runOrdinal: number;
+    readonly prompt: string;
+    readonly iso: string;
+    readonly replies: ReadonlyArray<{
+      readonly rowId: string;
+      readonly text: string;
+      readonly iso: string;
+    }>;
+  },
+) =>
+  Effect.gen(function* () {
+    yield* seedT3Run(h, threadId, CLAUDE, "completed", {
+      ordinal: input.runOrdinal,
+      iso: input.iso,
+    });
+    yield* seedT3Prompt(h, threadId, input.runOrdinal, input.prompt, input.iso);
+    const runId = seedRunPayload(threadId, CLAUDE, "completed", {
+      ordinal: input.runOrdinal,
+      iso: input.iso,
+    }).runId;
+    yield* h.eventSink.write({
+      events: input.replies.map((reply) => {
+        const seed = seedTimelineRow({
+          threadId,
+          key: `shown:${reply.rowId}`,
+          messageId: MessageId.make(`message:provider:claudeAgent:native-item:${reply.rowId}`),
+          role: "assistant",
+          text: reply.text,
+          at: DateTime.makeUnsafe(reply.iso),
+          runId,
+        });
+        return {
+          ...seed,
+          payload: {
+            ...seed.payload,
+            id: TurnItemId.make(`turn-item:provider:claudeAgent:native-item:${reply.rowId}`),
+          },
+        };
+      }),
+    });
+  });
+
+const liveSessionFile = (
+  h: Harness,
+  sessionId: string,
+  activeTurn: { readonly turnId: string; readonly startedAt: number } | null = null,
+) =>
+  Effect.gen(function* () {
+    const instanceDir = yield* h.makeDir("bridge", "claude", sessionId, "inst-1");
+    yield* h.write(joinPath(instanceDir, "session.json"), [
+      {
+        sid: sessionId,
+        instanceId: "inst-1",
+        heartbeatAt: yield* Clock.currentTimeMillis,
+        activeTurn: activeTurn === null ? null : { ...activeTurn, transcriptOffset: 0 },
+      },
+    ]);
+  });
+
+runtimeTest(
+  "a new session's first prompt is its run's to show, also when it was written before the turn was reported",
+  (h) =>
+    Effect.gen(function* () {
+      const claudeId = "aaaaaaaa-1111-4111-8111-1111111111a1";
+      const c = claudeSession({ sessionId: claudeId, cwd: h.workspace });
+      const claudePath = h.claudeFile(claudeId);
+      const threadId = importedThreadId(claudeId);
+      const prompt = "Reply with exactly: quick-1";
+      const note = (uuid: string, type: string): Entry => ({
+        type: "attachment",
+        uuid,
+        sessionId: claudeId,
+        timestamp: "2026-07-01T10:00:00.000Z",
+        isSidechain: false,
+        attachment: { type },
+      });
+      // On a busy machine Claude Code had written the prompt, and the rows it
+      // writes after one, before the turn was reported with the record's size.
+      const written = [
+        note("note-1", "environment"),
+        c.user("user-1", prompt, "2026-07-01T10:00:00.000Z"),
+        note("note-2", "skill_listing"),
+      ];
+      yield* h.write(claudePath, written);
+      const bridgeDir = yield* h.makeDir("bridge");
+      const importer = yield* h.importer({ bridgeDir });
+      yield* importer.adoptLiveClaudeSession({
+        sessionId: claudeId,
+        transcriptPath: claudePath,
+        cwd: h.workspace,
+        turnOffset: new TextEncoder().encode(jsonl(written)).length,
+        promptText: prompt,
+      });
+      // The session has its thread, named by the prompt, with nothing in it:
+      // the turn is the run's to show.
+      assert.strictEqual((yield* h.liveShell(threadId)).title, prompt);
+      assert.deepEqual(yield* conversation(h, threadId), []);
+
+      // The run offered for the turn shows it; the record is compared after.
+      yield* h.append(claudePath, [
+        c.assistant("assistant-1", "quick-1", "2026-07-01T10:00:02.000Z"),
+      ]);
+      yield* seedShownTurn(h, threadId, {
+        runOrdinal: 1,
+        prompt,
+        iso: "2026-07-01T10:00:01.000Z",
+        replies: [{ rowId: "assistant-1", text: "quick-1", iso: "2026-07-01T10:00:02.000Z" }],
+      });
+      yield* liveSessionFile(h, claudeId);
+      yield* importer.healLiveClaudeSession({ sessionId: claudeId, transcriptPath: claudePath });
+      assert.deepEqual(yield* conversation(h, threadId), [prompt, "quick-1"]);
+    }),
+);
+
+runtimeTest(
+  "history before a new session's first turn still comes in, with an earlier prompt of the same words",
+  (h) =>
+    Effect.gen(function* () {
+      const claudeId = "aaaaaaaa-1111-4111-8111-1111111111a2";
+      const c = claudeSession({ sessionId: claudeId, cwd: h.workspace });
+      const claudePath = h.claudeFile(claudeId);
+      const threadId = importedThreadId(claudeId);
+      // The session ran a turn before T3 knew it. The same words start the
+      // turn in flight, whose own row is not written yet.
+      const written = [
+        c.user("user-1", "continue", "2026-07-01T10:00:00.000Z"),
+        c.assistant("assistant-1", "Carried on.", "2026-07-01T10:00:05.000Z"),
+      ];
+      yield* h.write(claudePath, written);
+      const bridgeDir = yield* h.makeDir("bridge");
+      const importer = yield* h.importer({ bridgeDir });
+      yield* importer.adoptLiveClaudeSession({
+        sessionId: claudeId,
+        transcriptPath: claudePath,
+        cwd: h.workspace,
+        turnOffset: new TextEncoder().encode(jsonl(written)).length,
+        promptText: "continue",
+      });
+      assert.deepEqual(yield* conversation(h, threadId), ["continue", "Carried on."]);
+    }),
+);
+
+runtimeTest(
+  "a turn that ended before its run attached is that run's to show, and history once no run comes",
+  (h) =>
+    Effect.gen(function* () {
+      const claudeId = "aaaaaaaa-1111-4111-8111-1111111111a3";
+      const c = claudeSession({ sessionId: claudeId, cwd: h.workspace });
+      const claudePath = h.claudeFile(claudeId);
+      const threadId = importedThreadId(claudeId);
+      const history = [
+        c.user("user-1", "Fix the login bug please", "2026-07-01T10:00:00.000Z"),
+        c.assistant("assistant-1", "I fixed the login bug.", "2026-07-01T10:00:05.000Z"),
+      ];
+      yield* h.write(claudePath, history);
+      const bridgeDir = yield* h.makeDir("bridge");
+      const importer = yield* h.importer({ bridgeDir });
+      yield* importer.sweepNow();
+      yield* seedT3Run(h, threadId, CLAUDE, "completed", {
+        ordinal: 1,
+        iso: "2026-07-01T10:01:00.000Z",
+      });
+      // Two short turns typed in the terminal, each over before the run T3
+      // offered for it had attached.
+      const firstStartedAt = "2026-07-01T10:10:00.000Z";
+      yield* h.append(claudePath, [
+        c.user("user-2", "Reply with exactly: quick-2", firstStartedAt),
+        c.assistant("assistant-2", "quick-2", "2026-07-01T10:10:01.000Z"),
+      ]);
+      yield* liveSessionFile(h, claudeId);
+      const heal = (turnAwaitingRunSince?: string) =>
+        importer.healLiveClaudeSession({
+          sessionId: claudeId,
+          transcriptPath: claudePath,
+          ...(turnAwaitingRunSince === undefined
+            ? {}
+            : {
+                turnAwaitingRunSinceMs: DateTime.toEpochMillis(
+                  DateTime.makeUnsafe(turnAwaitingRunSince),
+                ),
+              }),
+        });
+      const settled = ["Fix the login bug please", "I fixed the login bug."];
+
+      // The record is compared while the first one's run is still to come.
+      yield* heal(firstStartedAt);
+      assert.deepEqual(yield* conversation(h, threadId), settled);
+      // The run attaches and shows the turn from its start.
+      yield* seedShownTurn(h, threadId, {
+        runOrdinal: 2,
+        prompt: "Reply with exactly: quick-2",
+        iso: "2026-07-01T10:10:02.000Z",
+        replies: [{ rowId: "assistant-2", text: "quick-2", iso: "2026-07-01T10:10:02.500Z" }],
+      });
+      yield* heal();
+      const shownOnce = [...settled, "Reply with exactly: quick-2", "quick-2"];
+      assert.deepEqual(yield* conversation(h, threadId), shownOnce);
+
+      // No run ever comes for the second: left alone while one still could,
+      // it is history after that.
+      const secondStartedAt = "2026-07-01T10:20:00.000Z";
+      yield* h.append(claudePath, [
+        c.user("user-3", "Reply with exactly: quick-3", secondStartedAt),
+        c.assistant("assistant-3", "quick-3", "2026-07-01T10:20:01.000Z"),
+      ]);
+      yield* heal(secondStartedAt);
+      assert.deepEqual(yield* conversation(h, threadId), shownOnce);
+      yield* heal();
+      assert.deepEqual(yield* conversation(h, threadId), [
+        ...shownOnce,
+        "Reply with exactly: quick-3",
+        "quick-3",
+      ]);
+    }),
+);
+
+runtimeTest(
+  "a command still running in a live session is left for the turn that shows it, and is history if none does",
+  (h) =>
+    Effect.gen(function* () {
+      const claudeId = "aaaaaaaa-1111-4111-8111-1111111111a4";
+      const c = claudeSession({ sessionId: claudeId, cwd: h.workspace });
+      const claudePath = h.claudeFile(claudeId);
+      const threadId = importedThreadId(claudeId);
+      const at = (iso: string) => DateTime.toEpochMillis(DateTime.makeUnsafe(iso));
+      yield* h.write(claudePath, [
+        c.user("user-1", "Fix the login bug please", "2026-07-01T10:00:00.000Z"),
+        c.assistant("assistant-1", "I fixed the login bug.", "2026-07-01T10:00:05.000Z"),
+      ]);
+      const bridgeDir = yield* h.makeDir("bridge");
+      const importer = yield* h.importer({ bridgeDir });
+      yield* importer.sweepNow();
+      yield* seedT3Run(h, threadId, CLAUDE, "completed", {
+        ordinal: 1,
+        iso: "2026-07-01T10:01:00.000Z",
+      });
+      const command = (uuid: string, name: string, iso: string): ReadonlyArray<Entry> => [
+        // The line as typed, then the command's own row.
+        c.user(`${uuid}-typed`, `/${name}`, iso),
+        c.user(
+          uuid,
+          `<command-name>/${name}</command-name>\n            <command-message>${name}</command-message>\n            <command-args></command-args>`,
+          iso,
+        ),
+      ];
+      const printed = (uuid: string, text: string, iso: string): Entry => ({
+        type: "system",
+        subtype: "local_command",
+        uuid,
+        sessionId: claudeId,
+        timestamp: iso,
+        isSidechain: false,
+        content: `<local-command-stdout>${text}</local-command-stdout>`,
+      });
+      const heal = (now: string) =>
+        Effect.gen(function* () {
+          yield* TestClock.setTime(at(now));
+          yield* liveSessionFile(h, claudeId);
+          yield* importer.healLiveClaudeSession({
+            sessionId: claudeId,
+            transcriptPath: claudePath,
+          });
+          return yield* conversation(h, threadId);
+        });
+      const lines = (shown: ReadonlyArray<string>, line: string) =>
+        shown.filter((text) => text === line).length;
+
+      // /compact typed in the terminal: two minutes pass before it prints.
+      yield* h.append(claudePath, command("compact-1", "compact", "2026-07-01T10:10:00.000Z"));
+      assert.strictEqual(lines(yield* heal("2026-07-01T10:10:40.000Z"), "/compact"), 0);
+      assert.strictEqual(lines(yield* heal("2026-07-01T10:11:50.000Z"), "/compact"), 0);
+      yield* h.append(claudePath, [
+        printed(
+          "compact-1-out",
+          "Compacted (ctrl+o to see full summary)",
+          "2026-07-01T10:12:00.000Z",
+        ),
+      ]);
+      // Printed a moment ago: the live attachment is about to show it.
+      assert.strictEqual(lines(yield* heal("2026-07-01T10:12:01.000Z"), "/compact"), 0);
+      // It does, as a turn of its own with the command as its line.
+      yield* seedShownTurn(h, threadId, {
+        runOrdinal: 2,
+        prompt: "/compact",
+        iso: "2026-07-01T10:12:02.000Z",
+        replies: [
+          {
+            rowId: "compact-1-out",
+            text: "Compacted (ctrl+o to see full summary)",
+            iso: "2026-07-01T10:12:02.000Z",
+          },
+        ],
+      });
+      const afterTurn = yield* heal("2026-07-01T10:13:00.000Z");
+      assert.strictEqual(lines(afterTurn, "/compact"), 1);
+      assert.strictEqual(lines(afterTurn, "Compacted (ctrl+o to see full summary)"), 1);
+
+      // A command nothing ever shows live (it printed nothing, or nothing was
+      // attached): held while it could still be running, history after that.
+      yield* h.append(claudePath, command("rename-1", "rename", "2026-07-01T10:20:00.000Z"));
+      assert.strictEqual(lines(yield* heal("2026-07-01T10:25:00.000Z"), "/rename"), 0);
+      assert.strictEqual(lines(yield* heal("2026-07-01T10:31:00.000Z"), "/rename"), 1);
+      // And one that printed with nothing attached to show it.
+      yield* h.append(claudePath, [
+        ...command("model-1", "model", "2026-07-01T10:40:00.000Z"),
+        printed("model-1-out", "Set model to Sonnet", "2026-07-01T10:40:00.500Z"),
+      ]);
+      const later = yield* heal("2026-07-01T10:41:00.000Z");
+      assert.strictEqual(lines(later, "/model"), 1);
+      assert.strictEqual(lines(later, "Set model to Sonnet"), 1);
+    }),
+);
+
 runtimeTest("a stock message T3 once showed as the person's own becomes a notice", (h) =>
   Effect.gen(function* () {
     const claudeId = "aaaaaaaa-1111-4111-8111-1111111111f1";

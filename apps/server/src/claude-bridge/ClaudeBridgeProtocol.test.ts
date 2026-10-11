@@ -3,6 +3,7 @@ import { assert, describe, it } from "@effect/vitest";
 import {
   claudeBridgeAlsoInTerminal,
   claudeBridgeAskingAgent,
+  claudeBridgeAttachmentPaths,
   claudeBridgeModAtLeast,
   claudeBridgeWakeDetail,
   claudeTranscriptCommandOutput,
@@ -340,6 +341,20 @@ describe("ClaudeBridgeProtocol record helpers", () => {
       "general-purpose",
     );
     assert.isNull(claudeBridgeAskingAgent({ signal: null }));
+  });
+
+  it("reads from a prompt the files T3 saved for it", () => {
+    assert.deepStrictEqual(
+      claudeBridgeAttachmentPaths(
+        'What is this?\n\n[Attached image "shot.png" is saved at: /Users/me/.t3/userdata/attachments/t1/shot.png]\n\n[T3: the user attached an image to this message.]',
+      ),
+      ["/Users/me/.t3/userdata/attachments/t1/shot.png"],
+    );
+    assert.deepStrictEqual(claudeBridgeAttachmentPaths("no files here"), []);
+    assert.deepStrictEqual(
+      claudeBridgeAttachmentPaths('[Attached file "x" is saved at: /a/../etc/passwd]'),
+      [],
+    );
   });
 
   it("compares bridge mod versions by number", () => {

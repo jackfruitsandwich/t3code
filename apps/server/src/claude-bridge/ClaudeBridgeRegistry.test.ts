@@ -1,11 +1,14 @@
 import { assert, describe, it } from "@effect/vitest";
 
 import {
+  CLAUDE_BRIDGE_MISSED_TURN_REPLAY_MS,
+  claudeBridgeTurnAwaitingRunSince,
   claudeHomesToScan,
   claudeLaunchArgs,
   claudeLaunchEnvironment,
   pickSessionHome,
   type ClaudeBridgeLaunchInput,
+  type ClaudeBridgeMissedTurn,
 } from "./ClaudeBridgeRegistry.ts";
 
 const input: ClaudeBridgeLaunchInput = {
@@ -105,5 +108,52 @@ describe("pickSessionHome", () => {
       pickSessionHome([{ home: "/home/me/.claude", lastPromptAt: null, hasJob: false }]),
       null,
     );
+  });
+});
+
+describe("claudeBridgeTurnAwaitingRunSince", () => {
+  const startedAt = 1_000_000;
+  const endedAt = startedAt + 1_200;
+  const start: ClaudeBridgeMissedTurn["start"] = {
+    seq: 1,
+    at: startedAt,
+    type: "turn.start",
+    turnId: "turn-1",
+    text: "Reply with exactly: quick-1",
+    transcriptOffset: 188,
+  };
+  const ended: ClaudeBridgeMissedTurn = {
+    start,
+    complete: {
+      seq: 2,
+      at: endedAt,
+      type: "turn.complete",
+      turnId: "turn-1",
+      reason: "answer",
+      answer: "quick-1",
+      isAborted: false,
+      durationMs: 1_200,
+      transcriptOffset: 900,
+    },
+  };
+
+  it("names a turn that ended with nothing attached while a run can still show it", () => {
+    assert.strictEqual(claudeBridgeTurnAwaitingRunSince(ended, endedAt + 1_500), startedAt);
+    assert.strictEqual(
+      claudeBridgeTurnAwaitingRunSince(ended, endedAt + CLAUDE_BRIDGE_MISSED_TURN_REPLAY_MS - 1),
+      startedAt,
+    );
+  });
+
+  it("names none once no run would show it any more: the turn is history then", () => {
+    assert.isUndefined(
+      claudeBridgeTurnAwaitingRunSince(ended, endedAt + CLAUDE_BRIDGE_MISSED_TURN_REPLAY_MS),
+    );
+  });
+
+  it("names none when an attachment took the turn, or while it still runs", () => {
+    assert.isUndefined(claudeBridgeTurnAwaitingRunSince(null, endedAt));
+    // A running turn is reported by the session itself, for as long as it runs.
+    assert.isUndefined(claudeBridgeTurnAwaitingRunSince({ start, complete: null }, endedAt));
   });
 });

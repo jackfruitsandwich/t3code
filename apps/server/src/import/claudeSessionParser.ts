@@ -16,6 +16,7 @@
 import {
   claudeTranscriptCommandOutput,
   claudeTranscriptCommandText,
+  isClaudeBridgeModRow,
   stripTerminalStyling,
 } from "../claude-bridge/ClaudeBridgeProtocol.ts";
 import {
@@ -137,10 +138,15 @@ export function parseClaudeSessionJsonl(content: string): ParsedCliSession {
     if (entry.isCompactSummary === true || entry.isVisibleInTranscriptOnly === true) {
       continue;
     }
-    // A `!` command is the person's line whoever wrote its row: the bridge
-    // mod writes it for a command sent from T3, and its rows are meta rows.
+    // A command is the person's line whoever wrote its row. The bridge mod
+    // writes the rows of one sent from T3 that Claude Code would not write
+    // itself (a `!` line, `/model`), and what it writes are meta rows.
     const shellInput = claudeTranscriptCommandText(entry)?.startsWith("! ") === true;
-    if (entry.isSidechain === true || (entry.isMeta === true && !shellInput)) {
+    const bridgeCommandRow =
+      isClaudeBridgeModRow(entry) &&
+      (claudeTranscriptCommandText(entry) !== null ||
+        claudeTranscriptCommandOutput(entry) !== null);
+    if (entry.isSidechain === true || (entry.isMeta === true && !shellInput && !bridgeCommandRow)) {
       continue;
     }
 

@@ -103,6 +103,61 @@ import {
 
 const DEFAULT_SWEEP_INTERVAL_MS = 30 * 1000;
 
+const sameWords = (left: string, right: string) =>
+  left.replace(/\s+/gu, " ").trim() === right.replace(/\s+/gu, " ").trim();
+
+/** How many rows at the record's end are what a command printed. */
+const trailingCommandOutput = (messages: ReadonlyArray<ParsedSessionMessage>): number => {
+  let count = 0;
+  while (count < messages.length) {
+    const message = messages[messages.length - 1 - count]!;
+    if (message.role !== "assistant" || message.command !== true) break;
+    count += 1;
+  }
+  return count;
+};
+
+/**
+ * The part of a running session's record that is history for the turn in
+ * flight. The turn is reported with the record's size at its start, but
+ * Claude Code can have written the turn's own prompt by then (seen on a busy
+ * machine: the prompt's row and the rows after it were in the file before
+ * the size was read). The prompt is the turn's. Where the record's last
+ * prompt reads as the turn's, with nothing after it but what a command
+ * printed, history ends before that row.
+ */
+export const claudeHistoryBeforeTurn = (history: string, promptText: string): string => {
+  if (promptText.trim().length === 0) return history;
+  const { messages } = parseClaudeSessionJsonl(history);
+  const prompt = messages[messages.length - 1 - trailingCommandOutput(messages)];
+  if (prompt === undefined || prompt.role !== "user" || prompt.midTurn === true) return history;
+  if (!sameWords(prompt.text, promptText)) return history;
+  return history
+    .split("\n")
+    .slice(0, prompt.lineIndex)
+    .map((line) => `${line}\n`)
+    .join("");
+};
+
+/**
+ * How many rows at the end of a live session's record belong to a command
+ * the live attachment is still to show as a turn of its own: the command's
+ * line while it runs (nothing printed yet), and the line with what it
+ * printed for a moment after. Older than that, nothing will show them, and
+ * they are history like any other row.
+ */
+export const claudeCommandRowsInFlight = (
+  messages: ReadonlyArray<ParsedSessionMessage>,
+  nowMs: number,
+): number => {
+  const printed = trailingCommandOutput(messages);
+  const line = messages[messages.length - 1 - printed];
+  if (line === undefined || line.role !== "user" || line.command !== true) return 0;
+  const newest = Date.parse(messages[messages.length - 1]!.timestamp);
+  const age = Math.abs(nowMs - newest);
+  return age < (printed === 0 ? COMMAND_RUNNING_MS : COMMAND_SETTLE_MS) ? printed + 1 : 0;
+};
+
 /**
  * Import layout epoch. Bumped when the project-placement rules change so
  * that migrated sessions can be re-imported under fresh ids. Epoch 2: codex
@@ -127,6 +182,15 @@ const DOUBLED_REPLY_REACH = 4;
  * never minutes.
  */
 const DOUBLED_REPLY_WINDOW_MS = 5 * 60_000;
+/**
+ * How long a command typed into a session a mod holds may run before its
+ * line is taken as history without what it printed. While it runs (a
+ * compaction takes minutes) the record ends with the command's line, and the
+ * live attachment shows the command as one turn once it has printed.
+ */
+const COMMAND_RUNNING_MS = 10 * 60_000;
+/** How soon after a command has printed the live attachment has shown it as a turn. */
+const COMMAND_SETTLE_MS = 10_000;
 const ACTIVE_RUN_STATUSES: ReadonlySet<string> = new Set([
   "preparing",
   "starting",
@@ -548,10 +612,14 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
           .pipe(Effect.orElseSucceed((): ReadonlyArray<string> => []));
         const now = yield* Clock.currentTimeMillis;
         for (const instanceId of instances) {
-          const raw = yield* fs
+          const read = fs
             .readFileString(path.join(dir, instanceId, "session.json"))
             .pipe(Effect.orElseSucceed(() => ""));
-          const session = parseClaudeBridgeSessionFile(parseJsonlLine(raw) ?? null);
+          let session = parseClaudeBridgeSessionFile(parseJsonlLine(yield* read) ?? null);
+          // The mod rewrites the file in place: a read can land mid-write.
+          if (session === null) {
+            session = parseClaudeBridgeSessionFile(parseJsonlLine(yield* read) ?? null);
+          }
           if (session !== null && isClaudeBridgeSessionLive(session, now)) return session;
         }
         return null;
@@ -826,7 +894,14 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
       /** The thread's runs: each row goes after the one that was the latest when it was written. */
       readonly runs?: ReadonlyArray<HealingRun>;
     }) {
-      const candidates = input.parsed.messages.filter(
+      // A command still running, or just over, is the live attachment's to
+      // show as a turn (see claudeCommandRowsInFlight): its rows wait.
+      const held = claudeCommandRowsInFlight(input.parsed.messages, yield* Clock.currentTimeMillis);
+      const settled =
+        held === 0
+          ? input.parsed.messages
+          : input.parsed.messages.slice(0, input.parsed.messages.length - held);
+      const candidates = settled.filter(
         (message) =>
           message.lineIndex >= input.fromLineIndex &&
           (input.afterMs === undefined ||
@@ -1198,10 +1273,21 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         ),
       );
       const settledBeforeMs = input.settledBeforeMs;
+      // A command a mod-held session is still running, or has just run, is
+      // the live attachment's to show: taken in now, its line would be there
+      // again when the attachment shows the command as a turn.
+      // (Whether a mod holds the session is read from a file the mod
+      // rewrites; a read that lands mid-write says "not live". The record
+      // itself says a command is running, so the hold does not hang on that.)
+      const commandInFlight = claudeCommandRowsInFlight(
+        parsed.messages,
+        yield* Clock.currentTimeMillis,
+      );
+      const settled = parsed.messages.slice(0, parsed.messages.length - commandInFlight);
       const rows =
         settledBeforeMs === undefined
-          ? parsed.messages
-          : parsed.messages.filter(
+          ? settled
+          : settled.filter(
               (message) =>
                 message.midTurn === true ||
                 DateTime.toEpochMillis(dateTime(message.timestamp)) < settledBeforeMs,
@@ -1266,9 +1352,10 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
       }
       yield* retireInventedPrompts({ threadId, rows: parsed.messages });
       yield* blankDoubledReplies({ threadId, rows: parsed.messages });
-      // The cursor says how far the file has been taken in; with a turn in
-      // flight its rows have not been, and the pass after it still needs them.
-      if (settledBeforeMs === undefined) {
+      // The cursor says how far the file has been taken in; with a turn or a
+      // command in flight its rows have not been, and the pass after it
+      // still needs them.
+      if (settledBeforeMs === undefined && commandInFlight === 0) {
         yield* upsertImportBinding({
           driver: input.driver,
           sessionId,
@@ -1296,6 +1383,12 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
       readonly threadId: ThreadId;
       readonly fromLineIndex: number;
       readonly context: Pick<SweepContext, "stats">;
+      /**
+       * When a turn began that has ended with nothing attached, and that a
+       * run offered for it is still to show from its start. Its rows are that
+       * run's, as a running turn's are the attachment's.
+       */
+      readonly turnAwaitingRunSinceMs?: number;
     }) {
       const live = yield* liveBridgeSession(input.sessionId);
       const activeRuns = yield* activeRunStartsMs(input.threadId);
@@ -1307,6 +1400,7 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
       const turnInFlight = [
         ...activeRuns,
         ...(live !== null && live.activeTurn !== null ? [live.activeTurn.startedAt] : []),
+        ...(input.turnAwaitingRunSinceMs === undefined ? [] : [input.turnAwaitingRunSinceMs]),
       ];
       const settledBeforeMs =
         turnInFlight.length === 0 ? undefined : Math.min(...turnInFlight) - IN_FLIGHT_MARGIN_MS;
@@ -1341,13 +1435,15 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         runs,
         ...(afterMs === undefined ? {} : { afterMs }),
       });
-      yield* upsertImportBinding({
-        driver: input.driver,
-        sessionId: input.sessionId,
-        threadId: input.threadId,
-        parsed: input.parsed,
-        filePath: input.filePath,
-      });
+      if (claudeCommandRowsInFlight(input.parsed.messages, yield* Clock.currentTimeMillis) === 0) {
+        yield* upsertImportBinding({
+          driver: input.driver,
+          sessionId: input.sessionId,
+          threadId: input.threadId,
+          parsed: input.parsed,
+          filePath: input.filePath,
+        });
+      }
       if (appendedCount > 0) {
         input.context.stats.updatedCount += 1;
         yield* Effect.logInfo("session.importer.owned-thread-caught-up", {
@@ -1685,13 +1781,17 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
           parsed,
           fromLineIndex: cursor.lineCount,
         });
-        yield* upsertImportBinding({
-          driver,
-          sessionId,
-          threadId,
-          parsed,
-          filePath: input.filePath,
-        });
+        // The cursor says how far the file has been taken in: not past a
+        // command whose rows are being held for the live attachment.
+        if (claudeCommandRowsInFlight(parsed.messages, yield* Clock.currentTimeMillis) === 0) {
+          yield* upsertImportBinding({
+            driver,
+            sessionId,
+            threadId,
+            parsed,
+            filePath: input.filePath,
+          });
+        }
         if (appendedCount > 0) {
           input.context.stats.updatedCount += 1;
           yield* Effect.logDebug("session.importer.updated", {
@@ -2311,12 +2411,14 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         const bytes = yield* fs
           .readFile(input.transcriptPath)
           .pipe(Effect.orElseSucceed(() => new Uint8Array(0)));
-        const history = new TextDecoder().decode(
+        const written = new TextDecoder().decode(
           bytes.subarray(0, Math.max(0, Math.min(bytes.length, input.turnOffset))),
         );
+        const history = claudeHistoryBeforeTurn(written, input.promptText);
         const parsed = parseClaudeSessionJsonl(history);
         // Agent plumbing and machine-launched runs keep the sweep's placement rules.
-        if (parsed.launch === "subagent" || isAutomationSession(parsed)) return;
+        const whole = history === written ? parsed : parseClaudeSessionJsonl(written);
+        if (whole.launch === "subagent" || isAutomationSession(whole)) return;
         const now = DateTime.formatIso(yield* DateTime.now);
         yield* importFreshSession({
           driver: CLAUDE_DRIVER,
@@ -2369,6 +2471,9 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
           // Only the comparison by row applies to a session a mod holds.
           fromLineIndex: parsed.lineCount,
           context: { stats: { importedCount: 0, updatedCount: 0 } },
+          ...(input.turnAwaitingRunSinceMs === undefined
+            ? {}
+            : { turnAwaitingRunSinceMs: input.turnAwaitingRunSinceMs }),
         });
       }).pipe(
         Effect.catch((error: unknown) =>

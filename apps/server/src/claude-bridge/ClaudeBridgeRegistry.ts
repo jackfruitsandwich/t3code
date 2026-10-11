@@ -75,6 +75,30 @@ export interface ClaudeBridgeMissedTurn {
   readonly complete: Extract<ClaudeBridgeEvent, { readonly type: "turn.complete" }> | null;
 }
 
+/**
+ * How recently a turn nobody was attached for must have ended for the next
+ * attachment to show it from its start. Until then its rows are that
+ * attachment's to show; after it they reach the thread as history. (The
+ * query runner replays a missed turn within the same span.)
+ */
+export const CLAUDE_BRIDGE_MISSED_TURN_REPLAY_MS = 15_000;
+
+/**
+ * When a turn began that ended with nothing attached and that an attachment
+ * may still show from its start; undefined when there is none, when it is
+ * still running (the session itself reports that one), or when it ended too
+ * long ago for an attachment to show it.
+ */
+export const claudeBridgeTurnAwaitingRunSince = (
+  missed: ClaudeBridgeMissedTurn | null,
+  nowMs: number,
+): number | undefined =>
+  missed !== null &&
+  missed.complete !== null &&
+  nowMs - missed.complete.at < CLAUDE_BRIDGE_MISSED_TURN_REPLAY_MS
+    ? missed.start.at
+    : undefined;
+
 export interface ClaudeBridgeProcess {
   readonly sid: string;
   readonly instanceId: string;

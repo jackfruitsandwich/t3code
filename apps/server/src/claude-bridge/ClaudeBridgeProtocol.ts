@@ -30,7 +30,7 @@ import type {
 import { isRecord, parseJsonlLine } from "../import/sessionImportTypes.ts";
 
 export const CLAUDE_BRIDGE_PROTOCOL_VERSION = 2;
-export const CLAUDE_BRIDGE_MOD_VERSION = "0.3.7";
+export const CLAUDE_BRIDGE_MOD_VERSION = "0.3.8";
 /**
  * The first protocol whose mod runs slash commands, answers questions with
  * their answers and reports the session's own commands. A process still on an
@@ -99,7 +99,17 @@ export interface ClaudeBridgeSessionFile {
 }
 
 export type ClaudeBridgeCommandBody =
-  | { readonly type: "prompt"; readonly text: string; readonly promptUuid: string }
+  | {
+      readonly type: "prompt";
+      readonly text: string;
+      readonly promptUuid: string;
+      /**
+       * Files T3 saved for this prompt (an image the person attached): the
+       * prompt tells the model where they are, and the session may read
+       * exactly these without asking.
+       */
+      readonly attachments?: ReadonlyArray<string>;
+    }
   /** A slash command, run in the session as if the person typed `/name args` there. */
   | {
       readonly type: "command";
@@ -581,6 +591,26 @@ export const claudeBridgeAlsoInTerminal = (options: unknown): boolean =>
  */
 export const claudeBridgeAskingAgent = (options: unknown): string | null =>
   isRecord(options) && typeof options.askedByAgent === "string" ? options.askedByAgent : null;
+/**
+ * Commands that move a Claude Code session on to another conversation: the
+ * terminal then shows that conversation, and it gets a thread of its own. A
+ * thread is one conversation and cannot follow, so sent from T3 they are not
+ * run; the person is told where to run them.
+ */
+const CLAUDE_SESSION_MOVING_COMMANDS: ReadonlySet<string> = new Set(["clear", "resume", "branch"]);
+/** What T3 says instead of running such a command, or null for any other command. */
+export function claudeSessionMovingNotice(name: string): string | null {
+  return CLAUDE_SESSION_MOVING_COMMANDS.has(name)
+    ? `Not run: /${name} moves this Claude Code session on to another conversation, and this thread cannot follow it yet. Run it in the session's terminal: the conversation it opens shows up here as its own thread. For a fresh conversation from T3, start a new chat.`
+    : null;
+}
+/** Where T3 says, in a prompt, that it saved a file the person attached (see AttachmentPrompt). */
+const SAVED_ATTACHMENT = /\[Attached [^\]\n]*? is saved at: ([^\]\n]+)\]/gu;
+/** The paths of the files a prompt from T3 says were saved for it. */
+export const claudeBridgeAttachmentPaths = (text: string): ReadonlyArray<string> =>
+  Array.from(text.matchAll(SAVED_ATTACHMENT), (match) => match[1]!.trim()).filter(
+    (path) => path.startsWith("/") && !path.includes("/../"),
+  );
 /** The first mod that runs `!` commands sent from T3. */
 export const CLAUDE_BRIDGE_BASH_MOD_VERSION = "0.3.4";
 /** The first mod that refuses a call through Claude Code's own dialog (`stopTurn`). */
