@@ -102,11 +102,16 @@ import {
 import { SessionImporter, type SessionImporterShape } from "../Services/SessionImporter.ts";
 import {
   bandForTime,
+  claudeRecordLines,
   type HealingPlacement,
   type HealingRun,
   planImportedRowOrdering,
   planImportedRowReseating,
+  planRecordSeating,
   planTranscriptHealing,
+  recordKeyOfTurnItem,
+  RUN_BAND,
+  sentPromptLines,
 } from "../transcriptHealing.ts";
 
 const DEFAULT_SWEEP_INTERVAL_MS = 30 * 1000;
@@ -217,6 +222,10 @@ const DOUBLED_REPLY_REACH = 4;
  * never minutes.
  */
 const DOUBLED_REPLY_WINDOW_MS = 5 * 60_000;
+/** Rows written again per write when a thread's rows are seated by the record. */
+const SEATING_WRITE_SIZE = 250;
+/** In the state directory: the ids of the threads kept in the record's line order. */
+const RECORD_ORDER_THREADS_FILE = "record-order-threads.json";
 /**
  * How long a command typed into a session a mod holds may run before its
  * line is taken as history without what it printed. While it runs (a
@@ -291,6 +300,13 @@ export interface SessionImporterLiveOptions {
    * turns itself; the importer leaves such a session alone.
    */
   readonly bridgeDir?: string;
+  /**
+   * Threads whose messages are kept in the order of the record's lines, each
+   * between the tool calls it was written among (see `planRecordSeating`).
+   * Other threads keep every imported row after the run that was the latest
+   * at its time.
+   */
+  readonly recordOrderThreads?: ReadonlySet<string>;
   /**
    * Path prefixes whose sessions route to the Automations project regardless
    * of launch markers. Agent harnesses that drive real interactive CLIs
@@ -568,6 +584,9 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
     const enabled = options?.enabled ?? true;
     const sweepIntervalMs = Math.max(1, options?.sweepIntervalMs ?? DEFAULT_SWEEP_INTERVAL_MS);
     const bridgeDir = options?.bridgeDir;
+    const recordOrderThreads = options?.recordOrderThreads ?? new Set<string>();
+    /** What a record-ordered thread looked like when it last needed nothing moved. */
+    const seatedThreads = new Map<string, string>();
     const maxFileBytes = Math.max(1, options?.maxFileBytes ?? DEFAULT_MAX_FILE_BYTES);
     const settleMs = Math.max(0, options?.settleMs ?? DEFAULT_SETTLE_MS);
     const automationRoots = (options?.automationRoots ?? []).map((root) =>
@@ -1324,6 +1343,11 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
      * row out of a thread, so the drawn copy is emptied (a reply with nothing
      * in it draws nothing), and where the record's row landed far from it
      * (re-read into a later run) that row takes the drawn copy's place.
+     *
+     * The record's row can itself be there twice: imported as history, then
+     * delivered by a run that showed the turn from its start. The run's copy
+     * sits among the turn's tool calls and is the one an import would have
+     * left alone, so the imported copy is emptied.
      */
     const blankDoubledReplies = Effect.fn("SessionImporter.blankDoubledReplies")(function* (input: {
       readonly threadId: ThreadId;
@@ -1384,8 +1408,28 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
           if (apartMs <= DOUBLED_REPLY_WINDOW_MS) pairs.push({ drawn, recorded, apartMs });
         });
       });
-      if (pairs.length === 0) return;
       const emptied = new Set<string>();
+      const twins = new Set<string>();
+      const importedPrefix = importedTurnItemId(threadId, "");
+      const deliveredTexts = new Map<string, Set<string>>();
+      for (const reply of replies) {
+        const rowId = recordRowOf(reply.turn_item_id);
+        if (rowId === null || reply.turn_item_id.startsWith(importedPrefix)) continue;
+        deliveredTexts.set(
+          rowId,
+          (deliveredTexts.get(rowId) ?? new Set()).add(normalize(reply.text)),
+        );
+      }
+      for (const reply of replies) {
+        const text = normalize(reply.text);
+        if (text.length === 0 || !reply.turn_item_id.startsWith(importedPrefix)) continue;
+        const rowId = recordRowOf(reply.turn_item_id);
+        if (rowId !== null && deliveredTexts.get(rowId)?.has(text) === true) {
+          emptied.add(reply.turn_item_id);
+          twins.add(reply.turn_item_id);
+        }
+      }
+      if (pairs.length === 0 && emptied.size === 0) return;
       const placeOf = new Map<string, number>();
       const taken = new Set<number>();
       let movedCount = 0;
@@ -1434,7 +1478,9 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
           ),
           type: "turn-item.updated",
           threadId,
-          occurredAt: item.updatedAt,
+          // An event's time becomes the thread's: emptying old history is
+          // not the thread being used, so it keeps the time it has.
+          occurredAt: twins.has(item.id) ? records.thread.updatedAt : item.updatedAt,
           payload: {
             ...item,
             ...(emptied.has(item.id) ? { text: "" } : {}),
@@ -1451,6 +1497,202 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         emptied: emptied.size,
         moved: movedCount,
       });
+    });
+
+    /**
+     * Puts a thread's messages in the order of the record's lines (see
+     * `planRecordSeating`): all of them for a thread kept in that order,
+     * and for any other thread only a message T3 sent into a running turn
+     * that the turn took later than it was sent.
+     *
+     * A row's place is kept apart from the row, one row to a place: the
+     * places are rewritten together, then every row whose shown place is not
+     * its place is written again, which is also what finishes a pass that
+     * was cut short. Rows of a run still going are left for the pass after
+     * it ends.
+     */
+    const seatRowsByRecord = Effect.fn("SessionImporter.seatRowsByRecord")(function* (input: {
+      readonly threadId: ThreadId;
+      readonly filePath: string;
+      readonly parsed: ParsedCliSession;
+      readonly runs: ReadonlyArray<HealingRun>;
+      readonly only?: "sent";
+    }) {
+      const { threadId } = input;
+      const sentRows = yield* sql<{
+        readonly turn_item_id: string;
+        readonly text: string | null;
+        readonly sent_at: string;
+      }>`
+        SELECT
+          turn_item_id,
+          json_extract(payload_json, '$.text') AS text,
+          coalesce(json_extract(payload_json, '$.startedAt'), updated_at) AS sent_at
+        FROM orchestration_v2_projection_turn_items
+        WHERE thread_id = ${threadId}
+          AND type = 'user_message'
+          AND json_extract(payload_json, '$.inputIntent') IN ('steer', 'promoted_queued_to_steer')
+      `;
+      if (input.only === "sent" && sentRows.length === 0) return;
+      const active = (yield* sql<{ readonly ordinal: number; readonly status: string }>`
+        SELECT ordinal, status
+        FROM orchestration_v2_projection_runs
+        WHERE thread_id = ${threadId}
+      `).flatMap((run) => (ACTIVE_RUN_STATUSES.has(run.status) ? [run.ordinal] : []));
+      const frozenBand = active.length === 0 ? undefined : Math.min(...active);
+      const below = frozenBand === undefined ? Number.MAX_SAFE_INTEGER : frozenBand * RUN_BAND;
+      const positioned = yield* sql<{
+        readonly turn_item_id: string;
+        readonly ordinal: number;
+        readonly shown: number | null;
+        readonly type: string | null;
+      }>`
+        SELECT place.turn_item_id, place.ordinal, item.ordinal AS shown, item.type
+        FROM orchestration_v2_turn_item_positions AS place
+        LEFT JOIN orchestration_v2_projection_turn_items AS item
+          ON item.thread_id = place.thread_id AND item.turn_item_id = place.turn_item_id
+        WHERE place.thread_id = ${threadId} AND place.ordinal < ${below}
+        ORDER BY place.ordinal
+      `;
+      const written = new Map<string, { readonly line: number; readonly atMs: number }>();
+      for (const message of input.parsed.messages) {
+        if (written.has(message.sourceId)) continue;
+        written.set(message.sourceId, {
+          line: message.lineIndex,
+          atMs: DateTime.toEpochMillis(dateTime(message.timestamp)),
+        });
+      }
+      const keys = new Map(
+        positioned.map((row) => [row.turn_item_id, recordKeyOfTurnItem(row.turn_item_id)]),
+      );
+      const sent = sentPromptLines({
+        // A message T3 sent carries T3's id, not a row of the record.
+        sent: sentRows.flatMap((row) =>
+          keys.get(row.turn_item_id) === null
+            ? [
+                {
+                  turnItemId: row.turn_item_id,
+                  text: row.text ?? "",
+                  sentAtMs: DateTime.toEpochMillis(dateTime(row.sent_at)),
+                },
+              ]
+            : [],
+        ),
+        rows: input.parsed.messages,
+        shownIds: new Set([...keys.values()].flatMap((key) => (key === null ? [] : [key]))),
+      });
+      // Nothing to look at again until a row is added, a run ends, or the
+      // record writes a sent message.
+      const settled = positioned.every((row) => row.shown === null || row.shown === row.ordinal);
+      const state = `${positioned.length}:${frozenBand ?? "none"}:${sent.size}`;
+      if (settled && seatedThreads.get(threadId) === state) return;
+      // Tool calls and reasoning place a message exactly; a sent message
+      // only has to clear the replies written before it.
+      const lines =
+        input.only === "sent"
+          ? new Map<string, number>()
+          : claudeRecordLines(yield* fs.readFileString(input.filePath));
+      const importedPrefix = importedTurnItemId(threadId, "");
+      const rows = positioned.map((row) => {
+        const key = keys.get(row.turn_item_id) ?? null;
+        const message = key === null ? sent.get(row.turn_item_id) : written.get(key);
+        return {
+          turnItemId: row.turn_item_id,
+          ordinal: row.ordinal,
+          line: message?.line ?? (key === null ? null : (lines.get(key) ?? null)),
+          kind: row.turn_item_id.startsWith(importedPrefix)
+            ? ("imported" as const)
+            : sent.has(row.turn_item_id)
+              ? ("sent" as const)
+              : row.type === "user_message" || row.type === "assistant_message"
+                ? ("message" as const)
+                : ("other" as const),
+          atMs: message?.atMs ?? 0,
+        };
+      });
+      const moves = planRecordSeating({
+        rows,
+        runs: input.runs,
+        ...(frozenBand === undefined ? {} : { frozenBand }),
+        ...(input.only === undefined ? {} : { only: input.only }),
+      });
+      if (moves.length > 0) {
+        // Every moved row steps aside before any takes its place.
+        yield* sql.withTransaction(
+          Effect.gen(function* () {
+            for (const [index, move] of moves.entries()) {
+              yield* sql`
+                UPDATE orchestration_v2_turn_item_positions
+                SET ordinal = ${-(index + 1)}
+                WHERE thread_id = ${threadId} AND turn_item_id = ${move.turnItemId}
+              `;
+            }
+            for (const move of moves) {
+              yield* sql`
+                UPDATE orchestration_v2_turn_item_positions
+                SET ordinal = ${move.ordinal}
+                WHERE thread_id = ${threadId} AND turn_item_id = ${move.turnItemId}
+              `;
+            }
+          }),
+        );
+      }
+      // Outside a thread kept in the record's order, only the runs a sent
+      // message sits in are this pass's to write.
+      const bands =
+        input.only === "sent"
+          ? new Set(
+              rows.flatMap((row) =>
+                row.kind === "sent" ? [Math.floor(row.ordinal / RUN_BAND)] : [],
+              ),
+            )
+          : undefined;
+      const placeOf = new Map(
+        (yield* sql<{ readonly turn_item_id: string; readonly ordinal: number }>`
+          SELECT item.turn_item_id, place.ordinal
+          FROM orchestration_v2_projection_turn_items AS item
+          JOIN orchestration_v2_turn_item_positions AS place
+            ON place.thread_id = item.thread_id AND place.turn_item_id = item.turn_item_id
+          WHERE item.thread_id = ${threadId}
+            AND item.ordinal <> place.ordinal
+            AND place.ordinal < ${below}
+        `).flatMap((row) =>
+          bands === undefined || bands.has(Math.floor(row.ordinal / RUN_BAND))
+            ? [[row.turn_item_id, row.ordinal] as const]
+            : [],
+        ),
+      );
+      if (placeOf.size > 0) {
+        const records = yield* threads.getThreadRecords(threadId, ["turnItems"]);
+        // A row can come back to a place it held before, and an event's id is
+        // written once: the thread's own count of events tells the passes apart.
+        const pass = yield* eventSink.latestSequence({ threadId });
+        const events = records.turnItems.flatMap((item): Array<OrchestrationV2DomainEvent> => {
+          const place = placeOf.get(item.id);
+          return place === undefined
+            ? []
+            : [
+                {
+                  id: importEventId(threadId, `record-seat:${pass}:${place}:${item.id}`),
+                  type: "turn-item.updated",
+                  threadId,
+                  // An event's time becomes the thread's: a row changing
+                  // place is not the thread being used.
+                  occurredAt: records.thread.updatedAt,
+                  payload: { ...item, ordinal: place },
+                },
+              ];
+        });
+        for (let start = 0; start < events.length; start += SEATING_WRITE_SIZE) {
+          yield* eventSink.write({ events: events.slice(start, start + SEATING_WRITE_SIZE) });
+        }
+        yield* Effect.logInfo("session.importer.rows-seated-by-record", {
+          threadId,
+          placesChanged: moves.length,
+          rowsWritten: events.length,
+        });
+      }
+      if (moves.length === 0) seatedThreads.set(threadId, state);
     });
 
     /**
@@ -1670,7 +1912,10 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         parsed: input.parsed,
         runs,
       };
-      yield* reseatImportedRows({ ...reseat, pass: "bands" });
+      // A thread kept in the record's line order has its rows seated after the
+      // comparison; placing them by time first would only move them away.
+      const byRecord = recordOrderThreads.has(input.threadId);
+      if (!byRecord) yield* reseatImportedRows({ ...reseat, pass: "bands" });
       const compared = yield* healBridgedThread({
         ...input,
         runs,
@@ -1678,7 +1923,14 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         ...(settledBeforeMs === undefined ? {} : { settledBeforeMs }),
       });
       // What was just added went to the end of its band.
-      yield* reseatImportedRows({ ...reseat, pass: "order" });
+      if (!byRecord) yield* reseatImportedRows({ ...reseat, pass: "order" });
+      yield* seatRowsByRecord({
+        threadId: input.threadId,
+        filePath: input.filePath,
+        parsed: input.parsed,
+        runs,
+        ...(byRecord ? {} : { only: "sent" as const }),
+      });
       if (compared) return;
       // Catching up by time takes whatever T3's record does not reach yet,
       // which a turn in flight is still adding to.
@@ -2884,8 +3136,23 @@ export const makeSessionImporterLive = (options?: SessionImporterLiveOptions) =>
       const serverConfig = yield* ServerConfig;
       const hostEnvironment = yield* HostProcessEnvironment;
       const path = yield* Path.Path;
+      const fs = yield* FileSystem.FileSystem;
+      // The threads kept in the record's line order: a JSON list of thread
+      // ids. Without the file no thread is.
+      const recordOrderThreads = yield* fs
+        .readFileString(path.join(serverConfig.stateDir, RECORD_ORDER_THREADS_FILE))
+        .pipe(
+          Effect.orElseSucceed(() => ""),
+          Effect.map((text) => {
+            const ids = parseJsonlLine(text);
+            return new Set(
+              Array.isArray(ids) ? ids.filter((id): id is string => typeof id === "string") : [],
+            );
+          }),
+        );
       return yield* makeSessionImporter({
         enabled: serverConfig.importCliSessions ?? false,
+        recordOrderThreads,
         bridgeDir:
           hostEnvironment[CLAUDE_BRIDGE_DIR_ENV]?.trim() ||
           path.join(serverConfig.stateDir, "bridge"),

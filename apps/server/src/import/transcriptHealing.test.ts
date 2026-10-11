@@ -2,10 +2,15 @@ import { assert, describe, it } from "@effect/vitest";
 
 import type { ParsedSessionMessage } from "./sessionImportTypes.ts";
 import {
+  claudeRecordLines,
   type HealingKnownMessage,
   planImportedRowOrdering,
   planImportedRowReseating,
+  planRecordSeating,
   planTranscriptHealing,
+  recordKeyOfTurnItem,
+  type SeatingRow,
+  sentPromptLines,
 } from "./transcriptHealing.ts";
 
 const at = (minute: number, second = 0) =>
@@ -237,6 +242,174 @@ describe("planImportedRowOrdering", () => {
         ],
       }),
       [],
+    );
+  });
+});
+
+describe("planRecordSeating", () => {
+  const RUNS = [
+    { id: "run-1", ordinal: 1, startedAtMs: ms(30) },
+    { id: "run-2", ordinal: 2, startedAtMs: ms(40) },
+  ];
+  /** `id@place` rows: the id's letter says the kind, its number the record line. */
+  const thread = (...placed: ReadonlyArray<string>): ReadonlyArray<SeatingRow> =>
+    placed.map((entry) => {
+      const [id, place] = entry.split("@") as [string, string];
+      const line = id.slice(1) === "" ? null : Number(id.slice(1));
+      const kinds = { i: "imported", m: "message", s: "sent", t: "other", x: "other" } as const;
+      return {
+        turnItemId: id,
+        ordinal: Number(place),
+        line,
+        kind: kinds[id[0] as keyof typeof kinds],
+        // Written a minute a line, so before the first run started.
+        atMs: line === null ? 0 : ms(line),
+      };
+    });
+  /** The thread as it reads once the plan is carried out, with each row's band. */
+  const after = (
+    rows: ReadonlyArray<SeatingRow>,
+    options: { only?: "sent"; frozenBand?: number },
+  ) => {
+    const moves = planRecordSeating({ rows, runs: RUNS, ...options });
+    const placeOf = new Map(moves.map((move) => [move.turnItemId, move.ordinal]));
+    const seatedRows = rows.map((row) => ({
+      ...row,
+      ordinal: placeOf.get(row.turnItemId) ?? row.ordinal,
+    }));
+    const places = seatedRows.map((row) => row.ordinal);
+    assert.strictEqual(new Set(places).size, places.length, "one row to a place");
+    // Carried out, the plan asks for nothing more.
+    assert.deepEqual(planRecordSeating({ rows: seatedRows, runs: RUNS, ...options }), []);
+    return {
+      moved: moves.length,
+      reads: seatedRows
+        .toSorted((left, right) => left.ordinal - right.ordinal)
+        .map((row) => `${Math.floor(row.ordinal / 1_000_000)}:${row.turnItemId}`)
+        .join(" "),
+    };
+  };
+
+  it("seats imported rows between the tool calls they were written among", () => {
+    // History above the run (prompts, and a reply the run shows again), then
+    // the run's own rows; `x` is a row the record does not hold.
+    const rows = thread(
+      "i1@1",
+      "i3@2",
+      "i6@3",
+      "i9@4",
+      "t2@1000001",
+      "m3@1000002",
+      "t4@1000003",
+      "t5@1000004",
+      "x@1000005",
+      "t7@1000006",
+      "m8@1000007",
+    );
+    const seated = after(rows, {});
+    assert.strictEqual(seated.reads, "0:i1 1:t2 1:m3 1:i3 1:t4 1:t5 1:i6 1:x 1:t7 1:m8 1:i9");
+    // Rows below the first one seated step down; the rows above it stay.
+    assert.strictEqual(seated.moved, 8);
+  });
+
+  it("moves a message a later run read late up to where it was written", () => {
+    const rows = thread("m1@1000001", "t2@1000002", "m5@1000003", "m3@2000001", "m9@2000002");
+    assert.strictEqual(after(rows, {}).reads, "1:m1 1:t2 1:m3 1:m5 2:m9");
+  });
+
+  it("is not thrown by tool calls that arrived in another order than they were written", () => {
+    const rows = thread("t2@1000001", "t4@1000002", "t3@1000003", "m5@1000004", "i6@1000005");
+    assert.deepEqual(planRecordSeating({ rows, runs: RUNS }), []);
+  });
+
+  it("moves a message T3 sent early below the reply written before it, and nothing else", () => {
+    // The steer (line 4) was shown when sent, above the reply (line 3) the
+    // turn was still writing; the record took it after that reply.
+    const rows = thread("m1@1000001", "s4@1000002", "m3@1000003", "m5@1000004", "i2@1000005");
+    const seated = after(rows, { only: "sent" });
+    assert.strictEqual(seated.reads, "1:m1 1:m3 1:s4 1:m5 1:i2");
+    assert.strictEqual(seated.moved, 2);
+    // A sent message that already reads in order is left where it is.
+    assert.deepEqual(
+      planRecordSeating({
+        rows: thread("m1@1000001", "s2@1000002", "x@1000003", "m3@1000004"),
+        runs: RUNS,
+        only: "sent",
+      }),
+      [],
+    );
+  });
+
+  it("leaves the rows of a run still going", () => {
+    const rows = thread("i2@1", "m1@1000001", "m3@1000002", "s9@2000001", "m8@2000002");
+    assert.strictEqual(after(rows, { frozenBand: 2 }).reads, "1:m1 1:i2 1:m3 2:s9 2:m8");
+  });
+});
+
+describe("the record's lines", () => {
+  it("names what a turn item shows of the record", () => {
+    assert.strictEqual(recordKeyOfTurnItem("cli-import:v2:cli-import-e2-s:uuid-1"), "uuid-1");
+    assert.strictEqual(
+      recordKeyOfTurnItem("turn-item:provider:claudeAgent:native-item:uuid-2"),
+      "uuid-2",
+    );
+    assert.strictEqual(
+      recordKeyOfTurnItem("turn-item:provider:claudeAgent:native-item:toolu_01"),
+      "toolu_01",
+    );
+    assert.strictEqual(
+      recordKeyOfTurnItem("turn-item:provider:claudeAgent:native-item:msg_01%253Athinking%253A0"),
+      "msg_01",
+    );
+    assert.strictEqual(recordKeyOfTurnItem("turn-item:message:message%3Athread%3At"), null);
+  });
+
+  it("finds the line each tool call and API message is first written on", () => {
+    const entry = (extra: object, content: ReadonlyArray<object>) =>
+      JSON.stringify({ type: "assistant", ...extra, message: { id: "msg_01", content } });
+    const lines = claudeRecordLines(
+      [
+        JSON.stringify({ type: "user", message: { content: '"assistant" toolu_00' } }),
+        entry({}, [{ type: "thinking" }]),
+        entry({}, [{ type: "tool_use", id: "toolu_01" }]),
+        entry({ isSidechain: true }, [{ type: "tool_use", id: "toolu_02" }]),
+        "not json",
+      ].join("\n"),
+    );
+    assert.deepEqual(
+      [...lines],
+      [
+        ["msg_01", 1],
+        ["toolu_01", 2],
+      ],
+    );
+  });
+
+  it("ties a message T3 sent to the record row written after it, one row to a message", () => {
+    const rows = [
+      row("user", "u1", "continue", 1),
+      row("assistant", "a1", "continue", 2),
+      row("user", "u2", "continue", 5),
+      row("user", "u3", "continue", 20),
+      row("user", "u4", "continue", 59),
+    ];
+    const lines = sentPromptLines({
+      sent: [
+        { turnItemId: "sent-1", text: "continue", sentAtMs: ms(4) },
+        { turnItemId: "sent-2", text: "something else", sentAtMs: ms(4) },
+        { turnItemId: "sent-3", text: "continue", sentAtMs: ms(3) },
+      ],
+      rows,
+      shownIds: new Set(["u1"]),
+    });
+    // u1 is shown under its own id, and was written before either was sent;
+    // u2 is closest to sent-1, which leaves u3 for sent-3; u4 is out of reach.
+    assert.deepEqual(
+      [...lines],
+      [
+        ["sent-1", { line: 5, atMs: ms(5) }],
+        ["sent-3", { line: 20, atMs: ms(20) }],
+      ],
     );
   });
 });

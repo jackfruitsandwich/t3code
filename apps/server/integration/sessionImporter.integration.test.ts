@@ -2566,6 +2566,328 @@ runtimeTest("a reply shown from the terminal and again from the record is left s
   }),
 );
 
+/**
+ * A turn imported as history, then shown again from its start by a run that
+ * picked the session up: both replies are there twice, what was typed sits
+ * above the run instead of in it, and a line a later run read sits below.
+ */
+const turnShownTwice = (h: Harness, claudeId: string) =>
+  Effect.gen(function* () {
+    const c = claudeSession({ sessionId: claudeId, cwd: h.workspace });
+    const claudePath = h.claudeFile(claudeId);
+    const threadId = importedThreadId(claudeId);
+    const thinking = (uuid: string, messageId: string, at: string): Entry => ({
+      ...c.assistant(uuid, "", at),
+      message: { id: messageId, role: "assistant", content: [{ type: "thinking", thinking: "" }] },
+    });
+    const halfway = c.assistant("assistant-p", "Halfway there.", "2026-07-01T10:00:20.000Z");
+    const record = [
+      c.user("user-1", "Fix the login bug please", "2026-07-01T10:00:00.000Z"),
+      c.assistant("assistant-1", "Looking at login.", "2026-07-01T10:00:05.000Z"),
+      thinking("thinking-1", "msg_one", "2026-07-01T10:00:10.000Z"),
+      halfway,
+      c.user("user-2", "And the logout bug", "2026-07-01T10:00:30.000Z"),
+      thinking("thinking-2", "msg_two", "2026-07-01T10:00:40.000Z"),
+      c.assistant("assistant-2", "Both fixed.", "2026-07-01T10:00:50.000Z"),
+    ];
+    // The import showed no progress line.
+    yield* h.write(
+      claudePath,
+      record.filter((entry) => entry !== halfway),
+    );
+    const bridgeDir = yield* h.makeDir("bridge");
+    const sweep = yield* h.importer({ bridgeDir });
+    yield* sweep.sweepNow();
+    yield* h.write(claudePath, record);
+    yield* seedT3Run(h, threadId, CLAUDE, "completed", {
+      ordinal: 1,
+      iso: "2026-07-01T10:02:00.000Z",
+    });
+    yield* seedT3Run(h, threadId, CLAUDE, "completed", {
+      ordinal: 2,
+      iso: "2026-07-01T10:04:00.000Z",
+    });
+    const firstRun = RunId.make(`seed-run:${threadId}`);
+    const laterRun = RunId.make(`seed-run:${threadId}:2`);
+    const delivered = (nativeId: string, text: string, iso: string, runId: RunId) => {
+      const seed = seedTimelineRow({
+        threadId,
+        key: `${nativeId}:${runId}`,
+        messageId: MessageId.make(`message:provider:claudeAgent:native-item:${nativeId}`),
+        role: "assistant",
+        text,
+        at: DateTime.makeUnsafe(iso),
+        runId,
+      });
+      return {
+        ...seed,
+        payload: {
+          ...seed.payload,
+          id: TurnItemId.make(`turn-item:provider:claudeAgent:native-item:${nativeId}`),
+        },
+      };
+    };
+    const reasoned = (messageId: string, iso: string) => {
+      const at = DateTime.makeUnsafe(iso);
+      return {
+        id: EventId.make(`seed:${threadId}:item:${messageId}`),
+        type: "turn-item.updated" as const,
+        threadId,
+        occurredAt: at,
+        payload: {
+          id: TurnItemId.make(
+            `turn-item:provider:claudeAgent:native-item:${messageId}%3Athinking%3A0`,
+          ),
+          threadId,
+          runId: firstRun,
+          nodeId: null,
+          providerThreadId: null,
+          providerTurnId: null,
+          nativeItemRef: null,
+          parentItemId: null,
+          ordinal: 0,
+          status: "completed" as const,
+          title: null,
+          startedAt: at,
+          completedAt: at,
+          updatedAt: at,
+          type: "reasoning" as const,
+          text: messageId,
+          streaming: false,
+        },
+      };
+    };
+    yield* h.eventSink.write({
+      events: [
+        delivered("assistant-1", "Looking at login.", "2026-07-01T10:02:01.000Z", firstRun),
+        reasoned("msg_one", "2026-07-01T10:02:02.000Z"),
+        reasoned("msg_two", "2026-07-01T10:02:03.000Z"),
+        delivered("assistant-2", "Both fixed.", "2026-07-01T10:02:04.000Z", firstRun),
+        delivered("assistant-p", "Halfway there.", "2026-07-01T10:04:01.000Z", laterRun),
+      ],
+    });
+    const instanceDir = yield* h.makeDir("bridge", "claude", claudeId, "inst-1");
+    yield* h.write(joinPath(instanceDir, "session.json"), [
+      {
+        sid: claudeId,
+        instanceId: "inst-1",
+        heartbeatAt: yield* Clock.currentTimeMillis,
+        activeTurn: null,
+      },
+    ]);
+    /** What the thread reads as, top to bottom; a row with nothing in it draws nothing. */
+    const reads = h.threads
+      .getThreadRecords(threadId, ["turnItems"])
+      .pipe(
+        Effect.map((records) =>
+          records.turnItems
+            .toSorted((left, right) => left.ordinal - right.ordinal)
+            .flatMap((item) =>
+              (item.type === "user_message" ||
+                item.type === "assistant_message" ||
+                item.type === "reasoning") &&
+              item.text.length > 0
+                ? [`${Math.floor(item.ordinal / 1_000_000)} ${item.text}`]
+                : [],
+            ),
+        ),
+      );
+    const places = h.threads
+      .getThreadRecords(threadId, ["turnItems"])
+      .pipe(
+        Effect.map((records) =>
+          records.turnItems.map((item) => `${item.id} ${item.ordinal}`).toSorted(),
+        ),
+      );
+    return { threadId, claudePath, bridgeDir, reads, places };
+  });
+
+const DAMAGED_TURN = [
+  "0 Fix the login bug please",
+  "0 Looking at login.",
+  "0 And the logout bug",
+  "0 Both fixed.",
+  "1 Looking at login.",
+  "1 msg_one",
+  "1 msg_two",
+  "1 Both fixed.",
+  "2 Halfway there.",
+];
+
+runtimeTest(
+  "a turn imported and then shown again by a run reads once, in the order the record wrote it",
+  (h) =>
+    Effect.gen(function* () {
+      const claudeId = "aaaaaaaa-1111-4111-8111-1111111111f3";
+      const turn = yield* turnShownTwice(h, claudeId);
+      assert.deepEqual(yield* turn.reads, DAMAGED_TURN);
+      const importer = yield* h.importer({
+        bridgeDir: turn.bridgeDir,
+        recordOrderThreads: new Set([turn.threadId]),
+      });
+      const heal = importer.healLiveClaudeSession({
+        sessionId: claudeId,
+        transcriptPath: turn.claudePath,
+      });
+      const rowsBefore = (yield* turn.places).length;
+
+      yield* heal;
+      // The first prompt was written before anything the run shows and stays
+      // above it; the rest sit in the run, between the rows they were written
+      // between, and each reply is there once.
+      assert.deepEqual(yield* turn.reads, [
+        "0 Fix the login bug please",
+        "1 Looking at login.",
+        "1 msg_one",
+        "1 Halfway there.",
+        "1 And the logout bug",
+        "1 msg_two",
+        "1 Both fixed.",
+      ]);
+      // Nothing is taken out of the thread, and no two rows share a place.
+      const places = yield* turn.places;
+      assert.strictEqual(places.length, rowsBefore);
+      assert.strictEqual(new Set(places.map((place) => place.split(" ")[1])).size, places.length);
+
+      // A second pass writes nothing.
+      const written = yield* h.sequence;
+      yield* heal;
+      assert.strictEqual(yield* h.sequence, written);
+      assert.deepEqual(yield* turn.places, places);
+    }),
+);
+
+runtimeTest(
+  "a thread not kept in the record's order still shows a twice-shown reply once, and moves nothing",
+  (h) =>
+    Effect.gen(function* () {
+      const claudeId = "aaaaaaaa-1111-4111-8111-1111111111f4";
+      const turn = yield* turnShownTwice(h, claudeId);
+      const importer = yield* h.importer({ bridgeDir: turn.bridgeDir });
+      const places = yield* turn.places;
+      yield* importer.healLiveClaudeSession({
+        sessionId: claudeId,
+        transcriptPath: turn.claudePath,
+      });
+      assert.deepEqual(yield* turn.reads, [
+        "0 Fix the login bug please",
+        "0 And the logout bug",
+        "1 Looking at login.",
+        "1 msg_one",
+        "1 msg_two",
+        "1 Both fixed.",
+        "2 Halfway there.",
+      ]);
+      assert.deepEqual(yield* turn.places, places);
+    }),
+);
+
+runtimeTest("a message sent into a turn that took it after its reply moves below that reply", (h) =>
+  Effect.gen(function* () {
+    const claudeId = "aaaaaaaa-1111-4111-8111-1111111111f5";
+    const c = claudeSession({ sessionId: claudeId, cwd: h.workspace });
+    const claudePath = h.claudeFile(claudeId);
+    const threadId = importedThreadId(claudeId);
+    yield* h.write(claudePath, [
+      c.user("user-0", "Fix the login bug please", "2026-07-01T10:00:00.000Z"),
+      c.assistant("assistant-0", "I fixed the login bug.", "2026-07-01T10:00:05.000Z"),
+    ]);
+    const bridgeDir = yield* h.makeDir("bridge");
+    const importer = yield* h.importer({ bridgeDir });
+    yield* importer.sweepNow();
+    // T3 ran this turn. The steer was sent while the reply was being
+    // written, so it was shown above it; with no tool call left to meet,
+    // the session took it as its next prompt, after the reply.
+    yield* seedT3Run(h, threadId, CLAUDE, "completed", {
+      ordinal: 1,
+      iso: "2026-07-01T10:05:00.000Z",
+    });
+    yield* seedT3Prompt(h, threadId, 1, "Count to three", "2026-07-01T10:05:00.000Z");
+    const runId = RunId.make(`seed-run:${threadId}`);
+    const steer = seedTimelineRow({
+      threadId,
+      key: "steer",
+      messageId: MessageId.make(`seed-steer-message:${threadId}`),
+      role: "user",
+      text: "Now say done",
+      at: DateTime.makeUnsafe("2026-07-01T10:05:10.000Z"),
+      runId,
+    });
+    const reply = (uuid: string, text: string, iso: string) => {
+      const seed = seedTimelineRow({
+        threadId,
+        key: uuid,
+        messageId: MessageId.make(`message:provider:claudeAgent:native-item:${uuid}`),
+        role: "assistant",
+        text,
+        at: DateTime.makeUnsafe(iso),
+        runId,
+      });
+      return {
+        ...seed,
+        payload: {
+          ...seed.payload,
+          id: TurnItemId.make(`turn-item:provider:claudeAgent:native-item:${uuid}`),
+        },
+      };
+    };
+    const steered = { ...steer, payload: { ...steer.payload, inputIntent: "steer" as const } };
+    yield* h.eventSink.write({
+      events: [
+        steered,
+        reply("assistant-1", "One two three.", "2026-07-01T10:05:20.000Z"),
+        reply("assistant-2", "done", "2026-07-01T10:05:30.000Z"),
+      ],
+    });
+    yield* h.append(claudePath, [
+      c.user("user-1", "Count to three", "2026-07-01T10:05:01.000Z"),
+      c.assistant("assistant-1", "One two three.", "2026-07-01T10:05:20.000Z"),
+      c.user("user-2", "Now say done", "2026-07-01T10:05:21.000Z"),
+      c.assistant("assistant-2", "done", "2026-07-01T10:05:30.000Z"),
+    ]);
+    const instanceDir = yield* h.makeDir("bridge", "claude", claudeId, "inst-1");
+    yield* h.write(joinPath(instanceDir, "session.json"), [
+      {
+        sid: claudeId,
+        instanceId: "inst-1",
+        heartbeatAt: yield* Clock.currentTimeMillis,
+        activeTurn: null,
+      },
+    ]);
+    const reads = h.threads
+      .getThreadRecords(threadId, ["turnItems"])
+      .pipe(
+        Effect.map((records) =>
+          records.turnItems
+            .toSorted((left, right) => left.ordinal - right.ordinal)
+            .flatMap((item) =>
+              item.type === "user_message" || item.type === "assistant_message" ? [item.text] : [],
+            ),
+        ),
+      );
+    const turn = ["Count to three", "Now say done", "One two three.", "done"];
+    assert.deepEqual((yield* reads).slice(-4), turn);
+    const heal = importer.healLiveClaudeSession({
+      sessionId: claudeId,
+      transcriptPath: claudePath,
+    });
+
+    yield* heal;
+    assert.deepEqual(yield* reads, [
+      "Fix the login bug please",
+      "I fixed the login bug.",
+      "Count to three",
+      "One two three.",
+      "Now say done",
+      "done",
+    ]);
+    // A second pass writes nothing.
+    const written = yield* h.sequence;
+    yield* heal;
+    assert.strictEqual(yield* h.sequence, written);
+  }),
+);
+
 runtimeTest(
   "does not repeat prompts and command output a running session's thread already shows",
   (h) =>

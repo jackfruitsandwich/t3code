@@ -248,3 +248,325 @@ export function planImportedRowOrdering(input: {
   }
   return moves;
 }
+
+/** One place of a thread, as the record sees it. */
+export interface SeatingRow {
+  readonly turnItemId: string;
+  readonly ordinal: number;
+  /** The record line the row shows; null when the record does not hold it. */
+  readonly line: number | null;
+  /**
+   * `imported`: a message the importer placed itself. `message`: a message a
+   * run delivered. `sent`: a message T3 sent into a running turn, shown where
+   * it was sent (`line` is where the record wrote it; see `sentPromptLines`).
+   * `other`: everything else (tool calls, reasoning, rows of T3's own).
+   */
+  readonly kind: "imported" | "message" | "sent" | "other";
+  /** When the record wrote the row; 0 when it does not hold it. */
+  readonly atMs: number;
+}
+
+export interface SeatingMove {
+  readonly turnItemId: string;
+  readonly ordinal: number;
+}
+
+/** A message sent into a turn reaches the record when the turn takes it, which can be at its end. */
+const SENT_PROMPT_WINDOW_MS = 30 * 60_000;
+/** The clocks of T3 and of the session's process differ by less than this. */
+const SENT_PROMPT_SKEW_MS = 5_000;
+
+/**
+ * The record row of each message T3 sent into a running turn: the row with
+ * its words, written closest after it was sent. T3's copy carries T3's id,
+ * so the words and the time are what tie the two; each row stands for one
+ * message. `shownIds` are the rows the thread shows under their own ids.
+ */
+export function sentPromptLines(input: {
+  readonly sent: ReadonlyArray<{
+    readonly turnItemId: string;
+    readonly text: string;
+    readonly sentAtMs: number;
+  }>;
+  readonly rows: ReadonlyArray<ParsedSessionMessage>;
+  readonly shownIds: ReadonlySet<string>;
+}): ReadonlyMap<string, { readonly line: number; readonly atMs: number }> {
+  const pairs: Array<{ readonly sent: number; readonly row: number; readonly apartMs: number }> =
+    [];
+  input.rows.forEach((row, rowIndex) => {
+    if (row.role !== "user" || row.notice !== undefined || input.shownIds.has(row.sourceId)) return;
+    const text = normalize(row.text);
+    const atMs = timeMs(row.timestamp);
+    input.sent.forEach((message, sentIndex) => {
+      const apartMs = atMs - message.sentAtMs;
+      if (apartMs < -SENT_PROMPT_SKEW_MS || apartMs > SENT_PROMPT_WINDOW_MS) return;
+      if (samePrompt(normalize(message.text), text)) {
+        pairs.push({ sent: sentIndex, row: rowIndex, apartMs: Math.abs(apartMs) });
+      }
+    });
+  });
+  const lines = new Map<string, { readonly line: number; readonly atMs: number }>();
+  const taken = new Set<number>();
+  for (const pair of pairs.toSorted((left, right) => left.apartMs - right.apartMs)) {
+    const message = input.sent[pair.sent]!;
+    if (lines.has(message.turnItemId) || taken.has(pair.row)) continue;
+    taken.add(pair.row);
+    const row = input.rows[pair.row]!;
+    lines.set(message.turnItemId, { line: row.lineIndex, atMs: timeMs(row.timestamp) });
+  }
+  return lines;
+}
+
+/** What a turn item shows of the record: a row's uuid, a tool call's id, or a reply's API message id. */
+export const recordKeyOfTurnItem = (turnItemId: string): string | null => {
+  let plain = turnItemId;
+  for (let pass = 0; pass < 3 && plain.includes("%"); pass += 1) {
+    try {
+      plain = decodeURIComponent(plain);
+    } catch {
+      break;
+    }
+  }
+  const native = plain.indexOf("native-item:");
+  if (native === -1) {
+    return plain.startsWith("cli-import:") ? plain.slice(plain.lastIndexOf(":") + 1) : null;
+  }
+  const tail = plain.slice(native + "native-item:".length);
+  // A reply's reasoning is `<API message id>:thinking:<n>`.
+  return /^(?:msg|toolu)_/u.test(tail) ? (tail.split(":")[0] ?? null) : tail;
+};
+
+/**
+ * The first line of a Claude Code transcript each tool call and each API
+ * message is written on, by id. Subagent rows are another conversation.
+ */
+export const claudeRecordLines = (content: string): ReadonlyMap<string, number> => {
+  const lines = new Map<string, number>();
+  content.split("\n").forEach((line, lineIndex) => {
+    if (!line.includes('"assistant"')) return;
+    let entry: unknown;
+    try {
+      entry = JSON.parse(line);
+    } catch {
+      return;
+    }
+    if (typeof entry !== "object" || entry === null) return;
+    const { type, isSidechain, message } = entry as Record<string, unknown>;
+    if (type !== "assistant" || isSidechain === true) return;
+    if (typeof message !== "object" || message === null) return;
+    const { id, content: blocks } = message as Record<string, unknown>;
+    if (typeof id === "string" && !lines.has(id)) lines.set(id, lineIndex);
+    if (!Array.isArray(blocks)) return;
+    for (const block of blocks) {
+      if (typeof block !== "object" || block === null) continue;
+      const { type: blockType, id: blockId } = block as Record<string, unknown>;
+      if (blockType === "tool_use" && typeof blockId === "string" && !lines.has(blockId)) {
+        lines.set(blockId, lineIndex);
+      }
+    }
+  });
+  return lines;
+};
+
+/** The longest run of `lines`, by position, that never steps back. */
+const longestInOrder = (lines: ReadonlyArray<number>): ReadonlyArray<number> => {
+  const tails: Array<number> = [];
+  const before: Array<number> = lines.map(() => -1);
+  lines.forEach((line, position) => {
+    let low = 0;
+    let high = tails.length;
+    while (low < high) {
+      const middle = (low + high) >> 1;
+      if (lines[tails[middle]!]! <= line) low = middle + 1;
+      else high = middle;
+    }
+    if (low > 0) before[position] = tails[low - 1]!;
+    tails[low] = position;
+  });
+  const kept: Array<number> = [];
+  for (let position = tails.at(-1) ?? -1; position !== -1; position = before[position]!) {
+    kept.push(position);
+  }
+  return kept.toReversed();
+};
+
+/**
+ * Where a thread's messages belong by the record's own line order, for a
+ * thread whose rows the record can place: the places to change, and nothing
+ * when the thread already reads in that order.
+ *
+ * Three kinds of message sit out of order. One the importer placed (it only
+ * knew the row's time, so it put the row above the first run, or at the end
+ * of a run, instead of between the tool calls it was written among). One a
+ * run read late: a run that picks a turn up shows rows written while an
+ * earlier run was showing that turn. And one T3 sent into a turn that took
+ * it later than it was sent: it sits above rows the record wrote before it.
+ * Tool calls, reasoning and every row the record does not hold stay as they
+ * are, and give the order the messages are seated in: a message goes right
+ * after the last such row written before it. Where that leaves a choice
+ * between two runs, the row's time decides, as `bandForTime` does.
+ *
+ * `only: "sent"` seats the third kind alone and leaves the others where the
+ * importer's other passes put them.
+ *
+ * A place holds one row, so rows beside a seated one step along, as far as
+ * the next free place, on whichever side moves fewer. Rows of `frozenBand`
+ * and later (a turn still running) are not looked at.
+ */
+export function planRecordSeating(input: {
+  readonly rows: ReadonlyArray<SeatingRow>;
+  readonly runs: ReadonlyArray<HealingRun>;
+  readonly frozenBand?: number;
+  readonly only?: "sent";
+}): ReadonlyArray<SeatingMove> {
+  const bandOf = (ordinal: number) => Math.floor(ordinal / RUN_BAND);
+  const lastBand = input.frozenBand === undefined ? Number.POSITIVE_INFINITY : input.frozenBand - 1;
+  const rows = input.rows
+    .filter((row) => row.ordinal >= 0 && bandOf(row.ordinal) <= lastBand)
+    .toSorted((left, right) => left.ordinal - right.ordinal);
+
+  // A run's message written before a message an earlier run shows was read late.
+  const rest: Array<SeatingRow> = [];
+  const seated: Array<SeatingRow & { readonly line: number }> = [];
+  let band = -1;
+  let shownBefore = -1;
+  let shownSoFar = -1;
+  for (const row of rows) {
+    if (bandOf(row.ordinal) !== band) {
+      band = bandOf(row.ordinal);
+      shownBefore = shownSoFar;
+    }
+    const { line } = row;
+    if (
+      line !== null &&
+      input.only === undefined &&
+      (row.kind === "imported" || (row.kind === "message" && line < shownBefore))
+    ) {
+      seated.push({ ...row, line });
+      continue;
+    }
+    if (line !== null && row.kind === "message") shownSoFar = Math.max(shownSoFar, line);
+    rest.push(row);
+  }
+
+  // The rows that stay, less any that are themselves out of line, are the frame.
+  const held = rest.flatMap((row, index) =>
+    row.line === null || row.kind === "sent" ? [] : [{ index, line: row.line }],
+  );
+  const kept = longestInOrder(held.map((row) => row.line)).map((position) => held[position]!);
+  // A sent message stays unless the thread shows, below it, a row written before it.
+  const early = new Set<number>();
+  let next = 0;
+  rest.forEach((row, index) => {
+    if (row.kind !== "sent" || row.line === null) return;
+    while (next < kept.length && kept[next]!.index < index) next += 1;
+    const below = kept[next];
+    if (below === undefined || below.line >= row.line) return;
+    early.add(index);
+    seated.push({ ...row, line: row.line });
+  });
+  if (seated.length === 0) return [];
+  const fixed = rest.filter((_, index) => !early.has(index));
+  const fixedIndex = new Map(fixed.map((row, index) => [row.turnItemId, index]));
+  const frame = kept.map((row) => ({
+    index: fixedIndex.get(rest[row.index]!.turnItemId)!,
+    line: row.line,
+  }));
+  const bandEnd = (after: number) => {
+    const index = fixed.findIndex((row) => bandOf(row.ordinal) > after);
+    return index === -1 ? fixed.length : index;
+  };
+  // `slot` k: right above the k-th row that stays.
+  const slots = new Map<number, Array<{ readonly row: SeatingRow; readonly band: number }>>();
+  for (const row of seated.toSorted(
+    (left, right) => left.line - right.line || left.ordinal - right.ordinal,
+  )) {
+    let low = 0;
+    let high = frame.length;
+    while (low < high) {
+      const middle = (low + high) >> 1;
+      if (frame[middle]!.line <= row.line) low = middle + 1;
+      else high = middle;
+    }
+    const above = frame[low - 1];
+    const below = frame[low];
+    const aboveBand = above === undefined ? 0 : bandOf(fixed[above.index]!.ordinal);
+    const belowBand = below === undefined ? lastBand : bandOf(fixed[below.index]!.ordinal);
+    const rowBand = Math.min(Math.max(bandForTime(input.runs, row.atMs), aboveBand), belowBand);
+    const slot =
+      above !== undefined && rowBand === aboveBand
+        ? above.index + 1
+        : below !== undefined && rowBand === belowBand
+          ? below.index
+          : bandEnd(rowBand);
+    slots.set(slot, [...(slots.get(slot) ?? []), { row, band: rowBand }]);
+  }
+  const order: Array<{
+    readonly row: SeatingRow;
+    readonly band: number;
+    readonly stays: boolean;
+  }> = [];
+  for (let index = 0; index <= fixed.length; index += 1) {
+    for (const entry of (slots.get(index) ?? []).toSorted(
+      (left, right) => left.band - right.band,
+    )) {
+      // A seated row already between the rows it belongs between stays too.
+      const above = fixed[index - 1];
+      const below = fixed[index];
+      order.push({
+        ...entry,
+        stays:
+          bandOf(entry.row.ordinal) === entry.band &&
+          (above === undefined || above.ordinal < entry.row.ordinal) &&
+          (below === undefined || entry.row.ordinal < below.ordinal),
+      });
+    }
+    const row = fixed[index];
+    if (row !== undefined) order.push({ row, band: bandOf(row.ordinal), stays: true });
+  }
+
+  // Each band's rows take places in that order, keeping the place they have
+  // where they can: counted from the band's top and from its bottom, and the
+  // way that moves fewer rows is the one used.
+  const moves: Array<SeatingMove> = [];
+  for (let start = 0; start < order.length;) {
+    const inBand = order[start]!.band;
+    let end = start;
+    while (end < order.length && order[end]!.band === inBand) end += 1;
+    const members = order.slice(start, end);
+    // The order runs through the bands one after another, or nothing is moved.
+    if (start > 0 && order[start - 1]!.band > inBand) return [];
+    const first = inBand * RUN_BAND + 1;
+    const final = inBand * RUN_BAND + RUN_BAND - 1;
+    const holds = (row: SeatingRow) => bandOf(row.ordinal) === inBand;
+    const place = (from: "top" | "bottom"): ReadonlyArray<SeatingMove> | null => {
+      const placed: Array<SeatingMove> = [];
+      let edge =
+        from === "top"
+          ? first - 1
+          : Math.max(
+              first + members.length - 1,
+              ...members.flatMap((member) => (holds(member.row) ? [member.row.ordinal] : [])),
+            ) + 1;
+      for (const { row, stays } of from === "top" ? members : members.toReversed()) {
+        const keeps = stays && (from === "top" ? row.ordinal > edge : row.ordinal < edge);
+        const ordinal = keeps ? row.ordinal : from === "top" ? edge + 1 : edge - 1;
+        if (ordinal < first || ordinal > final) return null;
+        if (ordinal !== row.ordinal) placed.push({ turnItemId: row.turnItemId, ordinal });
+        edge = ordinal;
+      }
+      return placed;
+    };
+    const fromTop = place("top");
+    const fromBottom = place("bottom");
+    const chosen =
+      fromTop === null || (fromBottom !== null && fromBottom.length < fromTop.length)
+        ? fromBottom
+        : fromTop;
+    // A band with no room left: nothing is moved anywhere.
+    if (chosen === null) return [];
+    moves.push(...chosen);
+    start = end;
+  }
+  return moves;
+}
