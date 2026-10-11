@@ -146,16 +146,43 @@ export const claudeHistoryBeforeTurn = (history: string, promptText: string): st
  * printed for a moment after. Older than that, nothing will show them, and
  * they are history like any other row.
  */
+const TYPED_COMMAND_LINE = /^\/[A-Za-z][\w:.-]*(?:\s|$)/;
 export const claudeCommandRowsInFlight = (
   messages: ReadonlyArray<ParsedSessionMessage>,
   nowMs: number,
 ): number => {
   const printed = trailingCommandOutput(messages);
   const line = messages[messages.length - 1 - printed];
-  if (line === undefined || line.role !== "user" || line.command !== true) return 0;
+  if (line === undefined || line.role !== "user") return 0;
+  // A compaction writes the command's own row when it is over: while it
+  // runs, the record ends with the line as the person typed it.
+  const typedOnly = printed === 0 && TYPED_COMMAND_LINE.test(line.text.trim());
+  if (line.command !== true && !typedOnly) return 0;
   const newest = Date.parse(messages[messages.length - 1]!.timestamp);
   const age = Math.abs(nowMs - newest);
   return age < (printed === 0 ? COMMAND_RUNNING_MS : COMMAND_SETTLE_MS) ? printed + 1 : 0;
+};
+
+/**
+ * When the last turn of a record began, while the record is fresh: its
+ * newest row younger than the span in which a run still shows a turn from
+ * its start. Undefined once it has been quiet that long. In a session a mod
+ * process holds, that turn is its run's to show, and the run can be seconds
+ * behind the record (seen on a busy machine: a short turn was over, and
+ * compared, before T3 had been told it began).
+ */
+export const claudeFreshTurnStartMs = (
+  messages: ReadonlyArray<ParsedSessionMessage>,
+  nowMs: number,
+): number | undefined => {
+  const newest = messages[messages.length - 1];
+  if (newest === undefined) return undefined;
+  if (Math.abs(nowMs - Date.parse(newest.timestamp)) >= FRESH_TURN_MS) return undefined;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index]!;
+    if (message.role === "user" && message.midTurn !== true) return Date.parse(message.timestamp);
+  }
+  return undefined;
 };
 
 /**
@@ -191,6 +218,14 @@ const DOUBLED_REPLY_WINDOW_MS = 5 * 60_000;
 const COMMAND_RUNNING_MS = 10 * 60_000;
 /** How soon after a command has printed the live attachment has shown it as a turn. */
 const COMMAND_SETTLE_MS = 10_000;
+/**
+ * How long after a mod-held session's record last moved its last turn is
+ * left for a run to show: the span in which a run still shows a turn from
+ * its start (CLAUDE_BRIDGE_MISSED_TURN_REPLAY_MS in the registry, counted
+ * from the turn's end), and room for what a turn does between its last row
+ * and its end. Past it, a turn no run has shown is history.
+ */
+const FRESH_TURN_MS = 25_000;
 const ACTIVE_RUN_STATUSES: ReadonlySet<string> = new Set([
   "preparing",
   "starting",
@@ -1364,6 +1399,9 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
           filePath: input.filePath,
         });
       }
+      // Held rows are taken in by a later pass; a command that prints
+      // nothing more leaves the file as it is, so the sweep looks again.
+      if (commandInFlight > 0) fileFingerprints.delete(input.filePath);
       return true;
     });
 
@@ -1397,11 +1435,20 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
       if (live === null && activeRuns.length > 0) return;
       // A session that is always working is never idle: everything from
       // before the turn in flight is compared now, not when it stops.
+      // A turn just over in a session a mod process holds is its run's to
+      // show, however far behind the record that run is.
+      const freshTurnSinceMs =
+        live === null
+          ? undefined
+          : claudeFreshTurnStartMs(input.parsed.messages, yield* Clock.currentTimeMillis);
       const turnInFlight = [
         ...activeRuns,
         ...(live !== null && live.activeTurn !== null ? [live.activeTurn.startedAt] : []),
         ...(input.turnAwaitingRunSinceMs === undefined ? [] : [input.turnAwaitingRunSinceMs]),
+        ...(freshTurnSinceMs === undefined ? [] : [freshTurnSinceMs]),
       ];
+      // Nothing may write the record again: the sweep looks once more.
+      if (freshTurnSinceMs !== undefined) fileFingerprints.delete(input.filePath);
       const settledBeforeMs =
         turnInFlight.length === 0 ? undefined : Math.min(...turnInFlight) - IN_FLIGHT_MARGIN_MS;
       const runs = yield* threadRuns(input.threadId);
@@ -1443,6 +1490,8 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
           parsed: input.parsed,
           filePath: input.filePath,
         });
+      } else {
+        fileFingerprints.delete(input.filePath);
       }
       if (appendedCount > 0) {
         input.context.stats.updatedCount += 1;
@@ -1774,6 +1823,16 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         if (parsed.lineCount <= cursor.lineCount) {
           return;
         }
+        // The first turn a mod-held session runs on a thread T3 only ever
+        // imported is its run's to show: the rows wait for the next sweep.
+        if (
+          driver === CLAUDE_DRIVER &&
+          claudeFreshTurnStartMs(parsed.messages, yield* Clock.currentTimeMillis) !== undefined &&
+          (yield* liveBridgeSession(sessionId)) !== null
+        ) {
+          fileFingerprints.delete(input.filePath);
+          return;
+        }
 
         const appendedCount = yield* appendMessages({
           sessionId,
@@ -1791,6 +1850,8 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
             parsed,
             filePath: input.filePath,
           });
+        } else {
+          fileFingerprints.delete(input.filePath);
         }
         if (appendedCount > 0) {
           input.context.stats.updatedCount += 1;

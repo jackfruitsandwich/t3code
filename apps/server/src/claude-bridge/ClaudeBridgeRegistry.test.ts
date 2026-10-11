@@ -2,10 +2,12 @@ import { assert, describe, it } from "@effect/vitest";
 
 import {
   CLAUDE_BRIDGE_MISSED_TURN_REPLAY_MS,
+  claudeBridgeStaleTurnEvents,
   claudeBridgeTurnAwaitingRunSince,
   claudeHomesToScan,
   claudeLaunchArgs,
   claudeLaunchEnvironment,
+  isClaudeBridgeSessionRecord,
   pickSessionHome,
   type ClaudeBridgeLaunchInput,
   type ClaudeBridgeMissedTurn,
@@ -155,5 +157,78 @@ describe("claudeBridgeTurnAwaitingRunSince", () => {
     assert.isUndefined(claudeBridgeTurnAwaitingRunSince(null, endedAt));
     // A running turn is reported by the session itself, for as long as it runs.
     assert.isUndefined(claudeBridgeTurnAwaitingRunSince({ start, complete: null }, endedAt));
+  });
+});
+
+describe("the record a mod process speaks for", () => {
+  const sid = "aaaaaaaa-1111-4111-8111-111111111111";
+  const branch = "bbbbbbbb-2222-4222-8222-222222222222";
+
+  it("is the file named after the session's id", () => {
+    assert.isTrue(isClaudeBridgeSessionRecord(sid, `/home/.claude/projects/-work/${sid}.jsonl`));
+  });
+
+  it("is not the record of the conversation the process is moving on to", () => {
+    // After /branch the process names the new conversation's record while
+    // its files still speak for the old session.
+    assert.isFalse(
+      isClaudeBridgeSessionRecord(sid, `/home/.claude/projects/-work/${branch}.jsonl`),
+    );
+    assert.isFalse(isClaudeBridgeSessionRecord(sid, ""));
+  });
+});
+
+describe("turns that were over long before T3 read of them", () => {
+  const at = 1_750_000_000_000;
+  const start = (turnId: string, when: number, commandId?: string) =>
+    ({
+      seq: 1,
+      at: when,
+      type: "turn.start",
+      turnId,
+      text: "hi",
+      transcriptOffset: 0,
+      ...(commandId === undefined ? {} : { commandId }),
+    }) as const;
+  const complete = (turnId: string, when: number) =>
+    ({
+      seq: 2,
+      at: when,
+      type: "turn.complete",
+      turnId,
+      reason: "answer",
+      answer: "",
+      isAborted: false,
+      durationMs: 900,
+      transcriptOffset: 0,
+    }) as const;
+  const span = CLAUDE_BRIDGE_MISSED_TURN_REPLAY_MS;
+
+  it("are history: neither their start nor their end is shown as a turn", () => {
+    const events = [start("t1", at), complete("t1", at + 1_000)];
+    assert.deepEqual([...claudeBridgeStaleTurnEvents(events, at + 1_000 + span)], [0, 1]);
+  });
+
+  it("are a run's to show while they ended a moment ago, or have not ended", () => {
+    const events = [start("t1", at), complete("t1", at + 1_000)];
+    assert.strictEqual(claudeBridgeStaleTurnEvents(events, at + span).size, 0);
+    assert.strictEqual(claudeBridgeStaleTurnEvents([start("t1", at)], at + 10 * span).size, 0);
+  });
+
+  it("never include a turn sent from T3, or what T3 is waiting on", () => {
+    const sent = [start("t1", at, "command-1"), complete("t1", at + 1_000)];
+    assert.strictEqual(claudeBridgeStaleTurnEvents(sent, at + 10 * span).size, 0);
+    const result = {
+      seq: 3,
+      at: at + 500,
+      type: "command.result",
+      commandId: "command-2",
+      ok: true,
+      startedTurn: false,
+      waitingInTerminal: false,
+      text: "done",
+    } as const;
+    const events = [start("t1", at), result, complete("t1", at + 1_000), start("t2", at + 60_000)];
+    assert.deepEqual([...claudeBridgeStaleTurnEvents(events, at + 70_000)], [0, 2]);
   });
 });

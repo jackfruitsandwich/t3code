@@ -99,6 +99,49 @@ export const claudeBridgeTurnAwaitingRunSince = (
     ? missed.start.at
     : undefined;
 
+/**
+ * Which events of one pass over a session's events belong to a turn that is
+ * history already: a turn nobody sent from T3, which began and ended before
+ * T3 read either event, and ended longer ago than a run still shows a turn
+ * from its start (T3 stood still, or was not running, while the session
+ * worked). Shown now it would be in the thread twice, beside the copy the
+ * record gives. What T3 itself is waiting on (a command's result, a prompt
+ * that was dropped, the session's end) is never among them.
+ */
+export const claudeBridgeStaleTurnEvents = (
+  events: ReadonlyArray<ClaudeBridgeEvent | null>,
+  nowMs: number,
+): ReadonlySet<number> => {
+  const stale = new Set<number>();
+  for (let index = 0; index < events.length; index += 1) {
+    const start = events[index];
+    if (start?.type !== "turn.start" || start.commandId !== undefined) continue;
+    const end = events.findIndex(
+      (event, at) => at > index && event?.type === "turn.complete" && event.turnId === start.turnId,
+    );
+    if (end === -1) continue;
+    if (nowMs - events[end]!.at < CLAUDE_BRIDGE_MISSED_TURN_REPLAY_MS) continue;
+    for (let at = index; at <= end; at += 1) {
+      const type = events[at]?.type;
+      if (
+        type === "command.result" ||
+        type === "config.result" ||
+        type === "prompt.dropped" ||
+        type === "ended"
+      ) {
+        continue;
+      }
+      stale.add(at);
+    }
+    index = end;
+  }
+  return stale;
+};
+
+/** Whether a path is the record of that session: the file named after its id. */
+export const isClaudeBridgeSessionRecord = (sid: string, transcriptPath: string): boolean =>
+  transcriptPath.endsWith(`/${sid}.jsonl`);
+
 export interface ClaudeBridgeProcess {
   readonly sid: string;
   readonly instanceId: string;
@@ -507,7 +550,12 @@ const make = Effect.gen(function* () {
   /** The session as its mod reports it, with the record found when the mod could not name it. */
   const locateRecord = (session: ClaudeBridgeSessionFile) =>
     Effect.gen(function* () {
-      if (session.transcriptPath.length > 0) {
+      // A session's record is the file named after its id. A process moving
+      // on to another conversation (/clear, /resume, /branch) can still be
+      // speaking for the old session while it names the new one's record:
+      // taken at its word, the new conversation's rows would be compared
+      // into the old one's thread.
+      if (isClaudeBridgeSessionRecord(session.sid, session.transcriptPath)) {
         recordUnknownToMod.delete(session.sid);
         return session;
       }
@@ -665,21 +713,25 @@ const make = Effect.gen(function* () {
 
   const dispatch = (event: ClaudeBridgeEvent, entry: ClaudeBridgeProcess) =>
     Effect.gen(function* () {
+      const subscriber = subscribers.get(entry.sid);
+      // Noted before the record is compared: the comparison asks whether a
+      // turn nobody was attached for is still a run's to show.
+      if (subscriber === undefined) {
+        if (event.type === "turn.start") {
+          missedTurns.set(entry.sid, { start: event, complete: null });
+        } else if (event.type === "turn.complete") {
+          const missed = missedTurns.get(entry.sid);
+          if (missed !== undefined && missed.start.turnId === event.turnId) {
+            missedTurns.set(entry.sid, { start: missed.start, complete: event });
+          }
+        }
+      }
       if (event.type === "turn.start" || event.type === "turn.complete") {
         yield* noteRecordChange(entry, event.type);
       }
-      const subscriber = subscribers.get(entry.sid);
       if (subscriber !== undefined) {
         yield* subscriber(event, entry);
         return;
-      }
-      if (event.type === "turn.start") {
-        missedTurns.set(entry.sid, { start: event, complete: null });
-      } else if (event.type === "turn.complete") {
-        const missed = missedTurns.get(entry.sid);
-        if (missed !== undefined && missed.start.turnId === event.turnId) {
-          missedTurns.set(entry.sid, { start: missed.start, complete: event });
-        }
       }
       for (const handler of unattachedHandlers) {
         yield* handler(event, entry);
@@ -702,13 +754,26 @@ const make = Effect.gen(function* () {
         .pipe(Effect.orElseSucceed((): ReadonlyArray<string> => [])))
         .filter((name) => name.endsWith(".json"))
         .sort();
+      const read: Array<{ readonly file: string; readonly event: ClaudeBridgeEvent | null }> = [];
       for (const name of files) {
         const file = path.join(eventsDir, name);
-        const event = parseClaudeBridgeEvent(yield* readJson(file));
+        read.push({ file, event: parseClaudeBridgeEvent(yield* readJson(file)) });
+      }
+      const stale = claudeBridgeStaleTurnEvents(
+        read.map((entry) => entry.event),
+        yield* Clock.currentTimeMillis,
+      );
+      for (const [index, { file, event }] of read.entries()) {
         yield* fs.remove(file).pipe(Effect.ignore);
         if (event === null) continue;
         // A dead process's leftovers are history the transcript already holds.
         if (!live && event.type !== "ended") continue;
+        // So is a turn that was over long before T3 read of it: the record
+        // is compared, and the turn reaches the thread from there.
+        if (stale.has(index)) {
+          if (event.type === "turn.complete") yield* noteRecordChange(entry, "turn.complete");
+          continue;
+        }
         // A mod that does not know the record yet reports every turn from 0.
         const located =
           event.type === "turn.start" &&

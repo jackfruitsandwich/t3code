@@ -1783,6 +1783,68 @@ runtimeTest(
 );
 
 runtimeTest(
+  "a short turn over before T3 heard of it is left for its run on every path, and is history when none comes",
+  (h) =>
+    Effect.gen(function* () {
+      const claudeId = "aaaaaaaa-1111-4111-8111-1111111111a5";
+      const c = claudeSession({ sessionId: claudeId, cwd: h.workspace });
+      const claudePath = h.claudeFile(claudeId);
+      const threadId = importedThreadId(claudeId);
+      const at = (iso: string) => DateTime.toEpochMillis(DateTime.makeUnsafe(iso));
+      yield* h.write(claudePath, [
+        c.user("user-1", "Fix the login bug please", "2026-07-01T10:00:00.000Z"),
+        c.assistant("assistant-1", "I fixed the login bug.", "2026-07-01T10:00:05.000Z"),
+      ]);
+      const bridgeDir = yield* h.makeDir("bridge");
+      const importer = yield* h.importer({ bridgeDir });
+      yield* importer.sweepNow();
+      const settled = ["Fix the login bug please", "I fixed the login bug."];
+      // Nothing says a turn is awaiting its run: T3 has not read the turn's
+      // events yet. The record and the mod's presence are all there is.
+      const compared = (now: string, how: "record-change" | "sweep") =>
+        Effect.gen(function* () {
+          yield* TestClock.setTime(at(now));
+          yield* liveSessionFile(h, claudeId);
+          yield* how === "sweep"
+            ? importer.sweepNow()
+            : importer.healLiveClaudeSession({ sessionId: claudeId, transcriptPath: claudePath });
+          return yield* conversation(h, threadId);
+        });
+
+      // The first turn the session runs on a thread T3 only ever imported.
+      yield* h.append(claudePath, [
+        c.user("user-2", "Reply with exactly: quick-2", "2026-07-01T10:10:00.000Z"),
+        c.assistant("assistant-2", "quick-2", "2026-07-01T10:10:01.000Z"),
+      ]);
+      assert.deepEqual(yield* compared("2026-07-01T10:10:05.000Z", "sweep"), settled);
+      // Its run attaches late and shows the turn from its start.
+      yield* seedShownTurn(h, threadId, {
+        runOrdinal: 1,
+        prompt: "Reply with exactly: quick-2",
+        iso: "2026-07-01T10:10:07.000Z",
+        replies: [{ rowId: "assistant-2", text: "quick-2", iso: "2026-07-01T10:10:07.500Z" }],
+      });
+      const shownOnce = [...settled, "Reply with exactly: quick-2", "quick-2"];
+      assert.deepEqual(yield* compared("2026-07-01T10:10:08.000Z", "record-change"), shownOnce);
+      assert.deepEqual(yield* compared("2026-07-01T10:11:00.000Z", "sweep"), shownOnce);
+
+      // The next one, on a thread T3 has run: left alone on both paths while
+      // a run could still show it, history once the record has been quiet.
+      yield* h.append(claudePath, [
+        c.user("user-3", "Reply with exactly: quick-3", "2026-07-01T10:20:00.000Z"),
+        c.assistant("assistant-3", "quick-3", "2026-07-01T10:20:01.000Z"),
+      ]);
+      assert.deepEqual(yield* compared("2026-07-01T10:20:05.000Z", "record-change"), shownOnce);
+      assert.deepEqual(yield* compared("2026-07-01T10:20:06.000Z", "sweep"), shownOnce);
+      assert.deepEqual(yield* compared("2026-07-01T10:20:40.000Z", "sweep"), [
+        ...shownOnce,
+        "Reply with exactly: quick-3",
+        "quick-3",
+      ]);
+    }),
+);
+
+runtimeTest(
   "a command still running in a live session is left for the turn that shows it, and is history if none does",
   (h) =>
     Effect.gen(function* () {
@@ -1876,6 +1938,37 @@ runtimeTest(
       const later = yield* heal("2026-07-01T10:41:00.000Z");
       assert.strictEqual(lines(later, "/model"), 1);
       assert.strictEqual(lines(later, "Set model to Sonnet"), 1);
+
+      // A compaction writes the command's own row only when it is over:
+      // while it runs the record ends with the line as typed.
+      yield* h.append(claudePath, [
+        c.user("compact-2-typed", "/compact", "2026-07-01T10:50:00.000Z"),
+      ]);
+      assert.strictEqual(lines(yield* heal("2026-07-01T10:50:40.000Z"), "/compact"), 1);
+      yield* h.append(claudePath, [
+        command("compact-2", "compact", "2026-07-01T10:50:00.030Z")[1]!,
+        printed(
+          "compact-2-out",
+          "Compacted (ctrl+o to see full summary)",
+          "2026-07-01T10:52:00.000Z",
+        ),
+      ]);
+      assert.strictEqual(lines(yield* heal("2026-07-01T10:52:01.000Z"), "/compact"), 1);
+      yield* seedShownTurn(h, threadId, {
+        runOrdinal: 3,
+        prompt: "/compact",
+        iso: "2026-07-01T10:52:02.000Z",
+        replies: [
+          {
+            rowId: "compact-2-out",
+            text: "Compacted (ctrl+o to see full summary)",
+            iso: "2026-07-01T10:52:02.000Z",
+          },
+        ],
+      });
+      const twice = yield* heal("2026-07-01T10:53:00.000Z");
+      assert.strictEqual(lines(twice, "/compact"), 2);
+      assert.strictEqual(lines(twice, "Compacted (ctrl+o to see full summary)"), 2);
     }),
 );
 
