@@ -57,6 +57,8 @@ import {
   CLAUDE_BRIDGE_DIALOG_REFUSAL_MOD_VERSION,
   claudeConfigModelChoice,
   claudeTranscriptCommandText,
+  claudeSessionNoticeFrame,
+  claudeSessionNotificationText,
   claudeTranscriptCommandOutput,
   claudeTranscriptPermissionMode,
   CLAUDE_BRIDGE_UPKEEP_COMMAND,
@@ -1375,6 +1377,29 @@ export const layer: Layer.Layer<
               if (drawn.length > 0 && !recorded) {
                 state.drawnMessages.push({ messageId: event.messageId, text: event.text, at: now });
               }
+              return;
+            }
+            case "notification": {
+              // What it calls about is on a card here already, or no turn of
+              // the session's is open to show it in.
+              const shown = state.asking.size === 0 && sessionTurnOpen();
+              yield* Effect.logInfo("claude-bridge.notification", {
+                sid,
+                kind: event.kind,
+                message: event.message,
+                dialog: event.dialog,
+                shown,
+              });
+              if (!shown) return;
+              const uuid = yield* crypto.randomUUIDv4.pipe(Effect.orDie);
+              yield* emit([
+                claudeSessionNoticeFrame({
+                  uuid,
+                  sessionId: sid,
+                  subtype: "notification",
+                  content: claudeSessionNotificationText(event),
+                }),
+              ]);
               return;
             }
             case "config.result": {

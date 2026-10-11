@@ -20,6 +20,9 @@ import {
   isClaudeBridgeNoticeFrame,
   makeClaudeBridgeFrameTranslator,
   parseClaudeBridgeEvent,
+  claudeSessionNoticeFrame,
+  claudeSessionNotificationText,
+  CLAUDE_TERMINAL_DIALOG_MARK,
   parseClaudeBridgeSessionFile,
   readTranscriptRows,
   threadSettingsForClaudeSession,
@@ -623,6 +626,37 @@ describe("ClaudeBridgeProtocol parsers", () => {
     if (event?.type !== "turn.complete") return;
     assert.deepEqual(event.usage, { model: "claude-opus-5-5", outputTokens: 7 });
     assert.isNull(parseClaudeBridgeEvent({ seq: 1, at: 1, type: "nope" }));
+  });
+
+  it("reads what the session raised for the person's attention, in its words", () => {
+    const raised = parseClaudeBridgeEvent({
+      seq: 4,
+      at: 6,
+      type: "notification",
+      message: " Claude Code needs your attention ",
+      title: "Claude Code",
+      kind: "elicitation_dialog",
+    });
+    assert.equal(raised?.type, "notification");
+    if (raised?.type !== "notification") return;
+    assert.equal(raised.message, "Claude Code needs your attention");
+    assert.equal(raised.kind, "elicitation_dialog");
+    assert.isFalse(raised.dialog);
+    // With a dialog open in the terminal and no card here, T3 says where the door is.
+    assert.equal(claudeSessionNotificationText(raised), "Claude Code needs your attention");
+    assert.equal(
+      claudeSessionNotificationText({ ...raised, dialog: true }),
+      `Claude Code needs your attention\n\n${CLAUDE_TERMINAL_DIALOG_MARK}`,
+    );
+    // The thread shows it from the same frame as a notice row of the record.
+    const frame = claudeSessionNoticeFrame({
+      uuid: "00000000-0000-4000-8000-0000000000e1",
+      sessionId: "s",
+      subtype: "notification",
+      content: raised.message,
+    });
+    assert.isTrue(isClaudeBridgeNoticeFrame(frame));
+    assert.isNull(parseClaudeBridgeEvent({ seq: 5, at: 7, type: "notification", message: "  " }));
   });
 
   it("reads only complete JSONL lines", () => {

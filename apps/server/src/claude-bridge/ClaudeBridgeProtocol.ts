@@ -30,7 +30,7 @@ import type {
 import { isRecord, parseJsonlLine } from "../import/sessionImportTypes.ts";
 
 export const CLAUDE_BRIDGE_PROTOCOL_VERSION = 2;
-export const CLAUDE_BRIDGE_MOD_VERSION = "0.3.13";
+export const CLAUDE_BRIDGE_MOD_VERSION = "0.3.15";
 /**
  * The first protocol whose mod runs slash commands, answers questions with
  * their answers and reports the session's own commands. A process still on an
@@ -349,6 +349,18 @@ export type ClaudeBridgeEvent = { readonly seq: number; readonly at: number } & 
       readonly messageId: string;
       readonly text: string;
     }
+  /**
+   * What the session raised for the person's attention, as its Notification
+   * hooks hear it: `kind` is Claude Code's own name for the occasion, and
+   * `dialog` says a dialog or panel was open in its terminal at that moment.
+   */
+  | {
+      readonly type: "notification";
+      readonly message: string;
+      readonly title: string;
+      readonly kind: string;
+      readonly dialog: boolean;
+    }
 );
 
 const readNumber = (value: unknown): number | undefined =>
@@ -568,6 +580,16 @@ export function parseClaudeBridgeEvent(value: unknown): ClaudeBridgeEvent | null
         turnId: readOptionalString(value.turnId) ?? "",
         messageId: value.messageId,
         text: value.text,
+      };
+    case "notification":
+      if (typeof value.message !== "string" || value.message.trim().length === 0) return null;
+      return {
+        ...base,
+        type: "notification",
+        message: value.message.trim(),
+        title: readOptionalString(value.title) ?? "",
+        kind: readOptionalString(value.kind) ?? "",
+        dialog: value.dialog === true,
       };
     case "ended":
       return {
@@ -790,7 +812,39 @@ export const claudeSessionNoticeText = (row: unknown): string | null => {
   return opening.length === 0 ? null : opening;
 };
 
-/** A frame the translator made from such a row. */
+/**
+ * What T3 adds to a call for the person's attention that it holds no card
+ * for while a dialog is open in the session's terminal: the door is there only.
+ */
+export const CLAUDE_TERMINAL_DIALOG_MARK =
+  "It is waiting in a dialog in the Claude Code terminal, which only that terminal can show and answer.";
+
+/** What the thread says for a call for the person's attention: the session's words, then T3's mark. */
+export const claudeSessionNotificationText = (input: {
+  readonly message: string;
+  readonly dialog: boolean;
+}): string => (input.dialog ? `${input.message}\n\n${CLAUDE_TERMINAL_DIALOG_MARK}` : input.message);
+
+/**
+ * The frame the thread shows a session notice from: what a `system` row said,
+ * or what the session raised for the person's attention.
+ */
+export const claudeSessionNoticeFrame = (input: {
+  readonly uuid: string;
+  readonly sessionId: string;
+  readonly subtype: string;
+  readonly content: string;
+}): SDKSystemMessage =>
+  ({
+    type: "system",
+    subtype: input.subtype,
+    content: input.content,
+    uuid: asUuid(input.uuid),
+    session_id: input.sessionId,
+    [CLAUDE_BRIDGE_NOTICE_KEY]: true,
+  }) as unknown as SDKSystemMessage;
+
+/** A frame made by claudeSessionNoticeFrame. */
 export const isClaudeBridgeNoticeFrame = (
   message: unknown,
 ): message is { readonly uuid: string; readonly content: string } =>
@@ -1280,15 +1334,14 @@ export function makeClaudeBridgeFrameTranslator(
       }
       const notice = claudeSessionNoticeText(row);
       if (notice !== null) {
-        const frame = {
-          type: "system",
-          subtype: typeof row.subtype === "string" ? row.subtype : "informational",
-          content: notice,
-          uuid: asUuid(row.uuid),
-          session_id: sessionId,
-          [CLAUDE_BRIDGE_NOTICE_KEY]: true,
-        } as unknown as SDKSystemMessage;
-        return [frame];
+        return [
+          claudeSessionNoticeFrame({
+            uuid: row.uuid,
+            sessionId,
+            subtype: typeof row.subtype === "string" ? row.subtype : "informational",
+            content: notice,
+          }),
+        ];
       }
       return [];
     },

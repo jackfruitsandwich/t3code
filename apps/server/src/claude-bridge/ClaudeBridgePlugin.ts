@@ -1001,6 +1001,19 @@ export function register(on) {
     return next(e)
   })
 
+  // What the session raises for the person's attention (a dialog waiting in
+  // the terminal, a sign-in, an idle prompt), in its own words.
+  on('classic.Notification', async ($, e, next) => {
+    try {
+      if (e && typeof e.message === 'string' && e.message.trim()) {
+        // Whether it calls the person to something open in the terminal.
+        const dialog = await dialogOpen($)
+        await emit($, 'notification', { message: e.message, title: typeof e.title === 'string' ? e.title : '', kind: String(e.notification_type || ''), dialog: dialog })
+      }
+    } catch {}
+    return next(e)
+  })
+
   // Each message as the terminal draws it, whole once it is finished. The
   // session's record does not keep every one, and T3 shows what it lacks.
   on('classic.MessageDisplay', async ($, e, next) => {
