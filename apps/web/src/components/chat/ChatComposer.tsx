@@ -2660,14 +2660,22 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       ];
     }
     if (composerTrigger.kind === "slash-command") {
+      // A thread whose settings belong to its session lists the session's own /model, not ours.
+      const sessionListsModelCommand =
+        settingsBelongToSession &&
+        selectedProviderSlashCommands.some((command) => command.name === "model");
       const builtInSlashCommandItems = [
-        {
-          id: "slash:model",
-          type: "slash-command",
-          command: "model",
-          label: "/model",
-          description: "Switch response model for this thread",
-        },
+        ...(sessionListsModelCommand
+          ? []
+          : ([
+              {
+                id: "slash:model",
+                type: "slash-command",
+                command: "model",
+                label: "/model",
+                description: "Switch response model for this thread",
+              },
+            ] as const)),
         ...(planModeUiEnabled
           ? ([
               {
@@ -2805,6 +2813,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     selectedProviderSlashCommands,
     selectedProviderStatus,
     settings.showSkillsInSlashMenu,
+    settingsBelongToSession,
     workspaceEntries.entries,
   ]);
 
@@ -3998,6 +4007,18 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
           }
           return;
         }
+        // The session's bare /model opens its model picker; here that picker is the composer's.
+        if (settingsBelongToSession && item.command.name === "model") {
+          const applied = applyPromptReplacement(trigger.rangeStart, trigger.rangeEnd, "", {
+            expectedText: snapshot.value.slice(trigger.rangeStart, trigger.rangeEnd),
+            focusEditorAfterReplace: false,
+          });
+          if (applied) {
+            setComposerHighlightedItemId(null);
+            setIsComposerModelPickerOpen(true);
+          }
+          return;
+        }
         const replacement = `/${item.command.name} `;
         const replacementRangeEnd = extendReplacementRangeForTrailingSpace(
           snapshot.value,
@@ -4098,6 +4119,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       planModeUiEnabled,
       onUsageLimitsCommand,
       resolveActiveComposerTrigger,
+      settingsBelongToSession,
     ],
   );
 
