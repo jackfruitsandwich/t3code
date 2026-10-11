@@ -175,11 +175,14 @@ const grants = []
 const t3Files = new Set()
 // Stale-tip guard state: message rows present when this process started, and
 // the rows it appended itself. Any other row means another process moved the
-// conversation on.
+// conversation on. A row stamped before this process took its baseline is
+// not that: a session sent to the background carries on under a new id, and
+// Claude Code copies the old conversation into the new record after it began.
 let baseline = null
+let baselineAt = 0
 const own = new Set()
 
-function messageRowIds(body) {
+function messageRowIds(body, since) {
   const ids = []
   for (const line of body.split('\\n')) {
     if (!line.startsWith('{')) continue
@@ -190,6 +193,7 @@ function messageRowIds(body) {
     if (row.isCompactSummary === true || row.isMeta === true) continue
     const content = row.message && row.message.content
     if (typeof content === 'string' && /^\\s*<(command-name|command-message|local-command-stdout|local-command-caveat)>/.test(content)) continue
+    if (since && Date.parse(row.timestamp) < since) continue
     ids.push(row.uuid)
   }
   return ids
@@ -197,6 +201,7 @@ function messageRowIds(body) {
 
 async function takeBaseline($) {
   if (!transcriptPath) return
+  baselineAt = Date.now()
   try {
     baseline = new Set(messageRowIds(await $.fs.read(transcriptPath)))
   } catch {
@@ -1051,7 +1056,7 @@ export function register(on) {
     if (baseline !== null && transcriptPath) {
       try {
         const body = await $.fs.read(transcriptPath)
-        const foreign = messageRowIds(body).filter((id) => !baseline.has(id) && !own.has(id))
+        const foreign = messageRowIds(body, baselineAt).filter((id) => !baseline.has(id) && !own.has(id))
         if (foreign.length > 0) {
           return { drop: 'This conversation continued in another process (' + foreign.length + ' new messages). Reload before sending.' }
         }
