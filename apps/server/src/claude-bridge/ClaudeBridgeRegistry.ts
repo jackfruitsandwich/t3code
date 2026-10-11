@@ -33,6 +33,8 @@ import {
   CLAUDE_BRIDGE_DIR_ENV,
   CLAUDE_BRIDGE_LAUNCH_ENV,
   CLAUDE_BRIDGE_PLUGIN_ID,
+  claudeContinuedInSession,
+  claudeSessionContinuedNotice,
   claudeTranscriptOffsetAt,
   isClaudeBridgeSessionLive,
   parseClaudeBridgeEvent,
@@ -57,6 +59,8 @@ const INBOX_HISTORY = 64;
 const TRANSCRIPT_LOOKUP_RETRY_MS = 5_000;
 /** How far back from the end of a record a turn's first row is searched for. */
 const TURN_START_SCAN_BYTES = 8 * 1024 * 1024;
+/** How much of a record's end is read for the row that says the conversation continued elsewhere. */
+const CONTINUED_IN_SCAN_BYTES = 262_144;
 const LAUNCH_ATTACH_TIMEOUT_MS = 45_000;
 
 export class ClaudeBridgeLaunchError extends Schema.TaggedError<ClaudeBridgeLaunchError>()(
@@ -512,7 +516,7 @@ const make = Effect.gen(function* () {
   const recordUnknownToMod = new Set<string>();
   const turnOffsets = new Map<string, number>();
 
-  const findTranscript = (session: ClaudeBridgeSessionFile) =>
+  const findTranscript = (session: Pick<ClaudeBridgeSessionFile, "sid" | "configDir">) =>
     Effect.gen(function* () {
       const now = yield* Clock.currentTimeMillis;
       const known = knownTranscripts.get(session.sid);
@@ -539,6 +543,26 @@ const make = Effect.gen(function* () {
       }
       knownTranscripts.set(session.sid, { file, lookedAt: now });
       return file;
+    });
+
+  /** The session the record's last rows say its conversation continued in, or null. */
+  const continuedIn = (file: string) =>
+    Effect.gen(function* () {
+      if (file.length === 0) return null;
+      const size = yield* fs.stat(file).pipe(
+        Effect.map((info) => Number(info.size)),
+        Effect.orElseSucceed(() => 0),
+      );
+      const from = Math.max(0, size - CONTINUED_IN_SCAN_BYTES);
+      const bytes = yield* Effect.scoped(
+        Effect.gen(function* () {
+          const handle = yield* fs.open(file, { flag: "r" });
+          yield* handle.seek(BigInt(from), "start");
+          return Option.getOrElse(yield* handle.readAlloc(size - from), () => new Uint8Array(0));
+        }),
+      ).pipe(Effect.orElseSucceed(() => new Uint8Array(0)));
+      const text = new TextDecoder().decode(bytes);
+      return claudeContinuedInSession(from === 0 ? text : text.slice(text.indexOf("\n") + 1));
     });
 
   /** Where in the record a turn that began at `startedAt` starts. */
@@ -1061,6 +1085,18 @@ const make = Effect.gen(function* () {
 
   const launch = (input: ClaudeBridgeLaunchInput) =>
     Effect.gen(function* () {
+      // The session was sent to the background and its conversation carries
+      // on under another id: resumed here it would become a second, diverging
+      // copy. Claude Code keeps such a session out of /resume for the same reason.
+      const movedTo = yield* continuedIn(
+        yield* findTranscript({ sid: input.sid, configDir: input.configDir }),
+      );
+      if (movedTo !== null) {
+        return yield* new ClaudeBridgeLaunchError({
+          sid: input.sid,
+          detail: claudeSessionContinuedNotice(movedTo),
+        });
+      }
       const hasSavedOptions = yield* hasSavedJobOptions(input);
       // The process runs under the session's home, so it keeps that home's account.
       const environment = homeEnvironment(input.environment, input.configDir);

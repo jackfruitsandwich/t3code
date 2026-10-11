@@ -14,6 +14,8 @@ import {
   claudeTurnPromptLabel,
   isClaudeNarrationBlock,
   isClaudeTypedMidTurnRow,
+  claudeContinuedInSession,
+  claudeSessionContinuedNotice,
   makeClaudeBridgeFrameTranslator,
   parseClaudeBridgeEvent,
   parseClaudeBridgeSessionFile,
@@ -505,6 +507,29 @@ describe("ClaudeBridgeProtocol record helpers", () => {
     assert.isTrue(isClaudeTypedMidTurnRow(queued({ kind: "human" })));
     assert.isFalse(isClaudeTypedMidTurnRow(queued({ kind: "task-notification" })));
     assert.isFalse(isClaudeTypedMidTurnRow({ type: "user", message: { content: "x" } }));
+  });
+});
+
+describe("a record that says its conversation continued under another session", () => {
+  const moved = '{"type":"continued-in","sessionId":"old","continuedInSessionId":"new-session"}';
+  const said = '{"type":"user","uuid":"u1","message":{"role":"user","content":"hello"}}';
+  const upkeep = '{"type":"cost-state","sessionId":"old","totalCostUSD":1}';
+
+  it("reads where the conversation went from the record's last rows", () => {
+    assert.strictEqual(claudeContinuedInSession(`${said}\n${upkeep}\n${moved}\n`), "new-session");
+    // Bookkeeping rows written after the mark change nothing.
+    assert.strictEqual(claudeContinuedInSession(`${said}\n${moved}\n${upkeep}\n`), "new-session");
+  });
+
+  it("says nothing for an ordinary record, or one taken up again after the mark", () => {
+    assert.isNull(claudeContinuedInSession(`${said}\n${upkeep}\n`));
+    assert.isNull(claudeContinuedInSession(`${moved}\n${said}\n`));
+    assert.isNull(claudeContinuedInSession(""));
+    assert.isNull(claudeContinuedInSession('{"type":"continued-in"}\nnot json\n'));
+  });
+
+  it("words the refusal with the session the conversation went to", () => {
+    assert.include(claudeSessionContinuedNotice("new-session"), "Claude Code session new-session");
   });
 });
 
