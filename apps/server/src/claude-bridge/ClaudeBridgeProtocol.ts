@@ -30,7 +30,7 @@ import type {
 import { isRecord, parseJsonlLine } from "../import/sessionImportTypes.ts";
 
 export const CLAUDE_BRIDGE_PROTOCOL_VERSION = 2;
-export const CLAUDE_BRIDGE_MOD_VERSION = "0.3.8";
+export const CLAUDE_BRIDGE_MOD_VERSION = "0.3.9";
 /**
  * The first protocol whose mod runs slash commands, answers questions with
  * their answers and reports the session's own commands. A process still on an
@@ -262,7 +262,11 @@ export type ClaudeBridgeEvent = { readonly seq: number; readonly at: number } & 
       readonly input: unknown;
       readonly reason?: string;
       readonly turnId?: string;
-      /** Claude Code's own dialog for this call is open in a terminal as well. */
+      /**
+       * The call is being asked through Claude Code's own permission request,
+       * which takes the answer: its dialog is open in the terminal, where
+       * the session has one.
+       */
       readonly alsoInTerminal?: boolean;
       /** The rules that dialog's "don't ask again" option would add, as Claude Code suggests them. */
       readonly suggestions?: ReadonlyArray<unknown>;
