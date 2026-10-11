@@ -59,12 +59,17 @@ describe("claudeLaunchArgs", () => {
 });
 
 describe("claudeLaunchEnvironment", () => {
-  it("drops the nested-session markers and names the bridge directory", () => {
+  it("drops the nested-session markers, names the bridge directory and says nobody is at its terminal", () => {
     const environment = claudeLaunchEnvironment(
       { CLAUDECODE: "1", CLAUDE_CODE_ENTRYPOINT: "cli", CLAUDE_CODE_SSE_PORT: "1", PATH: "/bin" },
       "/state/bridge",
     );
-    assert.deepStrictEqual(environment, { PATH: "/bin", T3CODE_BRIDGE_DIR: "/state/bridge" });
+    assert.deepStrictEqual(environment, {
+      PATH: "/bin",
+      T3CODE_BRIDGE_DIR: "/state/bridge",
+      // The process draws on a terminal no one watches: its mod reads this.
+      T3CODE_BRIDGE_LAUNCH: "background",
+    });
   });
 });
 

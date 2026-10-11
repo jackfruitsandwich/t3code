@@ -31,6 +31,7 @@ import {
 } from "./ClaudeBridgePlugin.ts";
 import {
   CLAUDE_BRIDGE_DIR_ENV,
+  CLAUDE_BRIDGE_LAUNCH_ENV,
   CLAUDE_BRIDGE_PLUGIN_ID,
   claudeTranscriptOffsetAt,
   isClaudeBridgeSessionLive,
@@ -44,6 +45,7 @@ import {
   type ClaudeBridgeInbox,
   type ClaudeBridgeSessionFile,
   type ClaudeBridgeSlashCommand,
+  type ClaudeBridgeWaitingRequest,
 } from "./ClaudeBridgeProtocol.ts";
 
 const EVENT_PUMP_INTERVAL_MS = 400;
@@ -155,6 +157,12 @@ export type ClaudeBridgeEventHandler = (
   process: ClaudeBridgeProcess,
 ) => Effect.Effect<void>;
 
+/** Told of a session that has something to ask and nothing attached to ask it through. */
+export type ClaudeBridgeWaitingHandler = (
+  process: ClaudeBridgeProcess,
+  waiting: ReadonlyArray<ClaudeBridgeWaitingRequest>,
+) => Effect.Effect<void>;
+
 export interface ClaudeBridgeClientSelection {
   readonly model: string;
   readonly permissionMode: string;
@@ -246,6 +254,14 @@ export class ClaudeBridgeRegistry extends Context.Service<
       handler: ClaudeBridgeEventHandler,
     ) => Effect.Effect<void, never, Scope.Scope>;
     /**
+     * Receives, on every pass, each live session that lists something it is
+     * waiting to ask T3 while nobody is subscribed to it. The session says
+     * nothing more until T3 attaches, so this is the only word of it.
+     */
+    readonly onUnattachedRequest: (
+      handler: ClaudeBridgeWaitingHandler,
+    ) => Effect.Effect<void, never, Scope.Scope>;
+    /**
      * Told when a session's record may hold something its attachment does not
      * carry: a turn began or ended, or the person typed into a running turn.
      */
@@ -305,7 +321,7 @@ export function claudeLaunchEnvironment(
     CLAUDE_CODE_SSE_PORT: _ssePort,
     ...rest
   } = environment;
-  return { ...rest, [CLAUDE_BRIDGE_DIR_ENV]: bridgeDir };
+  return { ...rest, [CLAUDE_BRIDGE_DIR_ENV]: bridgeDir, [CLAUDE_BRIDGE_LAUNCH_ENV]: "background" };
 }
 
 /**
@@ -454,6 +470,7 @@ const make = Effect.gen(function* () {
       return missed;
     });
   const unattachedHandlers = new Set<ClaudeBridgeEventHandler>();
+  const waitingHandlers = new Set<ClaudeBridgeWaitingHandler>();
   const recordHandlers = new Set<ClaudeBridgeRecordHandler>();
   const noteRecordChange = (entry: ClaudeBridgeProcess, change: ClaudeBridgeRecordChange) =>
     Effect.forEach(recordHandlers, (handler) => handler(entry, change), { discard: true }).pipe(
@@ -812,6 +829,16 @@ const make = Effect.gen(function* () {
     for (const entry of processes) {
       const live = isClaudeBridgeSessionLive(entry.session, now);
       yield* pumpProcess(entry, live);
+      const waiting = entry.session.waiting ?? [];
+      if (live && waiting.length > 0 && !subscribers.has(entry.sid)) {
+        yield* Effect.forEach(waitingHandlers, (handler) => handler(entry, waiting), {
+          discard: true,
+        }).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("claude-bridge.waiting-handler-failed", { sid: entry.sid, cause }),
+          ),
+        );
+      }
       if (!live && now - entry.session.heartbeatAt > DEAD_PROCESS_SWEEP_MS) {
         yield* sweepDead(entry);
       }
@@ -841,6 +868,17 @@ const make = Effect.gen(function* () {
       () =>
         Effect.sync(() => {
           unattachedHandlers.delete(handler);
+        }),
+    ).pipe(Effect.asVoid);
+
+  const onUnattachedRequest = (handler: ClaudeBridgeWaitingHandler) =>
+    Effect.acquireRelease(
+      Effect.sync(() => {
+        waitingHandlers.add(handler);
+      }),
+      () =>
+        Effect.sync(() => {
+          waitingHandlers.delete(handler);
         }),
     ).pipe(Effect.asVoid);
 
@@ -1119,6 +1157,7 @@ const make = Effect.gen(function* () {
     clearHeartbeat,
     subscribe,
     onUnattachedEvent,
+    onUnattachedRequest,
     onRecordChange,
     noteRecordChange,
     readClientSelection,
@@ -1157,6 +1196,7 @@ export const layerTest = Layer.succeed(
     clearHeartbeat: () => Effect.void,
     subscribe: () => Effect.void,
     onUnattachedEvent: () => Effect.void,
+    onUnattachedRequest: () => Effect.void,
     onRecordChange: () => Effect.void,
     noteRecordChange: () => Effect.void,
     readClientSelection: () => Effect.succeed(null),

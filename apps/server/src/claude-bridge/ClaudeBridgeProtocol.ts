@@ -30,7 +30,7 @@ import type {
 import { isRecord, parseJsonlLine } from "../import/sessionImportTypes.ts";
 
 export const CLAUDE_BRIDGE_PROTOCOL_VERSION = 2;
-export const CLAUDE_BRIDGE_MOD_VERSION = "0.3.10";
+export const CLAUDE_BRIDGE_MOD_VERSION = "0.3.11";
 /**
  * The first protocol whose mod runs slash commands, answers questions with
  * their answers and reports the session's own commands. A process still on an
@@ -43,6 +43,13 @@ export const CLAUDE_BRIDGE_MARKETPLACE_NAME = "t3-bridge";
 export const CLAUDE_BRIDGE_PLUGIN_ID = `${CLAUDE_BRIDGE_PLUGIN_NAME}@${CLAUDE_BRIDGE_MARKETPLACE_NAME}`;
 /** Environment variable that overrides the bridge directory, for the mod and the server alike. */
 export const CLAUDE_BRIDGE_DIR_ENV = "T3CODE_BRIDGE_DIR";
+/**
+ * Set to "background" in the environment of a process T3 starts itself
+ * (`claude --bg`). Such a process draws on a terminal nobody is at: Claude
+ * Code reports a terminal surface for it all the same, so the mod is told
+ * here that its dialogs are seen by no one until a client attaches.
+ */
+export const CLAUDE_BRIDGE_LAUNCH_ENV = "T3CODE_BRIDGE_LAUNCH";
 /** A heartbeat older than this means the process is gone. */
 export const CLAUDE_BRIDGE_LIVE_WINDOW_MS = 12_000;
 /** How often this server renews `t3.json` while attached. */
@@ -78,6 +85,14 @@ export interface ClaudeBridgeActiveTurn {
   readonly promptUuid?: string;
 }
 
+/** Something the session is holding for the person's answer, as its mod lists it. */
+export interface ClaudeBridgeWaitingRequest {
+  readonly toolUseId: string;
+  readonly kind: "approval" | "question";
+  /** The kind of subagent that asks, when one does. */
+  readonly agentType?: string;
+}
+
 export interface ClaudeBridgeSessionFile {
   readonly protocol: number;
   readonly sid: string;
@@ -98,6 +113,13 @@ export interface ClaudeBridgeSessionFile {
   /** Whether a person can see this process's own dialogs (a terminal runs or is attached to it). */
   readonly terminalPresent: boolean;
   readonly activeTurn: ClaudeBridgeActiveTurn | null;
+  /**
+   * What the session is waiting to ask T3 about right now. Events tell an
+   * attachment; this tells a T3 that is running with nothing attached (it
+   * was restarted, or let the session go) that there is something to attach
+   * for. Absent when nothing waits, and from a mod that does not list it.
+   */
+  readonly waiting?: ReadonlyArray<ClaudeBridgeWaitingRequest>;
   readonly modVersion: string;
   readonly ended: {
     readonly reason: string;
@@ -375,6 +397,15 @@ export function parseClaudeBridgeSessionFile(value: unknown): ClaudeBridgeSessio
         }
       : null;
   const ended = isRecord(value.ended) ? value.ended : null;
+  const waiting: Array<ClaudeBridgeWaitingRequest> = [];
+  for (const entry of Array.isArray(value.waiting) ? value.waiting : []) {
+    if (!isRecord(entry) || typeof entry.toolUseId !== "string") continue;
+    waiting.push({
+      toolUseId: entry.toolUseId,
+      kind: entry.kind === "question" ? "question" : "approval",
+      ...(typeof entry.agentType === "string" ? { agentType: entry.agentType } : {}),
+    });
+  }
   return {
     protocol: readNumber(value.protocol) ?? 0,
     sid,
@@ -398,6 +429,7 @@ export function parseClaudeBridgeSessionFile(value: unknown): ClaudeBridgeSessio
         ? value.terminalPresent
         : value.isInteractive === true,
     activeTurn: parsedTurn,
+    ...(waiting.length === 0 ? {} : { waiting }),
     modVersion: readOptionalString(value.modVersion) ?? "",
     ended:
       ended === null

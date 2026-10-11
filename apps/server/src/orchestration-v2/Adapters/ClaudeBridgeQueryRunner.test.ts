@@ -40,6 +40,8 @@ const attach = (input: {
   readonly transcript?: string;
   /** A turn the session began, and maybe ended, while nothing was attached. */
   readonly missedTurn?: (now: number) => ClaudeBridgeRegistry.ClaudeBridgeMissedTurn;
+  /** What the session lists in its file as waiting for T3's answer. */
+  readonly waiting?: ClaudeBridgeRegistry.ClaudeBridgeProcess["session"]["waiting"];
   readonly bridgeCanUseTool: (
     tool: string,
     toolInput: Record<string, unknown>,
@@ -75,6 +77,7 @@ const attach = (input: {
         effort: null,
         commandsRev: 1,
         activeTurn: null,
+        ...(input.waiting === undefined ? {} : { waiting: input.waiting }),
         modVersion: input.modVersion ?? "test",
         ended: null,
       },
@@ -104,6 +107,7 @@ const attach = (input: {
       clearHeartbeat: () => Effect.void,
       subscribe: (_sid, handler) => Deferred.succeed(subscribed, handler).pipe(Effect.asVoid),
       onUnattachedEvent: () => Effect.void,
+      onUnattachedRequest: () => Effect.void,
       onRecordChange: () => Effect.void,
       noteRecordChange: (_process, change) =>
         Effect.sync(() => {
@@ -822,6 +826,93 @@ describe("ClaudeBridgeQueryRunner requests with no turn open", () => {
       yield* until(() => frames.length === 3, "the request's turn closing");
       assert.isTrue(closesEmpty(frames[2]));
       assert.strictEqual(bridge.counts.sdkCalls, 0);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+});
+
+describe("ClaudeBridgeQueryRunner a run started for what the session is waiting to ask", () => {
+  const waiting = [
+    { toolUseId: "agent-tool", kind: "approval", agentType: "general-purpose" },
+  ] as const;
+  const closesEmpty = (frame: SDKMessage | undefined) =>
+    frame?.type === "result" && frame.subtype === "success" && frame.result === "";
+  /** The run found nothing buffered for it and asks whether anything is coming. */
+  const anythingComing = (bridge: {
+    readonly session: ClaudeAdapterV2.ClaudeAgentSdkQuerySession;
+  }) => bridge.session.hasPendingWake ?? Effect.succeed(false);
+
+  it.effect("stays open for the request, asks it there and closes once it is answered", () =>
+    Effect.gen(function* () {
+      let answerNow: (result: PermissionResult) => void = () => {};
+      const answered = new Promise<PermissionResult>((resolve) => {
+        answerNow = resolve;
+      });
+      const bridge = yield* attach({
+        protocol: 2,
+        waiting,
+        bridgeCanUseTool: () => answered,
+      });
+      const frames = yield* shownFrames(bridge);
+      assert.isTrue(yield* anythingComing(bridge));
+      // The run is the request's already: nothing asks for another one.
+      assert.lengthOf(frames, 0);
+      // The session sees T3 attached and tells the request itself.
+      yield* bridge.handler(
+        {
+          type: "approval.request",
+          seq: 1,
+          at: bridge.now,
+          toolUseId: "agent-tool",
+          tool: "Bash",
+          input: { command: "echo late" },
+          alsoInTerminal: true,
+          agentType: "general-purpose",
+        },
+        bridge.process,
+      );
+      yield* until(() => bridge.bridgeCalls.length === 1, "the request asked");
+      assert.lengthOf(frames, 0);
+      answerNow({ behavior: "allow" });
+      assert.deepStrictEqual(yield* Queue.take(bridge.commands), {
+        type: "approval",
+        toolUseId: "agent-tool",
+        decision: "allow",
+      });
+      yield* until(() => frames.length === 1, "the request's turn closing");
+      assert.isTrue(closesEmpty(frames[0]));
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect(
+    "closes again when the session never tells the request (it was settled meanwhile)",
+    () =>
+      Effect.gen(function* () {
+        const bridge = yield* attach({
+          protocol: 2,
+          waiting,
+          bridgeCanUseTool: () => ({ behavior: "allow" }),
+        });
+        const frames = yield* shownFrames(bridge);
+        assert.isTrue(yield* anythingComing(bridge));
+        yield* TestClock.adjust("14 seconds");
+        assert.lengthOf(frames, 0);
+        yield* TestClock.adjust("2 seconds");
+        yield* until(() => frames.length === 1, "the unused turn closing");
+        assert.isTrue(closesEmpty(frames[0]));
+        assert.lengthOf(bridge.bridgeCalls, 0);
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("is an empty run as before when the session lists nothing", () =>
+    Effect.gen(function* () {
+      const bridge = yield* attach({
+        protocol: 2,
+        bridgeCanUseTool: () => ({ behavior: "allow" }),
+      });
+      const frames = yield* shownFrames(bridge);
+      assert.isFalse(yield* anythingComing(bridge));
+      yield* TestClock.adjust("20 seconds");
+      assert.lengthOf(frames, 0);
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 });

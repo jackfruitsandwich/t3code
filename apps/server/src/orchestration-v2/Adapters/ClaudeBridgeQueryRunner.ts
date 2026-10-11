@@ -795,6 +795,43 @@ export const layer: Layer.Layer<
           return result;
         });
 
+      /**
+       * Takes up what the session is waiting to ask when a run was started
+       * for exactly that: nothing was attached, the session listed a request
+       * in its file, and a run was offered so that it could be asked. The run
+       * has no turn of the session's to show; the turn T3 keeps for requests
+       * is opened inside it, without the frames that would ask for a run of
+       * its own. The session tells the request itself once it sees T3
+       * attached; if it never does (it was settled meanwhile), the turn
+       * closes again.
+       */
+      const adoptWaitingRequestTurn = Effect.gen(function* () {
+        if (state.closed || translator.hasOpenTurn() || state.pendingPrompt !== null) return false;
+        const live = (yield* registry.readSession(bridgeProcess)) ?? bridgeProcess.session;
+        const waiting = live.waiting ?? [];
+        if (live.activeTurn !== null || waiting.length === 0) return false;
+        const now = yield* Clock.currentTimeMillis;
+        const turnId = `request-${waiting[0]!.toolUseId}-${now}`;
+        state.requestTurn = { turnId, startedAt: now };
+        translator.adoptTurn({
+          turnId,
+          startedAt: now,
+          transcriptOffset: yield* transcriptSize(state.transcriptPath),
+        });
+        yield* Effect.logInfo("claude-bridge.request-turn-adopted", { sid, turnId });
+        yield* Effect.sleep(`${REQUEST_TURN_WAIT_MS} millis`).pipe(
+          Effect.andThen(
+            Effect.suspend(() =>
+              state.requestTurn?.turnId === turnId && state.asking.size === 0
+                ? closeRequestTurn(false)
+                : Effect.void,
+            ),
+          ),
+          Effect.forkIn(sessionScope),
+        );
+        return true;
+      });
+
       /** An ask is over, however it ended. The turn T3 opened for requests closes with the last of them. */
       const askOver = (toolUseId: string) =>
         Effect.suspend(() => {
@@ -1481,11 +1518,16 @@ export const layer: Layer.Layer<
         interrupt: registry.send(bridgeProcess, { type: "interrupt" }).pipe(Effect.asVoid),
         close: finish,
         hasPendingWake: Effect.gen(function* () {
-          return (
+          if (
             translator.hasOpenTurn() ||
             state.pendingComplete !== null ||
             (yield* Queue.size(messages)) > 0
-          );
+          ) {
+            return true;
+          }
+          // Asked of a run that found nothing to show: one offered because
+          // the session has something to ask is not an empty one.
+          return yield* adoptWaitingRequestTurn;
         }),
       };
       return session;

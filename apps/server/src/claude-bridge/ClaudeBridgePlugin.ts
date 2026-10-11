@@ -91,6 +91,11 @@ const T3_TOOL_PREFIX = 'mcp__${CLAUDE_BRIDGE_PLUGIN_NAME}__'
 const MCP_PROTOCOL = '2025-06-18'
 const T3_TOOL_ATTACH_WAIT = 20
 const T3_ATTACH_GRACE_S = 15
+// A session nobody else can answer for (no terminal open): how long a new
+// request gives a T3 that has not been seen lately to attach, and how long a
+// request already waiting outlasts a T3 that went away (a restart, an update).
+const T3_ALONE_GRACE_S = 10
+const T3_ALONE_PATIENCE_S = 120
 const T3_FOLLOW_MS = 60000
 const T3_RECENT_MS = 300000
 // A request still waiting is told to T3 again this often. T3 shows a request
@@ -159,6 +164,11 @@ const attached = new Set()
 let passive = false
 const decisions = new Map()
 const answers = new Map()
+// What this session is holding for T3's answer right now, by tool call. It
+// is written into session.json: a T3 that is running with nothing attached
+// to this session (it was restarted, or let the session go) reads it there
+// and attaches, and is then told the request itself.
+const waiting = new Map()
 // Tool calls the person allowed for the rest of this session from T3.
 const grants = []
 // Files T3 saved for a prompt it sent here (what the person attached).
@@ -374,7 +384,20 @@ async function terminalOpen($) {
     surfacesKnown = true
   } catch {}
   if (attached.size > 0) return true
+  if (await startedUnattended($)) return false
   return surfacesKnown ? Array.isArray(surfaces) && surfaces.indexOf('terminal') !== -1 : isInteractive
+}
+
+// A process T3 started itself runs in the background and draws on a terminal
+// nobody is at. Claude Code reports a terminal surface for it all the same
+// (measured), so T3 says so in the environment it starts the process with:
+// until a client attaches, a dialog there is seen by no one.
+let unattended = null
+async function startedUnattended($) {
+  if (unattended === null) {
+    try { unattended = (await $.env.get('T3CODE_BRIDGE_LAUNCH')) === 'background' } catch { unattended = false }
+  }
+  return unattended
 }
 
 async function heartbeat($) {
@@ -402,9 +425,17 @@ async function heartbeat($) {
     effort: effort,
     commandsRev: commandsRev,
     activeTurn: activeTurn,
+    waiting: Array.from(waiting.values()),
     modVersion: MOD_VERSION,
     ended: ended,
   })
+}
+
+// Lists a held request in session.json, or takes it off (entry null), at once.
+async function noteWaiting($, toolUseId, entry) {
+  if (entry) waiting.set(toolUseId, entry)
+  else if (!waiting.delete(toolUseId)) return
+  try { await heartbeat($) } catch {}
 }
 
 // Whether a dialog or panel is open in the terminal right now. Claude Code
@@ -519,10 +550,12 @@ function t3Expected() {
 
 // Whether T3 is in sight, waiting a few seconds for it where it has been
 // around lately. isOver ends the wait when the thing asked about settled.
-async function t3InSightSoon($, isOver) {
+async function t3InSightSoon($, isOver, alone) {
   if (await t3Attached($)) return true
-  if (!t3Expected()) return false
-  for (let waited = 0; waited < T3_ATTACH_GRACE_S; waited += 1) {
+  // Where nobody else can answer, a T3 that is running but not attached gets
+  // a moment too: it reads what waits from session.json and attaches.
+  const grace = t3Expected() ? T3_ATTACH_GRACE_S : alone ? T3_ALONE_GRACE_S : 0
+  for (let waited = 0; waited < grace; waited += 1) {
     if (isOver()) return false
     await sleepOutsideBudget($)
     if (await t3Attached($)) return true
@@ -1078,62 +1111,75 @@ export function register(on) {
   // cannot answer a question.
   on('tool.call', { tool: 'AskUserQuestion' }, async ($, e, next) => {
     if (!e.tool_use_id || e.agentId) return next(e)
-    if (!(await t3Attached($)) && !t3Expected()) return next(e)
+    const withTerminal = await terminalOpen($)
+    // A terminal is open and T3 is nowhere near: the dialog is all there is.
+    if (withTerminal && !(await t3Attached($)) && !t3Expected()) return next(e)
     const toolUseId = e.tool_use_id
-    const request = { toolUseId: toolUseId, questions: e.questions, turnId: activeTurn ? activeTurn.turnId : undefined }
-    const fromT3 = (answer) => (answer.decision === 'deny'
-      ? { deny: answer.reason || 'The user declined to answer.' }
-      : { result: { questions: e.questions, answers: answer.answers || {} } })
-    if (await terminalOpen($)) {
-      // With a terminal on the session the question is asked in both places:
-      // Claude Code's own dialog runs beneath this hook, and T3 shows the same
-      // question. An answer from T3 returns here while the dialog is still
-      // open, which closes it; an answer in the terminal ends the wait.
-      let beneath = null
-      const running = next(e).then((value) => { beneath = { value: value } }, (error) => { beneath = { error: error } })
-      const settled = async () => {
-        await running
-        if (beneath.error) throw beneath.error
-        return beneath.value
-      }
-      const ask = () => emit($, 'question.request', Object.assign({ alsoInTerminal: true }, request))
-      // The dialog is open meanwhile; T3 can be a moment behind.
-      if (!(await t3InSightSoon($, () => beneath !== null))) return settled()
-      await ask()
-      const keepT3Told = t3Teller($, ask, () => emit($, 'question.resolved', { toolUseId: toolUseId, by: 'detached' }))
-      for (;;) {
-        if (beneath) {
-          await emit($, 'question.resolved', { toolUseId: toolUseId, by: 'terminal' })
-          return settled()
+    // Held for T3 from here on, and listed as waiting for as long.
+    await noteWaiting($, toolUseId, { toolUseId: toolUseId, kind: 'question' })
+    try {
+      const request = { toolUseId: toolUseId, questions: e.questions, turnId: activeTurn ? activeTurn.turnId : undefined }
+      const fromT3 = (answer) => (answer.decision === 'deny'
+        ? { deny: answer.reason || 'The user declined to answer.' }
+        : { result: { questions: e.questions, answers: answer.answers || {} } })
+      if (withTerminal) {
+        // With a terminal on the session the question is asked in both places:
+        // Claude Code's own dialog runs beneath this hook, and T3 shows the same
+        // question. An answer from T3 returns here while the dialog is still
+        // open, which closes it; an answer in the terminal ends the wait.
+        let beneath = null
+        const running = next(e).then((value) => { beneath = { value: value } }, (error) => { beneath = { error: error } })
+        const settled = async () => {
+          await running
+          if (beneath.error) throw beneath.error
+          return beneath.value
         }
+        const ask = () => emit($, 'question.request', Object.assign({ alsoInTerminal: true }, request))
+        // The dialog is open meanwhile; T3 can be a moment behind.
+        if (!(await t3InSightSoon($, () => beneath !== null))) return settled()
+        await ask()
+        const keepT3Told = t3Teller($, ask, () => emit($, 'question.resolved', { toolUseId: toolUseId, by: 'detached' }))
+        for (;;) {
+          if (beneath) {
+            await emit($, 'question.resolved', { toolUseId: toolUseId, by: 'terminal' })
+            return settled()
+          }
+          const answer = answers.get(toolUseId)
+          if (answer) {
+            answers.delete(toolUseId)
+            // Nobody in T3 took it: it stays with the terminal.
+            if (answer.decision === 'ask') return settled()
+            await emit($, 'question.resolved', { toolUseId: toolUseId, by: 't3' })
+            return fromT3(answer)
+          }
+          await keepT3Told()
+          await sleepOutsideBudget($)
+        }
+      }
+      // A background session nobody has open: asked in T3 alone. While T3 is
+      // out of sight the question waits for it (the dialog would be shown to no
+      // one), unless a terminal has been opened on the session meanwhile.
+      // A T3 that is running but not attached reads the question's waiting from
+      // session.json and attaches; it is given a moment for that.
+      if (!(await t3InSightSoon($, () => false, true)) && !t3Expected()) return next(e)
+      const askT3 = () => emit($, 'question.request', request)
+      await askT3()
+      const keepT3Told = t3Teller($, askT3, () => emit($, 'question.resolved', { toolUseId: toolUseId, by: 'detached' }))
+      let unseenFor = 0
+      for (;;) {
         const answer = answers.get(toolUseId)
         if (answer) {
           answers.delete(toolUseId)
-          // Nobody in T3 took it: it stays with the terminal.
-          if (answer.decision === 'ask') return settled()
+          if (answer.decision === 'ask') return next(e)
           await emit($, 'question.resolved', { toolUseId: toolUseId, by: 't3' })
           return fromT3(answer)
         }
-        await keepT3Told()
+        unseenFor = (await keepT3Told()) ? 0 : unseenFor + 1
+        if (unseenFor > 0 && ((await terminalOpen($)) || (!t3Expected() && unseenFor > T3_ALONE_PATIENCE_S))) return next(e)
         await sleepOutsideBudget($)
       }
-    }
-    // A background session nobody has open: asked in T3 alone. While T3 is
-    // out of sight the question waits for it (the dialog would be shown to no
-    // one), unless a terminal has been opened on the session meanwhile.
-    const askT3 = () => emit($, 'question.request', request)
-    await askT3()
-    const keepT3Told = t3Teller($, askT3, () => emit($, 'question.resolved', { toolUseId: toolUseId, by: 'detached' }))
-    for (;;) {
-      const answer = answers.get(toolUseId)
-      if (answer) {
-        answers.delete(toolUseId)
-        if (answer.decision === 'ask') return next(e)
-        await emit($, 'question.resolved', { toolUseId: toolUseId, by: 't3' })
-        return fromT3(answer)
-      }
-      if (!(await keepT3Told()) && ((await terminalOpen($)) || !t3Expected())) return next(e)
-      await sleepOutsideBudget($)
+    } finally {
+      await noteWaiting($, toolUseId, null)
     }
   })
 
@@ -1179,56 +1225,66 @@ export function register(on) {
     if (!ask) return next(e)
     const toolUseId = ask.toolUseId
     const withTerminal = await terminalOpen($)
-    // T3 is told once it is in sight, which can take a few seconds after
-    // this mod was reloaded. A dialog in the terminal takes the request if
-    // T3 does not show; with no terminal it waits for T3 as long as T3 has
-    // been around at all.
-    if (!(await t3InSightSoon($, () => settledCalls.has(toolUseId))) && (withTerminal || !t3Expected())) return next(e)
-    const request = { toolUseId: toolUseId, tool: e.tool_name, input: e.tool_input, turnId: activeTurn ? activeTurn.turnId : undefined, alsoInTerminal: true, suggestions: Array.isArray(e.permission_suggestions) ? e.permission_suggestions : undefined, agentType: e.agent_id ? String(e.agent_type || 'subagent') : undefined }
-    const askT3 = () => emit($, 'approval.request', request)
-    await askT3()
-    const keepT3Told = t3Teller($, askT3, () => emit($, 'approval.resolved', { toolUseId: toolUseId, decision: 'ask', by: 'detached' }))
-    let unseenFor = 0
-    for (;;) {
-      const decision = decisions.get(toolUseId)
-      if (decision) {
-        decisions.delete(toolUseId)
-        if (decision.decision === 'ask') return next(e)
-        await emit($, 'approval.resolved', { toolUseId: toolUseId, decision: decision.decision, by: 't3' })
-        // A refusal from T3 is the dialog's own "No": the call is refused and
-        // the turn ends, with the rows the terminal's answer leaves.
-        if (decision.decision !== 'allow' && decision.stopTurn === true) return { decision: { behavior: 'deny', interrupt: true } }
-        if (decision.decision !== 'allow') return { decision: { behavior: 'deny', message: decision.reason || 'Denied in T3 Code' } }
-        // The input goes back with the answer, as an SDK host's does: a
-        // dialog that asks more than yes or no (a plan's "Ready to code?")
-        // takes an allow without it as no answer at all.
-        // "For this session" with Claude Code's own suggested rules is the
-        // dialog's "don't ask again" option: Claude Code adds the rules.
-        if (Array.isArray(decision.updatedPermissions) && decision.updatedPermissions.length > 0) {
-          return { decision: { behavior: 'allow', updatedInput: e.tool_input, updatedPermissions: decision.updatedPermissions } }
+    // A terminal is open and T3 is nowhere near: the dialog is all there is.
+    if (withTerminal && !(await t3Attached($)) && !t3Expected()) return next(e)
+    // Held for T3 from here on, and listed as waiting for as long: a T3 that
+    // is running with nothing attached to this session attaches for it.
+    await noteWaiting($, toolUseId, { toolUseId: toolUseId, kind: 'approval', agentType: e.agent_id ? String(e.agent_type || 'subagent') : undefined })
+    try {
+      // T3 is told once it is in sight, which can take a few seconds after
+      // this mod was reloaded. A dialog in the terminal takes the request if
+      // T3 does not show; with no terminal it waits for T3 as long as T3 has
+      // been around at all.
+      if (!(await t3InSightSoon($, () => settledCalls.has(toolUseId), !withTerminal)) && (withTerminal || !t3Expected())) return next(e)
+      const request = { toolUseId: toolUseId, tool: e.tool_name, input: e.tool_input, turnId: activeTurn ? activeTurn.turnId : undefined, alsoInTerminal: true, suggestions: Array.isArray(e.permission_suggestions) ? e.permission_suggestions : undefined, agentType: e.agent_id ? String(e.agent_type || 'subagent') : undefined }
+      const askT3 = () => emit($, 'approval.request', request)
+      await askT3()
+      const keepT3Told = t3Teller($, askT3, () => emit($, 'approval.resolved', { toolUseId: toolUseId, decision: 'ask', by: 'detached' }))
+      let unseenFor = 0
+      for (;;) {
+        const decision = decisions.get(toolUseId)
+        if (decision) {
+          decisions.delete(toolUseId)
+          if (decision.decision === 'ask') return next(e)
+          await emit($, 'approval.resolved', { toolUseId: toolUseId, decision: decision.decision, by: 't3' })
+          // A refusal from T3 is the dialog's own "No": the call is refused and
+          // the turn ends, with the rows the terminal's answer leaves.
+          if (decision.decision !== 'allow' && decision.stopTurn === true) return { decision: { behavior: 'deny', interrupt: true } }
+          if (decision.decision !== 'allow') return { decision: { behavior: 'deny', message: decision.reason || 'Denied in T3 Code' } }
+          // The input goes back with the answer, as an SDK host's does: a
+          // dialog that asks more than yes or no (a plan's "Ready to code?")
+          // takes an allow without it as no answer at all.
+          // "For this session" with Claude Code's own suggested rules is the
+          // dialog's "don't ask again" option: Claude Code adds the rules.
+          if (Array.isArray(decision.updatedPermissions) && decision.updatedPermissions.length > 0) {
+            return { decision: { behavior: 'allow', updatedInput: e.tool_input, updatedPermissions: decision.updatedPermissions } }
+          }
+          if (decision.scope === 'session') grants.push({ tool: ask.tool, key: ask.key, wholeTool: decision.wholeTool === true })
+          return { decision: { behavior: 'allow', updatedInput: e.tool_input } }
         }
-        if (decision.scope === 'session') grants.push({ tool: ask.tool, key: ask.key, wholeTool: decision.wholeTool === true })
-        return { decision: { behavior: 'allow', updatedInput: e.tool_input } }
+        // Answered in the terminal. Nothing says so while the tool it allowed
+        // is still running (measured: neither the chain beneath this hook nor
+        // its signal moves before the tool is over); the call's result does.
+        if (settledCalls.has(toolUseId)) {
+          await emit($, 'approval.resolved', { toolUseId: toolUseId, decision: 'ask', by: 'terminal' })
+          return next(e)
+        }
+        // A subagent's request has no dialog anywhere while it is held here.
+        // With T3 out of sight for good it goes to the terminal's own.
+        unseenFor = (await keepT3Told()) ? 0 : unseenFor + 1
+        if (e.agent_id && unseenFor > T3_ATTACH_GRACE_S && (await terminalOpen($))) {
+          await emit($, 'approval.resolved', { toolUseId: toolUseId, decision: 'ask', by: 'terminal' })
+          return next(e)
+        }
+        // No terminal when it was asked, T3 out of sight: it waits for T3,
+        // unless a terminal has been opened on the session meanwhile (its
+        // dialog can take it), or T3 has not been around for minutes and has
+        // stayed away longer than a restart or an update of it takes.
+        if (!withTerminal && unseenFor > 0 && ((await terminalOpen($)) || (!t3Expected() && unseenFor > T3_ALONE_PATIENCE_S))) return next(e)
+        await sleepOutsideBudget($)
       }
-      // Answered in the terminal. Nothing says so while the tool it allowed
-      // is still running (measured: neither the chain beneath this hook nor
-      // its signal moves before the tool is over); the call's result does.
-      if (settledCalls.has(toolUseId)) {
-        await emit($, 'approval.resolved', { toolUseId: toolUseId, decision: 'ask', by: 'terminal' })
-        return next(e)
-      }
-      // A subagent's request has no dialog anywhere while it is held here.
-      // With T3 out of sight for good it goes to the terminal's own.
-      unseenFor = (await keepT3Told()) ? 0 : unseenFor + 1
-      if (e.agent_id && unseenFor > T3_ATTACH_GRACE_S && (await terminalOpen($))) {
-        await emit($, 'approval.resolved', { toolUseId: toolUseId, decision: 'ask', by: 'terminal' })
-        return next(e)
-      }
-      // No terminal when it was asked, T3 out of sight: it waits for T3,
-      // unless a terminal has been opened on the session meanwhile (its
-      // dialog can take it) or T3 has not been around for minutes.
-      if (!withTerminal && unseenFor > 0 && ((await terminalOpen($)) || !t3Expected())) return next(e)
-      await sleepOutsideBudget($)
+    } finally {
+      await noteWaiting($, toolUseId, null)
     }
   })
 
