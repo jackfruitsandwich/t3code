@@ -1,3 +1,4 @@
+import { proposedClaudeFileChange } from "./claudeToolChangePreview.ts";
 import { makeProviderTextDeltaCoalescer } from "./ProviderTextDeltaCoalescer.ts";
 import {
   dynamicToolTitle,
@@ -7011,10 +7012,17 @@ export function makeClaudeAdapterV2(
             callbackOptions.description ??
             callbackOptions.decisionReason ??
             summarizeClaudeToolRequest(toolName, nativeToolInput);
-          const prompt =
+          const asked =
             askingAgent === null
               ? summary
               : `${summary} (asked by ${askingAgent === "subagent" ? "a subagent" : `the ${askingAgent} subagent`})`;
+          // A file change is asked about with the change itself, as the
+          // terminal's dialog shows it.
+          const proposedChange =
+            requestKind === "file-change"
+              ? proposedClaudeFileChange(claudeNativeToolInputValue(nativeToolInput))
+              : undefined;
+          const prompt = proposedChange === undefined ? asked : `${asked}\n${proposedChange}`;
           const artifacts = yield* buildApprovalRequestArtifacts({
             context,
             nativeItemId: nativeRequestId,
