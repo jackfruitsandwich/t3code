@@ -116,6 +116,33 @@ const make = Effect.gen(function* () {
       Effect.orElseSucceed(() => null),
     );
 
+  /**
+   * The thread that holds a live session's conversation: its own, or the
+   * thread of the session it carried on from (a session sent to the
+   * background in its terminal goes on under a new id, in the same thread).
+   */
+  const threadOf = (entry: ClaudeBridgeRegistry.ClaudeBridgeProcess) =>
+    Effect.gen(function* () {
+      const own = yield* lookupThread(entry.sid);
+      if (own !== null) return own;
+      const session = (yield* registry.readSession(entry)) ?? entry.session;
+      if (session.transcriptPath.length === 0) return null;
+      const holder = yield* importer.claudeConversationHolder({
+        sessionId: entry.sid,
+        transcriptPath: session.transcriptPath,
+      });
+      if (holder === null || holder === entry.sid) return null;
+      const thread = yield* lookupThread(holder);
+      if (thread !== null) {
+        yield* Effect.logInfo("claude-bridge.conversation-followed", {
+          sid: entry.sid,
+          continuedFrom: holder,
+          threadId: thread.threadId,
+        });
+      }
+      return thread;
+    });
+
   // One offer per native turn: the pump can replay nothing, but a restart
   // scan and a late event could both name the same turn.
   const offeredTurns = new Set<string>();
@@ -138,7 +165,7 @@ const make = Effect.gen(function* () {
       if (offeredTurns.size > 512) {
         offeredTurns.delete(offeredTurns.values().next().value!);
       }
-      let thread = yield* lookupThread(sid);
+      let thread = yield* threadOf(entry);
       if (thread === null) {
         // A session a person just started in a terminal: it gets its thread
         // now, so its first turn shows while it runs. What the session wrote
@@ -211,7 +238,7 @@ const make = Effect.gen(function* () {
       requestOffers.set(key, (requestOffers.get(key) ?? 0) + 1);
       if (requestOffers.size > 512) requestOffers.delete(requestOffers.keys().next().value!);
       lastOfferedAt.set(sid, yield* Clock.currentTimeMillis);
-      const thread = yield* lookupThread(sid);
+      const thread = yield* threadOf(entry);
       if (thread === null) {
         yield* Effect.logInfo("claude-bridge.request-without-thread", { sid });
         return;
@@ -315,6 +342,7 @@ const make = Effect.gen(function* () {
     }),
   );
 
+  yield* registry.judgeContinuations((input) => importer.claudeSessionHeldElsewhere(input));
   yield* registry.onUnattachedEvent((event, entry) =>
     event.type === "turn.start" ? offerTurn(entry, event) : Effect.void,
   );

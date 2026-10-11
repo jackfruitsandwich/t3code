@@ -25,6 +25,7 @@ import { writeFileStringAtomically } from "../atomicWrite.ts";
 import * as ServerConfig from "../config.ts";
 import { isRecord, parseJsonlLine } from "../import/sessionImportTypes.ts";
 import * as ProcessRunner from "../processRunner.ts";
+import { makeClaudeContinuationReader } from "./claudeContinuation.ts";
 import {
   materializeClaudeBridgePlugin,
   type ClaudeBridgePluginFiles,
@@ -33,7 +34,6 @@ import {
   CLAUDE_BRIDGE_DIR_ENV,
   CLAUDE_BRIDGE_LAUNCH_ENV,
   CLAUDE_BRIDGE_PLUGIN_ID,
-  claudeContinuedInSession,
   claudeSessionContinuedNotice,
   claudeTranscriptOffsetAt,
   isClaudeBridgeSessionLive,
@@ -60,7 +60,6 @@ const TRANSCRIPT_LOOKUP_RETRY_MS = 5_000;
 /** How far back from the end of a record a turn's first row is searched for. */
 const TURN_START_SCAN_BYTES = 8 * 1024 * 1024;
 /** How much of a record's end is read for the row that says the conversation continued elsewhere. */
-const CONTINUED_IN_SCAN_BYTES = 262_144;
 const LAUNCH_ATTACH_TIMEOUT_MS = 45_000;
 
 export class ClaudeBridgeLaunchError extends Schema.TaggedError<ClaudeBridgeLaunchError>()(
@@ -304,8 +303,30 @@ export class ClaudeBridgeRegistry extends Context.Service<
      * (`history.jsonl` prompts, `--bg` job state), or null when none shows it.
      */
     readonly findSessionHome: (sid: string, configDir: string) => Effect.Effect<string | null>;
+    /**
+     * Where the conversation of `sid` went when its record says it continued
+     * under another session id (the session was sent to the background in its
+     * terminal), every such link followed; null when it did not. The thread
+     * follows it there unless another thread already holds that session.
+     */
+    readonly continuationOf: (
+      sid: string,
+      configDir: string,
+    ) => Effect.Effect<ClaudeBridgeContinuation | null>;
+    /** Who says whether another thread already holds the session a conversation continued in. */
+    readonly judgeContinuations: (judge: ClaudeBridgeContinuationJudge) => Effect.Effect<void>;
   }
 >()("t3/claude-bridge/ClaudeBridgeRegistry") {}
+
+export interface ClaudeBridgeContinuation {
+  readonly sid: string;
+  readonly heldElsewhere: boolean;
+}
+
+export type ClaudeBridgeContinuationJudge = (input: {
+  readonly from: string;
+  readonly to: string;
+}) => Effect.Effect<boolean>;
 
 const isProcessAlive = (pid: number): boolean => {
   try {
@@ -545,24 +566,15 @@ const make = Effect.gen(function* () {
       return file;
     });
 
-  /** The session the record's last rows say its conversation continued in, or null. */
-  const continuedIn = (file: string) =>
+  const continuations = makeClaudeContinuationReader(fs, path);
+  let continuationJudge: ClaudeBridgeContinuationJudge | null = null;
+  const continuationOf = (sid: string, configDir: string) =>
     Effect.gen(function* () {
-      if (file.length === 0) return null;
-      const size = yield* fs.stat(file).pipe(
-        Effect.map((info) => Number(info.size)),
-        Effect.orElseSucceed(() => 0),
-      );
-      const from = Math.max(0, size - CONTINUED_IN_SCAN_BYTES);
-      const bytes = yield* Effect.scoped(
-        Effect.gen(function* () {
-          const handle = yield* fs.open(file, { flag: "r" });
-          yield* handle.seek(BigInt(from), "start");
-          return Option.getOrElse(yield* handle.readAlloc(size - from), () => new Uint8Array(0));
-        }),
-      ).pipe(Effect.orElseSucceed(() => new Uint8Array(0)));
-      const text = new TextDecoder().decode(bytes);
-      return claudeContinuedInSession(from === 0 ? text : text.slice(text.indexOf("\n") + 1));
+      const to = yield* continuations.continuationOf(yield* findTranscript({ sid, configDir }));
+      if (to === null) return null;
+      const heldElsewhere =
+        continuationJudge === null ? false : yield* continuationJudge({ from: sid, to });
+      return { sid: to, heldElsewhere };
     });
 
   /** Where in the record a turn that began at `startedAt` starts. */
@@ -1088,7 +1100,7 @@ const make = Effect.gen(function* () {
       // The session was sent to the background and its conversation carries
       // on under another id: resumed here it would become a second, diverging
       // copy. Claude Code keeps such a session out of /resume for the same reason.
-      const movedTo = yield* continuedIn(
+      const movedTo = yield* continuations.continuationOf(
         yield* findTranscript({ sid: input.sid, configDir: input.configDir }),
       );
       if (movedTo !== null) {
@@ -1205,6 +1217,11 @@ const make = Effect.gen(function* () {
     launch,
     findTerminalHome,
     findSessionHome,
+    continuationOf,
+    judgeContinuations: (judge) =>
+      Effect.sync(() => {
+        continuationJudge = judge;
+      }),
   });
 });
 
@@ -1247,5 +1264,7 @@ export const layerTest = Layer.succeed(
       ),
     findTerminalHome: () => Effect.succeed(null),
     findSessionHome: () => Effect.succeed(null),
+    continuationOf: () => Effect.succeed(null),
+    judgeContinuations: () => Effect.void,
   }),
 );

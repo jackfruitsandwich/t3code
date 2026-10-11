@@ -378,6 +378,13 @@ export interface ClaudeAgentSdkQuerySession {
   readonly interrupt: Effect.Effect<void, ClaudeAgentSdkQueryRunnerError>;
   readonly close: Effect.Effect<void, ClaudeAgentSdkQueryRunnerError>;
   /**
+   * Whether the session's conversation has carried on under another session
+   * id since this was opened (a bridged session sent to the background in
+   * its terminal). Nothing more comes from this process then, and no turn
+   * reuses it: opened again, the session's conversation is followed.
+   */
+  readonly continuedElsewhere?: Effect.Effect<boolean>;
+  /**
    * Whether a turn is running in the native process with output still to
    * come. A transport that attaches to a process it does not own (the Claude
    * bridge) answers true while a terminal-typed turn is in flight, so a
@@ -7272,7 +7279,20 @@ export function makeClaudeAdapterV2(
           const queryPolicyKey = claudeEffectiveQueryPolicyKey(queryPolicy, mcpOverrides);
           const compiledSelection = compileClaudeModelSelection(turnInput.modelSelection);
           const resumeSessionAt = yield* getNativeConversationHeadId(turnInput.providerThread);
-          const found = yield* Ref.get(queryContext);
+          const kept = yield* Ref.get(queryContext);
+          // The conversation left the process this query holds: let go of it,
+          // and open the session as if none were live.
+          const left =
+            kept !== null &&
+            kept.nativeThreadId === nativeThreadId &&
+            kept.query.continuedElsewhere !== undefined &&
+            (yield* kept.query.continuedElsewhere);
+          if (kept !== null && left) {
+            yield* kept.query.close.pipe(Effect.ignore);
+            yield* Deferred.await(kept.closed).pipe(Effect.timeoutOption("10 seconds"));
+            yield* Ref.update(queryContext, (current) => (current === kept ? null : current));
+          }
+          const found = left ? null : kept;
           // A continuation prompts nothing: it drains output the live process
           // already produced, so it keeps that process whatever its selection.
           if (

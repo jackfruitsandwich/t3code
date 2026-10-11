@@ -60,6 +60,7 @@ import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 
+import { makeClaudeContinuationReader } from "../../claude-bridge/claudeContinuation.ts";
 import {
   CLAUDE_BRIDGE_DIR_ENV,
   CLAUDE_TURN_IN_FLIGHT_MARGIN_MS,
@@ -811,6 +812,24 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         Effect.orElseSucceed((): ThreadId | undefined => undefined),
       );
 
+    const continuations = makeClaudeContinuationReader(fs, path);
+    const waitedForEarlierSession = new Set<string>();
+    /**
+     * The thread that holds a Claude session's conversation, and the session
+     * it holds it under: the session's own thread, or the thread of an
+     * earlier session whose record says the conversation continued here.
+     */
+    const claudeConversationThread = (sessionId: string, filePath: string) =>
+      Effect.gen(function* () {
+        const own = yield* lookupOwnedThread(CLAUDE_DRIVER, sessionId);
+        if (own !== undefined) return { threadId: own, heldAs: sessionId };
+        for (const earlier of yield* continuations.continuedThrough(filePath)) {
+          const threadId = yield* lookupOwnedThread(CLAUDE_DRIVER, earlier);
+          if (threadId !== undefined) return { threadId, heldAs: earlier };
+        }
+        return undefined;
+      });
+
     const deleteThread = (threadId: ThreadId, commandId: CommandId) =>
       threads.dispatch({ type: "thread.delete", commandId, threadId }).pipe(Effect.asVoid);
 
@@ -1461,6 +1480,8 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
        * carries.
        */
       readonly settledBeforeMs?: number;
+      /** The thread holds this conversation under an earlier session id. */
+      readonly carriedOn?: boolean;
     }) {
       const { threadId, sessionId, parsed } = input;
       yield* threads.ensureLegacyTranscript(threadId);
@@ -1575,7 +1596,7 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
       // The cursor says how far the file has been taken in; with a turn or a
       // command in flight its rows have not been, and the pass after it
       // still needs them.
-      if (settledBeforeMs === undefined && commandInFlight === 0) {
+      if (settledBeforeMs === undefined && commandInFlight === 0 && input.carriedOn !== true) {
         yield* upsertImportBinding({
           driver: input.driver,
           sessionId,
@@ -1612,6 +1633,11 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
        * run's, as a running turn's are the attachment's.
        */
       readonly turnAwaitingRunSinceMs?: number;
+      /**
+       * The thread holds this conversation under an earlier session id (the
+       * session carried on from it): its binding keeps naming that one.
+       */
+      readonly carriedOn?: boolean;
     }) {
       const live = yield* liveBridgeSession(input.sessionId);
       const activeRuns = yield* activeRunStartsMs(input.threadId);
@@ -1667,7 +1693,9 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         runs,
         ...(afterMs === undefined ? {} : { afterMs }),
       });
-      if (claudeCommandRowsInFlight(input.parsed.messages, yield* Clock.currentTimeMillis) === 0) {
+      if (claudeCommandRowsInFlight(input.parsed.messages, yield* Clock.currentTimeMillis) > 0) {
+        fileFingerprints.delete(input.filePath);
+      } else if (input.carriedOn !== true) {
         yield* upsertImportBinding({
           driver: input.driver,
           sessionId: input.sessionId,
@@ -1675,8 +1703,6 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
           parsed: input.parsed,
           filePath: input.filePath,
         });
-      } else {
-        fileFingerprints.delete(input.filePath);
       }
       if (appendedCount > 0) {
         input.context.stats.updatedCount += 1;
@@ -2297,6 +2323,38 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
       if (parsed.launch === "subagent") {
         return;
       }
+      // A conversation that carried on under this id from a session with a
+      // thread stays that thread's: its rows are compared there, and it never
+      // becomes a second thread.
+      if (driver === CLAUDE_DRIVER) {
+        const held = yield* claudeConversationThread(sessionId, filePath);
+        if (held !== undefined && held.heldAs !== sessionId) {
+          yield* catchUpOwnedThread({
+            driver,
+            sessionId,
+            filePath,
+            parsed,
+            threadId: held.threadId,
+            fromLineIndex: 0,
+            context,
+            carriedOn: true,
+          });
+          return;
+        }
+        // The session it carried on from has no thread yet: that record gets
+        // its turn first, in whatever order the sweep reads them. One sweep
+        // is waited for it; a session that never becomes a thread is not
+        // waited for again.
+        if (
+          held === undefined &&
+          !waitedForEarlierSession.has(filePath) &&
+          (yield* continuations.continuedFrom(filePath)) !== null
+        ) {
+          waitedForEarlierSession.add(filePath);
+          fileFingerprints.delete(filePath);
+          return;
+        }
+      }
       if (isAutomationSession(parsed)) {
         context.deferredMachine.push({ kind: "fresh", driver, sessionId, filePath, parsed });
         return;
@@ -2699,7 +2757,11 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
 
     const adoptLiveClaudeSession: SessionImporterShape["adoptLiveClaudeSession"] = (input) =>
       Effect.gen(function* () {
-        if ((yield* lookupOwnedThread(CLAUDE_DRIVER, input.sessionId)) !== undefined) return;
+        if (
+          (yield* claudeConversationThread(input.sessionId, input.transcriptPath)) !== undefined
+        ) {
+          return;
+        }
         const { context } = yield* buildSweepContext;
         const key = sourceKey(CLAUDE_DRIVER, input.sessionId);
         if (context.bindingsBySource.has(key) || context.t3NativeSessions.has(key)) return;
@@ -2751,9 +2813,10 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
 
     const healLiveClaudeSession: SessionImporterShape["healLiveClaudeSession"] = (input) =>
       Effect.gen(function* () {
-        const threadId = yield* lookupOwnedThread(CLAUDE_DRIVER, input.sessionId);
+        const held = yield* claudeConversationThread(input.sessionId, input.transcriptPath);
         // A thread no run has touched is plain history: the sweep tails it.
-        if (threadId === undefined || !(yield* hasT3Runs(threadId))) return;
+        if (held === undefined || !(yield* hasT3Runs(held.threadId))) return;
+        const { threadId } = held;
         const bytes = yield* fs
           .readFile(input.transcriptPath)
           .pipe(Effect.orElseSucceed(() => new Uint8Array(0)));
@@ -2768,6 +2831,7 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
           // Only the comparison by row applies to a session a mod holds.
           fromLineIndex: parsed.lineCount,
           context: { stats: { importedCount: 0, updatedCount: 0 } },
+          carriedOn: held.heldAs !== input.sessionId,
           ...(input.turnAwaitingRunSinceMs === undefined
             ? {}
             : { turnAwaitingRunSinceMs: input.turnAwaitingRunSinceMs }),
@@ -2787,11 +2851,27 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         ),
       );
 
+    const claudeConversationHolder: SessionImporterShape["claudeConversationHolder"] = (input) =>
+      claudeConversationThread(input.sessionId, input.transcriptPath).pipe(
+        Effect.map((held) => held?.heldAs ?? null),
+      );
+
+    const claudeSessionHeldElsewhere: SessionImporterShape["claudeSessionHeldElsewhere"] = (
+      input,
+    ) =>
+      Effect.gen(function* () {
+        const theirs = yield* lookupOwnedThread(CLAUDE_DRIVER, input.to);
+        if (theirs === undefined) return false;
+        return theirs !== (yield* lookupOwnedThread(CLAUDE_DRIVER, input.from));
+      });
+
     return {
       start,
       sweepNow: () => guardedSweep,
       adoptLiveClaudeSession,
       healLiveClaudeSession,
+      claudeConversationHolder,
+      claudeSessionHeldElsewhere,
     } satisfies SessionImporterShape;
   });
 

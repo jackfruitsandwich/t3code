@@ -784,6 +784,94 @@ runtimeTest("appends new transcript lines incrementally and bumps recency", (h) 
   }),
 );
 
+const continuedConversation = (h: Harness, oldId: string, newId: string) => {
+  const before = claudeSession({ sessionId: oldId, cwd: h.workspace });
+  const after = claudeSession({ sessionId: newId, cwd: h.workspace });
+  return {
+    /** The session as it stood in its terminal. */
+    old: [
+      before.user("user-1", "Fix the login bug please", "2026-07-01T10:00:00.000Z"),
+      before.assistant("assistant-1", "I fixed the login bug.", "2026-07-01T10:00:05.000Z"),
+    ],
+    /** Sent to the background: the last row says where the conversation went on. */
+    mark: [
+      {
+        type: "continued-in",
+        timestamp: "2026-07-01T10:06:00.000Z",
+        sessionId: oldId,
+        continuedInSessionId: newId,
+      },
+    ],
+    /** The new session's record: a copy of the old rows, then its own. */
+    carriedOn: [
+      after.user("user-1", "Fix the login bug please", "2026-07-01T10:00:00.000Z"),
+      after.assistant("assistant-1", "I fixed the login bug.", "2026-07-01T10:00:05.000Z"),
+      after.user("user-2", "Now add a regression test", "2026-07-01T10:07:00.000Z"),
+      after.assistant("assistant-2", "Added a regression test.", "2026-07-01T10:07:30.000Z"),
+    ],
+    texts: [
+      "Fix the login bug please",
+      "I fixed the login bug.",
+      "Now add a regression test",
+      "Added a regression test.",
+    ],
+  };
+};
+
+runtimeTest("a session that carries on under a new id stays in the thread it had", (h) =>
+  Effect.gen(function* () {
+    const oldId = "aaaaaaaa-1111-4111-8111-111111111111";
+    const newId = "bbbbbbbb-2222-4222-8222-222222222222";
+    const rows = continuedConversation(h, oldId, newId);
+    yield* h.write(h.claudeFile(oldId), rows.old);
+    const importer = yield* h.importer();
+    yield* importer.sweepNow();
+    const threadId = importedThreadId(oldId);
+    assert.deepEqual(yield* h.texts(threadId), rows.texts.slice(0, 2));
+
+    yield* h.append(h.claudeFile(oldId), rows.mark);
+    yield* h.write(h.claudeFile(newId), rows.carriedOn);
+    yield* importer.sweepNow();
+
+    assert.deepEqual(yield* h.texts(threadId), rows.texts);
+    assert.isNull(yield* h.shell(importedThreadId(newId)), "no second thread");
+    // The thread is still held under the id it was made for.
+    assert.deepEqual((yield* h.binding(threadId)).resumeCursor, {
+      threadId,
+      resume: oldId,
+      turnCount: 1,
+    });
+
+    // Nothing changed: nothing written, by this importer or a restarted one.
+    const head = yield* h.sequence;
+    yield* importer.sweepNow();
+    yield* (yield* h.importer()).sweepNow();
+    yield* (yield* h.importer()).sweepNow();
+    assert.equal(yield* h.sequence, head);
+    assert.isNull(yield* h.shell(importedThreadId(newId)), "nor after a restart");
+  }),
+);
+
+runtimeTest("a carried-on session read before the one it came from still makes one thread", (h) =>
+  Effect.gen(function* () {
+    // Whichever of the two the sweep reads first.
+    for (const [oldId, newId] of [
+      ["11111111-1111-4111-8111-111111111111", "ffffffff-2222-4222-8222-222222222222"],
+      ["eeeeeeee-3333-4333-8333-333333333333", "22222222-4444-4444-8444-444444444444"],
+    ] as const) {
+      const rows = continuedConversation(h, oldId, newId);
+      yield* h.write(h.claudeFile(oldId), [...rows.old, ...rows.mark]);
+      yield* h.write(h.claudeFile(newId), rows.carriedOn);
+      const importer = yield* h.importer();
+      yield* importer.sweepNow();
+      yield* importer.sweepNow();
+
+      assert.deepEqual(yield* h.texts(importedThreadId(oldId)), rows.texts);
+      assert.isNull(yield* h.shell(importedThreadId(newId)), "no second thread");
+    }
+  }),
+);
+
 runtimeTest("waits for a transcript to settle and skips files over the size cap", (h) =>
   Effect.gen(function* () {
     const settlingId = "dddddddd-1111-4111-8111-111111111111";

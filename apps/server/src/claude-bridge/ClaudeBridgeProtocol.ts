@@ -675,6 +675,9 @@ export function claudeContinuedInSession(recordTail: string): string | null {
  */
 export const claudeSessionContinuedNotice = (continuedIn: string): string =>
   `Not sent: this conversation was sent to the background in its terminal and carries on as Claude Code session ${continuedIn}, which has its own thread here. Send your message in that thread.`;
+/** A prompt that reached a session in the moment its conversation moved on; the thread follows from the next one. */
+export const claudeSessionFollowedNotice = (continuedIn: string): string =>
+  `Not sent: this conversation was just sent to the background in its terminal and carries on as Claude Code session ${continuedIn}. This thread follows it there: send your message again.`;
 /** Where T3 says, in a prompt, that it saved a file the person attached (see AttachmentPrompt). */
 const SAVED_ATTACHMENT = /\[Attached [^\]\n]*? is saved at: ([^\]\n]+)\]/gu;
 /** The paths of the files a prompt from T3 says were saved for it. */

@@ -18,6 +18,7 @@ import * as ClaudeBridgeRegistry from "../../claude-bridge/ClaudeBridgeRegistry.
 import {
   claudeBridgeWakeDetail,
   claudeBridgeWakeRequest,
+  claudeContinuedInSession,
   type ClaudeBridgeCommandBody,
 } from "../../claude-bridge/ClaudeBridgeProtocol.ts";
 import * as ProviderEventLoggers from "../../provider/ProviderEventLoggers.ts";
@@ -43,6 +44,8 @@ const attach = (input: {
   readonly missedTurn?: (now: number) => ClaudeBridgeRegistry.ClaudeBridgeMissedTurn;
   /** What the session lists in its file as waiting for T3's answer. */
   readonly waiting?: ClaudeBridgeRegistry.ClaudeBridgeProcess["session"]["waiting"];
+  /** Another thread already holds the session this one's conversation continued in. */
+  readonly heldElsewhere?: boolean;
   readonly bridgeCanUseTool: (
     tool: string,
     toolInput: Record<string, unknown>,
@@ -86,12 +89,18 @@ const attach = (input: {
     const commands = yield* Queue.unbounded<ClaudeBridgeCommandBody>();
     const recordChanges: Array<ClaudeBridgeRegistry.ClaudeBridgeRecordChange> = [];
     const subscribed = yield* Deferred.make<ClaudeBridgeRegistry.ClaudeBridgeEventHandler>();
+    /** The sessions whose live process the runner asked for. */
+    const asked: Array<string> = [];
     const registry = ClaudeBridgeRegistry.ClaudeBridgeRegistry.of({
       bridgeDir: root,
       plugin: { marketplaceDir: root, pluginDir: root },
       isPluginInstalled: () => Effect.succeed(true),
       listLiveProcesses: Effect.succeed([process]),
-      findLiveProcess: () => Effect.succeed(process),
+      findLiveProcess: (sid) =>
+        Effect.sync(() => {
+          asked.push(sid);
+          return process;
+        }),
       // The process keeps reporting, however far a test moves its clock.
       readSession: () =>
         Clock.currentTimeMillis.pipe(
@@ -126,6 +135,20 @@ const attach = (input: {
       launch: () => Effect.die("This test must attach without launching Claude."),
       findTerminalHome: () => Effect.succeed(null),
       findSessionHome: () => Effect.succeed(root),
+      // The record of the session the test attaches to says where its conversation went.
+      continuationOf: (sid) =>
+        sid !== process.sid
+          ? Effect.succeed(null)
+          : fs.readFileString(transcriptPath).pipe(
+              Effect.map((record) => {
+                const to = claudeContinuedInSession(record);
+                return to === null
+                  ? null
+                  : { sid: to, heldElsewhere: input.heldElsewhere === true };
+              }),
+              Effect.orElseSucceed(() => null),
+            ),
+      judgeContinuations: () => Effect.void,
     });
     const services = yield* Layer.build(ClaudeBridgeQueryRunner.layer).pipe(
       Effect.provideService(ClaudeBridgeRegistry.ClaudeBridgeRegistry, registry),
@@ -166,7 +189,7 @@ const attach = (input: {
     });
     yield* Effect.addFinalizer(() => session.close.pipe(Effect.orDie));
     const handler = yield* Deferred.await(subscribed);
-    return { session, handler, commands, process, bridgeCalls, counts, now, recordChanges };
+    return { session, handler, commands, process, bridgeCalls, counts, now, recordChanges, asked };
   });
 
 /** Everything the thread is given, as it arrives. */
@@ -1076,13 +1099,38 @@ describe("ClaudeBridgeQueryRunner slash commands", () => {
   const saidRow = (uuid: string, text: string) =>
     `${JSON.stringify({ type: "user", uuid, timestamp: "2026-07-01T10:00:01.000Z", message: { role: "user", content: text } })}\n`;
   const continuedInRow = `${JSON.stringify({ type: "continued-in", sessionId: "old", continuedInSessionId: "99999999-9999-4999-8999-999999999999" })}\n`;
-  it.live("sends nothing into a session whose conversation continued under another id", () =>
+  const continuedTo = "99999999-9999-4999-8999-999999999999";
+  it.live("opens the session its conversation continued in", () =>
     Effect.gen(function* () {
       const bridge = yield* attach({
         protocol: 2,
         bridgeCanUseTool: () => null,
         transcript: saidRow("00000000-0000-4000-8000-0000000000d1", "before") + continuedInRow,
       });
+      assert.isAbove(bridge.asked.length, 0);
+      assert.deepStrictEqual(Array.from(new Set(bridge.asked)), [continuedTo]);
+      yield* bridge.session.offer({
+        ...userMessage("are you there"),
+        uuid: "00000000-0000-4000-8000-000000000041",
+      });
+      assert.deepStrictEqual(yield* Queue.take(bridge.commands), {
+        type: "prompt",
+        text: "are you there",
+        promptUuid: "00000000-0000-4000-8000-000000000041",
+      });
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.live("sends nothing into a session whose continuation another thread holds", () =>
+    Effect.gen(function* () {
+      const bridge = yield* attach({
+        protocol: 2,
+        bridgeCanUseTool: () => null,
+        heldElsewhere: true,
+        transcript: saidRow("00000000-0000-4000-8000-0000000000d1", "before") + continuedInRow,
+      });
+      assert.deepStrictEqual(Array.from(new Set(bridge.asked)), ["bridge-session"]);
+      assert.isFalse(yield* bridge.session.continuedElsewhere ?? Effect.succeed(true));
       yield* bridge.session.offer({
         ...userMessage("are you there"),
         uuid: "00000000-0000-4000-8000-000000000041",
@@ -1097,7 +1145,8 @@ describe("ClaudeBridgeQueryRunner slash commands", () => {
         "Not sent: this conversation was sent to the background in its terminal and carries on as Claude ",
         describe(result),
       );
-      assert.include(said, "99999999-9999-4999-8999-999999999999");
+      assert.include(said, continuedTo);
+      assert.include(said, "has its own thread here");
       // The old session taken up again in its own right (rows after the mark) is sent to as before.
       const fs = yield* FileSystem.FileSystem;
       yield* fs.writeFileString(
@@ -1114,6 +1163,37 @@ describe("ClaudeBridgeQueryRunner slash commands", () => {
         text: "and now",
         promptUuid: "00000000-0000-4000-8000-000000000042",
       });
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.live("says its conversation moved on once the record does, and sends nothing after it", () =>
+    Effect.gen(function* () {
+      const bridge = yield* attach({
+        protocol: 2,
+        bridgeCanUseTool: () => null,
+        transcript: saidRow("00000000-0000-4000-8000-0000000000d1", "before"),
+      });
+      const movedOn = bridge.session.continuedElsewhere ?? Effect.succeed(false);
+      assert.isFalse(yield* movedOn);
+      const fs = yield* FileSystem.FileSystem;
+      yield* fs.writeFileString(bridge.process.session.transcriptPath, continuedInRow, {
+        flag: "a",
+      });
+      // The adapter lets go of such a session before the next turn; a prompt
+      // that still lands here is not sent into the process left behind.
+      assert.isTrue(yield* movedOn);
+      yield* bridge.session.offer({
+        ...userMessage("are you there"),
+        uuid: "00000000-0000-4000-8000-000000000041",
+      });
+      const frames = Array.from(
+        yield* bridge.session.messages.pipe(Stream.take(2), Stream.runCollect),
+      );
+      const result = frames[1];
+      const said = result?.type === "result" && result.subtype === "success" ? result.result : "";
+      assert.include(said, "Not sent: this conversation was just sent to the background");
+      assert.include(said, continuedTo);
+      assert.include(said, "This thread follows it there");
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 

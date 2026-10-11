@@ -50,8 +50,8 @@ import {
   claudeBridgeAttachmentPaths,
   claudeBridgeModAtLeast,
   claudeBridgeRequestTurnText,
-  claudeContinuedInSession,
   claudeSessionContinuedNotice,
+  claudeSessionFollowedNotice,
   claudeSessionMovingNotice,
   CLAUDE_BRIDGE_BASH_MOD_VERSION,
   CLAUDE_BRIDGE_DIALOG_REFUSAL_MOD_VERSION,
@@ -860,17 +860,6 @@ export const layer: Layer.Layer<
         });
 
       /** A turn's worth of frames for a slash command that started no model turn. */
-      /** The session this one's record says the conversation continued in, or null. */
-      const continuedInSession = Effect.gen(function* () {
-        if (state.transcriptPath.length === 0) return null;
-        const size = yield* transcriptSize(state.transcriptPath);
-        const from = Math.max(0, size - PERMISSION_MODE_SCAN_BYTES);
-        const tail = new TextDecoder().decode(
-          yield* readTranscriptBytes(state.transcriptPath, from, size - from),
-        );
-        return claudeContinuedInSession(from === 0 ? tail : tail.slice(tail.indexOf("\n") + 1));
-      });
-
       const emitCommandTurn = (input: {
         readonly turnId: string;
         readonly text: string;
@@ -1452,19 +1441,24 @@ export const layer: Layer.Layer<
                 ? message.uuid
                 : yield* crypto.randomUUIDv4.pipe(Effect.orDie);
             // The conversation moved on under another session id and this
-            // process was left behind: nothing is sent into it.
-            const continuedIn = yield* continuedInSession;
-            if (continuedIn !== null) {
+            // process was left behind: nothing is sent into it. The thread
+            // goes with the conversation the next time it opens the session;
+            // only a move in the moment before this prompt lands here.
+            const moved = yield* registry.continuationOf(sid, configDir);
+            if (moved !== null) {
               yield* Effect.logInfo("claude-bridge.not-sent-session-continued", {
                 sid,
-                continuedIn,
+                continuedIn: moved.sid,
+                heldElsewhere: moved.heldElsewhere,
               });
               yield* emitCommandTurn({
                 turnId: `not-sent-${promptUuid}`,
                 text,
                 promptUuid,
                 ok: true,
-                answer: claudeSessionContinuedNotice(continuedIn),
+                answer: moved.heldElsewhere
+                  ? claudeSessionContinuedNotice(moved.sid)
+                  : claudeSessionFollowedNotice(moved.sid),
               });
               return;
             }
@@ -1563,6 +1557,9 @@ export const layer: Layer.Layer<
         setPermissionMode: () => Effect.void,
         interrupt: registry.send(bridgeProcess, { type: "interrupt" }).pipe(Effect.asVoid),
         close: finish,
+        continuedElsewhere: registry
+          .continuationOf(sid, configDir)
+          .pipe(Effect.map((moved) => moved !== null && !moved.heldElsewhere)),
         hasPendingWake: Effect.gen(function* () {
           if (
             translator.hasOpenTurn() ||
@@ -1617,6 +1614,21 @@ export const layer: Layer.Layer<
           ) {
             yield* Effect.logInfo("claude-bridge.first-turn-over-sdk", { sid, cwd });
             return yield* openSdkForFirstTurn(input);
+          }
+          // The session was sent to the background in its terminal and the
+          // conversation carries on under another session id: the thread goes
+          // with the conversation, as Claude Code's own list of sessions does.
+          const moved = yield* registry.continuationOf(sid, configDir);
+          if (moved !== null && !moved.heldElsewhere) {
+            yield* Effect.logInfo("claude-bridge.following-continuation", {
+              sid,
+              continuedIn: moved.sid,
+            });
+            const { sessionId: _named, ...options } = input.options;
+            return yield* openBridge(
+              { ...input, options: { ...options, resume: moved.sid } },
+              configDir,
+            );
           }
           return yield* openBridge(input, configDir);
         }),

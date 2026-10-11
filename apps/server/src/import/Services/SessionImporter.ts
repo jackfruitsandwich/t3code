@@ -53,6 +53,29 @@ export interface SessionImporterShape {
      */
     readonly turnAwaitingRunSinceMs?: number;
   }) => Effect.Effect<void>;
+
+  /**
+   * The session under whose id T3 holds the conversation a Claude Code
+   * session is part of: the session itself, or an earlier one whose record
+   * says the conversation continued here (a session sent to the background
+   * in its terminal carries on under a new id, and its thread goes with it).
+   * Null when no thread holds the conversation.
+   */
+  readonly claudeConversationHolder: (input: {
+    readonly sessionId: string;
+    readonly transcriptPath: string;
+  }) => Effect.Effect<string | null>;
+
+  /**
+   * Whether a thread other than the one holding session `from` already holds
+   * session `to`, which `from`'s conversation continued in (both were taken
+   * in as conversations of their own by an earlier build): each keeps its
+   * thread.
+   */
+  readonly claudeSessionHeldElsewhere: (input: {
+    readonly from: string;
+    readonly to: string;
+  }) => Effect.Effect<boolean>;
 }
 
 export class SessionImporter extends Context.Service<SessionImporter, SessionImporterShape>()(
