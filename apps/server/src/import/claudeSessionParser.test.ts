@@ -1,9 +1,21 @@
 import { assert, describe, it } from "@effect/vitest";
 
-import { claudeTaskNotice, parseClaudeSessionJsonl } from "./claudeSessionParser.ts";
+import {
+  claudeTaskNotice,
+  claudeTaskNotification,
+  parseClaudeSessionJsonl,
+} from "./claudeSessionParser.ts";
 import { isEligibleCliSession } from "./sessionImportTypes.ts";
 
 const SESSION_ID = "11111111-1111-4111-8111-111111111111";
+
+/** A thinking block's signature as the API writes one, with `kind` where Claude Code reads it. */
+const signatureOf = (kind: string): string => {
+  const field = (number: number, body: Buffer) =>
+    Buffer.concat([Buffer.from([(number << 3) | 2, body.length]), body]);
+  const header = Buffer.concat([Buffer.from([0x08, 0x01]), field(8, Buffer.from(kind, "utf8"))]);
+  return field(2, field(1, header)).toString("base64");
+};
 
 function line(entry: Record<string, unknown>): string {
   return `${JSON.stringify(entry)}\n`;
@@ -492,5 +504,62 @@ describe("parseClaudeSessionJsonl", () => {
       parsed.messages.map((message) => [message.text, message.command === true]),
       [["/d7-echo kiwi 91dbf", true]],
     );
+  });
+});
+
+describe("what the terminal draws that is not a text block", () => {
+  it("imports narration as the message it is drawn as, and leaves a thought out", () => {
+    const parsed = parseClaudeSessionJsonl(
+      line(userEntry()) +
+        line(
+          assistantEntry({
+            uuid: "assistant-thought",
+            message: {
+              role: "assistant",
+              content: [
+                { type: "thinking", thinking: "Which file?", signature: signatureOf("thinking") },
+              ],
+            },
+          }),
+        ) +
+        line(
+          assistantEntry({
+            uuid: "assistant-narration",
+            message: {
+              role: "assistant",
+              content: [
+                {
+                  type: "thinking",
+                  thinking: "Found it; fixing the login check now.",
+                  signature: signatureOf("narration"),
+                },
+              ],
+            },
+          }),
+        ),
+    );
+    assert.deepEqual(
+      parsed.messages.map((message) => [message.role, message.sourceId, message.text]),
+      [
+        ["user", "user-uuid-1", "Fix the login bug"],
+        ["assistant", "assistant-narration", "Found it; fixing the login check now."],
+      ],
+    );
+  });
+
+  it("gives a turn a background task opened the task's own line as its notice", () => {
+    assert.deepEqual(
+      claudeTaskNotification(
+        '<task-notification>\n<task-id>b1</task-id>\n<status>completed</status>\n<summary>Background command "Run the suite" completed (exit code 0)</summary>\n</task-notification>',
+      ),
+      {
+        source: { kind: "background_task" },
+        outcome: "completed",
+        summary: 'Background command "Run the suite" completed (exit code 0)',
+      },
+    );
+    assert.isNull(claudeTaskNotification("fix the login bug"), "a typed prompt is no notice");
+    assert.isNull(claudeTaskNotification("Stop hook feedback: keep going"));
+    assert.isNull(claudeTaskNotification(null));
   });
 });

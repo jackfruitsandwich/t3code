@@ -100,6 +100,7 @@ import {
   threadModesForClaudePermissionMode,
 } from "../../claude-bridge/ClaudeBridgeProtocol.ts";
 import * as ServerConfig from "../../config.ts";
+import { claudeTaskNotification } from "../../import/claudeSessionParser.ts";
 import { expandHomePath } from "../../pathExpansion.ts";
 import {
   claudeSignedOutMessage,
@@ -5538,7 +5539,10 @@ export function makeClaudeAdapterV2(
                   },
                   outcome: "updated",
                   summary: detail,
-                } satisfies OrchestrationV2Notification));
+                } satisfies OrchestrationV2Notification)) ??
+            // A background task reporting back: its own line, as the
+            // terminal draws it.
+            claudeTaskNotification(detail);
           yield* Effect.logInfo("orchestration-v2.claude-wake-turn-detected", {
             providerSessionId: input.providerSessionId,
             threadId: route.threadId,

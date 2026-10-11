@@ -12,6 +12,7 @@ import {
   claudeTranscriptCommandText,
   claudeTranscriptOffsetAt,
   claudeTurnPromptLabel,
+  isClaudeNarrationBlock,
   isClaudeTypedMidTurnRow,
   makeClaudeBridgeFrameTranslator,
   parseClaudeBridgeEvent,
@@ -30,6 +31,14 @@ const translator = () =>
     model: "claude-opus-5-5",
     permissionMode: "default",
   });
+
+/** A thinking block's signature as the API writes one, with `kind` where Claude Code reads it. */
+const signatureOf = (kind: string): string => {
+  const field = (number: number, body: Buffer) =>
+    Buffer.concat([Buffer.from([(number << 3) | 2, body.length]), body]);
+  const header = Buffer.concat([Buffer.from([0x08, 0x01]), field(8, Buffer.from(kind, "utf8"))]);
+  return field(2, field(1, header)).toString("base64");
+};
 
 const assistantRow = (uuid: string, content: ReadonlyArray<Record<string, unknown>>) => ({
   type: "assistant",
@@ -492,5 +501,37 @@ describe("ClaudeBridgeProtocol parsers", () => {
     const { rows, consumedChars } = readTranscriptRows('{"a":1}\n{"b":2}\n{"c":');
     assert.lengthOf(rows, 2);
     assert.equal(consumedChars, 16);
+  });
+});
+
+describe("narration, what the model says to the person between tool calls", () => {
+  const said = {
+    type: "thinking",
+    thinking: "Tests pass; building now.",
+    signature: signatureOf("narration"),
+  };
+  const thought = {
+    type: "thinking",
+    thinking: "Which file first?",
+    signature: signatureOf("thinking"),
+  };
+
+  it("is told from a thought by the label in the block's signature, as Claude Code tells it", () => {
+    assert.isTrue(isClaudeNarrationBlock(said));
+    assert.isFalse(isClaudeNarrationBlock(thought));
+    assert.isFalse(isClaudeNarrationBlock({ ...said, signature: "not a signature" }));
+    assert.isFalse(isClaudeNarrationBlock({ ...said, signature: undefined }));
+    assert.isFalse(isClaudeNarrationBlock({ ...said, thinking: "  " }), "nothing to draw");
+    assert.isFalse(isClaudeNarrationBlock({ type: "text", text: "Done." }));
+  });
+
+  it("reaches the thread as the message the terminal draws; a thought stays a thought", () => {
+    const frames = translator();
+    const content = (row: ReturnType<typeof assistantRow>) =>
+      Reflect.get(Reflect.get(frames.onTranscriptRow(row)[0]!, "message") as object, "content");
+    assert.deepEqual(content(assistantRow("n1", [said])), [
+      { type: "text", text: "Tests pass; building now." },
+    ]);
+    assert.deepEqual(content(assistantRow("t1", [thought])), [thought]);
   });
 });

@@ -13,7 +13,10 @@
  *
  * @module import/claudeSessionParser
  */
+import type { OrchestrationV2Notification } from "@t3tools/contracts";
+
 import {
+  claudeNarrationAsText,
   claudeTranscriptCommandOutput,
   claudeTranscriptCommandText,
   claudeTranscriptPermissionMode,
@@ -89,10 +92,22 @@ export function claudeTaskNotice(text: string): ParsedSessionNotice {
 }
 
 /**
+ * The notice a turn the harness opened shows, when what opened it is a
+ * background task reporting back: the task's own line, as the terminal draws
+ * it. Null for any other prompt.
+ */
+export function claudeTaskNotification(text: string | null): OrchestrationV2Notification | null {
+  if (text === null || !isClaudeTaskNoticeText(text)) return null;
+  const notice = claudeTaskNotice(text);
+  return { source: { kind: "background_task" }, outcome: notice.outcome, summary: notice.summary };
+}
+
+/**
  * Extract the concatenated text-block content from a Claude message
  * `content` value, which is either a plain string or an array of typed
  * blocks. Non-text blocks (tool_use, tool_result, thinking, images) are
- * dropped; an entry whose content has no text block yields "".
+ * dropped; an entry whose content has no text block yields "". Narration,
+ * which the terminal draws as a message, is text here too.
  */
 function extractTextContent(content: unknown): string {
   if (typeof content === "string") {
@@ -102,7 +117,8 @@ function extractTextContent(content: unknown): string {
     return "";
   }
   const parts: string[] = [];
-  for (const block of content) {
+  for (const raw of content) {
+    const block = claudeNarrationAsText(raw);
     if (isRecord(block) && block.type === "text" && typeof block.text === "string") {
       parts.push(block.text);
     }

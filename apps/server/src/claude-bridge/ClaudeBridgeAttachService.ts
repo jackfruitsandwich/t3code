@@ -22,6 +22,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as SqlClient from "effect/sql/SqlClient";
 
+import { claudeTaskNotification } from "../import/claudeSessionParser.ts";
 import * as SessionImporter from "../import/Services/SessionImporter.ts";
 import { CLAUDE_PROVIDER } from "../orchestration-v2/Adapters/ClaudeAdapterV2.ts";
 import * as ProviderContinuationRequests from "../orchestration-v2/ProviderContinuationRequests.ts";
@@ -175,6 +176,7 @@ const make = Effect.gen(function* () {
         threadId: thread.threadId,
       });
       lastOfferedAt.set(sid, yield* Clock.currentTimeMillis);
+      const taskNotice = claudeTaskNotification(text);
       yield* continuations.offer({
         threadId: thread.threadId,
         providerThreadId: thread.providerThreadId,
@@ -184,6 +186,9 @@ const make = Effect.gen(function* () {
         // injected (a task notice, a hook's feedback) is not their message,
         // and neither is a turn picked up with nothing known of how it began.
         createdBy: text.trim().length === 0 || isHarnessPrompt(text) ? "agent" : "user",
+        // A background task reporting back shows as its own line, not as
+        // a notice without words.
+        ...(taskNotice === null ? {} : { notification: taskNotice }),
       });
     });
 

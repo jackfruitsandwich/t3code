@@ -1091,7 +1091,9 @@ export function makeClaudeBridgeFrameTranslator(
             : typeof message.content === "string"
               ? [{ type: "text", text: message.content }]
               : []
-        ).map(asT3ToolCall);
+        )
+          .map(claudeNarrationAsText)
+          .map(asT3ToolCall);
         const current = turn;
         const stamp =
           current !== null && current.promptUuid !== null && !current.assistantStamped
@@ -1262,6 +1264,75 @@ const asT3ToolCall = (block: unknown): unknown =>
   block.name.startsWith(BRIDGED_T3_TOOL_PREFIX)
     ? { ...block, name: T3_TOOL_PREFIX + block.name.slice(BRIDGED_T3_TOOL_PREFIX.length) }
     : block;
+
+/**
+ * The length-delimited field `field` of a protobuf message (the last, if it
+ * repeats); undefined when it is absent or the bytes are not such a message.
+ */
+function protobufBytesField(bytes: Uint8Array, field: number): Uint8Array | undefined {
+  let found: Uint8Array | undefined;
+  let at = 0;
+  const varint = (): number | undefined => {
+    let value = 0;
+    for (let shift = 0; shift <= 63; shift += 7) {
+      if (at >= bytes.length) return undefined;
+      const byte = bytes[at++]!;
+      value += (byte & 0x7f) * 2 ** shift;
+      if ((byte & 0x80) === 0) return value;
+    }
+    return undefined;
+  };
+  while (at < bytes.length) {
+    const tag = varint();
+    if (tag === undefined) return undefined;
+    const wire = tag % 8;
+    if (wire === 0) {
+      if (varint() === undefined) return undefined;
+    } else if (wire === 1) {
+      at += 8;
+    } else if (wire === 5) {
+      at += 4;
+    } else if (wire === 2) {
+      const length = varint();
+      if (length === undefined || at + length > bytes.length) return undefined;
+      if (Math.floor(tag / 8) === field) found = bytes.subarray(at, at + length);
+      at += length;
+    } else {
+      return undefined;
+    }
+    if (at > bytes.length) return undefined;
+  }
+  return found;
+}
+
+const NARRATION_BLOCK_KIND = "narration";
+
+/**
+ * Whether a content block is narration: what the model says to the person
+ * between tool calls of a turn it is still thinking in. The API returns it as
+ * a thinking block, and the terminal draws it as a message, not as a thought.
+ * Claude Code tells the two apart by a label inside the block's signature;
+ * this reads the same label, and a block it cannot read is a thought.
+ */
+export function isClaudeNarrationBlock(block: unknown): boolean {
+  if (
+    !isRecord(block) ||
+    block.type !== "thinking" ||
+    typeof block.signature !== "string" ||
+    typeof block.thinking !== "string" ||
+    block.thinking.trim().length === 0
+  ) {
+    return false;
+  }
+  const envelope = protobufBytesField(Buffer.from(block.signature, "base64"), 2);
+  const header = envelope === undefined ? undefined : protobufBytesField(envelope, 1);
+  const kind = header === undefined ? undefined : protobufBytesField(header, 8);
+  return kind !== undefined && Buffer.from(kind).toString("utf8") === NARRATION_BLOCK_KIND;
+}
+
+/** A narration block as the text the terminal draws it as; any other block as it is. */
+export const claudeNarrationAsText = (block: unknown): unknown =>
+  isClaudeNarrationBlock(block) && isRecord(block) ? { type: "text", text: block.thinking } : block;
 
 /** The row Claude Code writes when a turn is over: every row of that turn is before it. */
 export function isClaudeTurnEndRow(row: unknown): boolean {
