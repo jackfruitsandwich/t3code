@@ -87,6 +87,11 @@ import {
 } from "@t3tools/client-runtime/errors";
 import { readPastedComposerContext } from "./composerInlineTokenPaste";
 import { isPasteAsTextShortcut } from "@t3tools/client-runtime/text-paste";
+import {
+  SESSION_PERMISSION_MODE_NOTICE,
+  sessionModelCommand,
+  threadSettingsBelongToSession,
+} from "@t3tools/client-runtime/session-owned-settings";
 import { effectiveSnoozed, threadWokeAt } from "@t3tools/client-runtime/state/thread-settled";
 import { useAcknowledgeThreadWoke, useThreadActions } from "../hooks/useThreadActions";
 import {
@@ -2147,12 +2152,6 @@ export default function ChatView(props: ChatViewProps) {
   const [, setThreadErrorBannerDismissTick] = useState(0);
   const defaultRuntimeMode = resolveProjectSettings(settings, activeThread?.projectId ?? null)
     .settings.defaultRuntimeMode;
-  // Implicit drafts follow their current project/environment, including retargets.
-  // Explicit composer choices and existing server threads retain their permissions.
-  const runtimeMode =
-    composerRuntimeMode ??
-    (isServerThread ? activeThread?.runtimeMode : undefined) ??
-    defaultRuntimeMode;
   const isLocalDraftThread = !isServerThread && localDraftThread !== undefined;
   const canCheckoutPullRequestIntoThread = isLocalDraftThread;
   const activeThreadId = activeThread?.id ?? null;
@@ -3220,11 +3219,25 @@ export default function ChatView(props: ChatViewProps) {
   const selectedProvider = selectedProviderEntry?.driverKind ?? requestedDriverKind;
   const activeProviderInstanceId = selectedProviderEntry?.instanceId ?? null;
   const activeProviderStatus = selectedProviderEntry?.snapshot ?? null;
+  // A started thread whose session keeps its own model and modes shows the
+  // thread's values: the composer's copies are neither shown nor sent.
+  const settingsBelongToSession = threadSettingsBelongToSession({
+    hasStartedThread: isServerThread,
+    provider: activeProviderStatus,
+  });
+  // Implicit drafts follow their current project/environment, including retargets.
+  // Explicit composer choices and existing server threads retain their permissions.
+  const runtimeMode =
+    (settingsBelongToSession ? activeThread?.runtimeMode : undefined) ??
+    composerRuntimeMode ??
+    (isServerThread ? activeThread?.runtimeMode : undefined) ??
+    defaultRuntimeMode;
   const { enabled: interactionModeEnabled, interactionMode } = resolveComposerInteractionMode({
     planModeEnabled: settings.planModeEnabled,
     provider: activeProviderStatus,
     interactionMode:
       composerInteractionMode ?? activeThread?.interactionMode ?? DEFAULT_INTERACTION_MODE,
+    sessionInteractionMode: settingsBelongToSession ? activeThread?.interactionMode : null,
   });
   const conversationProviderStatus =
     providerStatuses.find((status) => status.instanceId === activeRuntime?.providerInstanceId) ??
@@ -5201,6 +5214,11 @@ export default function ChatView(props: ChatViewProps) {
   const handleRuntimeModeChange = useCallback(
     (mode: RuntimeMode) => {
       if (mode === runtimeMode) return;
+      if (settingsBelongToSession) {
+        toastManager.add({ type: "info", title: SESSION_PERMISSION_MODE_NOTICE });
+        scheduleComposerFocus();
+        return;
+      }
       setComposerDraftRuntimeMode(composerDraftTarget, mode);
       if (isLocalDraftThread) {
         setDraftThreadContext(composerDraftTarget, { runtimeMode: mode });
@@ -5214,6 +5232,7 @@ export default function ChatView(props: ChatViewProps) {
       composerDraftTarget,
       setComposerDraftRuntimeMode,
       setDraftThreadContext,
+      settingsBelongToSession,
     ],
   );
 
@@ -6106,6 +6125,11 @@ export default function ChatView(props: ChatViewProps) {
         }
       }
 
+      // A session that keeps its own modes is never sent the composer's.
+      if (settingsBelongToSession) {
+        return result;
+      }
+
       if (input.runtimeMode !== serverThread.runtimeMode) {
         result = mapAtomCommandResult(
           await setThreadRuntimeMode({
@@ -6143,6 +6167,7 @@ export default function ChatView(props: ChatViewProps) {
       serverThread,
       setThreadInteractionMode,
       setThreadRuntimeMode,
+      settingsBelongToSession,
       updateThreadMetadata,
     ],
   );
@@ -10479,6 +10504,18 @@ export default function ChatView(props: ChatViewProps) {
         if (options?.focusComposer !== false) scheduleComposerFocus();
         return;
       }
+      // The session keeps its own model: a pick runs the session's /model, and
+      // the picker shows the new model once the session reports it. Another
+      // provider's model is a handoff and stays with the composer.
+      if (settingsBelongToSession && instanceId === activeThread.modelSelection.instanceId) {
+        const command = sessionModelCommand({
+          current: activeThread.modelSelection,
+          picked: nextModelSelection,
+        });
+        if (command !== null) void sendStandaloneCommand(command, "Failed to switch model.");
+        if (options?.focusComposer !== false) scheduleComposerFocus();
+        return;
+      }
       setComposerDraftModelSelection(
         scopeThreadRef(activeThread.environmentId, activeThread.id),
         nextModelSelection,
@@ -10495,8 +10532,10 @@ export default function ChatView(props: ChatViewProps) {
       lockedProvider,
       supportsProviderSwitchingViaHandoff,
       scheduleComposerFocus,
+      sendStandaloneCommand,
       setComposerDraftModelSelection,
       setStickyComposerModelSelection,
+      settingsBelongToSession,
       providerStatuses,
       settings,
     ],
@@ -11112,6 +11151,7 @@ export default function ChatView(props: ChatViewProps) {
                 {...(draftId ? { onWorktreeSetupWorkLocally } : {})}
                 {...(onOpenWorktreeSetupTerminal ? { onOpenWorktreeSetupTerminal } : {})}
                 isPreparingWorktree={!paintOnlyDisplayedTimeline && isPreparingWorktree}
+                steerWaitsForTurnEnd={settingsBelongToSession}
                 listRef={legendListRef}
                 timelineEntries={displayedTimeline.entries}
                 providerStatuses={

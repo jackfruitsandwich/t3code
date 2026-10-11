@@ -32,6 +32,12 @@ import {
   type CodexFeedbackSubmission,
 } from "@t3tools/client-runtime/state/threads";
 import { resolveThreadWorkingStartedAt } from "@t3tools/client-runtime/state/models";
+import {
+  resolveStartedThreadSettings,
+  SESSION_MODEL_OPTIONS_NOTICE,
+  SESSION_PERMISSION_MODE_NOTICE,
+  sessionModelCommand,
+} from "@t3tools/client-runtime/session-owned-settings";
 import { upgradeLegacyContextMessage } from "@t3tools/shared/composerContextLegacy";
 import { composerContextSendBlockReason, reidentifyComposerContext } from "../lib/composerContext";
 import { uuidv4 } from "../lib/uuid";
@@ -328,16 +334,24 @@ export function useThreadComposerState() {
   const draftAttachments = editedDraft?.attachments ?? [];
   const selectedThreadQueueCount = selectedThreadQueuedMessages.length;
   const selectedThread = selectedThreadShell;
-  const modelSelection = selectedDraft?.modelSelection ?? selectedThread?.modelSelection ?? null;
-  const runtimeMode = selectedDraft?.runtimeMode ?? selectedThread?.runtimeMode ?? null;
+  // A thread whose session keeps its own model and modes shows the thread's
+  // values; the composer's saved copies are neither shown nor sent.
+  const threadSettings = selectedThread
+    ? resolveStartedThreadSettings({
+        thread: selectedThread,
+        draft: selectedDraft,
+        providers: selectedEnvironmentRuntime?.serverConfig?.providers ?? [],
+      })
+    : null;
+  const modelSelection = threadSettings?.modelSelection ?? null;
+  const runtimeMode = threadSettings?.runtimeMode ?? null;
   const selectedProvider = selectedEnvironmentRuntime?.serverConfig?.providers.find(
     (provider) => provider.instanceId === modelSelection?.instanceId,
   );
-  const interactionMode = selectedThread
-    ? resolveProviderInteractionMode(
-        selectedProvider,
-        selectedDraft?.interactionMode ?? selectedThread.interactionMode,
-      )
+  const interactionMode = threadSettings
+    ? threadSettings.belongToSession
+      ? threadSettings.interactionMode
+      : resolveProviderInteractionMode(selectedProvider, threadSettings.interactionMode)
     : null;
   // Whether the model picker may leave this thread's provider. Derived here
   // because the projection already drives this hook; the composer only needs
@@ -604,8 +618,13 @@ export function useThreadComposerState() {
         return null;
       }
 
-      const modelSelection = draft.modelSelection ?? thread.modelSelection;
       const serverConfig = selectedEnvironmentRuntime?.serverConfig;
+      const turnSettings = resolveStartedThreadSettings({
+        thread,
+        draft,
+        providers: serverConfig?.providers ?? [],
+      });
+      const modelSelection = turnSettings.modelSelection;
       if (
         selectedEnvironmentRuntime?.connectionState === "connected" &&
         isModelSelectionUnavailable(serverConfig, modelSelection)
@@ -688,11 +707,10 @@ export function useThreadComposerState() {
         attachments,
         context: draft.context,
         modelSelection,
-        runtimeMode: draft.runtimeMode ?? thread.runtimeMode,
-        interactionMode: resolveProviderInteractionMode(
-          provider,
-          draft.interactionMode ?? thread.interactionMode,
-        ),
+        runtimeMode: turnSettings.runtimeMode,
+        interactionMode: turnSettings.belongToSession
+          ? turnSettings.interactionMode
+          : resolveProviderInteractionMode(provider, turnSettings.interactionMode),
         ...(followUpDispatchMode === null ? {} : { dispatchMode: followUpDispatchMode }),
         createdAt: metadata.createdAt,
       });
@@ -999,6 +1017,26 @@ export function useThreadComposerState() {
       if (!selectedThreadKey) {
         return;
       }
+      // The session keeps its own model: the pick becomes the session's own
+      // /model in the message box, for the person to send. Another provider's
+      // model is a handoff and stays with the composer.
+      if (
+        selectedThreadShell &&
+        threadSettings?.belongToSession === true &&
+        value.instanceId === selectedThreadShell.modelSelection.instanceId
+      ) {
+        const command = sessionModelCommand({
+          current: selectedThreadShell.modelSelection,
+          picked: value,
+        });
+        if (command !== null) {
+          setComposerDraftText(activeComposerDraftKey(selectedThreadShell), command);
+        } else {
+          // Same model, so an option (effort, context window) was what changed.
+          Alert.alert("Model options", SESSION_MODEL_OPTIONS_NOTICE);
+        }
+        return;
+      }
       const provider = selectedEnvironmentRuntime?.serverConfig?.providers.find(
         (candidate) => candidate.instanceId === value.instanceId,
       );
@@ -1009,7 +1047,12 @@ export function useThreadComposerState() {
           : {}),
       });
     },
-    [selectedEnvironmentRuntime?.serverConfig, selectedThreadKey],
+    [
+      selectedEnvironmentRuntime?.serverConfig,
+      selectedThreadKey,
+      selectedThreadShell,
+      threadSettings?.belongToSession,
+    ],
   );
 
   const onUpdateRuntimeMode = useCallback(
@@ -1017,9 +1060,13 @@ export function useThreadComposerState() {
       if (!selectedThreadKey) {
         return;
       }
+      if (threadSettings?.belongToSession === true) {
+        Alert.alert("Permission mode", SESSION_PERMISSION_MODE_NOTICE);
+        return;
+      }
       updateComposerDraftSettings(selectedThreadKey, { runtimeMode: value });
     },
-    [selectedThreadKey],
+    [selectedThreadKey, threadSettings?.belongToSession],
   );
 
   const onUpdateInteractionMode = useCallback(

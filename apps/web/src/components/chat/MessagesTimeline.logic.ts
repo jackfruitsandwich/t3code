@@ -785,6 +785,35 @@ function timelineEntryFoldRunId(entry: TimelineEntry, runlessKey: RunId | null):
   return null;
 }
 
+/**
+ * How a user message that did not open a turn is marked. A session that takes
+ * a message from T3 only between turns has not been steered by one sent
+ * mid-turn: the message is delivered when the turn ends, and the mark says so.
+ */
+export function userMessageIntentMarker(
+  intent: Exclude<NonNullable<ChatMessage["inputIntent"]>, "turn_start">,
+  options: { readonly steerWaitsForTurnEnd: boolean },
+): { readonly label: string; readonly tooltip: string; readonly isSteer: boolean } {
+  if (intent === "queued_turn") {
+    return { label: "Queued", tooltip: "Queued behind the active turn", isSteer: false };
+  }
+  if (options.steerWaitsForTurnEnd) {
+    return {
+      label: "Sent when this turn ends",
+      tooltip: "The session takes a message from T3 only between turns",
+      isSteer: false,
+    };
+  }
+  return {
+    label: "Steer",
+    tooltip:
+      intent === "promoted_queued_to_steer"
+        ? "Originally queued, then promoted to steer the active turn"
+        : "Steered the active turn",
+    isSteer: true,
+  };
+}
+
 /** A steer adds input to its existing turn, without creating a new header. */
 function timelineEntryStartsResponse(entry: TimelineEntry): boolean {
   return (

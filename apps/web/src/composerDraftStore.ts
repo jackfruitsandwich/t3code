@@ -4526,8 +4526,16 @@ export function useEffectiveComposerModelState(input: {
   threadModelSelection: ModelSelection | null | undefined;
   projectModelSelection: ModelSelection | null | undefined;
   settings: UnifiedSettings;
+  /**
+   * The thread's session keeps its own model: the thread's selection is the
+   * state, and the composer's saved copy is not consulted.
+   */
+  followThread?: boolean;
 }): EffectiveComposerModelState {
-  const draft = useComposerDraftModelState(input.threadRef ?? input.draftId ?? DraftId.make(""));
+  const savedDraft = useComposerDraftModelState(
+    input.threadRef ?? input.draftId ?? DraftId.make(""),
+  );
+  const draft = input.followThread === true ? null : savedDraft;
 
   return useMemo(
     () =>

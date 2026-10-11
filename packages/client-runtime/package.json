@@ -39,6 +39,10 @@
       "types": "./src/userMessage.ts",
       "default": "./src/userMessage.ts"
     },
+    "./session-owned-settings": {
+      "types": "./src/sessionOwnedSettings.ts",
+      "default": "./src/sessionOwnedSettings.ts"
+    },
     "./secret-request": {
       "types": "./src/secretRequest.ts",
       "default": "./src/secretRequest.ts"

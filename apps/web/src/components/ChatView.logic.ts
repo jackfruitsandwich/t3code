@@ -622,12 +622,20 @@ export function resolveComposerProviderSelection(input: {
   };
 }
 
-/** Keep restored drafts and every plan control on the selected instance's supported mode. */
+/**
+ * Keep restored drafts and every plan control on the selected instance's supported mode.
+ * A thread whose session keeps its own modes passes the session's: T3's toggle
+ * is not offered, and what is sent with a turn is what the session already has.
+ */
 export function resolveComposerInteractionMode(input: {
   planModeEnabled: boolean;
   provider: Pick<ServerProvider, "showInteractionModeToggle"> | null | undefined;
   interactionMode: ProviderInteractionMode;
+  sessionInteractionMode?: ProviderInteractionMode | null | undefined;
 }): { enabled: boolean; interactionMode: ProviderInteractionMode } {
+  if (input.sessionInteractionMode != null) {
+    return { enabled: false, interactionMode: input.sessionInteractionMode };
+  }
   const enabled =
     input.planModeEnabled &&
     input.provider != null &&

@@ -1688,6 +1688,26 @@ describe("resolveComposerInteractionMode", () => {
       }),
     ).toEqual({ enabled: false, interactionMode: "default" });
   });
+
+  it("follows the session's mode, without a toggle, when the session keeps its own", () => {
+    expect(
+      resolveComposerInteractionMode({
+        planModeEnabled: true,
+        provider: { showInteractionModeToggle: false },
+        // A stale composer copy says default; the session is planning.
+        interactionMode: "default",
+        sessionInteractionMode: "plan",
+      }),
+    ).toEqual({ enabled: false, interactionMode: "plan" });
+    expect(
+      resolveComposerInteractionMode({
+        planModeEnabled: true,
+        provider: { showInteractionModeToggle: true },
+        interactionMode: "plan",
+        sessionInteractionMode: "default",
+      }),
+    ).toEqual({ enabled: false, interactionMode: "default" });
+  });
 });
 
 describe("resolveBackgroundDraftWorkspaceOptions", () => {

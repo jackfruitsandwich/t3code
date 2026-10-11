@@ -208,6 +208,7 @@ import {
   shouldFollowWorkGroupAppend,
   shouldPreserveAssistantLineBreaks,
   toolGroupAction,
+  userMessageIntentMarker,
   workEntryDisplayLabel,
   workEntryReadOutput,
   workEntryIsVisibleInGroup,
@@ -309,6 +310,8 @@ interface TimelineRowSharedState {
   providerStatuses: ReadonlyArray<ServerProvider>;
   /** Projection runs, for recovering handoff models on legacy items. */
   runs: ReadonlyArray<HandoffTimelineRun>;
+  /** The thread's session takes a message only between turns; see userMessageIntentMarker. */
+  steerWaitsForTurnEnd: boolean;
   activeThreadEnvironmentId: EnvironmentId;
   onRevertToTurnCount: (targetTurnCount: number, messageId: MessageId) => void;
   onUseArtifactTemplate: (template: CodexArtifactTemplate) => void;
@@ -472,6 +475,7 @@ interface MessagesTimelineProps {
   skills?: ReadonlyArray<Pick<ServerProviderSkill, "name" | "displayName">>;
   providerStatuses: ReadonlyArray<ServerProvider>;
   runs: ReadonlyArray<HandoffTimelineRun>;
+  steerWaitsForTurnEnd?: boolean;
   anchorMessageId: MessageId | null;
   onAnchorReady: (messageId: MessageId, anchorIndex: number) => void;
   onAnchorSizeChanged: (messageId: MessageId, size: number) => void;
@@ -547,6 +551,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   skills = EMPTY_TIMELINE_SKILLS,
   providerStatuses,
   runs: runsProp,
+  steerWaitsForTurnEnd = false,
   anchorMessageId,
   onAnchorReady,
   onAnchorSizeChanged,
@@ -1163,6 +1168,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       skills,
       providerStatuses,
       runs,
+      steerWaitsForTurnEnd,
       activeThreadEnvironmentId,
       onRevertToTurnCount,
       onRunShellCommand,
@@ -1198,6 +1204,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       skills,
       providerStatuses,
       runs,
+      steerWaitsForTurnEnd,
       activeThreadEnvironmentId,
       onRevertToTurnCount,
       onRunShellCommand,
@@ -2146,7 +2153,10 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
         </p>
       ) : null}
       {row.message.inputIntent && row.message.inputIntent !== "turn_start" ? (
-        <UserMessageIntentMarker intent={row.message.inputIntent} />
+        <UserMessageIntentMarker
+          intent={row.message.inputIntent}
+          steerWaitsForTurnEnd={ctx.steerWaitsForTurnEnd}
+        />
       ) : null}
       <div className="relative max-w-[80%] rounded-2xl bg-message p-3 text-message-foreground">
         <MessageAuthorHeading>You</MessageAuthorHeading>
@@ -2313,25 +2323,13 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
 
 function UserMessageIntentMarker({
   intent,
+  steerWaitsForTurnEnd,
 }: {
-  readonly intent: NonNullable<ChatMessage["inputIntent"]>;
+  readonly intent: Exclude<NonNullable<ChatMessage["inputIntent"]>, "turn_start">;
+  readonly steerWaitsForTurnEnd: boolean;
 }) {
-  const presentation =
-    intent === "queued_turn"
-      ? {
-          label: "Queued",
-          icon: null,
-        }
-      : intent === "promoted_queued_to_steer"
-        ? {
-            label: "Steer",
-            icon: Redo2Icon,
-          }
-        : {
-            label: "Steer",
-            icon: Redo2Icon,
-          };
-  const IntentIcon = presentation.icon;
+  const presentation = userMessageIntentMarker(intent, { steerWaitsForTurnEnd });
+  const IntentIcon = presentation.isSteer ? Redo2Icon : null;
   return (
     <Tooltip>
       <TooltipTrigger
@@ -2345,13 +2343,7 @@ function UserMessageIntentMarker({
         {IntentIcon ? <IntentIcon aria-hidden="true" className="size-3" /> : null}
         {presentation.label}
       </TooltipTrigger>
-      <TooltipPopup side="top">
-        {intent === "queued_turn"
-          ? "Queued behind the active turn"
-          : intent === "promoted_queued_to_steer"
-            ? "Originally queued, then promoted to steer the active turn"
-            : "Steered the active turn"}
-      </TooltipPopup>
+      <TooltipPopup side="top">{presentation.tooltip}</TooltipPopup>
     </Tooltip>
   );
 }

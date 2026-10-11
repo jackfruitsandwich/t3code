@@ -225,6 +225,10 @@ export const ServerProvider = Schema.Struct({
   badgeLabel: Schema.optional(TrimmedNonEmptyString),
   continuation: Schema.optional(ServerProviderContinuation),
   showInteractionModeToggle: Schema.optional(Schema.Boolean),
+  // The provider's threads are windows onto native sessions that keep their
+  // own model and modes. Clients show the thread's values on a started thread
+  // and change one by sending the session's own command, never a composer copy.
+  sessionOwnsThreadSettings: Schema.optional(Schema.Boolean),
   // The driver streams context window usage, so a started thread will have a
   // meter once its activities load. Clients reserve the meter's space on it.
   reportsContextWindow: Schema.optional(Schema.Boolean),

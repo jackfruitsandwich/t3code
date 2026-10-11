@@ -12,7 +12,7 @@
  *
  * @module provider/Drivers/ClaudeDriver
  */
-import { ClaudeSettings, ProviderDriverKind } from "@t3tools/contracts";
+import { ClaudeSettings, ProviderDriverKind, type ServerProvider } from "@t3tools/contracts";
 import * as Cache from "effect/Cache";
 import * as Duration from "effect/Duration";
 import * as Crypto from "effect/Crypto";
@@ -73,6 +73,7 @@ import {
   makeClaudeContinuationGroupKey,
   resolveClaudeHomePath,
 } from "./ClaudeHome.ts";
+import { readClaudeHomeIsBridged, withSessionOwnedSettings } from "./ClaudeSessionWindow.ts";
 const decodeClaudeSettings = Schema.decodeSync(ClaudeSettings);
 
 const DRIVER_KIND = ProviderDriverKind.make("claudeAgent");
@@ -170,6 +171,14 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv> = {
         accentColor,
         continuationGroupKey,
       });
+      // Read with each snapshot: the plugin can be installed or switched off
+      // while the server runs.
+      const stampSessionWindow = (stamped: ServerProvider) =>
+        readClaudeHomeIsBridged(configDir, hostEnvironment).pipe(
+          Effect.map((isBridged) => withSessionOwnedSettings(stamped, isBridged)),
+          Effect.provideService(FileSystem.FileSystem, fileSystem),
+          Effect.provideService(Path.Path, path),
+        );
 
       const scopedLimitNames = yield* makeClaudeScopedLimitNames;
       const orchestrationAdapter = yield* createClaudeAdapterV2(
@@ -237,6 +246,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv> = {
               ),
             ),
             Effect.map(stampIdentity),
+            Effect.flatMap(stampSessionWindow),
           ),
         ),
         Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
@@ -256,6 +266,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv> = {
               makePendingClaudeProvider(settings.provider, resolveClaudeModelCatalog(manifest)),
             ),
             Effect.map(stampIdentity),
+            Effect.flatMap(stampSessionWindow),
           ),
         checkProvider,
         enrichSnapshot: ({ settings, snapshot, publishSnapshot }) =>
