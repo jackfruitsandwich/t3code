@@ -648,6 +648,33 @@ export function claudeSessionMovingNotice(name: string): string | null {
     ? `Not run: /${name} moves this Claude Code session on to another conversation, and this thread cannot follow it yet. Run it in the session's terminal: the conversation it opens shows up here as its own thread. For a fresh conversation from T3, start a new chat.`
     : null;
 }
+/**
+ * The session a record says its conversation continued in, read from the
+ * record's last rows. Claude Code sending a session to the background carries
+ * the conversation on under a new id and closes the old record with this row;
+ * it then keeps the old session out of /resume. Null when the record says no
+ * such thing, or was written to again afterwards (the old session resumed).
+ */
+export function claudeContinuedInSession(recordTail: string): string | null {
+  let continuedIn: string | null = null;
+  for (const line of recordTail.split("\n")) {
+    const row = parseJsonlLine(line);
+    if (!isRecord(row)) continue;
+    if (row.type === "continued-in" && typeof row.continuedInSessionId === "string") {
+      continuedIn = row.continuedInSessionId.length > 0 ? row.continuedInSessionId : null;
+    } else if (row.type === "user" || row.type === "assistant") {
+      continuedIn = null;
+    }
+  }
+  return continuedIn;
+}
+/**
+ * What T3 says instead of sending a message into a session whose conversation
+ * continued under another id: sent there, it would start a second, diverging
+ * copy of the conversation in the process that was left behind.
+ */
+export const claudeSessionContinuedNotice = (continuedIn: string): string =>
+  `Not sent: this conversation was sent to the background in its terminal and carries on as Claude Code session ${continuedIn}, which has its own thread here. Send your message in that thread.`;
 /** Where T3 says, in a prompt, that it saved a file the person attached (see AttachmentPrompt). */
 const SAVED_ATTACHMENT = /\[Attached [^\]\n]*? is saved at: ([^\]\n]+)\]/gu;
 /** The paths of the files a prompt from T3 says were saved for it. */

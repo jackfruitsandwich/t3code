@@ -4,6 +4,7 @@ import { assert, describe, it } from "@effect/vitest";
 import { ProviderSessionId, ThreadId } from "@t3tools/contracts";
 import { HostProcessEnvironment, HostProcessWorkingDirectory } from "@t3tools/shared/hostProcess";
 import * as Clock from "effect/Clock";
+import * as DateTime from "effect/DateTime";
 import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -191,6 +192,9 @@ const until = (predicate: () => boolean, label: string): Effect.Effect<void> =>
     }
     return yield* Effect.die(`Timed out waiting for ${label}.`);
   });
+
+/** The time a record row carries, as Claude Code writes it. A turn's rows are stamped inside the turn. */
+const stamp = (atMs: number) => DateTime.formatIso(DateTime.makeUnsafe(atMs));
 
 describe("ClaudeBridgeQueryRunner permissions", () => {
   const cases: ReadonlyArray<{
@@ -1067,6 +1071,52 @@ describe("ClaudeBridgeQueryRunner slash commands", () => {
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
+  // Claude Code sent the session to the background: the conversation carries
+  // on under another id, and the process this thread knows was left behind.
+  const saidRow = (uuid: string, text: string) =>
+    `${JSON.stringify({ type: "user", uuid, timestamp: "2026-07-01T10:00:01.000Z", message: { role: "user", content: text } })}\n`;
+  const continuedInRow = `${JSON.stringify({ type: "continued-in", sessionId: "old", continuedInSessionId: "99999999-9999-4999-8999-999999999999" })}\n`;
+  it.live("sends nothing into a session whose conversation continued under another id", () =>
+    Effect.gen(function* () {
+      const bridge = yield* attach({
+        protocol: 2,
+        bridgeCanUseTool: () => null,
+        transcript: saidRow("00000000-0000-4000-8000-0000000000d1", "before") + continuedInRow,
+      });
+      yield* bridge.session.offer({
+        ...userMessage("are you there"),
+        uuid: "00000000-0000-4000-8000-000000000041",
+      });
+      const frames = Array.from(
+        yield* bridge.session.messages.pipe(Stream.take(2), Stream.runCollect),
+      );
+      const result = frames[1];
+      const said = result?.type === "result" && result.subtype === "success" ? result.result : "";
+      assert.strictEqual(
+        said.slice(0, 96),
+        "Not sent: this conversation was sent to the background in its terminal and carries on as Claude ",
+        describe(result),
+      );
+      assert.include(said, "99999999-9999-4999-8999-999999999999");
+      // The old session taken up again in its own right (rows after the mark) is sent to as before.
+      const fs = yield* FileSystem.FileSystem;
+      yield* fs.writeFileString(
+        bridge.process.session.transcriptPath,
+        saidRow("00000000-0000-4000-8000-0000000000d2", "resumed"),
+        { flag: "a" },
+      );
+      yield* bridge.session.offer({
+        ...userMessage("and now"),
+        uuid: "00000000-0000-4000-8000-000000000042",
+      });
+      assert.deepStrictEqual(yield* Queue.take(bridge.commands), {
+        type: "prompt",
+        text: "and now",
+        promptUuid: "00000000-0000-4000-8000-000000000042",
+      });
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
   it.effect("sends text that only looks like a command to the model as written", () =>
     Effect.gen(function* () {
       const bridge = yield* attach({
@@ -1137,7 +1187,7 @@ describe("ClaudeBridgeQueryRunner commands the mod writes into the record", () =
           isSidechain: false,
           isMeta: true,
           origin: { kind: "plugin", name: "t3bridge" },
-          timestamp: new Date().toISOString(),
+          timestamp: stamp(bridge.now),
           message: { role: "user", content: [{ type: "text", text }] },
         })}\n`;
       yield* fs.writeFileString(
@@ -1239,13 +1289,13 @@ describe("ClaudeBridgeQueryRunner messages the terminal drew", () => {
   // Claude Code shows text written before a tool call and, in a turn that
   // also thinks, does not keep it in the record. The mod reports each message
   // as drawn; the thread takes it from there when the record has none.
-  const row = (uuid: string, content: ReadonlyArray<Record<string, unknown>>) =>
+  const row = (uuid: string, content: ReadonlyArray<Record<string, unknown>>, atMs: number) =>
     `${JSON.stringify({
       type: "assistant",
       uuid,
       parentUuid: null,
       isSidechain: false,
-      timestamp: new Date().toISOString(),
+      timestamp: stamp(atMs),
       message: {
         id: "msg_1",
         type: "message",
@@ -1260,8 +1310,12 @@ describe("ClaudeBridgeQueryRunner messages the terminal drew", () => {
   const TOOL_ROW = "00000000-0000-4000-8000-0000000000b2";
   const DRAWN = "44444444-4444-4444-8444-444444444444";
   // Built when it is written, inside the turn: a row carries the time it was made.
-  const toolUse = () =>
-    row(TOOL_ROW, [{ type: "tool_use", id: "toolu_1", name: "Bash", input: { command: "ls" } }]);
+  const toolUse = (atMs: number) =>
+    row(
+      TOOL_ROW,
+      [{ type: "tool_use", id: "toolu_1", name: "Bash", input: { command: "ls" } }],
+      atMs,
+    );
   const start = (bridge: { readonly now: number }) => ({
     seq: 1,
     at: bridge.now,
@@ -1291,7 +1345,9 @@ describe("ClaudeBridgeQueryRunner messages the terminal drew", () => {
       const fs = yield* FileSystem.FileSystem;
       yield* bridge.handler(start(bridge), bridge.process);
       yield* bridge.handler(drawn(bridge, "About to list the files."), bridge.process);
-      yield* fs.writeFileString(bridge.process.session.transcriptPath, toolUse(), { flag: "a" });
+      yield* fs.writeFileString(bridge.process.session.transcriptPath, toolUse(bridge.now), {
+        flag: "a",
+      });
       const frames = Array.from(
         yield* bridge.session.messages.pipe(Stream.take(4), Stream.runCollect),
       );
@@ -1314,7 +1370,8 @@ describe("ClaudeBridgeQueryRunner messages the terminal drew", () => {
       yield* bridge.handler(drawn(bridge, "About to list the files."), bridge.process);
       yield* fs.writeFileString(
         file,
-        row(TEXT_ROW, [{ type: "text", text: "About to list the files." }]) + toolUse(),
+        row(TEXT_ROW, [{ type: "text", text: "About to list the files." }], bridge.now) +
+          toolUse(bridge.now),
         { flag: "a" },
       );
       const frames = Array.from(
@@ -1365,7 +1422,8 @@ describe("ClaudeBridgeQueryRunner messages the terminal drew", () => {
       assert.deepStrictEqual(shape(first), ["user", "system", `${DRAWN}:text`]);
       yield* fs.writeFileString(
         file,
-        row(TEXT_ROW, [{ type: "text", text: "About to list the files." }]) + toolUse(),
+        row(TEXT_ROW, [{ type: "text", text: "About to list the files." }], bridge.now) +
+          toolUse(bridge.now),
         { flag: "a" },
       );
       // The record's row is the reply: it is shown under its own id, which is
@@ -1388,7 +1446,7 @@ describe("ClaudeBridgeQueryRunner missed turns", () => {
       parentUuid: null,
       isSidechain: false,
       requestId: `req_${uuid}`,
-      timestamp: new Date(at).toISOString(),
+      timestamp: stamp(at),
       message: {
         id: `msg_${uuid}`,
         type: "message",
@@ -1400,8 +1458,10 @@ describe("ClaudeBridgeQueryRunner missed turns", () => {
       },
     })}\n`;
   /** The record of a turn that has just ended: its one reply, stamped inside it. */
-  const recordNow = () =>
-    replyRow("00000000-0000-4000-8000-0000000000a1", "quick answer", Date.now());
+  const recordAt = (now: number) =>
+    replyRow("00000000-0000-4000-8000-0000000000a1", "quick answer", now);
+  const turnEndRow = (uuid: string, at: number) =>
+    `${JSON.stringify({ type: "system", subtype: "turn_duration", uuid, timestamp: stamp(at), durationMs: 1_000 })}\n`;
   const turn = (
     now: number,
     endedAgoMs: number,
@@ -1440,7 +1500,7 @@ describe("ClaudeBridgeQueryRunner missed turns", () => {
   // for the frames it produces, on the live clock.
   it.live("shows a turn that was over before the attachment, from its start", () =>
     Effect.gen(function* () {
-      const transcript = recordNow();
+      const transcript = recordAt(yield* Clock.currentTimeMillis);
       const bridge = yield* attach({
         protocol: 2,
         bridgeCanUseTool: () => null,
@@ -1460,7 +1520,7 @@ describe("ClaudeBridgeQueryRunner missed turns", () => {
 
   it.live("leaves an older finished turn to the thread's history", () =>
     Effect.gen(function* () {
-      const transcript = recordNow();
+      const transcript = recordAt(yield* Clock.currentTimeMillis);
       const bridge = yield* attach({
         protocol: 2,
         bridgeCanUseTool: () => null,
@@ -1477,16 +1537,10 @@ describe("ClaudeBridgeQueryRunner missed turns", () => {
   // place the turn starts at.
   it.live("leaves another session's rows, copied in after the turn began, to history", () =>
     Effect.gen(function* () {
-      const now = Date.now();
+      const now = yield* Clock.currentTimeMillis;
       const transcript =
         replyRow("00000000-0000-4000-8000-0000000000a2", "said in the old session", now - 120_000) +
-        `${JSON.stringify({
-          type: "system",
-          subtype: "turn_duration",
-          uuid: "00000000-0000-4000-8000-0000000000a3",
-          timestamp: new Date(now - 119_000).toISOString(),
-          durationMs: 1_000,
-        })}\n` +
+        turnEndRow("00000000-0000-4000-8000-0000000000a3", now - 119_000) +
         replyRow("00000000-0000-4000-8000-0000000000a1", "quick answer", now);
       const bridge = yield* attach({
         protocol: 2,

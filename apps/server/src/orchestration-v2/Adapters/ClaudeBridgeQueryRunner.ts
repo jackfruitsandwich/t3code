@@ -50,6 +50,8 @@ import {
   claudeBridgeAttachmentPaths,
   claudeBridgeModAtLeast,
   claudeBridgeRequestTurnText,
+  claudeContinuedInSession,
+  claudeSessionContinuedNotice,
   claudeSessionMovingNotice,
   CLAUDE_BRIDGE_BASH_MOD_VERSION,
   CLAUDE_BRIDGE_DIALOG_REFUSAL_MOD_VERSION,
@@ -858,6 +860,17 @@ export const layer: Layer.Layer<
         });
 
       /** A turn's worth of frames for a slash command that started no model turn. */
+      /** The session this one's record says the conversation continued in, or null. */
+      const continuedInSession = Effect.gen(function* () {
+        if (state.transcriptPath.length === 0) return null;
+        const size = yield* transcriptSize(state.transcriptPath);
+        const from = Math.max(0, size - PERMISSION_MODE_SCAN_BYTES);
+        const tail = new TextDecoder().decode(
+          yield* readTranscriptBytes(state.transcriptPath, from, size - from),
+        );
+        return claudeContinuedInSession(from === 0 ? tail : tail.slice(tail.indexOf("\n") + 1));
+      });
+
       const emitCommandTurn = (input: {
         readonly turnId: string;
         readonly text: string;
@@ -1438,6 +1451,23 @@ export const layer: Layer.Layer<
               typeof message.uuid === "string"
                 ? message.uuid
                 : yield* crypto.randomUUIDv4.pipe(Effect.orDie);
+            // The conversation moved on under another session id and this
+            // process was left behind: nothing is sent into it.
+            const continuedIn = yield* continuedInSession;
+            if (continuedIn !== null) {
+              yield* Effect.logInfo("claude-bridge.not-sent-session-continued", {
+                sid,
+                continuedIn,
+              });
+              yield* emitCommandTurn({
+                turnId: `not-sent-${promptUuid}`,
+                text,
+                promptUuid,
+                ok: true,
+                answer: claudeSessionContinuedNotice(continuedIn),
+              });
+              return;
+            }
             // A message from a client carries the client's copy of the settings.
             if (state.selection !== null)
               yield* registry.writeClientSelection(sid, state.selection);

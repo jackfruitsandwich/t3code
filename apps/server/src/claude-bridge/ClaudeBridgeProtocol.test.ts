@@ -291,7 +291,7 @@ describe("ClaudeBridgeProtocol frame translator", () => {
       assert.isAbove(frames.onTranscriptRow(own).length, 0);
       // The prompt's own row is stamped a moment before the turn is reported.
       assert.isFalse(
-        frames.isFromBeforeTurn({ type: "user", timestamp: new Date(began - 1_500).toISOString() }),
+        frames.isFromBeforeTurn({ type: "user", timestamp: "2026-10-11T10:29:18.294Z" }),
       );
       // A row that carries no time (the session's settings) is never left out.
       assert.isFalse(frames.isFromBeforeTurn({ type: "permission-mode", permissionMode: "auto" }));
