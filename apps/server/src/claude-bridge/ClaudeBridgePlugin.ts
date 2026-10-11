@@ -703,7 +703,16 @@ async function runSlashCommand($, command) {
         await report({ ok: false, text: String(outcome.deny) })
         return
       }
-      const text = 'Set model to ' + model
+      // The line the terminal's /model prints: the model by the name the
+      // session gives it (its /model entry reads "currently <name>"), and
+      // what a change through the settings row also does (measured).
+      let named = model
+      try {
+        const entry = (await $.command.list()).find((c) => c.name === 'model')
+        const current = entry ? /\\(currently ([^)]+)\\)/.exec(String(entry.description || '')) : null
+        if (current) named = String.fromCharCode(96) + current[1] + String.fromCharCode(96)
+      } catch {}
+      const text = 'Set model to ' + named + ' and saved as your default for new sessions'
       // Before the report: T3 shows the record's own row for what was printed.
       await appendCommandRows($, 'model', command.args, text)
       await report({ ok: true, text: text })
