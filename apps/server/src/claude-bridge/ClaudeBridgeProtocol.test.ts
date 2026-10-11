@@ -257,6 +257,47 @@ describe("ClaudeBridgeProtocol frame translator", () => {
     assert.lengthOf(frames.onEnded("again"), 0);
   });
 
+  it("leaves out rows older than the open turn: another session's conversation, copied in after it began", () => {
+    const began = Date.parse("2026-10-11T10:29:19.794Z");
+    const said = (uuid: string, text: string, timestamp: string) => ({
+      ...assistantRow(uuid, [{ type: "text", text }]),
+      timestamp,
+    });
+    const copied = said(
+      "00000000-0000-4000-8000-0000000000c1",
+      "before",
+      "2026-10-11T10:28:24.000Z",
+    );
+    const own = said("00000000-0000-4000-8000-0000000000c2", "now", "2026-10-11T10:31:41.000Z");
+    for (const open of ["adopted", "reported"] as const) {
+      const frames = translator();
+      // Between turns nothing is left out: there is no turn to be older than.
+      assert.isFalse(frames.isFromBeforeTurn(copied));
+      if (open === "adopted") {
+        frames.adoptTurn({ turnId: "turn-5", startedAt: began, transcriptOffset: 220 });
+      } else {
+        frames.onTurnStart({
+          seq: 1,
+          at: began,
+          type: "turn.start",
+          turnId: "turn-5",
+          text: "carry on",
+          transcriptOffset: 220,
+        });
+      }
+      assert.isTrue(frames.isFromBeforeTurn(copied));
+      assert.lengthOf(frames.onTranscriptRow(copied), 0);
+      assert.isFalse(frames.isFromBeforeTurn(own));
+      assert.isAbove(frames.onTranscriptRow(own).length, 0);
+      // The prompt's own row is stamped a moment before the turn is reported.
+      assert.isFalse(
+        frames.isFromBeforeTurn({ type: "user", timestamp: new Date(began - 1_500).toISOString() }),
+      );
+      // A row that carries no time (the session's settings) is never left out.
+      assert.isFalse(frames.isFromBeforeTurn({ type: "permission-mode", permissionMode: "auto" }));
+    }
+  });
+
   it("maps an error completion to an error result", () => {
     const frames = translator();
     const result = frames.onTurnComplete({

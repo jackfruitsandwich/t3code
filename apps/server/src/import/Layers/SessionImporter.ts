@@ -62,6 +62,7 @@ import * as SqlClient from "effect/sql/SqlClient";
 
 import {
   CLAUDE_BRIDGE_DIR_ENV,
+  CLAUDE_TURN_IN_FLIGHT_MARGIN_MS,
   isClaudeBridgeSessionLive,
   parseClaudeBridgeSessionFile,
   threadSettingsForClaudeSession,
@@ -201,8 +202,8 @@ const IMPORT_EPOCH = 2;
 
 const CLAUDE_DRIVER = ProviderDriverKind.make("claudeAgent");
 /** Run statuses under which T3 is writing the thread's rows itself. */
-/** A turn's first row is written a moment either side of the instant the turn is reported. */
-const IN_FLIGHT_MARGIN_MS = 2_000;
+/** The same measure the attachment leaves older rows out by: a row is history or a run's, never both. */
+const IN_FLIGHT_MARGIN_MS = CLAUDE_TURN_IN_FLIGHT_MARGIN_MS;
 /**
  * How many rows from a drawn reply its record copy normally sits: the
  * thinking row the record puts before the text, and little else. A copy

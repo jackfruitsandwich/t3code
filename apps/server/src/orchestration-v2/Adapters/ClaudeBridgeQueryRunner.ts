@@ -604,6 +604,7 @@ export const layer: Layer.Layer<
           );
           const decoder = new TextDecoder();
           let lineStart = 0;
+          let olderRows = 0;
           for (;;) {
             const newline = bytes.indexOf(0x0a, lineStart);
             if (newline === -1) break;
@@ -613,6 +614,12 @@ export const layer: Layer.Layer<
             lineStart = newline + 1;
             state.lastRowAt = yield* Clock.currentTimeMillis;
             if (row === undefined) continue;
+            // Another session's conversation, copied into this record after
+            // the turn began: not this turn's replies, tools or turn ends.
+            if (translator.isFromBeforeTurn(row)) {
+              olderRows += 1;
+              continue;
+            }
             // What the person typed into the running turn is in the record
             // only. It is placed in the thread now, before the rows that
             // follow it are shown, so it sits where it was written.
@@ -683,6 +690,15 @@ export const layer: Layer.Layer<
               state.turnEndsRead += 1;
               if (untilTurnEnd) break;
             }
+          }
+          if (olderRows > 0) {
+            // They may have landed after the thread's history was last
+            // compared with the record: it is compared again.
+            yield* Effect.logInfo("claude-bridge.older-rows-left-to-history", {
+              sid,
+              rows: olderRows,
+            });
+            yield* registry.noteRecordChange(bridgeProcess, "older-rows");
           }
         });
       const readNewRows = readRows(false);

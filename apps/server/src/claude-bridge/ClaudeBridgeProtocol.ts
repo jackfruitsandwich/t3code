@@ -904,8 +904,17 @@ export interface ClaudeBridgeFrameTranslatorOptions {
   readonly permissionMode: PermissionMode;
 }
 
+/**
+ * A turn's first row is written a moment either side of the instant the turn
+ * is reported. A row stamped longer than this before a turn began is not that
+ * turn's: the importer takes it as history, and the attachment leaves it out.
+ */
+export const CLAUDE_TURN_IN_FLIGHT_MARGIN_MS = 2_000;
+
 interface TranslatorTurn {
   readonly turnId: string;
+  /** When the turn began, as the session reported it; 0 when nothing said. */
+  readonly startedAt: number;
   /** The T3 prompt this turn answers, or null for a turn started elsewhere. */
   readonly promptUuid: string | null;
   assistantStamped: boolean;
@@ -926,6 +935,14 @@ export interface ClaudeBridgeFrameTranslator {
   ) => ReadonlyArray<SDKMessage>;
   /** Frames for one transcript line, already parsed from JSON. */
   readonly onTranscriptRow: (row: unknown) => ReadonlyArray<SDKMessage>;
+  /**
+   * Whether a row was written before the open turn began. A record can gain
+   * such rows after the turn's starting point: Claude Code continuing a
+   * session under a new id (sent to the background, say) copies the old
+   * conversation into the new record once the first turn is already running.
+   * They are history, never this turn's output.
+   */
+  readonly isFromBeforeTurn: (row: unknown) => boolean;
   /** The `result` frame closing a turn. */
   readonly onTurnComplete: (
     event: Extract<ClaudeBridgeEvent, { type: "turn.complete" }>,
@@ -1043,10 +1060,17 @@ export function makeClaudeBridgeFrameTranslator(
     } as SDKResultMessage;
   };
 
+  const isFromBeforeTurn = (row: unknown): boolean => {
+    if (turn === null || !isRecord(row) || typeof row.timestamp !== "string") return false;
+    const at = Date.parse(row.timestamp);
+    return !Number.isNaN(at) && at < turn.startedAt - CLAUDE_TURN_IN_FLIGHT_MARGIN_MS;
+  };
+
   return {
     onTurnStart: (event, turnOptions) => {
       turn = {
         turnId: event.turnId,
+        startedAt: event.at,
         promptUuid: event.promptUuid ?? null,
         assistantStamped: false,
         assistantMessages: 0,
@@ -1073,8 +1097,9 @@ export function makeClaudeBridgeFrameTranslator(
       frames.push(initFrame(event.turnId));
       return frames;
     },
+    isFromBeforeTurn,
     onTranscriptRow: (row) => {
-      if (!isRecord(row)) return [];
+      if (!isRecord(row) || isFromBeforeTurn(row)) return [];
       if (row.type === "cost-state") {
         costState = {
           totalCostUSD: readNumber(row.totalCostUSD) ?? costState?.totalCostUSD ?? 0,
@@ -1200,6 +1225,7 @@ export function makeClaudeBridgeFrameTranslator(
         // attached mid-turn): the frame still closes whatever is open.
         turn = {
           turnId: event.turnId,
+          startedAt: 0,
           promptUuid: event.promptUuid ?? null,
           assistantStamped: false,
           assistantMessages: 0,
@@ -1235,6 +1261,7 @@ export function makeClaudeBridgeFrameTranslator(
     adoptTurn: (active) => {
       turn = {
         turnId: active.turnId,
+        startedAt: active.startedAt,
         promptUuid: active.promptUuid ?? null,
         assistantStamped: false,
         assistantMessages: 0,

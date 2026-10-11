@@ -178,7 +178,9 @@ export type ClaudeBridgeRecordChange =
   | "turn.complete"
   | "typed-mid-turn"
   /** The record's row arrived for a reply already shown from what the terminal drew. */
-  | "reply-recorded";
+  | "reply-recorded"
+  /** Rows older than the turn being shown turned up in the record: history, for the comparison to take in. */
+  | "older-rows";
 
 export type ClaudeBridgeRecordHandler = (
   process: ClaudeBridgeProcess,
