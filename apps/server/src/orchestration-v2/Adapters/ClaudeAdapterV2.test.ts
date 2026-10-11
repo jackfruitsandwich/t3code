@@ -5983,6 +5983,113 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     ),
   );
 
+  // A subagent sent to the background asks for permission after the turn that
+  // started it has ended. The bridge opens a turn of its own for the request;
+  // nobody typed it.
+  it.effect(
+    "runs a turn the bridge opened for a request as activity, and asks the request in it",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const harness = yield* makeWakeHarness;
+          const now = yield* DateTime.now;
+          const asking = "The general-purpose subagent is asking for permission";
+
+          yield* harness.runtime.startTurn(
+            makeClaudeTestTurnInput({
+              threadId: harness.threadId,
+              providerThread: harness.providerThread,
+              now,
+              attemptId: RunAttemptId.make("attempt-claude-bridge-request-1"),
+              text: "Start a subagent in the background.",
+              attachments: [],
+            }),
+          );
+          yield* Queue.offer(harness.sdkMessages, turnOneResult);
+          yield* awaitUntil(() => harness.terminalEvents().length === 1, "first turn terminal");
+
+          const callbackOptions = {
+            signal: new AbortController().signal,
+            toolUseID: "late-subagent-bash",
+            requestId: "late-subagent-bash",
+            askedByAgent: "general-purpose",
+          };
+          // With no turn open the request has no run to show in.
+          assert.isNull(
+            yield* Effect.promise(() =>
+              harness.getBridgeCanUseTool()!("Bash", { command: "echo late" }, callbackOptions),
+            ),
+          );
+
+          yield* Queue.offer(
+            harness.sdkMessages,
+            claudeSdkFrame({
+              type: "user",
+              message: { role: "user", content: asking },
+              parent_tool_use_id: null,
+              uuid: "00000000-0000-4000-8000-000000000204",
+              session_id: WAKE_NATIVE_SESSION,
+              t3_wake_detail: asking,
+              t3_wake_request: "subagent",
+            }),
+          );
+          yield* Queue.offer(harness.sdkMessages, wakeTurnInit);
+          yield* awaitUntil(
+            () => harness.continuationRequests.length === 1,
+            "request continuation",
+          );
+          const offered = harness.continuationRequests[0];
+          assert.equal(offered?.detail, asking);
+          // Not the person's message: a row that says who asks.
+          assert.isUndefined(offered?.createdBy);
+          assert.deepEqual(offered?.notification, {
+            source: { kind: "subagent" },
+            outcome: "updated",
+            summary: asking,
+          });
+
+          yield* harness.runtime.startTurn(
+            makeClaudeTestTurnInput({
+              threadId: harness.threadId,
+              providerThread: harness.providerThread,
+              now,
+              attemptId: RunAttemptId.make("attempt-claude-bridge-request-2"),
+              text: asking,
+              attachments: [],
+              providerTurnOrdinal: 2,
+              messageCreatedBy: "agent",
+              messageCreationSource: "provider",
+            }),
+          );
+          // The run stays open for the request, which is now asked in it.
+          const decision = yield* Effect.promise(() =>
+            harness.getBridgeCanUseTool()!("Bash", { command: "echo late" }, callbackOptions),
+          ).pipe(Effect.forkScoped);
+          const request = yield* Queue.take(harness.runtimeRequestReceipts);
+          assert.equal(request.runtimeRequest.status, "pending");
+          assert.lengthOf(harness.terminalEvents(), 1);
+          yield* harness.runtime.respondToRuntimeRequest({
+            requestId: request.runtimeRequest.id,
+            decision: "accept",
+          });
+          assert.equal((yield* Fiber.join(decision))?.behavior, "allow");
+
+          // Answered: the bridge closes the turn it opened.
+          yield* Queue.offer(
+            harness.sdkMessages,
+            makeResultFrame({ uuid: "00000000-0000-4000-8000-000000000205", result: "" }),
+          );
+          yield* awaitUntil(() => harness.terminalEvents().length === 2, "request turn terminal");
+          assert.equal(harness.terminalEvents()[1]?.status, "completed");
+          assert.isFalse(
+            harness.events.some(
+              (event) => event.type === "message.updated" && event.message.text === asking,
+            ),
+          );
+        }).pipe(Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+      ),
+  );
+
   // The CLI sends one frame per content block, each carrying the id of the
   // native message it belongs to.
   const makeSubagentAssistantFrames = (input: {

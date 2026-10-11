@@ -95,8 +95,9 @@ const T3_FOLLOW_MS = 60000
 const T3_RECENT_MS = 300000
 // A request still waiting is told to T3 again this often. T3 shows a request
 // inside a run of its thread; one that outlives that run (a background
-// subagent's) is picked up by the next. T3 ignores what it is already asking.
-const T3_RETELL_MS = 20000
+// subagent's) is picked up by the next, and so is one whose card was put
+// away because a new turn began. T3 ignores what it is already asking.
+const T3_RETELL_MS = 5000
 const SHELL_COMMAND_TIMEOUT_MS = 120000
 // What Claude Code writes before a local command's rows, for the model.
 const LOCAL_COMMAND_CAVEAT = "The command below was run directly in Claude Code, not sent to you as a request, and its output goes straight to the user. It's recorded here as context for later messages."
@@ -230,8 +231,16 @@ function noteClassic($, e) {
   if (e.effort && typeof e.effort.level === 'string') effort = e.effort.level
   if (typeof e.transcript_path === 'string' && e.transcript_path && e.transcript_path !== transcriptPath) {
     transcriptPath = e.transcript_path
-    if (sid) $.store.set('transcript:' + sid, transcriptPath).catch(() => {})
+    if (recordIsOf(sid)) $.store.set('transcript:' + sid, transcriptPath).catch(() => {})
   }
+}
+
+// A session's record is the file named after its id. While this process is
+// moving on to another conversation (/clear, /resume, /branch) the path it
+// has just learned is the next session's, not the one its files still speak
+// for.
+function recordIsOf(id) {
+  return !!id && !!transcriptPath && transcriptPath.slice(-(id.length + 6)) === id + '.jsonl'
 }
 
 // Declares T3's tools in this session. The engine refuses until the session
@@ -382,7 +391,7 @@ async function heartbeat($) {
     instanceId: instanceId,
     cwd: cwd,
     configDir: configDir,
-    transcriptPath: transcriptPath,
+    transcriptPath: recordIsOf(sid) ? transcriptPath : '',
     surfaces: surfaces,
     isInteractive: isInteractive,
     terminalPresent: terminalPresent(),
@@ -561,7 +570,7 @@ async function openSessionDir($) {
   activeTurn = null
   pendingCommand = null
   commandsBody = ''
-  if (!transcriptPath) {
+  if (!recordIsOf(sid)) {
     try { transcriptPath = String((await $.store.get('transcript:' + sid)) || '') } catch {}
   }
   await heartbeat($)
@@ -757,11 +766,17 @@ async function runShellCommand($, command) {
   let shell = '/bin/sh'
   try { shell = (await $.env.get('SHELL')) || shell } catch {}
   let outcome
+  const startedAt = Date.now()
   try {
     outcome = await $.process.run([shell, '-c', command.command], { timeoutMs: SHELL_COMMAND_TIMEOUT_MS })
   } catch (err) {
-    await report({ ok: false, text: String((err && err.message) || err) })
-    return
+    // Cut at the limit, as the terminal cuts it: the record says so in the
+    // terminal's words, and the model is handed that like any other output.
+    if (Date.now() - startedAt < SHELL_COMMAND_TIMEOUT_MS - 1000) {
+      await report({ ok: false, text: String((err && err.message) || err) })
+      return
+    }
+    outcome = { stdout: '', stderr: 'Command timed out after ' + Math.floor(SHELL_COMMAND_TIMEOUT_MS / 60000) + 'm ' + Math.floor((SHELL_COMMAND_TIMEOUT_MS % 60000) / 1000) + 's' }
   }
   const printed = '<bash-stdout>' + String(outcome.stdout || '').trimEnd() + '</bash-stdout><bash-stderr>' + String(outcome.stderr || '').trimEnd() + '</bash-stderr>'
   try {

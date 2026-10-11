@@ -5,7 +5,9 @@ import {
   claudeBridgeAskingAgent,
   claudeBridgeAttachmentPaths,
   claudeBridgeModAtLeast,
+  claudeBridgeRequestTurnText,
   claudeBridgeWakeDetail,
+  claudeBridgeWakeRequest,
   claudeTranscriptCommandOutput,
   claudeTranscriptCommandText,
   claudeTranscriptOffsetAt,
@@ -142,6 +144,40 @@ describe("ClaudeBridgeProtocol frame translator", () => {
     if (frame?.type !== "result") throw new Error("expected result");
     assert.equal(frame.user_message_uuid, "bridge:turn-2");
     assert.equal(frame.terminal_reason, "aborted_streaming");
+  });
+
+  it("marks a turn opened to carry a request, with who asks, and leaves a typed turn unmarked", () => {
+    const frames = translator();
+    const text = claudeBridgeRequestTurnText({ agentType: "general-purpose" });
+    assert.equal(text, "The general-purpose subagent is asking for permission");
+    assert.equal(
+      claudeBridgeRequestTurnText({ agentType: "subagent" }),
+      "A subagent is asking for permission",
+    );
+    assert.equal(
+      claudeBridgeRequestTurnText({ question: true }),
+      "Claude Code is asking a question",
+    );
+    const opened = frames.onTurnStart(
+      { seq: 0, at: 1, type: "turn.start", turnId: "request-1", text, transcriptOffset: 0 },
+      { request: "subagent" },
+    );
+    assert.deepEqual(
+      opened.map((frame) => frame.type),
+      ["user", "system"],
+    );
+    assert.equal(claudeBridgeWakeDetail(opened[0]!), text);
+    assert.equal(claudeBridgeWakeRequest(opened[0]!), "subagent");
+    assert.isNull(claudeBridgeWakeRequest(opened[1]!));
+    const typed = translator().onTurnStart({
+      seq: 1,
+      at: 1,
+      type: "turn.start",
+      turnId: "turn-3",
+      text: "fix the tests",
+      transcriptOffset: 0,
+    });
+    assert.isNull(claudeBridgeWakeRequest(typed[0]!));
   });
 
   it("ignores typed user rows, meta rows and sidechain rows", () => {

@@ -44,6 +44,7 @@ import {
   type ModelSelection,
   type OrchestrationV2ConversationMessage,
   type OrchestrationV2ExecutionNode,
+  type OrchestrationV2Notification,
   type OrchestrationV2ProviderCapabilities,
   type OrchestrationV2ProviderFailure,
   OrchestrationV2ProviderGoal,
@@ -94,6 +95,7 @@ import {
   claudeBridgeAlsoInTerminal,
   claudeBridgeAskingAgent,
   claudeBridgeWakeDetail,
+  claudeBridgeWakeRequest,
   isClaudeHarnessPrompt,
   threadModesForClaudePermissionMode,
 } from "../../claude-bridge/ClaudeBridgeProtocol.ts";
@@ -3215,6 +3217,11 @@ export function makeClaudeAdapterV2(
               readonly detail: string | null;
               /** Whether `detail` is a prompt typed into the native process. */
               readonly typed?: boolean;
+              /**
+               * Who asks, when the bridge opened this turn itself to carry a
+               * request the session raised with no turn of its own.
+               */
+              readonly request?: "subagent" | "session";
             }
           >(),
         );
@@ -5409,6 +5416,9 @@ export function makeClaudeAdapterV2(
             message.type === "user" && message.parent_tool_use_id === null
               ? claudeBridgeWakeDetail(message)
               : null;
+          // A turn the bridge opened to carry a request says who asks, and
+          // nobody typed it.
+          const requestBy = typedPromptDetail === null ? null : claudeBridgeWakeRequest(message);
           if (isPendingTaskNotification) {
             yield* recordWakeReport(
               wakeInput.nativeThreadId,
@@ -5442,7 +5452,13 @@ export function makeClaudeAdapterV2(
               detail: notificationSummary ?? typedPromptDetail ?? existing?.detail ?? null,
               typed:
                 notificationSummary === null &&
+                requestBy === null &&
                 (typedPromptDetail !== null || existing?.typed === true),
+              ...(requestBy !== null
+                ? { request: requestBy }
+                : existing?.request === undefined
+                  ? {}
+                  : { request: existing.request }),
             });
             return updated;
           });
@@ -5508,9 +5524,21 @@ export function makeClaudeAdapterV2(
           const typedByPerson =
             wakeBuffer?.typed === true && detail !== null && !isClaudeHarnessPrompt(detail);
           const reports = yield* takeWakeReports(wakeInput.nativeThreadId);
-          const notification = backgroundWorkNotification(
-            [...(reports?.values() ?? [])].map((entry) => entry.report),
-          );
+          const notification =
+            backgroundWorkNotification(
+              [...(reports?.values() ?? [])].map((entry) => entry.report),
+            ) ??
+            // A request waiting for the person: the row says who asks, and
+            // the request itself follows in the run.
+            (wakeBuffer?.request === undefined || detail === null
+              ? null
+              : ({
+                  source: {
+                    kind: wakeBuffer.request === "subagent" ? "subagent" : "background_task",
+                  },
+                  outcome: "updated",
+                  summary: detail,
+                } satisfies OrchestrationV2Notification));
           yield* Effect.logInfo("orchestration-v2.claude-wake-turn-detected", {
             providerSessionId: input.providerSessionId,
             threadId: route.threadId,

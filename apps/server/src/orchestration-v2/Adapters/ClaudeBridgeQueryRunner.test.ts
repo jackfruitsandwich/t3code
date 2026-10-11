@@ -11,9 +11,14 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
 
 import * as ClaudeBridgeRegistry from "../../claude-bridge/ClaudeBridgeRegistry.ts";
-import type { ClaudeBridgeCommandBody } from "../../claude-bridge/ClaudeBridgeProtocol.ts";
+import {
+  claudeBridgeWakeDetail,
+  claudeBridgeWakeRequest,
+  type ClaudeBridgeCommandBody,
+} from "../../claude-bridge/ClaudeBridgeProtocol.ts";
 import * as ProviderEventLoggers from "../../provider/ProviderEventLoggers.ts";
 import * as ClaudeAdapterV2 from "./ClaudeAdapterV2.ts";
 import * as ClaudeBridgeQueryRunner from "./ClaudeBridgeQueryRunner.ts";
@@ -83,7 +88,11 @@ const attach = (input: {
       isPluginInstalled: () => Effect.succeed(true),
       listLiveProcesses: Effect.succeed([process]),
       findLiveProcess: () => Effect.succeed(process),
-      readSession: () => Effect.succeed(process.session),
+      // The process keeps reporting, however far a test moves its clock.
+      readSession: () =>
+        Clock.currentTimeMillis.pipe(
+          Effect.map((heartbeatAt) => ({ ...process.session, heartbeatAt })),
+        ),
       readCommands: () =>
         Effect.succeed(
           input.slashCommands === undefined
@@ -155,17 +164,36 @@ const attach = (input: {
     return { session, handler, commands, process, bridgeCalls, counts, now, recordChanges };
   });
 
+/** Everything the thread is given, as it arrives. */
+const shownFrames = (bridge: { readonly session: ClaudeAdapterV2.ClaudeAgentSdkQuerySession }) =>
+  Effect.gen(function* () {
+    const frames: Array<SDKMessage> = [];
+    yield* bridge.session.messages.pipe(
+      Stream.runForEach((frame) =>
+        Effect.sync(() => {
+          frames.push(frame);
+        }),
+      ),
+      Effect.forkScoped,
+    );
+    return frames;
+  });
+
+const until = (predicate: () => boolean, label: string): Effect.Effect<void> =>
+  Effect.gen(function* () {
+    for (let attempt = 0; attempt < 5000; attempt += 1) {
+      if (predicate()) return;
+      yield* Effect.yieldNow;
+    }
+    return yield* Effect.die(`Timed out waiting for ${label}.`);
+  });
+
 describe("ClaudeBridgeQueryRunner permissions", () => {
   const cases: ReadonlyArray<{
     name: string;
-    result: PermissionResult | null;
+    result: PermissionResult;
     expected: ReadonlyArray<ClaudeBridgeCommandBody>;
   }> = [
-    {
-      name: "returns an unowned request to native permission handling",
-      result: null,
-      expected: [{ type: "approval", toolUseId: "tool-1", decision: "ask" }],
-    },
     {
       name: "preserves a real denial and its reason",
       result: { behavior: "deny", message: "The user denied this command." },
@@ -528,6 +556,276 @@ describe("ClaudeBridgeQueryRunner permissions", () => {
   );
 });
 
+// The thread shows a request inside a run. A subagent sent to the background
+// asks after the turn that started it has ended and closed: the session has
+// no turn, the thread no run. T3 then opens a turn of its own for the request.
+describe("ClaudeBridgeQueryRunner requests with no turn open", () => {
+  const REQUEST_TEXT = "The general-purpose subagent is asking for permission";
+  const ask = (
+    bridge: {
+      readonly handler: ClaudeBridgeRegistry.ClaudeBridgeEventHandler;
+      readonly process: ClaudeBridgeRegistry.ClaudeBridgeProcess;
+      readonly now: number;
+    },
+    seq = 1,
+  ) =>
+    bridge.handler(
+      {
+        type: "approval.request",
+        seq,
+        at: bridge.now,
+        toolUseId: "agent-tool",
+        tool: "Bash",
+        input: { command: "echo late" },
+        alsoInTerminal: true,
+        agentType: "general-purpose",
+      },
+      bridge.process,
+    );
+  /** No run is there for the first try; from the second on the person is asked, and answers when the test says. */
+  const personAnswersLater = () => {
+    let answerNow: (result: PermissionResult) => void = () => {};
+    const answered = new Promise<PermissionResult>((resolve) => {
+      answerNow = resolve;
+    });
+    const seen = { calls: 0, aborted: 0 };
+    const bridgeCanUseTool = (
+      _tool: string,
+      _input: Record<string, unknown>,
+      _toolUseId: string,
+      signal: AbortSignal,
+    ): PermissionResult | null | Promise<PermissionResult | null> => {
+      seen.calls += 1;
+      if (seen.calls === 1) return null;
+      return new Promise((resolve) => {
+        signal.addEventListener("abort", () => {
+          seen.aborted += 1;
+          resolve({ behavior: "deny", message: "User cancelled tool execution." });
+        });
+        void answered.then(resolve);
+      });
+    };
+    return { seen, bridgeCanUseTool, answer: (result: PermissionResult) => answerNow(result) };
+  };
+  const types = (frames: ReadonlyArray<SDKMessage>) => frames.map((frame) => frame.type);
+  const closesEmpty = (frame: SDKMessage | undefined) =>
+    frame?.type === "result" && frame.subtype === "success" && frame.result === "";
+
+  it.effect.each([
+    {
+      name: "accepted",
+      result: { behavior: "allow" },
+      sent: { type: "approval", toolUseId: "agent-tool", decision: "allow" },
+    },
+    {
+      name: "declined",
+      result: { behavior: "deny", message: "User declined tool execution." },
+      sent: {
+        type: "approval",
+        toolUseId: "agent-tool",
+        decision: "deny",
+        reason: "User declined tool execution.",
+      },
+    },
+  ] satisfies ReadonlyArray<{
+    name: string;
+    result: PermissionResult;
+    sent: ClaudeBridgeCommandBody;
+  }>)("opens a turn for the request, and closes it once it is answered ($name)", (testCase) =>
+    Effect.gen(function* () {
+      const person = personAnswersLater();
+      const bridge = yield* attach({ protocol: 2, bridgeCanUseTool: person.bridgeCanUseTool });
+      const frames = yield* shownFrames(bridge);
+      yield* ask(bridge);
+      yield* until(() => frames.length === 2, "the request's turn");
+      // Opened as a turn typed in the terminal is, marked as nobody's prompt.
+      assert.deepStrictEqual(types(frames), ["user", "system"]);
+      assert.strictEqual(claudeBridgeWakeDetail(frames[0]!), REQUEST_TEXT);
+      assert.strictEqual(claudeBridgeWakeRequest(frames[0]!), "subagent");
+      yield* TestClock.adjust("300 millis");
+      yield* until(() => person.seen.calls === 2, "the request asked again");
+      // Asked and not answered yet: the turn stays open.
+      assert.lengthOf(frames, 2);
+      person.answer(testCase.result);
+      assert.deepStrictEqual(yield* Queue.take(bridge.commands), testCase.sent);
+      yield* until(() => frames.length === 3, "the request's turn closing");
+      assert.isTrue(closesEmpty(frames[2]));
+      assert.strictEqual(person.seen.aborted, 0);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("puts the request away and closes its turn when the session settles it", () =>
+    Effect.gen(function* () {
+      const person = personAnswersLater();
+      const bridge = yield* attach({ protocol: 2, bridgeCanUseTool: person.bridgeCanUseTool });
+      const frames = yield* shownFrames(bridge);
+      yield* ask(bridge);
+      yield* until(() => frames.length === 2, "the request's turn");
+      yield* TestClock.adjust("300 millis");
+      yield* until(() => person.seen.calls === 2, "the request asked again");
+      yield* bridge.handler(
+        {
+          type: "approval.resolved",
+          seq: 2,
+          at: bridge.now,
+          toolUseId: "agent-tool",
+          decision: "allow",
+          by: "terminal",
+        },
+        bridge.process,
+      );
+      yield* until(() => frames.length === 3, "the request's turn closing");
+      assert.isTrue(closesEmpty(frames[2]));
+      assert.strictEqual(person.seen.aborted, 1);
+      // Nothing is sent back for it.
+      assert.strictEqual(yield* Queue.size(bridge.commands), 0);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("gives way to a turn of the session's own, where the request is asked again", () =>
+    Effect.gen(function* () {
+      const person = personAnswersLater();
+      const bridge = yield* attach({ protocol: 2, bridgeCanUseTool: person.bridgeCanUseTool });
+      const frames = yield* shownFrames(bridge);
+      yield* ask(bridge);
+      yield* until(() => frames.length === 2, "the request's turn");
+      yield* TestClock.adjust("300 millis");
+      yield* until(() => person.seen.calls === 2, "the request asked again");
+      yield* bridge.handler(
+        {
+          seq: 2,
+          at: bridge.now,
+          type: "turn.start",
+          turnId: "turn-next",
+          text: "what the person typed",
+          transcriptOffset: 0,
+        },
+        bridge.process,
+      );
+      yield* until(() => frames.length === 5, "the session's own turn");
+      // The request's turn is closed before the next one opens.
+      assert.deepStrictEqual(types(frames), ["user", "system", "result", "user", "system"]);
+      assert.isTrue(closesEmpty(frames[2]));
+      assert.isNull(claudeBridgeWakeRequest(frames[3]!));
+      assert.strictEqual(person.seen.aborted, 1);
+      assert.strictEqual(yield* Queue.size(bridge.commands), 0);
+      // The mod repeats a request that is still open: asked again, in the turn now open.
+      for (let repeat = 0; repeat < 50 && person.seen.calls < 3; repeat += 1) {
+        yield* ask(bridge, 3 + repeat);
+        yield* Effect.yieldNow;
+      }
+      assert.strictEqual(person.seen.calls, 3);
+      person.answer({ behavior: "allow" });
+      assert.deepStrictEqual(yield* Queue.take(bridge.commands), {
+        type: "approval",
+        toolUseId: "agent-tool",
+        decision: "allow",
+      });
+      // No turn of T3's own was opened for it this time.
+      assert.lengthOf(frames, 5);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("keeps a request no turn has taken yet for the turn that follows", () =>
+    Effect.gen(function* () {
+      let calls = 0;
+      let aborted = 0;
+      const bridge = yield* attach({
+        protocol: 2,
+        // Nothing takes it until the session's own turn is open.
+        bridgeCanUseTool: (_tool, _input, _toolUseId, signal) => {
+          calls += 1;
+          signal.addEventListener("abort", () => {
+            aborted += 1;
+          });
+          return calls < 3 ? null : { behavior: "allow" };
+        },
+      });
+      const frames = yield* shownFrames(bridge);
+      yield* ask(bridge);
+      yield* until(() => frames.length === 2, "the request's turn");
+      yield* bridge.handler(
+        {
+          seq: 2,
+          at: bridge.now,
+          type: "turn.start",
+          turnId: "turn-next",
+          text: "what the person typed",
+          transcriptOffset: 0,
+        },
+        bridge.process,
+      );
+      yield* until(() => frames.length === 5, "the session's own turn");
+      assert.strictEqual(aborted, 0);
+      yield* TestClock.adjust("300 millis");
+      yield* until(() => calls >= 2, "the second try");
+      yield* TestClock.adjust("300 millis");
+      assert.deepStrictEqual(yield* Queue.take(bridge.commands), {
+        type: "approval",
+        toolUseId: "agent-tool",
+        decision: "allow",
+      });
+      assert.strictEqual(aborted, 0);
+      assert.lengthOf(frames, 5);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("opens no turn of its own while a prompt sent from T3 is about to start one", () =>
+    Effect.gen(function* () {
+      let calls = 0;
+      const bridge = yield* attach({
+        protocol: 2,
+        bridgeCanUseTool: () => {
+          calls += 1;
+          return calls === 1 ? null : { behavior: "allow" };
+        },
+      });
+      const frames = yield* shownFrames(bridge);
+      yield* bridge.session.offer({
+        ...userMessage("carry on"),
+        uuid: "00000000-0000-4000-8000-000000000031",
+      });
+      assert.strictEqual((yield* Queue.take(bridge.commands)).type, "prompt");
+      yield* ask(bridge);
+      yield* until(() => calls === 1, "the first try");
+      yield* Effect.yieldNow;
+      yield* TestClock.adjust("300 millis");
+      assert.deepStrictEqual(yield* Queue.take(bridge.commands), {
+        type: "approval",
+        toolUseId: "agent-tool",
+        decision: "allow",
+      });
+      assert.lengthOf(frames, 0);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("hands the request back to Claude Code's own dialog when no run takes it", () =>
+    Effect.gen(function* () {
+      let calls = 0;
+      const bridge = yield* attach({
+        protocol: 2,
+        bridgeCanUseTool: () => {
+          calls += 1;
+          return null;
+        },
+      });
+      const frames = yield* shownFrames(bridge);
+      yield* ask(bridge);
+      yield* until(() => frames.length === 2, "the request's turn");
+      yield* TestClock.adjust("16 seconds");
+      assert.deepStrictEqual(yield* Queue.take(bridge.commands), {
+        type: "approval",
+        toolUseId: "agent-tool",
+        decision: "ask",
+      });
+      assert.isAtLeast(calls, 2);
+      yield* until(() => frames.length === 3, "the request's turn closing");
+      assert.isTrue(closesEmpty(frames[2]));
+      assert.strictEqual(bridge.counts.sdkCalls, 0);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+});
+
 describe("ClaudeBridgeQueryRunner questions", () => {
   it.effect("answers a question with the person's answers, not with an approval", () =>
     Effect.gen(function* () {
@@ -557,13 +855,16 @@ describe("ClaudeBridgeQueryRunner questions", () => {
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
-  it.effect("hands a question nobody in T3 owns back to the terminal dialog", () =>
+  it.effect("hands a question no turn of the thread takes back to the terminal dialog", () =>
     Effect.gen(function* () {
       const bridge = yield* attach({ protocol: 2, bridgeCanUseTool: () => null });
+      const frames = yield* shownFrames(bridge);
       yield* bridge.handler(
         { type: "question.request", seq: 1, at: bridge.now, toolUseId: "ask-2", questions: [] },
         bridge.process,
       );
+      yield* until(() => frames.length === 2, "the turn opened for the question");
+      yield* TestClock.adjust("16 seconds");
       assert.deepStrictEqual(yield* Queue.take(bridge.commands), {
         type: "answer",
         toolUseId: "ask-2",

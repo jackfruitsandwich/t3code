@@ -30,7 +30,7 @@ import type {
 import { isRecord, parseJsonlLine } from "../import/sessionImportTypes.ts";
 
 export const CLAUDE_BRIDGE_PROTOCOL_VERSION = 2;
-export const CLAUDE_BRIDGE_MOD_VERSION = "0.3.9";
+export const CLAUDE_BRIDGE_MOD_VERSION = "0.3.10";
 /**
  * The first protocol whose mod runs slash commands, answers questions with
  * their answers and reports the session's own commands. A process still on an
@@ -53,6 +53,14 @@ export const CLAUDE_BRIDGE_T3_HEARTBEAT_MS = 3_000;
  * from the real SDK.
  */
 export const CLAUDE_BRIDGE_WAKE_DETAIL_KEY = "t3_wake_detail";
+/**
+ * Set beside it when the turn is one T3 opened itself, to carry a request the
+ * session raised while it had no turn of its own (a subagent sent to the
+ * background asks after the turn that started it has ended). Its value is
+ * who asks. Nobody typed such a turn: the adapter files it as activity.
+ */
+export const CLAUDE_BRIDGE_WAKE_REQUEST_KEY = "t3_wake_request";
+export type ClaudeBridgeRequestTurnBy = "subagent" | "session";
 /**
  * Set on the synthesized `assistant` frame that carries a slash command's
  * printed output, so the runner can keep it for the turn or command it
@@ -788,6 +796,29 @@ export function claudeBridgeWakeDetail(message: SDKMessage): string | null {
   return typeof detail === "string" && detail.length > 0 ? detail : null;
 }
 
+/** Who asks, when a bridge `user` frame opens a turn T3 made to carry a request; null for any other frame. */
+export function claudeBridgeWakeRequest(message: SDKMessage): ClaudeBridgeRequestTurnBy | null {
+  const by = Reflect.get(message, CLAUDE_BRIDGE_WAKE_REQUEST_KEY);
+  return by === "subagent" || by === "session" ? by : null;
+}
+
+/**
+ * What the thread says when a turn is opened to carry a request: who is
+ * asking. `agentType` is the kind of subagent as Claude Code names it.
+ */
+export function claudeBridgeRequestTurnText(input: {
+  readonly agentType?: string | undefined;
+  readonly question?: boolean;
+}): string {
+  const who =
+    input.agentType === undefined
+      ? "Claude Code"
+      : input.agentType === "subagent"
+        ? "A subagent"
+        : `The ${input.agentType} subagent`;
+  return `${who} is ${input.question === true ? "asking a question" : "asking for permission"}`;
+}
+
 // ---------------------------------------------------------------------------
 // Transcript rows and mod events -> SDK frames
 // ---------------------------------------------------------------------------
@@ -813,9 +844,14 @@ interface TranslatorTurn {
 }
 
 export interface ClaudeBridgeFrameTranslator {
-  /** Frames for a turn that began: a wake `user` frame for a foreign turn, then `init`. */
+  /**
+   * Frames for a turn that began: a wake `user` frame for a foreign turn, then
+   * `init`. `request` marks a turn T3 opens itself to carry a request, with
+   * who asks.
+   */
   readonly onTurnStart: (
     event: Extract<ClaudeBridgeEvent, { type: "turn.start" }>,
+    options?: { readonly request?: ClaudeBridgeRequestTurnBy },
   ) => ReadonlyArray<SDKMessage>;
   /** Frames for one transcript line, already parsed from JSON. */
   readonly onTranscriptRow: (row: unknown) => ReadonlyArray<SDKMessage>;
@@ -937,7 +973,7 @@ export function makeClaudeBridgeFrameTranslator(
   };
 
   return {
-    onTurnStart: (event) => {
+    onTurnStart: (event, turnOptions) => {
       turn = {
         turnId: event.turnId,
         promptUuid: event.promptUuid ?? null,
@@ -955,6 +991,9 @@ export function makeClaudeBridgeFrameTranslator(
           uuid: asUuid(`bridge-user-${event.turnId}`),
           session_id: sessionId,
           [CLAUDE_BRIDGE_WAKE_DETAIL_KEY]: event.text,
+          ...(turnOptions?.request === undefined
+            ? {}
+            : { [CLAUDE_BRIDGE_WAKE_REQUEST_KEY]: turnOptions.request }),
         } as unknown as SDKUserMessage;
         frames.push(wakeUser);
       }

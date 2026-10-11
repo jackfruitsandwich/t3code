@@ -22,7 +22,12 @@
  */
 import * as NodeOS from "node:os";
 
-import type { CanUseTool, SDKMessage, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+import type {
+  CanUseTool,
+  PermissionResult,
+  SDKMessage,
+  SDKUserMessage,
+} from "@anthropic-ai/claude-agent-sdk";
 import { HostProcessEnvironment, HostProcessWorkingDirectory } from "@t3tools/shared/hostProcess";
 import type * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
@@ -44,6 +49,7 @@ import {
   CLAUDE_BRIDGE_WINDOW_PROTOCOL,
   claudeBridgeAttachmentPaths,
   claudeBridgeModAtLeast,
+  claudeBridgeRequestTurnText,
   claudeSessionMovingNotice,
   CLAUDE_BRIDGE_BASH_MOD_VERSION,
   CLAUDE_BRIDGE_DIALOG_REFUSAL_MOD_VERSION,
@@ -62,6 +68,7 @@ import {
   readTranscriptRows,
   type ClaudeBridgeCommandBody,
   type ClaudeBridgeEvent,
+  type ClaudeBridgeRequestTurnBy,
 } from "../../claude-bridge/ClaudeBridgeProtocol.ts";
 import { isRecord, parseJsonlLine } from "../../import/sessionImportTypes.ts";
 import * as ProviderEventLoggers from "../../provider/ProviderEventLoggers.ts";
@@ -110,6 +117,13 @@ const MISSED_TURN_REPLAY_MS = 15_000;
  * is shown as a short turn of its own.
  */
 const LOCAL_COMMAND_QUIET_MS = 1_500;
+/**
+ * How long a request the session raised waits for a turn of the thread to
+ * take it: the turn it belongs to, whose run is still starting, or one T3
+ * opens for it. After that it goes back to Claude Code's own dialog.
+ */
+const REQUEST_TURN_WAIT_MS = 15_000;
+const REQUEST_TURN_POLL_MS = 250;
 
 const runnerError = (cause: unknown, method: string) =>
   new ClaudeAdapterV2.ClaudeAgentSdkQueryRunnerError({ method, cause });
@@ -357,6 +371,13 @@ export const layer: Layer.Layer<
          * has ended.
          */
         agentAsks: new Set<string>(),
+        /** Those no turn of the thread has taken yet: nothing shows for them so far. */
+        unplaced: new Set<string>(),
+        /**
+         * A turn T3 opened itself, to show a request the session raised while
+         * it had no turn of its own. It closes with the last thing asked in it.
+         */
+        requestTurn: null as { readonly turnId: string; readonly startedAt: number } | null,
         /** Drawn messages already shown: the record's own copy, arriving later, is the same row. */
         shownDrawn: [] as Array<{ readonly messageId: string; readonly text: string }>,
         /** Texts of the record's recent replies, to tell a drawn message it already holds. */
@@ -384,9 +405,13 @@ export const layer: Layer.Layer<
           { discard: true },
         );
 
+      /** A turn of the session's own is open in the thread, not one T3 opened to carry a request. */
+      const sessionTurnOpen = () => translator.hasOpenTurn() && state.requestTurn === null;
+
       const finish = Effect.gen(function* () {
         if (state.closed) return;
         state.closed = true;
+        state.requestTurn = null;
         for (const controller of state.approvals.values()) controller.abort();
         state.approvals.clear();
         yield* Queue.end(messages);
@@ -643,7 +668,7 @@ export const layer: Layer.Layer<
               }
             }
             for (const frame of translator.onTranscriptRow(row)) {
-              if (isClaudeBridgeCommandOutputFrame(frame) && !translator.hasOpenTurn()) {
+              if (isClaudeBridgeCommandOutputFrame(frame) && !sessionTurnOpen()) {
                 state.heldOutput.push(frame);
                 state.heldAt = state.lastRowAt;
               } else {
@@ -662,6 +687,123 @@ export const layer: Layer.Layer<
         });
       const readNewRows = readRows(false);
 
+      const settleElsewhere = (toolUseId: string) =>
+        Effect.sync(() => {
+          const controller = state.approvals.get(toolUseId);
+          if (controller === undefined) return;
+          state.settledElsewhere.add(toolUseId);
+          controller.abort();
+        });
+
+      /**
+       * Opens a turn of T3's own for a request the session raised while it has
+       * no turn of its own: a subagent sent to the background asks after the
+       * turn that started it has ended. The thread shows a request inside a
+       * run, and this turn is what gives the request one. Nothing is opened
+       * while a turn is open, or a prompt sent from T3 is about to start one.
+       */
+      const openRequestTurn = (toolUseId: string, text: string, by: ClaudeBridgeRequestTurnBy) =>
+        Effect.gen(function* () {
+          if (state.closed || translator.hasOpenTurn() || state.pendingPrompt !== null) return;
+          const now = yield* Clock.currentTimeMillis;
+          const turnId = `request-${toolUseId}-${now}`;
+          state.requestTurn = { turnId, startedAt: now };
+          yield* emit(
+            translator.onTurnStart(
+              { seq: 0, at: now, type: "turn.start", turnId, text, transcriptOffset: 0 },
+              { request: by },
+            ),
+          );
+          yield* Effect.logInfo("claude-bridge.request-turn-opened", { sid, turnId });
+        });
+
+      /**
+       * Closes the turn T3 opened for a request. `superseded`: the session has
+       * begun something of its own. What is still asked in the request's turn
+       * is put away with it; the mod repeats a request that is still open, and
+       * it is then asked in what follows.
+       */
+      const closeRequestTurn = (superseded: boolean) =>
+        Effect.gen(function* () {
+          const open = state.requestTurn;
+          if (open === null) return;
+          state.requestTurn = null;
+          // Something else already closed whatever was open.
+          if (!translator.hasOpenTurn()) return;
+          if (superseded) {
+            // A request no turn has taken yet shows nothing: it goes on
+            // waiting for the turn that follows.
+            for (const toolUseId of state.approvals.keys()) {
+              if (!state.unplaced.has(toolUseId)) yield* settleElsewhere(toolUseId);
+            }
+          }
+          const now = yield* Clock.currentTimeMillis;
+          yield* emit(
+            translator.onTurnComplete({
+              seq: 0,
+              at: now,
+              type: "turn.complete",
+              turnId: open.turnId,
+              reason: "answer",
+              answer: "",
+              isAborted: false,
+              durationMs: now - open.startedAt,
+              transcriptOffset: 0,
+            }),
+          );
+        });
+
+      /**
+       * Asks T3 about a call until a turn of the thread takes the request.
+       * `ask` answers null when no run is there to show it: the turn it
+       * belongs to was reported a moment ago and its run is still starting,
+       * or the session has no turn of its own and one is opened for it. Null
+       * in the end means nobody took it.
+       */
+      const askUntilTaken = (input: {
+        readonly toolUseId: string;
+        readonly signal: AbortSignal;
+        readonly ask: () => Promise<PermissionResult | null>;
+        readonly openTurn: Effect.Effect<void>;
+      }) =>
+        Effect.gen(function* () {
+          const attempt = Effect.result(
+            Effect.tryPromise({
+              try: input.ask,
+              catch: (cause) => runnerError(cause, "canUseTool"),
+            }),
+          );
+          let result = yield* attempt;
+          // A session whose mod asks T3 alone takes no second answer.
+          if (bridgeProcess.session.protocol < CLAUDE_BRIDGE_WINDOW_PROTOCOL) return result;
+          const deadline = (yield* Clock.currentTimeMillis) + REQUEST_TURN_WAIT_MS;
+          while (
+            result._tag === "Success" &&
+            result.success === null &&
+            !state.closed &&
+            !input.signal.aborted &&
+            (yield* Clock.currentTimeMillis) < deadline
+          ) {
+            yield* input.openTurn;
+            state.unplaced.add(input.toolUseId);
+            yield* Effect.sleep(`${REQUEST_TURN_POLL_MS} millis`).pipe(
+              Effect.ensuring(Effect.sync(() => state.unplaced.delete(input.toolUseId))),
+            );
+            if (state.closed || input.signal.aborted) break;
+            result = yield* attempt;
+          }
+          return result;
+        });
+
+      /** An ask is over, however it ended. The turn T3 opened for requests closes with the last of them. */
+      const askOver = (toolUseId: string) =>
+        Effect.suspend(() => {
+          state.asking.delete(toolUseId);
+          state.agentAsks.delete(toolUseId);
+          state.unplaced.delete(toolUseId);
+          return state.asking.size === 0 ? closeRequestTurn(false) : Effect.void;
+        });
+
       /** A turn's worth of frames for a slash command that started no model turn. */
       const emitCommandTurn = (input: {
         readonly turnId: string;
@@ -671,6 +813,7 @@ export const layer: Layer.Layer<
         readonly answer: string;
       }) =>
         Effect.gen(function* () {
+          yield* closeRequestTurn(true);
           const now = yield* Clock.currentTimeMillis;
           yield* emit(
             translator.onTurnStart({
@@ -722,7 +865,7 @@ export const layer: Layer.Layer<
           state.heldOutput.length > 0 &&
           state.pendingPrompt === null &&
           state.pendingComplete === null &&
-          !translator.hasOpenTurn() &&
+          !sessionTurnOpen() &&
           now - state.heldAt >= LOCAL_COMMAND_QUIET_MS
         ) {
           yield* emitCommandTurn({
@@ -742,7 +885,7 @@ export const layer: Layer.Layer<
         if (
           // The run stays open while a background subagent's request waits in
           // it: the request can only be answered from a run that is open.
-          state.agentAsks.size === 0 &&
+          [...state.agentAsks].every((toolUseId) => state.unplaced.has(toolUseId)) &&
           state.byteOffset >= pending.event.transcriptOffset &&
           now - state.lastRowAt >= COMPLETE_QUIET_MS &&
           now - pending.seenAt >= COMPLETE_QUIET_MS
@@ -879,21 +1022,25 @@ export const layer: Layer.Layer<
           }
           const controller = new AbortController();
           state.approvals.set(event.toolUseId, controller);
-          const result = yield* Effect.result(
-            Effect.tryPromise({
-              try: () =>
-                canUseTool(event.tool, isRecord(event.input) ? event.input : {}, {
-                  signal: controller.signal,
-                  toolUseID: event.toolUseId,
-                  requestId: event.toolUseId,
-                  ...(event.reason === undefined ? {} : { decisionReason: event.reason }),
-                  ...(event.alsoInTerminal === true ? { alsoInTerminal: true } : {}),
-                  ...(event.suggestions === undefined ? {} : { suggestions: event.suggestions }),
-                  ...(event.agentType === undefined ? {} : { askedByAgent: event.agentType }),
-                } as Parameters<CanUseTool>[2]),
-              catch: (cause) => runnerError(cause, "canUseTool"),
-            }),
-          );
+          const result = yield* askUntilTaken({
+            toolUseId: event.toolUseId,
+            signal: controller.signal,
+            ask: () =>
+              canUseTool(event.tool, isRecord(event.input) ? event.input : {}, {
+                signal: controller.signal,
+                toolUseID: event.toolUseId,
+                requestId: event.toolUseId,
+                ...(event.reason === undefined ? {} : { decisionReason: event.reason }),
+                ...(event.alsoInTerminal === true ? { alsoInTerminal: true } : {}),
+                ...(event.suggestions === undefined ? {} : { suggestions: event.suggestions }),
+                ...(event.agentType === undefined ? {} : { askedByAgent: event.agentType }),
+              } as Parameters<CanUseTool>[2]),
+            openTurn: openRequestTurn(
+              event.toolUseId,
+              claudeBridgeRequestTurnText({ agentType: event.agentType }),
+              event.agentType === undefined ? "session" : "subagent",
+            ),
+          });
           state.approvals.delete(event.toolUseId);
           if (state.closed) return;
           // The session settled it without T3 (answered in the terminal, the
@@ -971,21 +1118,25 @@ export const layer: Layer.Layer<
           }
           const controller = new AbortController();
           state.approvals.set(event.toolUseId, controller);
-          const result = yield* Effect.result(
-            Effect.tryPromise({
-              try: () =>
-                canUseTool(
-                  "AskUserQuestion",
-                  { questions: event.questions },
-                  {
-                    signal: controller.signal,
-                    toolUseID: event.toolUseId,
-                    requestId: event.toolUseId,
-                  },
-                ),
-              catch: (cause) => runnerError(cause, "canUseTool"),
-            }),
-          );
+          const result = yield* askUntilTaken({
+            toolUseId: event.toolUseId,
+            signal: controller.signal,
+            ask: () =>
+              canUseTool(
+                "AskUserQuestion",
+                { questions: event.questions },
+                {
+                  signal: controller.signal,
+                  toolUseID: event.toolUseId,
+                  requestId: event.toolUseId,
+                },
+              ),
+            openTurn: openRequestTurn(
+              event.toolUseId,
+              claudeBridgeRequestTurnText({ question: true }),
+              "session",
+            ),
+          });
           state.approvals.delete(event.toolUseId);
           if (state.closed) return;
           if (state.settledElsewhere.delete(event.toolUseId)) return;
@@ -1018,14 +1169,6 @@ export const layer: Layer.Layer<
           });
         });
 
-      const settleElsewhere = (toolUseId: string) =>
-        Effect.sync(() => {
-          const controller = state.approvals.get(toolUseId);
-          if (controller === undefined) return;
-          state.settledElsewhere.add(toolUseId);
-          controller.abort();
-        });
-
       const handleEvent = (event: ClaudeBridgeEvent) =>
         Effect.gen(function* () {
           if (state.closed) return;
@@ -1036,6 +1179,8 @@ export const layer: Layer.Layer<
           });
           switch (event.type) {
             case "turn.start": {
+              // A turn T3 opened for a request gives way to the session's own.
+              yield* closeRequestTurn(true);
               // The turn before this one has ended and its end is still
               // waiting for its last rows (a message queued behind it starts
               // the next at once). It is closed first: otherwise the two run
@@ -1108,7 +1253,7 @@ export const layer: Layer.Layer<
               if (state.asking.has(event.toolUseId)) return;
               state.asking.add(event.toolUseId);
               yield* resolveQuestion(event).pipe(
-                Effect.ensuring(Effect.sync(() => state.asking.delete(event.toolUseId))),
+                Effect.ensuring(askOver(event.toolUseId)),
                 Effect.forkIn(sessionScope),
               );
               return;
@@ -1147,12 +1292,7 @@ export const layer: Layer.Layer<
               state.asking.add(event.toolUseId);
               if (event.agentType !== undefined) state.agentAsks.add(event.toolUseId);
               yield* resolveApproval(event).pipe(
-                Effect.ensuring(
-                  Effect.sync(() => {
-                    state.asking.delete(event.toolUseId);
-                    state.agentAsks.delete(event.toolUseId);
-                  }),
-                ),
+                Effect.ensuring(askOver(event.toolUseId)),
                 Effect.forkIn(sessionScope),
               );
               return;
