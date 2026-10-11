@@ -677,6 +677,16 @@ export const claudeBridgeAlsoInTerminal = (options: unknown): boolean =>
 export const claudeBridgeAskingAgent = (options: unknown): string | null =>
   isRecord(options) && typeof options.askedByAgent === "string" ? options.askedByAgent : null;
 /**
+ * Why a bridged session's permission callback is aborted when the session
+ * settled the request without T3: it was answered in the terminal, or its
+ * turn was stopped or ended. The thread then puts the request away at once.
+ * A callback aborted for any other reason (the bridge is closing) leaves the
+ * request to whoever closes the session.
+ */
+export const CLAUDE_BRIDGE_SETTLED_ELSEWHERE = "settled-elsewhere";
+export const claudeBridgeSettledElsewhere = (signal: AbortSignal): boolean =>
+  signal.aborted && signal.reason === CLAUDE_BRIDGE_SETTLED_ELSEWHERE;
+/**
  * Commands that move a Claude Code session on to another conversation: the
  * terminal then shows that conversation, and it gets a thread of its own. A
  * thread is one conversation and cannot follow, so sent from T3 they are not

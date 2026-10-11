@@ -61,6 +61,7 @@ import {
   claudeSessionNotificationText,
   claudeTranscriptCommandOutput,
   claudeTranscriptPermissionMode,
+  CLAUDE_BRIDGE_SETTLED_ELSEWHERE,
   CLAUDE_BRIDGE_UPKEEP_COMMAND,
   isClaudeBridgeModRow,
   isClaudeTurnEndRow,
@@ -710,9 +711,11 @@ export const layer: Layer.Layer<
       const settleElsewhere = (toolUseId: string) =>
         Effect.sync(() => {
           const controller = state.approvals.get(toolUseId);
-          if (controller === undefined) return;
+          // A request whose wait has not begun yet (it and its settling were
+          // read together) is remembered, and is then not asked at all.
+          if (controller === undefined && !state.asking.has(toolUseId)) return;
           state.settledElsewhere.add(toolUseId);
-          controller.abort();
+          controller?.abort(CLAUDE_BRIDGE_SETTLED_ELSEWHERE);
         });
 
       /**
@@ -856,6 +859,7 @@ export const layer: Layer.Layer<
       const askOver = (toolUseId: string) =>
         Effect.suspend(() => {
           state.asking.delete(toolUseId);
+          state.settledElsewhere.delete(toolUseId);
           state.agentAsks.delete(toolUseId);
           state.unplaced.delete(toolUseId);
           return state.asking.size === 0 ? closeRequestTurn(false) : Effect.void;
@@ -1063,6 +1067,8 @@ export const layer: Layer.Layer<
 
       const resolveApproval = (event: Extract<ClaudeBridgeEvent, { type: "approval.request" }>) =>
         Effect.gen(function* () {
+          // Settled before T3 came to ask: there is nothing to ask.
+          if (state.settledElsewhere.has(event.toolUseId)) return;
           const canUseTool =
             (bridgeProcess.session.protocol < CLAUDE_BRIDGE_WINDOW_PROTOCOL
               ? input.bridgeCanUseToolLegacy
@@ -1163,6 +1169,7 @@ export const layer: Layer.Layer<
       /** A question Claude asked: answered with the person's answers, not with an approval. */
       const resolveQuestion = (event: Extract<ClaudeBridgeEvent, { type: "question.request" }>) =>
         Effect.gen(function* () {
+          if (state.settledElsewhere.has(event.toolUseId)) return;
           const canUseTool = input.bridgeCanUseTool ?? options.canUseTool;
           const handBack = registry.send(bridgeProcess, {
             type: "answer",

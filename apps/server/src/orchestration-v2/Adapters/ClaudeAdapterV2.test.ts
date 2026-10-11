@@ -68,6 +68,7 @@ import {
 } from "../ProviderAdapter.ts";
 import type { ProviderContinuationRequest } from "../ProviderContinuationRequests.ts";
 import { makeProviderFailure } from "../ProviderFailure.ts";
+import { CLAUDE_BRIDGE_SETTLED_ELSEWHERE } from "../../claude-bridge/ClaudeBridgeProtocol.ts";
 import * as ClaudeAdapterV2 from "./ClaudeAdapterV2.ts";
 import * as IdAllocator from "../IdAllocator.ts";
 
@@ -2379,6 +2380,91 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       assert.equal(result.decisionClassification, "user_reject");
       assert.equal(result.message, "User declined tool execution.");
     }).pipe(Effect.scoped, Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+  );
+
+  // Answered in the terminal, a request is settled by the session and its turn
+  // goes on, sometimes for hours: the thread must not keep asking until the
+  // turn ends.
+  it.effect.each([
+    { tool: "Bash", toolInput: { command: "wc -l notes.md" } },
+    {
+      tool: "AskUserQuestion",
+      toolInput: {
+        questions: [
+          {
+            header: "Target",
+            question: "Where to?",
+            options: [
+              { label: "Production", description: "Deploy to production." },
+              { label: "Staging", description: "Deploy to staging." },
+            ],
+            multiSelect: false,
+          },
+        ],
+      },
+    },
+  ])(
+    "puts a request the session settled without T3 away while its turn goes on: $tool",
+    ({ tool, toolInput }) =>
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        yield* harness.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("bridge-settled-in-terminal"),
+            text: "Count the lines, then keep working.",
+            attachments: [],
+            runtimePolicy: ProviderAdapterV2RuntimePolicy.make({
+              runtimeMode: "approval-required",
+              interactionMode: "default",
+              cwd: "/workspace",
+            }),
+          }),
+        );
+        const settled = new AbortController();
+        const asked = yield* Effect.promise(() =>
+          harness.getBridgeCanUseTool()!(tool, toolInput, {
+            signal: settled.signal,
+            toolUseID: "settled-in-terminal",
+            requestId: "settled-in-terminal",
+          }),
+        ).pipe(Effect.forkScoped);
+        const request = yield* Queue.take(harness.runtimeRequestReceipts);
+        assert.equal(request.runtimeRequest.status, "pending");
+
+        settled.abort(CLAUDE_BRIDGE_SETTLED_ELSEWHERE);
+        yield* Fiber.join(asked);
+        let quietYields = 0;
+        yield* awaitUntil(() => quietYields++ >= 50, "settled request quiet window");
+        const last = <Type extends ProviderAdapterV2Event["type"]>(type: Type) =>
+          harness.events.findLast(
+            (event): event is Extract<ProviderAdapterV2Event, { type: Type }> =>
+              event.type === type,
+          );
+        // The turn is still running: nothing but the request was closed.
+        assert.lengthOf(harness.terminalEvents(), 0);
+        assert.equal(last("runtime_request.updated")?.runtimeRequest.id, request.runtimeRequest.id);
+        assert.equal(last("runtime_request.updated")?.runtimeRequest.status, "cancelled");
+        assert.isNotNull(last("runtime_request.updated")?.runtimeRequest.resolvedAt);
+        const node = harness.events.findLast(
+          (event) =>
+            event.type === "node.updated" && event.node.id === request.runtimeRequest.nodeId,
+        );
+        assert.equal(node?.type === "node.updated" ? node.node.status : null, "cancelled");
+        const item = harness.events.findLast(
+          (event) =>
+            event.type === "turn_item.updated" &&
+            event.turnItem.nodeId === request.runtimeRequest.nodeId,
+        );
+        assert.equal(item?.type === "turn_item.updated" ? item.turnItem.status : null, "cancelled");
+        // T3 no longer holds an answer for it.
+        const late = yield* harness.runtime
+          .respondToRuntimeRequest({ requestId: request.runtimeRequest.id, decision: "accept" })
+          .pipe(Effect.flip);
+        assert.include(String(late.cause), "No pending Claude runtime request");
+      }).pipe(Effect.scoped, Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
   );
 
   it.effect.each([

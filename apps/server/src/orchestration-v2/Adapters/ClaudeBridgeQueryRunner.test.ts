@@ -16,6 +16,7 @@ import * as TestClock from "effect/testing/TestClock";
 
 import * as ClaudeBridgeRegistry from "../../claude-bridge/ClaudeBridgeRegistry.ts";
 import {
+  claudeBridgeSettledElsewhere,
   claudeBridgeWakeDetail,
   claudeBridgeWakeRequest,
   claudeContinuedInSession,
@@ -423,15 +424,17 @@ describe("ClaudeBridgeQueryRunner permissions", () => {
 
   it.effect("sends nothing back for a request the session settled without T3", () =>
     Effect.gen(function* () {
+      let settledElsewhere = false;
       const bridge = yield* attach({
         protocol: 2,
         bridgeCanUseTool: (_tool, _input, toolUseId, signal) =>
           toolUseId === "tool-1"
             ? // The person has not answered in T3; the wait ends only when aborted.
               new Promise<PermissionResult>((resolve) => {
-                signal.addEventListener("abort", () =>
-                  resolve({ behavior: "deny", message: "User cancelled tool execution." }),
-                );
+                signal.addEventListener("abort", () => {
+                  settledElsewhere = claudeBridgeSettledElsewhere(signal);
+                  resolve({ behavior: "deny", message: "User cancelled tool execution." });
+                });
               })
             : { behavior: "allow" },
       });
@@ -447,25 +450,40 @@ describe("ClaudeBridgeQueryRunner permissions", () => {
           },
           bridge.process,
         );
+      const answeredInTerminal = (toolUseId: string) =>
+        bridge.handler(
+          {
+            type: "approval.resolved",
+            seq: 2,
+            at: bridge.now,
+            toolUseId,
+            decision: "allow",
+            by: "terminal",
+          },
+          bridge.process,
+        );
       yield* request("tool-1");
-      yield* bridge.handler(
-        {
-          type: "approval.resolved",
-          seq: 2,
-          at: bridge.now,
-          toolUseId: "tool-1",
-          decision: "allow",
-          by: "terminal",
-        },
-        bridge.process,
-      );
+      yield* until(() => bridge.bridgeCalls.length === 1, "the request asked");
+      yield* answeredInTerminal("tool-1");
+      // The wait is ended as settled, which is what puts the request away in the thread.
+      assert.isTrue(settledElsewhere);
+
+      // Read together with its settling (T3 was not reading for a while), a
+      // request is not asked at all.
+      yield* request("tool-0");
+      yield* answeredInTerminal("tool-0");
+
       yield* request("tool-2");
-      // The first thing T3 says is about the second request: the settled one got no reply.
+      // The first thing T3 says is about the last request: the settled ones got no reply.
       assert.deepStrictEqual(yield* Queue.take(bridge.commands), {
         type: "approval",
         toolUseId: "tool-2",
         decision: "allow",
       });
+      assert.deepStrictEqual(
+        bridge.bridgeCalls.map((call) => call.toolUseId),
+        ["tool-1", "tool-2"],
+      );
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 

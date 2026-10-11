@@ -95,6 +95,7 @@ import { compileClaudeModelSelection } from "../../claudeModelOptions.ts";
 import {
   claudeBridgeAlsoInTerminal,
   claudeBridgeAskingAgent,
+  claudeBridgeSettledElsewhere,
   claudeBridgeWakeDetail,
   claudeBridgeWakeRequest,
   isClaudeBridgeNoticeFrame,
@@ -6870,6 +6871,47 @@ export function makeClaudeAdapterV2(
           // A bridged session's subagent keeps its calls in a record of its
           // own. The thread shows the request and no tool row beside it.
           const askingAgent = origin === "bridge" ? claudeBridgeAskingAgent(callbackOptions) : null;
+          // The session settled the request without T3: it was answered in
+          // the terminal, or its turn was stopped or ended. Nothing else puts
+          // the request away before the turn ends, and a turn can go on for
+          // hours after the answer, so it is put away here. (A subagent's
+          // request is put away however its wait ended, as before.)
+          const putAwayIfSettledElsewhere = (artifacts: {
+            readonly request: OrchestrationV2RuntimeRequest;
+            readonly node: OrchestrationV2ExecutionNode;
+            readonly turnItem: OrchestrationV2TurnItem;
+          }) =>
+            Effect.gen(function* () {
+              const signal = callbackOptions.signal;
+              if (!signal.aborted) return;
+              if (askingAgent === null && !claudeBridgeSettledElsewhere(signal)) return;
+              const now = yield* DateTime.now;
+              yield* Effect.all(
+                [
+                  emitProviderEvent({
+                    type: "runtime_request.updated",
+                    driver: CLAUDE_PROVIDER,
+                    runtimeRequest: { ...artifacts.request, status: "cancelled", resolvedAt: now },
+                  }),
+                  emitProviderEvent({
+                    type: "node.updated",
+                    driver: CLAUDE_PROVIDER,
+                    node: { ...artifacts.node, status: "cancelled", completedAt: now },
+                  }),
+                  emitProviderEvent({
+                    type: "turn_item.updated",
+                    driver: CLAUDE_PROVIDER,
+                    turnItem: {
+                      ...artifacts.turnItem,
+                      status: "cancelled",
+                      completedAt: now,
+                      updatedAt: now,
+                    },
+                  }),
+                ],
+                { concurrency: 1 },
+              );
+            });
           if (toolName === "Agent") {
             rememberClaudeSubagentLaunch(context, nativeRequestId, nativeToolInput, null);
           } else if (!heldForEcho && askingAgent === null) {
@@ -6955,6 +6997,7 @@ export function makeClaudeAdapterV2(
                 }),
               ),
             );
+            yield* putAwayIfSettledElsewhere(artifacts);
             return callbackOptions.signal.aborted
               ? ({
                   behavior: "deny",
@@ -7075,37 +7118,7 @@ export function makeClaudeAdapterV2(
             ),
           );
 
-          // The session settled a subagent's request without T3 (its turn
-          // was stopped, or ended). The call has no row in this thread whose
-          // result would put the request away, so it is put away here.
-          if (askingAgent !== null && callbackOptions.signal.aborted) {
-            const now = yield* DateTime.now;
-            yield* Effect.all(
-              [
-                emitProviderEvent({
-                  type: "runtime_request.updated",
-                  driver: CLAUDE_PROVIDER,
-                  runtimeRequest: { ...artifacts.request, status: "cancelled", resolvedAt: now },
-                }),
-                emitProviderEvent({
-                  type: "node.updated",
-                  driver: CLAUDE_PROVIDER,
-                  node: { ...artifacts.node, status: "cancelled", completedAt: now },
-                }),
-                emitProviderEvent({
-                  type: "turn_item.updated",
-                  driver: CLAUDE_PROVIDER,
-                  turnItem: {
-                    ...artifacts.turnItem,
-                    status: "cancelled",
-                    completedAt: now,
-                    updatedAt: now,
-                  },
-                }),
-              ],
-              { concurrency: 1 },
-            );
-          }
+          yield* putAwayIfSettledElsewhere(artifacts);
 
           return permissionResultFromDecision({
             toolName,
