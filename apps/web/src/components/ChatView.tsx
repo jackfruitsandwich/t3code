@@ -11394,6 +11394,7 @@ export default function ChatView(props: ChatViewProps) {
                                     threadId={activeThread.id}
                                     optimisticMessages={optimisticUserMessages}
                                     editingRunId={editingQueuedRun?.runId ?? null}
+                                    steerWaitsForTurnEnd={settingsBelongToSession}
                                     onEditQueuedRun={beginEditingQueuedRun}
                                     onCancelEdit={cancelEditingQueuedRun}
                                   />
