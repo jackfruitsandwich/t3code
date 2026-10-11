@@ -22,6 +22,8 @@ import {
   CLAUDE_BRIDGE_MARKETPLACE_NAME,
   CLAUDE_BRIDGE_MOD_VERSION,
   CLAUDE_BRIDGE_PLUGIN_NAME,
+  CLAUDE_MID_TURN_CLOSING,
+  CLAUDE_MID_TURN_OPENING,
 } from "./ClaudeBridgeProtocol.ts";
 import { loadClaudeBridgeToolSpecs, type ClaudeBridgeToolSpec } from "./ClaudeBridgeTools.ts";
 
@@ -136,6 +138,11 @@ let pendingCommand = null
 let lastShellInput = null
 // Commands sent while a turn was running, run when it ends.
 const afterTurn = []
+// Prompts T3 sent to steer the running turn, kept until its next tool
+// boundary, and the words Claude Code puts around a message typed meanwhile.
+const steering = []
+const MID_TURN_OPENING = ${JSON.stringify(CLAUDE_MID_TURN_OPENING)}
+const MID_TURN_CLOSING = ${JSON.stringify(CLAUDE_MID_TURN_CLOSING)}
 // Panels commands sent from T3 have opened in the terminal and that are still open.
 let panelsOpen = 0
 // Whether the latest turn was sent from T3 (else typed here, or a wake).
@@ -837,6 +844,21 @@ async function runShellCommand($, command) {
   $.prompt.submit({ text: printed, asUser: true }).then((result) => (result && result.drop ? dropped(result.drop) : undefined)).catch(dropped)
 }
 
+// Submits a prompt T3 sent as a turn of its own (Claude Code runs it once the session is idle).
+function submitPrompt($, command) {
+  pendingCommand = { id: command.id, text: command.text, promptUuid: command.promptUuid, at: Date.now() }
+  // The person's half-typed draft stays where it is: a submit does not touch it.
+  $.prompt.submit({ text: command.text, asUser: true }).then(async (result) => {
+    if (result && result.drop) {
+      if (pendingCommand && pendingCommand.id === command.id) pendingCommand = null
+      await emit($, 'prompt.dropped', { commandId: command.id, reason: String(result.drop) })
+    }
+  }).catch(async (err) => {
+    if (pendingCommand && pendingCommand.id === command.id) pendingCommand = null
+    await emit($, 'prompt.dropped', { commandId: command.id, reason: String(err) })
+  })
+}
+
 async function handleCommand($, command) {
   if (command.type === 'prompt') {
     // Files T3 saved for this prompt, under its own attachments folder.
@@ -846,17 +868,13 @@ async function handleCommand($, command) {
       if (typeof file === 'string' && file.indexOf(folder) === 0 && file.indexOf('/../') === -1) t3Files.add(file)
       if (t3Files.size > 64) t3Files.delete(t3Files.values().next().value)
     }
-    pendingCommand = { id: command.id, text: command.text, promptUuid: command.promptUuid, at: Date.now() }
-    // The person's half-typed draft stays where it is: a submit does not touch it.
-    $.prompt.submit({ text: command.text, asUser: true }).then(async (result) => {
-      if (result && result.drop) {
-        if (pendingCommand && pendingCommand.id === command.id) pendingCommand = null
-        await emit($, 'prompt.dropped', { commandId: command.id, reason: String(result.drop) })
-      }
-    }).catch(async (err) => {
-      if (pendingCommand && pendingCommand.id === command.id) pendingCommand = null
-      await emit($, 'prompt.dropped', { commandId: command.id, reason: String(err) })
-    })
+    // Sent to steer the turn that is running: it waits for that turn's next
+    // tool boundary, where Claude Code hands over a message typed meanwhile.
+    if (command.midTurn === true && activeTurn !== null) {
+      steering.push({ id: command.id, text: command.text, promptUuid: command.promptUuid })
+      return
+    }
+    submitPrompt($, command)
     return
   }
   if (command.type === 'command') {
@@ -1130,6 +1148,28 @@ export function register(on) {
     for (const command of afterTurn.splice(0)) {
       runSlashCommand($, command).catch(() => {})
     }
+    // A message sent to steer this turn that met no tool boundary runs next,
+    // like any prompt; one more still held steers the turn that starts.
+    const unsteered = steering.shift()
+    if (unsteered) submitPrompt($, unsteered)
+    return next(e)
+  })
+
+  // The tool boundary of a running turn: every call of the batch has its
+  // result and the model is asked again next. A message T3 sent to steer the
+  // turn goes in here, as a row of the person's words inside Claude Code's
+  // own for a message typed meanwhile. A subagent's batch is not the place.
+  on('classic.PostToolBatch', async ($, e, next) => {
+    try {
+      while (steering.length > 0 && activeTurn !== null && !(e && (e.agent_id || e.agentId))) {
+        const held = steering[0]
+        const added = await $.session.append({ message: { type: 'user', content: [{ type: 'text', text: MID_TURN_OPENING + held.text + MID_TURN_CLOSING }] } })
+        if (!added || added.deny || typeof added.uuid !== 'string') break
+        steering.shift()
+        own.add(added.uuid)
+        await emit($, 'prompt.delivered', { commandId: held.id, promptUuid: held.promptUuid, turnId: activeTurn.turnId, uuid: added.uuid })
+      }
+    } catch {}
     return next(e)
   })
 
@@ -1323,6 +1363,7 @@ export function register(on) {
 
   on('session.end', async ($, e, next) => {
     ended = { reason: e.reason, sessionId: e.sessionId, at: Date.now() }
+    steering.length = 0
     await emit($, 'ended', { reason: e.reason, sessionId: e.sessionId })
     await heartbeat($)
     return next(e)

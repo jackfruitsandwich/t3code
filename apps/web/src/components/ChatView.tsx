@@ -11151,7 +11151,6 @@ export default function ChatView(props: ChatViewProps) {
                 {...(draftId ? { onWorktreeSetupWorkLocally } : {})}
                 {...(onOpenWorktreeSetupTerminal ? { onOpenWorktreeSetupTerminal } : {})}
                 isPreparingWorktree={!paintOnlyDisplayedTimeline && isPreparingWorktree}
-                steerWaitsForTurnEnd={settingsBelongToSession}
                 listRef={legendListRef}
                 timelineEntries={displayedTimeline.entries}
                 providerStatuses={
@@ -11394,7 +11393,6 @@ export default function ChatView(props: ChatViewProps) {
                                     threadId={activeThread.id}
                                     optimisticMessages={optimisticUserMessages}
                                     editingRunId={editingQueuedRun?.runId ?? null}
-                                    steerWaitsForTurnEnd={settingsBelongToSession}
                                     onEditQueuedRun={beginEditingQueuedRun}
                                     onCancelEdit={cancelEditingQueuedRun}
                                   />

@@ -311,7 +311,6 @@ interface TimelineRowSharedState {
   /** Projection runs, for recovering handoff models on legacy items. */
   runs: ReadonlyArray<HandoffTimelineRun>;
   /** The thread's session takes a message only between turns; see userMessageIntentMarker. */
-  steerWaitsForTurnEnd: boolean;
   activeThreadEnvironmentId: EnvironmentId;
   onRevertToTurnCount: (targetTurnCount: number, messageId: MessageId) => void;
   onUseArtifactTemplate: (template: CodexArtifactTemplate) => void;
@@ -475,7 +474,6 @@ interface MessagesTimelineProps {
   skills?: ReadonlyArray<Pick<ServerProviderSkill, "name" | "displayName">>;
   providerStatuses: ReadonlyArray<ServerProvider>;
   runs: ReadonlyArray<HandoffTimelineRun>;
-  steerWaitsForTurnEnd?: boolean;
   anchorMessageId: MessageId | null;
   onAnchorReady: (messageId: MessageId, anchorIndex: number) => void;
   onAnchorSizeChanged: (messageId: MessageId, size: number) => void;
@@ -551,7 +549,6 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   skills = EMPTY_TIMELINE_SKILLS,
   providerStatuses,
   runs: runsProp,
-  steerWaitsForTurnEnd = false,
   anchorMessageId,
   onAnchorReady,
   onAnchorSizeChanged,
@@ -1168,7 +1165,6 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       skills,
       providerStatuses,
       runs,
-      steerWaitsForTurnEnd,
       activeThreadEnvironmentId,
       onRevertToTurnCount,
       onRunShellCommand,
@@ -1204,7 +1200,6 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       skills,
       providerStatuses,
       runs,
-      steerWaitsForTurnEnd,
       activeThreadEnvironmentId,
       onRevertToTurnCount,
       onRunShellCommand,
@@ -2153,10 +2148,7 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
         </p>
       ) : null}
       {row.message.inputIntent && row.message.inputIntent !== "turn_start" ? (
-        <UserMessageIntentMarker
-          intent={row.message.inputIntent}
-          steerWaitsForTurnEnd={ctx.steerWaitsForTurnEnd}
-        />
+        <UserMessageIntentMarker intent={row.message.inputIntent} />
       ) : null}
       <div className="relative max-w-[80%] rounded-2xl bg-message p-3 text-message-foreground">
         <MessageAuthorHeading>You</MessageAuthorHeading>
@@ -2323,12 +2315,10 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
 
 function UserMessageIntentMarker({
   intent,
-  steerWaitsForTurnEnd,
 }: {
   readonly intent: Exclude<NonNullable<ChatMessage["inputIntent"]>, "turn_start">;
-  readonly steerWaitsForTurnEnd: boolean;
 }) {
-  const presentation = userMessageIntentMarker(intent, { steerWaitsForTurnEnd });
+  const presentation = userMessageIntentMarker(intent);
   const IntentIcon = presentation.isSteer ? Redo2Icon : null;
   return (
     <Tooltip>

@@ -1094,6 +1094,26 @@ describe("ClaudeBridgeQueryRunner slash commands", () => {
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
+  it.live("marks a message sent to steer the running turn, and no other", () =>
+    Effect.gen(function* () {
+      const bridge = yield* attach({ protocol: 2, bridgeCanUseTool: () => null });
+      yield* bridge.session.offer({
+        ...userMessage("also check the logs"),
+        uuid: "00000000-0000-4000-8000-000000000013",
+        priority: "now",
+      });
+      const steer = yield* Queue.take(bridge.commands);
+      assert.strictEqual(steer.type === "prompt" ? steer.midTurn : undefined, true);
+      yield* bridge.session.offer({
+        ...userMessage("and then the tests"),
+        uuid: "00000000-0000-4000-8000-000000000014",
+      });
+      const plain = yield* Queue.take(bridge.commands);
+      assert.strictEqual(plain.type, "prompt");
+      assert.isFalse("midTurn" in plain);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
   // Claude Code sent the session to the background: the conversation carries
   // on under another id, and the process this thread knows was left behind.
   const saidRow = (uuid: string, text: string) =>

@@ -1,6 +1,10 @@
 import { assert, describe, it } from "@effect/vitest";
 
 import {
+  CLAUDE_MID_TURN_CLOSING,
+  CLAUDE_MID_TURN_OPENING,
+} from "../claude-bridge/ClaudeBridgeProtocol.ts";
+import {
   claudeTaskNotice,
   claudeTaskNotification,
   parseClaudeSessionJsonl,
@@ -163,6 +167,38 @@ describe("parseClaudeSessionJsonl", () => {
     assert.equal(parsed.lineCount, 1);
     assert.equal(parsed.malformedLineCount, 0);
     assert.lengthOf(parsed.messages, 1);
+  });
+
+  it("reads a message sent from T3 to steer a running turn as the person's own", () => {
+    const steered = {
+      type: "user",
+      uuid: "steered-1",
+      sessionId: SESSION_ID,
+      timestamp: "2026-07-01T10:00:03.000Z",
+      isSidechain: false,
+      isMeta: true,
+      origin: { kind: "plugin", name: "t3bridge" },
+      message: {
+        role: "user",
+        content: [
+          {
+            type: "text",
+            text: `${CLAUDE_MID_TURN_OPENING}also check the logs${CLAUDE_MID_TURN_CLOSING}`,
+          },
+        ],
+      },
+    };
+    const parsed = parseClaudeSessionJsonl(
+      line(userEntry()) + line(steered) + line(assistantEntry()),
+    );
+    assert.deepEqual(
+      parsed.messages.map((message) => [message.role, message.text, message.midTurn === true]),
+      [
+        ["user", "Fix the login bug", false],
+        ["user", "also check the logs", true],
+        ["assistant", "I found the bug.", false],
+      ],
+    );
   });
 
   it("reads what the person typed into a running turn, and not the harness's own notices", () => {

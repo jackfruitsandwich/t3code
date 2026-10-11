@@ -1321,6 +1321,17 @@ export const layer: Layer.Layer<
               }
               return;
             }
+            case "prompt.delivered": {
+              // The model has it, inside the turn that was running: no turn
+              // of its own will start for it.
+              yield* Effect.logInfo("claude-bridge.prompt-delivered-mid-turn", {
+                sid,
+                commandId: event.commandId,
+                turnId: event.turnId,
+              });
+              if (state.pendingPrompt?.commandId === event.commandId) state.pendingPrompt = null;
+              return;
+            }
             case "prompt.dropped": {
               if (state.pendingPrompt?.commandId !== event.commandId) return;
               const promptUuid = state.pendingPrompt.promptUuid;
@@ -1561,6 +1572,9 @@ export const layer: Layer.Layer<
               text: text.startsWith("/") ? ` ${text}` : text,
               promptUuid,
               ...(savedForPrompt.length === 0 ? {} : { attachments: savedForPrompt }),
+              // Sent to steer the turn that is running: the mod hands it to
+              // the model at that turn's next tool boundary.
+              ...(message.priority === "now" ? { midTurn: true as const } : {}),
             };
             const pending = { commandId: "", promptUuid, label: null, body };
             state.pendingPrompt = pending;

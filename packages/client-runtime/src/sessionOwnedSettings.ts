@@ -16,9 +16,6 @@ export const SESSION_PERMISSION_MODE_NOTICE =
 export const SESSION_MODEL_OPTIONS_NOTICE =
   "Model options belong to the Claude Code session: /effort and /model work from here.";
 
-/** Said of a message sent while the session's turn is still running. */
-export const SENT_WHEN_TURN_ENDS_NOTICE = "Sent when this turn ends.";
-
 /**
  * Whether a thread's model and modes belong to its native session rather
  * than to the composer. A thread that has not started has no session yet, so

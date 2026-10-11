@@ -30,7 +30,7 @@ import type {
 import { isRecord, parseJsonlLine } from "../import/sessionImportTypes.ts";
 
 export const CLAUDE_BRIDGE_PROTOCOL_VERSION = 2;
-export const CLAUDE_BRIDGE_MOD_VERSION = "0.3.15";
+export const CLAUDE_BRIDGE_MOD_VERSION = "0.3.16";
 /**
  * The first protocol whose mod runs slash commands, answers questions with
  * their answers and reports the session's own commands. A process still on an
@@ -135,6 +135,13 @@ export type ClaudeBridgeCommandBody =
       readonly type: "prompt";
       readonly text: string;
       readonly promptUuid: string;
+      /**
+       * Sent to steer a turn that is running: the mod hands it to the model
+       * at that turn's next tool boundary, as Claude Code does with a message
+       * typed in the terminal meanwhile. A turn that ends first leaves it to
+       * run as the next turn, like any prompt.
+       */
+      readonly midTurn?: true;
       /**
        * Files T3 saved for this prompt (an image the person attached): the
        * prompt tells the model where they are, and the session may read
@@ -287,6 +294,8 @@ export type ClaudeBridgeEvent = { readonly seq: number; readonly at: number } & 
       readonly promptUuid?: string;
     }
   | { readonly type: "prompt.dropped"; readonly commandId: string; readonly reason: string }
+  /** A prompt sent to steer a running turn was handed to the model inside that turn. */
+  | { readonly type: "prompt.delivered"; readonly commandId: string; readonly turnId: string }
   | {
       readonly type: "approval.request";
       readonly toolUseId: string;
@@ -505,6 +514,14 @@ export function parseClaudeBridgeEvent(value: unknown): ClaudeBridgeEvent | null
         type: "prompt.dropped",
         commandId: value.commandId,
         reason: readOptionalString(value.reason) ?? "dropped",
+      };
+    case "prompt.delivered":
+      if (typeof value.commandId !== "string") return null;
+      return {
+        ...base,
+        type: "prompt.delivered",
+        commandId: value.commandId,
+        turnId: readOptionalString(value.turnId) ?? "",
       };
     case "approval.request":
       if (typeof value.toolUseId !== "string" || typeof value.tool !== "string") return null;
@@ -872,6 +889,30 @@ export function isClaudeBridgeModRow(row: unknown): boolean {
     row.origin.kind === "plugin" &&
     row.origin.name === CLAUDE_BRIDGE_PLUGIN_NAME
   );
+}
+
+/**
+ * The words Claude Code itself puts around a message the person typed while a
+ * turn was running, when it hands the message to the model inside that turn
+ * (as its 2.1.296 build writes them). A message sent from T3 to steer a
+ * running turn reaches the model in the same words, in a row the mod writes.
+ */
+export const CLAUDE_MID_TURN_OPENING = "The user sent a new message while you were working:\n";
+export const CLAUDE_MID_TURN_CLOSING =
+  "\n\nThis is how Claude Code surfaces messages the user sends mid-turn \u2014 within the running turn, often alongside the next tool result, rather than as a separate conversation turn. Address the message above as you continue this turn.";
+
+/**
+ * The person's own words in a row the mod wrote to hand them to the model
+ * inside a running turn; null for every other row.
+ */
+export function claudeBridgeMidTurnWords(row: unknown): string | null {
+  if (!isRecord(row) || row.type !== "user" || !isClaudeBridgeModRow(row)) return null;
+  const text = rowText(row);
+  if (text === null || !text.startsWith(CLAUDE_MID_TURN_OPENING)) return null;
+  const words = text.slice(CLAUDE_MID_TURN_OPENING.length);
+  return words.endsWith(CLAUDE_MID_TURN_CLOSING)
+    ? words.slice(0, -CLAUDE_MID_TURN_CLOSING.length)
+    : words;
 }
 
 /** What a slash command printed, when the row is Claude Code's record of that, else null. */

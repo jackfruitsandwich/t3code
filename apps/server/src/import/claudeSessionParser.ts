@@ -16,6 +16,7 @@
 import type { OrchestrationV2Notification } from "@t3tools/contracts";
 
 import {
+  claudeBridgeMidTurnWords,
   claudeNarrationAsText,
   claudeTranscriptCommandOutput,
   claudeTranscriptCommandText,
@@ -190,6 +191,27 @@ export function parseClaudeSessionJsonl(content: string): ParsedCliSession {
         attachment.origin.kind === "human"
           ? extractTextContent(attachment.prompt).trim()
           : "";
+      if (timestamp !== undefined && text.length > 0) {
+        startedAt ??= timestamp;
+        messages.push({
+          role: "user",
+          sourceId: readString(entry.uuid) ?? `line-${lineIndex}`,
+          text,
+          timestamp,
+          lineIndex,
+          midTurn: true,
+        });
+      }
+      continue;
+    }
+
+    // A message sent from T3 to steer a running turn has no row of its own
+    // either: the bridge mod hands it to the model inside that turn, in a
+    // row that holds the person's words within Claude Code's own for these.
+    const steered = entry.isSidechain === true ? null : claudeBridgeMidTurnWords(entry);
+    if (steered !== null) {
+      const timestamp = readString(entry.timestamp);
+      const text = steered.trim();
       if (timestamp !== undefined && text.length > 0) {
         startedAt ??= timestamp;
         messages.push({

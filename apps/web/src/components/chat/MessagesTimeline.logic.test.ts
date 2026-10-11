@@ -332,26 +332,14 @@ describe("work entry labels", () => {
 });
 
 describe("userMessageIntentMarker", () => {
-  it("marks a message sent mid-turn as a steer where the provider takes it mid-turn", () => {
-    expect(userMessageIntentMarker("steer", { steerWaitsForTurnEnd: false })).toMatchObject({
-      label: "Steer",
-      isSteer: true,
-    });
-  });
-
-  it("says when the message is delivered where the session takes it only between turns", () => {
+  it("marks a message sent mid-turn as a steer", () => {
     for (const intent of ["steer", "promoted_queued_to_steer"] as const) {
-      expect(userMessageIntentMarker(intent, { steerWaitsForTurnEnd: true })).toMatchObject({
-        label: "Sent when this turn ends",
-        isSteer: false,
-      });
+      expect(userMessageIntentMarker(intent)).toMatchObject({ label: "Steer", isSteer: true });
     }
   });
 
-  it("keeps a queued message marked as queued either way", () => {
-    expect(userMessageIntentMarker("queued_turn", { steerWaitsForTurnEnd: true }).label).toBe(
-      "Queued",
-    );
+  it("marks a queued message as queued", () => {
+    expect(userMessageIntentMarker("queued_turn").label).toBe("Queued");
   });
 });
 

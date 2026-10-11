@@ -4,6 +4,9 @@ import {
   claudeBridgeAlsoInTerminal,
   claudeBridgeAskingAgent,
   claudeBridgeAttachmentPaths,
+  claudeBridgeMidTurnWords,
+  CLAUDE_MID_TURN_CLOSING,
+  CLAUDE_MID_TURN_OPENING,
   claudeBridgeModAtLeast,
   claudeBridgeRequestTurnText,
   claudeBridgeWakeDetail,
@@ -626,6 +629,41 @@ describe("ClaudeBridgeProtocol parsers", () => {
     if (event?.type !== "turn.complete") return;
     assert.deepEqual(event.usage, { model: "claude-opus-5-5", outputTokens: 7 });
     assert.isNull(parseClaudeBridgeEvent({ seq: 1, at: 1, type: "nope" }));
+  });
+
+  it("reads that a prompt sent to steer a turn was handed over inside it", () => {
+    const event = parseClaudeBridgeEvent({
+      seq: 4,
+      at: 9,
+      type: "prompt.delivered",
+      commandId: "command-7",
+      turnId: "turn-3",
+      uuid: "row-1",
+    });
+    assert.deepEqual(event, {
+      seq: 4,
+      at: 9,
+      type: "prompt.delivered",
+      commandId: "command-7",
+      turnId: "turn-3",
+    });
+    assert.isNull(parseClaudeBridgeEvent({ seq: 4, at: 9, type: "prompt.delivered" }));
+  });
+
+  it("finds the person's words in the row the mod wrote to steer a running turn", () => {
+    const row = (text: string, origin: Record<string, unknown>) => ({
+      type: "user",
+      isMeta: true,
+      origin,
+      message: { role: "user", content: [{ type: "text", text }] },
+    });
+    const ours = { kind: "plugin", name: "t3bridge" };
+    const wrapped = `${CLAUDE_MID_TURN_OPENING}also check the logs${CLAUDE_MID_TURN_CLOSING}`;
+    assert.equal(claudeBridgeMidTurnWords(row(wrapped, ours)), "also check the logs");
+    // Another plugin's row in the same words, and the mod's rows in other words, are not it.
+    assert.isNull(claudeBridgeMidTurnWords(row(wrapped, { kind: "plugin", name: "other" })));
+    assert.isNull(claudeBridgeMidTurnWords(row("<bash-input>ls</bash-input>", ours)));
+    assert.isNull(claudeBridgeMidTurnWords({ type: "assistant", origin: ours }));
   });
 
   it("reads what the session raised for the person's attention, in its words", () => {

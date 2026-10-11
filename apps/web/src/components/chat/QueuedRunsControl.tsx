@@ -61,11 +61,6 @@ export function QueuedRunsControl({
   >;
   /** The saved queue entry stays visible while its draft is edited in the composer. */
   readonly editingRunId: RunId | null;
-  /**
-   * The thread's session takes a message only between turns, so a queued
-   * message cannot be made to reach the running turn and Steer is not offered.
-   */
-  readonly steerWaitsForTurnEnd?: boolean;
   readonly onEditQueuedRun: (request: EditQueuedRunRequest) => void;
   readonly onCancelEdit: () => void;
 }) {
@@ -193,10 +188,9 @@ export function QueuedRunsControl({
     void move(runId, queued[insertIndex]?.run.id ?? null);
   };
 
-  const canSteer = workflow?.canPromoteToSteer === true && props.steerWaitsForTurnEnd !== true;
   const steerInFlightRef = useRef(false);
   const steer = async (queuedRunId: RunId) => {
-    if (activeRun === null || !canSteer || steerInFlightRef.current) return;
+    if (activeRun === null || !workflow?.canPromoteToSteer || steerInFlightRef.current) return;
     steerInFlightRef.current = true;
     setBusyRunId(queuedRunId);
     try {
@@ -213,7 +207,7 @@ export function QueuedRunsControl({
   useImperativeHandle(ref, () => ({
     steerNext(repeat) {
       const next = queued[0];
-      if (!next || !canSteer) return false;
+      if (!next || !workflow?.canPromoteToSteer) return false;
       if (!repeat && busyRunId === null) void steer(next.run.id);
       return true;
     },
@@ -448,30 +442,32 @@ export function QueuedRunsControl({
                             {`Edit in the composer${item.serverIndex === queued.length - 1 && props.editShortcutLabel ? ` (${props.editShortcutLabel})` : ""}`}
                           </TooltipPopup>
                         </Tooltip>
-                        {props.steerWaitsForTurnEnd ? null : (
-                          <Tooltip>
-                            <TooltipTrigger render={<span className="flex shrink-0" />}>
-                              <Button
-                                size="xs"
-                                variant="ghost-muted"
-                                disabled={item.runId === null || busyRunId !== null || !canSteer}
-                                onClick={() => {
-                                  if (item.runId !== null) {
-                                    void steer(item.runId);
-                                  }
-                                }}
-                              >
-                                <CornerUpRightIcon />
-                                Steer
-                              </Button>
-                            </TooltipTrigger>
-                            <TooltipPopup>
-                              {activeRun === null
-                                ? "There is no active run to steer"
-                                : `Send as a steer instead${item.serverIndex === 0 && props.steerShortcutLabel ? ` (${props.steerShortcutLabel})` : ""}`}
-                            </TooltipPopup>
-                          </Tooltip>
-                        )}
+                        <Tooltip>
+                          <TooltipTrigger render={<span className="flex shrink-0" />}>
+                            <Button
+                              size="xs"
+                              variant="ghost-muted"
+                              disabled={
+                                item.runId === null ||
+                                busyRunId !== null ||
+                                !workflow?.canPromoteToSteer
+                              }
+                              onClick={() => {
+                                if (item.runId !== null) {
+                                  void steer(item.runId);
+                                }
+                              }}
+                            >
+                              <CornerUpRightIcon />
+                              Steer
+                            </Button>
+                          </TooltipTrigger>
+                          <TooltipPopup>
+                            {activeRun === null
+                              ? "There is no active run to steer"
+                              : `Send as a steer instead${item.serverIndex === 0 && props.steerShortcutLabel ? ` (${props.steerShortcutLabel})` : ""}`}
+                          </TooltipPopup>
+                        </Tooltip>
                         <Tooltip>
                           <TooltipTrigger
                             render={

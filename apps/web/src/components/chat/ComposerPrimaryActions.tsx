@@ -15,7 +15,6 @@ import {
   alternateComposerDispatchAction,
   resolveComposerDispatchMode,
 } from "@t3tools/client-runtime/state/composer-dispatch";
-import { SENT_WHEN_TURN_ENDS_NOTICE } from "@t3tools/client-runtime/session-owned-settings";
 
 interface PendingActionState {
   questionIndex: number;
@@ -34,7 +33,6 @@ interface ComposerPrimaryActionsProps {
   canInterrupt: boolean;
   followUpBehavior?: "queue" | "steer";
   /** The session takes a message only between turns, so one sent now is delivered when this turn ends. */
-  sendsWhenTurnEnds?: boolean;
   alternateShortcutLabel?: string | null;
   showPlanFollowUpPrompt: boolean;
   promptHasText: boolean;
@@ -87,7 +85,6 @@ export const ComposerPrimaryActions = memo(function ComposerPrimaryActions({
   isRunning,
   canInterrupt,
   followUpBehavior = "steer",
-  sendsWhenTurnEnds = false,
   alternateShortcutLabel = null,
   showPlanFollowUpPrompt,
   promptHasText,
@@ -263,9 +260,7 @@ export const ComposerPrimaryActions = memo(function ComposerPrimaryActions({
       : isQueuing
         ? "Queue message"
         : isRunning
-          ? sendsWhenTurnEnds
-            ? "Send when this turn ends"
-            : "Steer message"
+          ? "Steer message"
           : "Submit message";
   const submitStatus = isEnvironmentUnavailable
     ? "Environment disconnected"
@@ -282,9 +277,7 @@ export const ComposerPrimaryActions = memo(function ComposerPrimaryActions({
   const submitTooltip =
     submitStatus ??
     (isRunning && !isEditingQueuedMessage
-      ? sendsWhenTurnEnds
-        ? SENT_WHEN_TURN_ENDS_NOTICE
-        : `Click to ${followUpBehavior}, Ctrl/⌘-click${alternateShortcutLabel ? ` or ${alternateShortcutLabel}` : ""} to ${alternateAction}`
+      ? `Click to ${followUpBehavior}, Ctrl/⌘-click${alternateShortcutLabel ? ` or ${alternateShortcutLabel}` : ""} to ${alternateAction}`
       : submitLabel);
 
   const sendButton = (
