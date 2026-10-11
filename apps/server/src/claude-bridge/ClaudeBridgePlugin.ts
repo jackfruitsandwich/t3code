@@ -1110,7 +1110,8 @@ export function register(on) {
   // themselves, as the terminal dialog would return them; a bare approval
   // cannot answer a question.
   on('tool.call', { tool: 'AskUserQuestion' }, async ($, e, next) => {
-    if (!e.tool_use_id || e.agentId) return next(e)
+    // A session a host drives answers its own questions; T3 cannot see it.
+    if (passive || !e.tool_use_id || e.agentId) return next(e)
     const withTerminal = await terminalOpen($)
     // A terminal is open and T3 is nowhere near: the dialog is all there is.
     if (withTerminal && !(await t3Attached($)) && !t3Expected()) return next(e)
@@ -1207,7 +1208,11 @@ export function register(on) {
     // (classic.PermissionRequest), after the session's mode has had its say:
     // auto mode settles most asks itself, and this check runs before it
     // (measured, with and without a terminal). The call is remembered until
-    // then, whether or not T3 is in sight at this instant.
+    // then, whether or not T3 is in sight at this instant. Not in a session
+    // a host drives (claude -p, an SDK): it has no protocol files, so T3 can
+    // never see the request, and holding it only delays the host's own answer
+    // (measured: a claude -p run sat a minute before its refusal).
+    if (passive) return verdict
     asks.push({ toolUseId: e.tool_use_id, tool: e.tool, key: grantKey(e), at: Date.now() })
     if (asks.length > 16) asks.shift()
     return verdict
@@ -1221,6 +1226,7 @@ export function register(on) {
   // request is still open, it is told again.
   on('classic.PermissionRequest', async ($, e, next) => {
     noteClassic($, e)
+    if (passive) return next(e)
     const ask = takeAsk(e.tool_name, e.tool_input)
     if (!ask) return next(e)
     const toolUseId = ask.toolUseId
