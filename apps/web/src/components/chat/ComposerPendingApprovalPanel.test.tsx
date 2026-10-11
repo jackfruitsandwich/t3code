@@ -24,6 +24,27 @@ describe("ComposerPendingApprovalPanel", () => {
     expect(markup).not.toContain("Command approval requested");
   });
 
+  it("keeps a changed file's name in sight and its changed lines in their columns", () => {
+    const path = `/Users/someone/${"deep/".repeat(30)}notes.txt`;
+    const markup = renderToStaticMarkup(
+      <ComposerPendingApprovalPanel
+        approval={{
+          requestId: RuntimeRequestId.make("approval-change"),
+          requestKind: "file-change",
+          createdAt: "2026-07-18T00:00:00.000Z",
+          detail: `Edit: ${path}\n-pear\n+kiwi\n+lime`,
+          responseCapability: "live",
+        }}
+        pendingCount={1}
+      />,
+    );
+
+    expect(markup).toContain(
+      `<span class="block whitespace-pre-wrap wrap-anywhere">Edit: ${path}</span>`,
+    );
+    expect(markup).toContain(`<span class="block">-pear\n+kiwi\n+lime</span>`);
+  });
+
   it("falls back to the approval kind when the provider sends an empty detail", () => {
     const markup = renderToStaticMarkup(
       <ComposerPendingApprovalPanel

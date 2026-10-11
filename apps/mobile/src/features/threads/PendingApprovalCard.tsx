@@ -4,7 +4,7 @@ import type {
   ProviderApprovalOption,
   RuntimeRequestId,
 } from "@t3tools/contracts";
-import { View } from "react-native";
+import { Platform, ScrollView, View } from "react-native";
 
 import { AppText as Text } from "../../components/AppText";
 import type { PendingApproval } from "../../lib/threadActivity";
@@ -32,6 +32,13 @@ export function PendingApprovalCard(props: PendingApprovalCardProps) {
   // behind this card, so a translucent surface bleeds messages through it.
   const canRespond = props.approval.responseCapability === "live";
   const disabled = !canRespond || props.respondingApprovalId === props.approval.requestId;
+  // A request can carry what it would change under its first line (a file's
+  // new lines, an edit's removed and added ones). Those keep their columns:
+  // monospace, unwrapped, in a block that scrolls instead of growing the card.
+  const detail = props.approval.detail ?? "";
+  const firstBreak = detail.indexOf("\n");
+  const summary = firstBreak === -1 ? detail : detail.slice(0, firstBreak);
+  const change = firstBreak === -1 ? "" : detail.slice(firstBreak + 1);
   return (
     <View className="gap-2.5 rounded-[20px] border border-border bg-card-alt p-4">
       <Text className="font-t3-bold text-2xs uppercase tracking-[1.1px] text-foreground-secondary">
@@ -40,10 +47,28 @@ export function PendingApprovalCard(props: PendingApprovalCardProps) {
       <Text className="font-t3-bold text-lg text-foreground">
         {props.approval.appName ?? props.approval.requestKind}
       </Text>
-      {props.approval.detail ? (
+      {summary ? (
         <Text className="font-sans text-sm leading-normal text-foreground-secondary">
-          {props.approval.detail}
+          {summary}
         </Text>
+      ) : null}
+      {change ? (
+        <ScrollView
+          nestedScrollEnabled
+          className="max-h-40 rounded-lg border border-border bg-subtle"
+        >
+          <ScrollView
+            horizontal
+            bounces={false}
+            nestedScrollEnabled={Platform.OS === "android"}
+            showsHorizontalScrollIndicator={false}
+            contentContainerClassName="px-3 py-2"
+          >
+            <Text selectable className="font-mono text-2xs leading-normal text-foreground">
+              {change}
+            </Text>
+          </ScrollView>
+        </ScrollView>
       ) : null}
       {!canRespond ? (
         <Text className="font-sans text-sm leading-5 text-adaptive-neutral-600-400">

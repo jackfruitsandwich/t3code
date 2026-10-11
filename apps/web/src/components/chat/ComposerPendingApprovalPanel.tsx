@@ -8,6 +8,13 @@ interface ComposerPendingApprovalPanelProps {
   className?: string;
 }
 
+function splitFileChangeDetail(detail: string): { file: string; change: string } {
+  const firstBreak = detail.indexOf("\n");
+  return firstBreak === -1
+    ? { file: detail, change: "" }
+    : { file: detail.slice(0, firstBreak), change: detail.slice(firstBreak + 1) };
+}
+
 export const ComposerPendingApprovalPanel = memo(function ComposerPendingApprovalPanel({
   approval,
   pendingCount,
@@ -34,6 +41,12 @@ export const ComposerPendingApprovalPanel = memo(function ComposerPendingApprova
           : approval.requestKind === "permission"
             ? "Permission request"
             : "File change";
+  // A file change names its file on the first line and may carry the change under it. The file's
+  // name stays in sight (a long path wraps); the changed lines keep their columns and scroll.
+  const fileChange =
+    approval.requestKind === "file-change" && approval.detail
+      ? splitFileChangeDetail(approval.detail)
+      : null;
 
   return (
     <span
@@ -51,7 +64,7 @@ export const ComposerPendingApprovalPanel = memo(function ComposerPendingApprova
       <Detail
         aria-label={detailAriaLabel}
         className={cn(
-          "block max-h-20 w-full min-w-0 overflow-auto text-xs text-foreground [scrollbar-width:thin] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/70 [&::-webkit-scrollbar]:h-1.5",
+          "block max-h-40 w-full min-w-0 overflow-auto text-xs text-foreground [scrollbar-width:thin] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/70 [&::-webkit-scrollbar]:h-1.5",
           approval.requestKind === "mcp-elicitation"
             ? "whitespace-pre-wrap font-sans wrap-break-word"
             : "whitespace-pre font-mono",
@@ -59,9 +72,16 @@ export const ComposerPendingApprovalPanel = memo(function ComposerPendingApprova
         data-approval-detail="complete"
         tabIndex={0}
       >
-        {approval.responseCapability === "not_resumable"
-          ? "Provider process is gone — interrupt or restart the run to respond."
-          : approval.detail || fallbackLabel}
+        {approval.responseCapability === "not_resumable" ? (
+          "Provider process is gone — interrupt or restart the run to respond."
+        ) : fileChange ? (
+          <>
+            <span className="block whitespace-pre-wrap wrap-anywhere">{fileChange.file}</span>
+            {fileChange.change ? <span className="block">{fileChange.change}</span> : null}
+          </>
+        ) : (
+          approval.detail || fallbackLabel
+        )}
       </Detail>
     </span>
   );
