@@ -64,6 +64,7 @@ import {
   CLAUDE_BRIDGE_DIR_ENV,
   isClaudeBridgeSessionLive,
   parseClaudeBridgeSessionFile,
+  threadSettingsForClaudeSession,
 } from "../../claude-bridge/ClaudeBridgeProtocol.ts";
 import { ServerConfig } from "../../config.ts";
 import * as EventSink from "../../orchestration-v2/EventSink.ts";
@@ -80,7 +81,11 @@ import {
 import { ProjectService } from "../../project/ProjectService.ts";
 import { resolveCodexHomeLayout } from "../../provider/Drivers/CodexHomeLayout.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
-import { parseClaudeSessionJsonl } from "../claudeSessionParser.ts";
+import {
+  claudeTaskNotice,
+  isClaudeTaskNoticeText,
+  parseClaudeSessionJsonl,
+} from "../claudeSessionParser.ts";
 import { parseCodexRolloutJsonl } from "../codexRolloutParser.ts";
 import {
   isCommandNoiseText,
@@ -89,6 +94,7 @@ import {
   parseJsonlLine,
   type ParsedCliSession,
   type ParsedSessionMessage,
+  type ParsedSessionNotice,
   truncateSessionTitle,
 } from "../sessionImportTypes.ts";
 import { SessionImporter, type SessionImporterShape } from "../Services/SessionImporter.ts";
@@ -451,6 +457,14 @@ const toBinding = (row: ProviderSessionRuntime): ImportBinding => ({
 
 const dateTime = (iso: string) => DateTime.makeUnsafe(iso);
 
+/** The notice a background task's report shows as: what a live wake shows, in the report's words. */
+const taskNotification = (notice: ParsedSessionNotice) =>
+  ({
+    source: { kind: "background_task" },
+    outcome: notice.outcome,
+    summary: notice.summary,
+  }) as const;
+
 /** Message + timeline events for imported text, as upstream's AgentSessionImporter writes them. */
 function messageEvents(input: {
   readonly threadId: ThreadId;
@@ -478,6 +492,12 @@ function messageEvents(input: {
     completedAt: at,
     updatedAt: at,
   };
+  // A background task reporting back is the harness's row: it shows as the
+  // notice a live wake shows, with the report's own words, and nobody said it.
+  const notification =
+    message.role === "user" && message.notice !== undefined
+      ? taskNotification(message.notice)
+      : undefined;
   return [
     {
       id: importEventId(threadId, `message:${message.sourceId}`),
@@ -485,7 +505,7 @@ function messageEvents(input: {
       threadId,
       occurredAt: at,
       payload: {
-        createdBy: message.role === "user" ? "user" : "agent",
+        createdBy: message.role === "user" && notification === undefined ? "user" : "agent",
         creationSource: "server",
         id: messageId,
         threadId,
@@ -493,6 +513,7 @@ function messageEvents(input: {
         nodeId: null,
         role: message.role,
         text: message.text,
+        ...(notification === undefined ? {} : { notification }),
         attachments: [],
         streaming: false,
         createdAt: at,
@@ -505,24 +526,26 @@ function messageEvents(input: {
       threadId,
       occurredAt: at,
       payload:
-        message.role === "user"
-          ? {
-              ...base,
-              createdBy: "user",
-              creationSource: "server",
-              type: "user_message",
-              messageId,
-              inputIntent: "turn_start",
-              text: message.text,
-              attachments: [],
-            }
-          : {
-              ...base,
-              type: "assistant_message",
-              messageId,
-              text: message.text,
-              streaming: false,
-            },
+        notification !== undefined
+          ? { ...base, type: "notification", ...notification }
+          : message.role === "user"
+            ? {
+                ...base,
+                createdBy: "user",
+                creationSource: "server",
+                type: "user_message",
+                messageId,
+                inputIntent: "turn_start",
+                text: message.text,
+                attachments: [],
+              }
+            : {
+                ...base,
+                type: "assistant_message",
+                messageId,
+                text: message.text,
+                streaming: false,
+              },
     },
   ];
 }
@@ -620,6 +643,92 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
       threads
         .getThreadRecords(threadId, ["runs"])
         .pipe(Effect.map((records) => records.runs.length > 0));
+
+    /**
+     * The model and modes of a session a mod process holds, as its thread
+     * shows them: what an attachment writes onto the thread row when a turn
+     * runs. Null when no mod process holds the session. The record's own
+     * note of the permission mode outranks the mod's, as it does there.
+     */
+    const liveSessionThreadSettings = (sessionId: string, parsed: ParsedCliSession) =>
+      liveBridgeSession(sessionId).pipe(
+        Effect.map((live) =>
+          live === null
+            ? null
+            : threadSettingsForClaudeSession({
+                model: live.model,
+                permissionMode: parsed.permissionMode ?? live.permissionMode,
+              }),
+        ),
+      );
+
+    /**
+     * A thread T3 has never run, on a session a mod process holds: no
+     * attachment has said what the session runs on, and the thread would
+     * show T3's defaults. The row is given the session's own model and
+     * modes; once T3 runs the thread, its attachment keeps them.
+     */
+    const showLiveSessionSettings = Effect.fn("SessionImporter.showLiveSessionSettings")(
+      function* (input: {
+        readonly threadId: ThreadId;
+        readonly sessionId: string;
+        readonly parsed: ParsedCliSession;
+      }) {
+        const observed = yield* liveSessionThreadSettings(input.sessionId, input.parsed);
+        if (observed === null) return;
+        let thread = (yield* threads.getThreadRecords(input.threadId, [])).thread;
+        const at = yield* Clock.currentTimeMillis;
+        const events: Array<OrchestrationV2DomainEvent> = [];
+        const write = (
+          type:
+            | "thread.model-selection-updated"
+            | "thread.runtime-mode-updated"
+            | "thread.interaction-mode-updated",
+        ) =>
+          events.push({
+            // The thread follows what the session says now: not a fact
+            // about a row of the record, so not an id a replay would repeat.
+            id: importEventId(thread.id, `session-settings:${at}:${type}`),
+            type,
+            threadId: thread.id,
+            providerInstanceId: thread.providerInstanceId,
+            // Seeing a session is not activity in its thread.
+            occurredAt: thread.updatedAt,
+            payload: thread,
+          });
+        if (observed.model !== undefined && thread.modelSelection.model !== observed.model) {
+          thread = {
+            ...thread,
+            // The previous model's options belong to that model.
+            modelSelection: {
+              instanceId: thread.modelSelection.instanceId,
+              model: observed.model,
+              ...(observed.contextWindow === undefined
+                ? {}
+                : { options: [{ id: "contextWindow", value: observed.contextWindow }] }),
+            },
+          };
+          write("thread.model-selection-updated");
+        }
+        if (observed.runtimeMode !== undefined && thread.runtimeMode !== observed.runtimeMode) {
+          thread = { ...thread, runtimeMode: observed.runtimeMode };
+          write("thread.runtime-mode-updated");
+        }
+        if (
+          observed.interactionMode !== undefined &&
+          thread.interactionMode !== observed.interactionMode
+        ) {
+          thread = { ...thread, interactionMode: observed.interactionMode };
+          write("thread.interaction-mode-updated");
+        }
+        if (events.length === 0) return;
+        yield* eventSink.write({ events });
+        yield* Effect.logInfo("session.importer.session-settings-shown", {
+          sessionId: input.sessionId,
+          threadId: input.threadId,
+        });
+      },
+    );
 
     /** When each run T3 is driving on the thread right now was asked for. */
     const activeRunStartsMs = (threadId: ThreadId) =>
@@ -1116,6 +1225,78 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
     );
 
     /**
+     * A background task reporting back used to be filed as the person's own
+     * message, markup and all. Nobody typed it: each such row of a thread
+     * becomes the notice it is, worded from the row itself. Run where the
+     * session's record holds such reports; a thread with none left is one
+     * short search of its own rows.
+     */
+    const retireTaskNoticePrompts = Effect.fn("SessionImporter.retireTaskNoticePrompts")(
+      function* (input: {
+        readonly threadId: ThreadId;
+        readonly rows: ReadonlyArray<ParsedSessionMessage>;
+      }) {
+        const { threadId } = input;
+        // The text sits at the head of the row's stored form: told without
+        // reading every message of the thread in full.
+        const suspects = yield* sql<{ readonly turn_item_id: string }>`
+          SELECT turn_item_id
+          FROM orchestration_v2_projection_turn_items
+          WHERE thread_id = ${threadId}
+            AND type = 'user_message'
+            AND substr(payload_json, instr(payload_json, '"text":"') + 8, 19) = '<task-notification>'
+        `;
+        if (suspects.length === 0) return;
+        // The record says who wrote a row: words the person did type stay theirs.
+        const typed = new Set(
+          input.rows.flatMap((row) =>
+            row.role === "user" && row.notice === undefined && isClaudeTaskNoticeText(row.text)
+              ? [row.text.trim()]
+              : [],
+          ),
+        );
+        const ids = new Set(suspects.map((row) => row.turn_item_id));
+        const records = yield* threads.getThreadRecords(threadId, ["turnItems"]);
+        const events: Array<OrchestrationV2DomainEvent> = [];
+        for (const item of records.turnItems) {
+          if (item.type !== "user_message" || !ids.has(item.id)) continue;
+          if (item.createdBy !== "user" || !isClaudeTaskNoticeText(item.text)) continue;
+          if (typed.has(item.text.trim())) continue;
+          events.push({
+            id: importEventId(threadId, `task-notice-retired:${item.id}`),
+            type: "turn-item.updated",
+            threadId,
+            occurredAt: item.updatedAt,
+            payload: {
+              id: item.id,
+              threadId: item.threadId,
+              runId: item.runId,
+              nodeId: item.nodeId,
+              providerThreadId: item.providerThreadId,
+              providerTurnId: item.providerTurnId,
+              nativeItemRef: item.nativeItemRef,
+              parentItemId: item.parentItemId,
+              ordinal: item.ordinal,
+              status: item.status,
+              title: item.title,
+              startedAt: item.startedAt,
+              completedAt: item.completedAt,
+              updatedAt: item.updatedAt,
+              type: "notification",
+              ...taskNotification(claudeTaskNotice(item.text)),
+            },
+          });
+        }
+        if (events.length === 0) return;
+        yield* eventSink.write({ events });
+        yield* Effect.logInfo("session.importer.task-notices-retired", {
+          threadId,
+          count: events.length,
+        });
+      },
+    );
+
+    /**
      * A reply can reach a thread twice: once from what the terminal drew,
      * under that message's own id, and once as the record's row for it (the
      * record can be seconds behind, and a restarted T3 reads a running turn
@@ -1386,6 +1567,9 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         });
       }
       yield* retireInventedPrompts({ threadId, rows: parsed.messages });
+      if (parsed.messages.some((message) => message.notice !== undefined)) {
+        yield* retireTaskNoticePrompts({ threadId, rows: parsed.messages });
+      }
       yield* blankDoubledReplies({ threadId, rows: parsed.messages });
       // The cursor says how far the file has been taken in; with a turn or a
       // command in flight its rows have not been, and the pass after it
@@ -1570,6 +1754,10 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         return;
       }
       const instanceId = defaultInstanceIdForDriver(driver);
+      // A session a mod process holds says what it runs on: its thread shows
+      // that from the start, not T3's defaults.
+      const observed =
+        driver === CLAUDE_DRIVER ? yield* liveSessionThreadSettings(sessionId, parsed) : null;
       const createdAt = dateTime(parsed.startedAt ?? firstMessage.timestamp);
       const updatedAt = dateTime(lastMessage.timestamp);
       const providerThreadId = deriveProviderThread({ driver, nativeThreadId: sessionId });
@@ -1583,10 +1771,13 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         providerInstanceId: instanceId,
         modelSelection: {
           instanceId,
-          model: DEFAULT_MODEL_BY_PROVIDER[driver] ?? DEFAULT_MODEL,
+          model: observed?.model ?? DEFAULT_MODEL_BY_PROVIDER[driver] ?? DEFAULT_MODEL,
+          ...(observed?.contextWindow === undefined
+            ? {}
+            : { options: [{ id: "contextWindow", value: observed.contextWindow }] }),
         },
-        runtimeMode: "full-access",
-        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: observed?.runtimeMode ?? "full-access",
+        interactionMode: observed?.interactionMode ?? DEFAULT_PROVIDER_INTERACTION_MODE,
         branch: null,
         // Deliberately null: the imported session ran in the workspace root
         // itself, and provider cwd resolution falls back to it.
@@ -1820,6 +2011,9 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
           // instead of resurrecting it.
           return;
         }
+        if (driver === CLAUDE_DRIVER) {
+          yield* showLiveSessionSettings({ threadId, sessionId, parsed });
+        }
         if (parsed.lineCount <= cursor.lineCount) {
           return;
         }
@@ -1973,6 +2167,14 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
               threadId: binding.threadId,
             });
           }
+        }
+        // A background task's report an earlier build filed as the person's
+        // own message becomes the notice it is.
+        if (
+          driver === CLAUDE_DRIVER &&
+          parsed.messages.some((message) => message.notice !== undefined)
+        ) {
+          yield* retireTaskNoticePrompts({ threadId: binding.threadId, rows: parsed.messages });
         }
         // Backfill fork signatures onto bindings imported before signatures
         // existed (including adopted/native ones), so their threads can join
@@ -2317,6 +2519,34 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
       }
     });
 
+    /**
+     * Threads whose session's record is no longer on disk are never reached
+     * through it. Once after a start, when the first sweep has seen every
+     * record there is, the reports filed as the person's own in those
+     * threads are put right too, told by how they open.
+     */
+    let orphanTaskNoticesDue = true;
+    const retireOrphanTaskNotices = Effect.fn("SessionImporter.retireOrphanTaskNotices")(function* (
+      context: SweepContext,
+    ) {
+      if (!orphanTaskNoticesDue) return;
+      orphanTaskNoticesDue = false;
+      const done = new Set<string>();
+      for (const [key, binding] of context.bindingsBySource) {
+        if (binding.provider !== CLAUDE_DRIVER || context.seenSessionIds.has(key)) continue;
+        if (done.has(binding.threadId)) continue;
+        done.add(binding.threadId);
+        yield* retireTaskNoticePrompts({ threadId: binding.threadId, rows: [] }).pipe(
+          Effect.catch((error) =>
+            Effect.logDebug("session.importer.task-notice-thread-skipped", {
+              threadId: binding.threadId,
+              error,
+            }),
+          ),
+        );
+      }
+    });
+
     const buildSweepContext = Effect.gen(function* () {
       const settings = yield* serverSettings.getSettings;
       const claudeProjectsDir = options?.claudeProjectsDir ?? resolveClaudeProjectsDir(settings);
@@ -2419,6 +2649,11 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         ),
         Effect.catchDefect((defect) =>
           Effect.logWarning("session.importer.family-pass-defect", { defect }),
+        ),
+      );
+      yield* retireOrphanTaskNotices(context).pipe(
+        Effect.catchDefect((defect) =>
+          Effect.logWarning("session.importer.task-notice-pass-defect", { defect }),
         ),
       );
 

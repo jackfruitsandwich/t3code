@@ -2036,6 +2036,250 @@ runtimeTest("a stock message T3 once showed as the person's own becomes a notice
   }),
 );
 
+runtimeTest(
+  "a background task reporting back is a notice in imported history, and one filed as the person's own becomes one",
+  (h) =>
+    Effect.gen(function* () {
+      const claudeId = "aaaaaaaa-1111-4111-8111-1111111111f3";
+      const c = claudeSession({ sessionId: claudeId, cwd: h.workspace });
+      const claudePath = h.claudeFile(claudeId);
+      const threadId = importedThreadId(claudeId);
+      const report = (summary: string) =>
+        `<task-notification>\n<task-id>b1</task-id>\n<status>completed</status>\n<summary>${summary}</summary>\n</task-notification>`;
+      yield* h.write(claudePath, [
+        c.user("user-1", "Fix the login bug please", "2026-07-01T10:00:00.000Z"),
+        c.assistant("assistant-1", "Started the build.", "2026-07-01T10:00:05.000Z"),
+        {
+          ...c.user(
+            "task-1",
+            report('Background command "build" completed (exit code 0)'),
+            "2026-07-01T10:02:00.000Z",
+          ),
+          origin: { kind: "task-notification" },
+          promptSource: "system",
+        },
+        c.assistant("assistant-2", "The build passed.", "2026-07-01T10:02:05.000Z"),
+        // Words the person typed stay theirs, whatever they open with: the
+        // record says who wrote a row.
+        {
+          ...c.user(
+            "user-2",
+            "<task-notification> rows: what are they?",
+            "2026-07-01T10:02:30.000Z",
+          ),
+          origin: { kind: "human" },
+          promptSource: "typed",
+        },
+        c.assistant("assistant-3", "The harness writes them.", "2026-07-01T10:02:35.000Z"),
+      ]);
+      const shown = h.threads
+        .getThreadRecords(threadId, ["turnItems"])
+        .pipe(
+          Effect.map((records) =>
+            records.turnItems
+              .toSorted((left, right) => left.ordinal - right.ordinal)
+              .flatMap((item) =>
+                item.type === "user_message"
+                  ? [`said: ${item.text}`]
+                  : item.type === "assistant_message"
+                    ? [`reply: ${item.text}`]
+                    : item.type === "notification"
+                      ? [`notice (${item.outcome}): ${item.summary}`]
+                      : [],
+              ),
+          ),
+        );
+      yield* (yield* h.importer()).sweepNow();
+      const imported = [
+        "said: Fix the login bug please",
+        "reply: Started the build.",
+        'notice (completed): Background command "build" completed (exit code 0)',
+        "reply: The build passed.",
+        "said: <task-notification> rows: what are they?",
+        "reply: The harness writes them.",
+      ];
+      assert.deepEqual(yield* shown, imported);
+
+      // What an earlier build wrote for such a row: the person's message, raw.
+      const at = DateTime.makeUnsafe("2026-07-01T10:03:00.000Z");
+      const filed = seedTimelineRow({
+        threadId,
+        key: "old-report",
+        messageId: MessageId.make(`seed-old-report:${threadId}`),
+        role: "user",
+        text: report('Agent "Stage 2" finished'),
+        at,
+        runId: null,
+      });
+      yield* h.eventSink.write({
+        events: [
+          filed.payload.type === "user_message"
+            ? { ...filed, payload: { ...filed.payload, creationSource: "server" as const } }
+            : filed,
+        ],
+      });
+      assert.include(yield* shown, `said: ${report('Agent "Stage 2" finished')}`);
+
+      // The next start puts it right, once.
+      const restarted = yield* h.importer();
+      yield* restarted.sweepNow();
+      const repaired = yield* shown;
+      assert.include(repaired, 'notice (completed): Agent "Stage 2" finished');
+      assert.deepEqual(
+        repaired.filter((row) => row.startsWith("said: ")),
+        ["said: Fix the login bug please", "said: <task-notification> rows: what are they?"],
+      );
+      const settled = yield* h.sequence;
+      yield* restarted.sweepNow();
+      yield* (yield* h.importer()).sweepNow();
+      assert.strictEqual(yield* h.sequence, settled);
+      assert.deepEqual(yield* shown, repaired);
+    }),
+);
+
+runtimeTest(
+  "a task's report filed as the person's own becomes a notice also where the session's record is gone",
+  (h) =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const claudeId = "aaaaaaaa-1111-4111-8111-1111111111f6";
+      const c = claudeSession({ sessionId: claudeId, cwd: h.workspace });
+      const claudePath = h.claudeFile(claudeId);
+      const threadId = importedThreadId(claudeId);
+      yield* h.write(claudePath, [
+        c.user("user-1", "Fix the login bug please", "2026-07-01T10:00:00.000Z"),
+        c.assistant("assistant-1", "I fixed the login bug.", "2026-07-01T10:00:05.000Z"),
+      ]);
+      yield* (yield* h.importer()).sweepNow();
+      const filed = seedTimelineRow({
+        threadId,
+        key: "old-report",
+        messageId: MessageId.make(`seed-old-report:${threadId}`),
+        role: "user",
+        text: '<task-notification>\n<task-id>m1</task-id>\n<summary>Monitor event: "deploy log"</summary>\n<event>done</event>\n</task-notification>',
+        at: DateTime.makeUnsafe("2026-07-01T10:03:00.000Z"),
+        runId: null,
+      });
+      yield* h.eventSink.write({
+        events: [
+          filed.payload.type === "user_message"
+            ? { ...filed, payload: { ...filed.payload, creationSource: "server" as const } }
+            : filed,
+        ],
+      });
+      // Claude Code clears old records away; the thread stays.
+      yield* fs.remove(claudePath);
+      const rows = h.threads.getThreadRecords(threadId, ["turnItems"]).pipe(
+        Effect.map((records) =>
+          records.turnItems
+            .filter((item) => item.type === "user_message" || item.type === "notification")
+            .map((item) =>
+              item.type === "user_message" ? `said: ${item.text}` : `notice: ${item.summary}`,
+            )
+            .toSorted(),
+        ),
+      );
+      const restarted = yield* h.importer();
+      yield* restarted.sweepNow();
+      assert.deepEqual(yield* rows, [
+        'notice: Monitor event: "deploy log"',
+        "said: Fix the login bug please",
+      ]);
+      const settled = yield* h.sequence;
+      yield* restarted.sweepNow();
+      yield* (yield* h.importer()).sweepNow();
+      assert.strictEqual(yield* h.sequence, settled);
+    }),
+);
+
+runtimeTest(
+  "a session a mod process holds gives its thread its own model and modes, at import and when first seen",
+  (h) =>
+    Effect.gen(function* () {
+      const held = "aaaaaaaa-1111-4111-8111-1111111111f4";
+      const later = "aaaaaaaa-1111-4111-8111-1111111111f5";
+      const bridgeDir = yield* h.makeDir("bridge");
+      const importer = yield* h.importer({ bridgeDir });
+      const record = (sessionId: string, mode: string) => {
+        const c = claudeSession({ sessionId, cwd: h.workspace });
+        return [
+          { type: "permission-mode", permissionMode: mode, sessionId },
+          c.user(`${sessionId}-u1`, "Fix the login bug please", "2026-07-01T10:00:00.000Z"),
+          c.assistant(`${sessionId}-a1`, "I fixed the login bug.", "2026-07-01T10:00:05.000Z"),
+        ];
+      };
+      const holdSession = (sessionId: string, model: string, permissionMode: string | null) =>
+        Effect.gen(function* () {
+          const instanceDir = yield* h.makeDir("bridge", "claude", sessionId, "inst-1");
+          yield* h.write(joinPath(instanceDir, "session.json"), [
+            {
+              sid: sessionId,
+              instanceId: "inst-1",
+              heartbeatAt: yield* Clock.currentTimeMillis,
+              activeTurn: null,
+              model,
+              ...(permissionMode === null ? {} : { permissionMode }),
+            },
+          ]);
+        });
+      const settings = (sessionId: string) =>
+        h.threads.getThreadRecords(importedThreadId(sessionId), []).pipe(
+          Effect.map(({ thread }) => ({
+            model: thread.modelSelection.model,
+            options: thread.modelSelection.options ?? [],
+            runtimeMode: thread.runtimeMode,
+            interactionMode: thread.interactionMode,
+            updatedAt: DateTime.formatIso(thread.updatedAt),
+          })),
+        );
+
+      // A copy made with /fork: a mod process holds it, no turn has run, and
+      // nothing is attached. The record's note of the mode outranks the mod's.
+      yield* h.write(h.claudeFile(held), record(held, "acceptEdits"));
+      yield* holdSession(held, "claude-haiku-5-5[1m]", "default");
+      // A session nothing holds is imported as before.
+      yield* h.write(h.claudeFile(later), record(later, "default"));
+      yield* importer.sweepNow();
+      const heldSettings = yield* settings(held);
+      assert.deepEqual(
+        { ...heldSettings, updatedAt: null },
+        {
+          model: "claude-haiku-5-5",
+          options: [{ id: "contextWindow", value: "1m" }],
+          runtimeMode: "auto-accept-edits",
+          interactionMode: "default",
+          updatedAt: null,
+        },
+      );
+      const before = yield* settings(later);
+      assert.strictEqual(before.runtimeMode, "full-access");
+
+      // Its terminal is opened again and the mode changed there, before any
+      // turn runs: the thread T3 never ran shows what the session says.
+      yield* holdSession(later, "claude-sonnet-5-5", null);
+      yield* h.append(h.claudeFile(later), [
+        { type: "permission-mode", permissionMode: "plan", sessionId: later },
+      ]);
+      yield* importer.sweepNow();
+      const after = yield* settings(later);
+      assert.deepEqual(after, {
+        model: "claude-sonnet-5-5",
+        options: [],
+        runtimeMode: "full-access",
+        interactionMode: "plan",
+        // Seeing a session is not activity in its thread.
+        updatedAt: before.updatedAt,
+      });
+      // Seen again with nothing changed, both stay as they are.
+      yield* h.append(h.claudeFile(later), [
+        { type: "permission-mode", permissionMode: "plan", sessionId: later },
+      ]);
+      yield* importer.sweepNow();
+      assert.deepEqual(yield* settings(later), after);
+      assert.deepEqual(yield* settings(held), heldSettings);
+    }),
+);
+
 runtimeTest("a reply shown from the terminal and again from the record is left showing once", (h) =>
   Effect.gen(function* () {
     const claudeId = "aaaaaaaa-1111-4111-8111-1111111111f2";

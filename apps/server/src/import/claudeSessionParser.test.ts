@@ -1,6 +1,6 @@
 import { assert, describe, it } from "@effect/vitest";
 
-import { parseClaudeSessionJsonl } from "./claudeSessionParser.ts";
+import { claudeTaskNotice, parseClaudeSessionJsonl } from "./claudeSessionParser.ts";
 import { isEligibleCliSession } from "./sessionImportTypes.ts";
 
 const SESSION_ID = "11111111-1111-4111-8111-111111111111";
@@ -357,5 +357,140 @@ describe("parseClaudeSessionJsonl", () => {
   it("is ineligible without at least one user and one assistant message", () => {
     assert.isFalse(isEligibleCliSession(parseClaudeSessionJsonl(line(userEntry()))));
     assert.isFalse(isEligibleCliSession(parseClaudeSessionJsonl(line(assistantEntry()))));
+  });
+
+  const taskReport =
+    "<task-notification>\n<task-id>b1</task-id>\n<tool-use-id>toolu_1</tool-use-id>\n" +
+    "<output-file>/tmp/tasks/b1.output</output-file>\n<status>completed</status>\n" +
+    '<summary>Background command "Wait for the build &amp; tests" completed (exit code 0)</summary>\n' +
+    "</task-notification>";
+
+  it("reads a background task reporting back as the harness's notice, in the report's words", () => {
+    const parsed = parseClaudeSessionJsonl(
+      line(userEntry()) +
+        line(assistantEntry()) +
+        line(
+          userEntry({
+            uuid: "task-1",
+            timestamp: "2026-07-01T10:05:00.000Z",
+            origin: { kind: "task-notification" },
+            promptSource: "system",
+            message: { role: "user", content: taskReport },
+          }),
+        ) +
+        // A record from before prompts were stamped with who wrote them.
+        line(
+          userEntry({
+            uuid: "task-2",
+            timestamp: "2026-07-01T10:06:00.000Z",
+            message: {
+              role: "user",
+              content:
+                '<task-notification>\n<task-id>m1</task-id>\n<summary>Monitor event: "deploy log"</summary>\n<event>ERROR &gt; disk</event>\n</task-notification>',
+            },
+          }),
+        ),
+    );
+    assert.deepEqual(
+      parsed.messages.map((message) => [message.role, message.notice ?? null]),
+      [
+        ["user", null],
+        ["assistant", null],
+        [
+          "user",
+          {
+            summary: 'Background command "Wait for the build & tests" completed (exit code 0)',
+            outcome: "completed",
+          },
+        ],
+        ["user", { summary: 'Monitor event: "deploy log"', outcome: "updated" }],
+      ],
+    );
+    // The row's own text stays: a thread's live copy of it is told by it.
+    assert.strictEqual(parsed.messages[2]!.text, taskReport);
+  });
+
+  it("leaves a line the person typed as theirs, whatever it opens with", () => {
+    const parsed = parseClaudeSessionJsonl(
+      line(
+        userEntry({
+          origin: { kind: "human" },
+          promptSource: "typed",
+          message: { role: "user", content: "<task-notification> is what the harness writes?" },
+        }),
+      ),
+    );
+    assert.isUndefined(parsed.messages[0]!.notice);
+  });
+
+  it("words a report by how the task ended, and one with no summary by its first sentence", () => {
+    assert.deepEqual(
+      claudeTaskNotice(
+        '<task-notification>\n<status>failed</status>\n<summary>Agent "Stage 2" failed: API error</summary>\n</task-notification>',
+      ),
+      { summary: 'Agent "Stage 2" failed: API error', outcome: "failed" },
+    );
+    assert.strictEqual(
+      claudeTaskNotice(
+        "<task-notification>\n<status>killed</status>\n<summary>Background command was stopped</summary>\n</task-notification>",
+      ).outcome,
+      "cancelled",
+    );
+    assert.deepEqual(
+      claudeTaskNotice(
+        "<task-notification>\n<fork-source>\nThis session began as a fork (copy) of another session that is still running: a session whose self-reported name is 'trusted-9f'. The conversation up to 2026-10-11T02:50:44.043Z is shared history with it.\n</fork-source>\n</task-notification>",
+      ),
+      {
+        summary:
+          "This session began as a fork (copy) of another session that is still running: a session whose self-reported name is 'trusted-9f'.",
+        outcome: "updated",
+      },
+    );
+    assert.strictEqual(
+      claudeTaskNotice("<task-notification></task-notification>").summary,
+      "Background activity updated",
+    );
+  });
+
+  it("never titles a session by a task's report, and reads the permission mode the record names", () => {
+    const parsed = parseClaudeSessionJsonl(
+      line({ type: "permission-mode", permissionMode: "default", sessionId: SESSION_ID }) +
+        line(
+          userEntry({
+            uuid: "task-1",
+            origin: { kind: "task-notification" },
+            message: { role: "user", content: taskReport },
+          }),
+        ) +
+        line({ type: "permission-mode", permissionMode: "acceptEdits", sessionId: SESSION_ID }) +
+        line(
+          userEntry({
+            uuid: "user-2",
+            timestamp: "2026-07-01T10:01:00.000Z",
+            message: { role: "user", content: "Fix the login bug" },
+          }),
+        ),
+    );
+    assert.strictEqual(parsed.title, "Fix the login bug");
+    assert.strictEqual(parsed.permissionMode, "acceptEdits");
+  });
+
+  it("shows a project command that starts a turn as the line the person typed", () => {
+    const parsed = parseClaudeSessionJsonl(
+      line(
+        userEntry({
+          origin: { kind: "human" },
+          message: {
+            role: "user",
+            content:
+              "<command-message>d7-echo</command-message>\n<command-name>/d7-echo</command-name>\n<command-args>kiwi 91dbf</command-args>",
+          },
+        }),
+      ),
+    );
+    assert.deepEqual(
+      parsed.messages.map((message) => [message.text, message.command === true]),
+      [["/d7-echo kiwi 91dbf", true]],
+    );
   });
 });

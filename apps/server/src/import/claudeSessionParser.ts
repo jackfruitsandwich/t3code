@@ -16,6 +16,7 @@
 import {
   claudeTranscriptCommandOutput,
   claudeTranscriptCommandText,
+  claudeTranscriptPermissionMode,
   isClaudeBridgeModRow,
   stripTerminalStyling,
 } from "../claude-bridge/ClaudeBridgeProtocol.ts";
@@ -28,10 +29,64 @@ import {
   truncateSessionTitle,
   type ParsedCliSession,
   type ParsedSessionMessage,
+  type ParsedSessionNotice,
 } from "./sessionImportTypes.ts";
 
 const FORK_SIGNATURE_LENGTH = 5;
 const LOCAL_COMMAND_STDOUT = /^\s*<local-command-stdout>([\s\S]*)<\/local-command-stdout>\s*$/u;
+
+const TASK_NOTICE_HEAD = "<task-notification>";
+const NOTICE_SUMMARY = /<summary>([\s\S]*?)<\/summary>/u;
+const NOTICE_STATUS = /<status>\s*([A-Za-z_-]+)\s*<\/status>/u;
+const NOTICE_FIRST_SENTENCE = /^(.+?[.!?])\s+(?=[A-Z])/u;
+const NOTICE_SUMMARY_MAX = 200;
+/** What a wake shows when nothing is known of what woke the session. */
+const NOTICE_WITHOUT_WORDS = "Background activity updated";
+const NOTICE_ENTITIES: Readonly<Record<string, string>> = {
+  "&lt;": "<",
+  "&gt;": ">",
+  "&quot;": '"',
+  "&#39;": "'",
+  "&apos;": "'",
+  "&amp;": "&",
+};
+
+/**
+ * Whether a prompt's text is a background task reporting back, as the
+ * harness writes one: rows from before Claude Code stamped who wrote a
+ * prompt are told by how they open.
+ */
+export const isClaudeTaskNoticeText = (text: string): boolean =>
+  text.trimStart().startsWith(TASK_NOTICE_HEAD);
+
+/**
+ * The notice a background task's report is, in the report's own words: the
+ * line the terminal draws for it (its summary), and how the task ended where
+ * the report says. A report with no summary (a copy's note of where it came
+ * from) is its first sentence.
+ */
+export function claudeTaskNotice(text: string): ParsedSessionNotice {
+  const status = NOTICE_STATUS.exec(text)?.[1];
+  const outcome =
+    status === "completed"
+      ? "completed"
+      : status === "failed"
+        ? "failed"
+        : status === "stopped" || status === "killed"
+          ? "cancelled"
+          : "updated";
+  const plain = (words: string) =>
+    words
+      .replace(/&(?:lt|gt|quot|apos|amp|#39);/gu, (entity) => NOTICE_ENTITIES[entity] ?? entity)
+      .replace(/\s+/gu, " ")
+      .trim();
+  const summary = NOTICE_SUMMARY.exec(text)?.[1];
+  const body = plain(summary ?? text.replace(/<[^>]*>/gu, " "));
+  const said = summary === undefined ? (NOTICE_FIRST_SENTENCE.exec(body)?.[1] ?? body) : body;
+  const clipped =
+    said.length > NOTICE_SUMMARY_MAX ? `${said.slice(0, NOTICE_SUMMARY_MAX - 1).trimEnd()}…` : said;
+  return { summary: clipped.length > 0 ? clipped : NOTICE_WITHOUT_WORDS, outcome };
+}
 
 /**
  * Extract the concatenated text-block content from a Claude message
@@ -67,6 +122,7 @@ export function parseClaudeSessionJsonl(content: string): ParsedCliSession {
   let bridgeUpkeepOutputDue = false;
   let startedAt: string | undefined;
   let entrypoint: string | undefined;
+  let permissionMode: string | undefined;
   let malformedLineCount = 0;
 
   for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
@@ -83,6 +139,12 @@ export function parseClaudeSessionJsonl(content: string): ParsedCliSession {
       continue;
     }
 
+    // The record notes each change of permission mode in a row of its own.
+    const recordedMode = claudeTranscriptPermissionMode(entry);
+    if (recordedMode !== null) {
+      permissionMode = recordedMode;
+      continue;
+    }
     if (entry.type === "ai-title") {
       const title = readString(entry.aiTitle);
       if (title !== undefined && customTitle === undefined) {
@@ -216,6 +278,16 @@ export function parseClaudeSessionJsonl(content: string): ParsedCliSession {
       commandSourceIds.add(previous.sourceId);
       continue;
     }
+    // A background task reporting back is the harness's row, which the
+    // terminal draws as a notice. The row's own stamp says who wrote it;
+    // rows from before the stamp are told by how they open.
+    const writtenBy = isRecord(entry.origin) ? entry.origin.kind : undefined;
+    const taskNotice =
+      entry.type === "user" &&
+      commandOutput === undefined &&
+      commandText === null &&
+      (writtenBy === "task-notification" ||
+        (writtenBy === undefined && isClaudeTaskNoticeText(rawText)));
     messages.push({
       role:
         commandOutput !== undefined
@@ -230,6 +302,7 @@ export function parseClaudeSessionJsonl(content: string): ParsedCliSession {
       timestamp,
       lineIndex,
       ...(commandOutput !== undefined || commandText !== null ? { command: true as const } : {}),
+      ...(taskNotice ? { notice: claudeTaskNotice(rawText) } : {}),
     });
   }
 
@@ -237,6 +310,7 @@ export function parseClaudeSessionJsonl(content: string): ParsedCliSession {
     messages.find(
       (message) =>
         message.role === "user" &&
+        message.notice === undefined &&
         !commandSourceIds.has(message.sourceId) &&
         !isCommandNoiseText(message.text),
     )?.text ?? messages.find((message) => message.role === "user")?.text;
@@ -260,5 +334,6 @@ export function parseClaudeSessionJsonl(content: string): ParsedCliSession {
     malformedLineCount,
     launch: entrypoint === undefined || entrypoint === "cli" ? "human" : "machine",
     forkSignature,
+    ...(permissionMode === undefined ? {} : { permissionMode }),
   };
 }

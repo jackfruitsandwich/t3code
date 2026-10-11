@@ -11,11 +11,13 @@ import {
   claudeTranscriptCommandOutput,
   claudeTranscriptCommandText,
   claudeTranscriptOffsetAt,
+  claudeTurnPromptLabel,
   isClaudeTypedMidTurnRow,
   makeClaudeBridgeFrameTranslator,
   parseClaudeBridgeEvent,
   parseClaudeBridgeSessionFile,
   readTranscriptRows,
+  threadSettingsForClaudeSession,
 } from "./ClaudeBridgeProtocol.ts";
 
 const SID = "11111111-1111-4111-8111-111111111111";
@@ -180,6 +182,30 @@ describe("ClaudeBridgeProtocol frame translator", () => {
     assert.isNull(claudeBridgeWakeRequest(typed[0]!));
   });
 
+  it("shows a slash command typed in the terminal that starts a turn as the line, not its markup", () => {
+    const row =
+      "<command-message>d7-echo</command-message>\n<command-name>/d7-echo</command-name>\n<command-args>kiwi 91dbf</command-args>";
+    assert.strictEqual(claudeTurnPromptLabel(row), "/d7-echo kiwi 91dbf");
+    assert.strictEqual(
+      claudeTurnPromptLabel(
+        "<command-name>/review</command-name>\n<command-message>review</command-message>\n<command-args></command-args>",
+      ),
+      "/review",
+    );
+    // A prompt that only mentions such markup is the person's own words.
+    const pasted = "why does the record say <command-name>/model</command-name> here?";
+    assert.strictEqual(claudeTurnPromptLabel(pasted), pasted);
+    const started = translator().onTurnStart({
+      seq: 1,
+      at: 1,
+      type: "turn.start",
+      turnId: "turn-4",
+      text: row,
+      transcriptOffset: 0,
+    });
+    assert.equal(claudeBridgeWakeDetail(started[0]!), "/d7-echo kiwi 91dbf");
+  });
+
   it("ignores typed user rows, meta rows and sidechain rows", () => {
     const frames = translator();
     assert.lengthOf(
@@ -268,6 +294,27 @@ describe("ClaudeBridgeProtocol T3 tools called through the mod", () => {
         : [],
     );
     assert.deepStrictEqual(names, ["mcp__t3-code__html_render", "Bash"]);
+  });
+});
+
+describe("ClaudeBridgeProtocol thread settings", () => {
+  it("shows a session's model and permission mode the way its thread names them", () => {
+    assert.deepEqual(
+      threadSettingsForClaudeSession({ model: "claude-haiku-5-5", permissionMode: "default" }),
+      { model: "claude-haiku-5-5", runtimeMode: "approval-required", interactionMode: "default" },
+    );
+    assert.deepEqual(
+      threadSettingsForClaudeSession({ model: "claude-opus-5-5[1m]", permissionMode: "plan" }),
+      { model: "claude-opus-5-5", contextWindow: "1m", interactionMode: "plan" },
+    );
+  });
+
+  it("leaves out what the session does not say", () => {
+    assert.deepEqual(threadSettingsForClaudeSession({ model: null, permissionMode: null }), {});
+    assert.deepEqual(
+      threadSettingsForClaudeSession({ model: null, permissionMode: "someFutureMode" }),
+      {},
+    );
   });
 });
 

@@ -639,13 +639,23 @@ export function claudeBridgeModAtLeast(
   }
   return true;
 }
+const COMMAND_ROW_HEAD = /^\s*<command-(?:name|message)>/u;
 /**
  * How a turn is named when all that is known of its start is its prompt. A
  * turn that follows a `!` command starts with what the command printed; the
  * mod names it by the command, and one that could not is named plainly.
  */
-export const claudeTurnPromptLabel = (text: string): string =>
-  BASH_OUTPUT.test(text) ? "! (shell command)" : text;
+export const claudeTurnPromptLabel = (text: string): string => {
+  if (BASH_OUTPUT.test(text)) return "! (shell command)";
+  // A slash command that starts a turn (a project command, a skill) is
+  // recorded as the markup Claude Code wraps it in; what the person typed,
+  // and what the terminal shows, is the line.
+  if (!COMMAND_ROW_HEAD.test(text)) return text;
+  const name = COMMAND_NAME.exec(text)?.[1];
+  if (name === undefined) return text;
+  const args = COMMAND_ARGS.exec(text)?.[1]?.trim() ?? "";
+  return args.length === 0 ? name : `${name} ${args}`;
+};
 /** `! command` of a row `!` wrote, else null. */
 const bashCommandText = (text: string): string | null => {
   const command = BASH_INPUT.exec(text)?.[1]?.trim();
@@ -774,6 +784,35 @@ export function threadModesForClaudePermissionMode(mode: string): {
     default:
       return null;
   }
+}
+
+/**
+ * A session's model and permission mode as a T3 thread shows them. The
+ * thread follows the session, never the reverse; what the session does not
+ * say is left out.
+ */
+export function threadSettingsForClaudeSession(session: {
+  readonly model: string | null;
+  readonly permissionMode: string | null;
+}): {
+  readonly model?: string;
+  readonly contextWindow?: "1m";
+  readonly runtimeMode?: "approval-required" | "auto-accept-edits" | "auto" | "full-access";
+  readonly interactionMode?: "default" | "plan";
+} {
+  const model = session.model === null ? "" : session.model.replace(/\[[^\]]*\]\s*$/u, "").trim();
+  const modes =
+    session.permissionMode === null
+      ? null
+      : threadModesForClaudePermissionMode(session.permissionMode);
+  return {
+    ...(model.length === 0 ? {} : { model }),
+    ...(session.model !== null && /\[1m\]\s*$/u.test(session.model)
+      ? { contextWindow: "1m" as const }
+      : {}),
+    ...(modes?.runtimeMode === undefined ? {} : { runtimeMode: modes.runtimeMode }),
+    ...(modes === null ? {} : { interactionMode: modes.interactionMode }),
+  };
 }
 
 /**
@@ -984,13 +1023,15 @@ export function makeClaudeBridgeFrameTranslator(
       };
       const frames: Array<SDKMessage> = [];
       if (event.promptUuid === undefined) {
+        // Typed in the terminal: shown as the terminal shows the line.
+        const typed = claudeTurnPromptLabel(event.text);
         const wakeUser = {
           type: "user",
-          message: { role: "user", content: event.text },
+          message: { role: "user", content: typed },
           parent_tool_use_id: null,
           uuid: asUuid(`bridge-user-${event.turnId}`),
           session_id: sessionId,
-          [CLAUDE_BRIDGE_WAKE_DETAIL_KEY]: event.text,
+          [CLAUDE_BRIDGE_WAKE_DETAIL_KEY]: typed,
           ...(turnOptions?.request === undefined
             ? {}
             : { [CLAUDE_BRIDGE_WAKE_REQUEST_KEY]: turnOptions.request }),

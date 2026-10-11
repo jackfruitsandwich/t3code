@@ -26,6 +26,17 @@ export interface ParsedSessionMessage {
   readonly command?: true;
   /** Typed while a turn was running and delivered inside it: it started no turn of its own. */
   readonly midTurn?: true;
+  /**
+   * Set on a row the harness wrote for itself and the terminal draws as a
+   * notice, not as the person's line (a background task reporting back):
+   * what the notice says, in the row's own words. `text` stays the row's.
+   */
+  readonly notice?: ParsedSessionNotice;
+}
+
+export interface ParsedSessionNotice {
+  readonly summary: string;
+  readonly outcome: "completed" | "failed" | "cancelled" | "updated";
 }
 
 export interface ParsedCliSession {
@@ -70,6 +81,8 @@ export interface ParsedCliSession {
    * human session out of the Automations project.
    */
   readonly forkSignature?: ReadonlyArray<string>;
+  /** The permission mode the session's record last names (Claude). */
+  readonly permissionMode?: string;
 }
 
 const MAX_TITLE_LENGTH = 60;

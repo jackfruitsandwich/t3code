@@ -151,7 +151,7 @@ export function planTranscriptHealing(input: {
     if (row.role === "user") {
       if (row.command === true) commandShown = shown[index] === true;
       if (shown[index]) return;
-      if (isClaudeHarnessPrompt(row.text)) return;
+      if (row.notice !== undefined || isClaudeHarnessPrompt(row.text)) return;
       // A prompt T3 shows in other words: the turn it started ran in T3, and
       // that run has its prompt. Only a run known to have none (one that
       // picked the turn up after it began) leaves the prompt to be added.
