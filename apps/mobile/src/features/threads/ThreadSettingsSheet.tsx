@@ -249,6 +249,11 @@ type ThreadSettingsSessionProps = {
   readonly reportedModelSelection?: ModelSelection | null;
   readonly onSelectModel: (option: ModelOption) => void;
   readonly optionDescriptors: ReadonlyArray<ProviderOptionDescriptor>;
+  /**
+   * The thread's session keeps its own model options (effort, context window):
+   * no rows for them while the model shown is one of the session's provider.
+   */
+  readonly optionsBelongToSession?: boolean;
   readonly onUpdateOptionSelections: (selections: ReadonlyArray<ProviderOptionSelection>) => void;
   readonly runtimeMode: RuntimeMode;
   readonly onUpdateRuntimeMode: (mode: RuntimeMode) => void;
@@ -385,14 +390,20 @@ function ThreadSettingsSessionProvider(
   const displayedDescriptors = useMemo(
     () =>
       pendingModel
-        ? pendingModel.capabilities
+        ? pendingModel.capabilities &&
+          !(
+            props.optionsBelongToSession === true &&
+            pendingModel.selection.instanceId === props.providerInstanceId
+          )
           ? getProviderOptionDescriptors({
               caps: pendingModel.capabilities,
               selections: pendingModel.selection.options,
             })
           : []
-        : props.optionDescriptors,
-    [pendingModel, props.optionDescriptors],
+        : props.optionsBelongToSession === true
+          ? []
+          : props.optionDescriptors,
+    [pendingModel, props.optionDescriptors, props.optionsBelongToSession, props.providerInstanceId],
   );
   const displayedModel = useMemo(
     () =>

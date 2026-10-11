@@ -63,14 +63,22 @@ export function buildComposerSlashCommandItems(input: {
   /** Whether T3 itself offers /usage-limits for the selected provider. */
   readonly offersUsageLimits?: boolean;
   readonly allowInteractionMode: boolean;
+  /** The thread's model and modes are its session's: the session's own commands are listed, not ours. */
+  readonly settingsBelongToSession?: boolean;
   readonly selectedProviderStatus: Pick<
     ServerProvider,
     "driver" | "slashCommands" | "showInteractionModeToggle"
   > | null;
 }): ComposerCommandItem[] {
   const query = input.query.toLowerCase();
+  const settingsBelongToSession = input.settingsBelongToSession === true;
   const allowInteractionMode =
-    input.allowInteractionMode && input.selectedProviderStatus?.showInteractionModeToggle !== false;
+    !settingsBelongToSession &&
+    input.allowInteractionMode &&
+    input.selectedProviderStatus?.showInteractionModeToggle !== false;
+  const sessionListsModelCommand =
+    settingsBelongToSession &&
+    (input.selectedProviderStatus?.slashCommands ?? []).some((command) => command.name === "model");
   const builtIn = [
     {
       id: "cmd:model",
@@ -95,7 +103,9 @@ export function buildComposerSlashCommandItems(input: {
     },
   ] satisfies ComposerCommandItem[];
   const items: ComposerCommandItem[] = builtIn.filter(
-    (item) => item.command.includes(query) && (item.command === "model" || allowInteractionMode),
+    (item) =>
+      item.command.includes(query) &&
+      (item.command === "model" ? !sessionListsModelCommand : allowInteractionMode),
   );
 
   // Providers expand commands only at the start of a message. T3 commands
@@ -183,6 +193,8 @@ export function useComposerCommandMenu({
   onChangeDraftMessage,
   onUpdateInteractionMode,
   onUsageLimits,
+  settingsBelongToSession = false,
+  onSessionModel,
 }: {
   readonly draftMessage: string;
   readonly ownerKey: string | null;
@@ -204,6 +216,10 @@ export function useComposerCommandMenu({
   readonly onUpdateInteractionMode?: (mode: ProviderInteractionMode) => void;
   /** Picking /usage-limits is the action itself; the draft keeps nothing of it. */
   readonly onUsageLimits?: () => void;
+  /** The thread's model and modes are its session's (see `threadSettingsBelongToSession`). */
+  readonly settingsBelongToSession?: boolean;
+  /** The session's bare /model opens its model picker; here that is the thread's settings. */
+  readonly onSessionModel?: () => void;
 }) {
   const [selection, setSelection] = useState(() => composerSelectionAtEnd(draftMessage));
   const previousOwnerKeyRef = useRef(ownerKey);
@@ -381,6 +397,7 @@ export function useComposerCommandMenu({
         hasCompactableConversation,
         offersUsageLimits,
         allowInteractionMode: onUpdateInteractionMode !== undefined,
+        settingsBelongToSession,
         selectedProviderStatus: selectedProviderStatus
           ? {
               ...selectedProviderStatus,
@@ -521,6 +538,7 @@ export function useComposerCommandMenu({
     hasThread,
     hasCompactableConversation,
     onUpdateInteractionMode,
+    settingsBelongToSession,
     pathSearch.entries,
     pullRequestSearch.entries,
     projectCwd,
@@ -614,11 +632,25 @@ export function useComposerCommandMenu({
         return;
       }
 
+      if (
+        item.type === "provider-slash-command" &&
+        item.command.name === "model" &&
+        settingsBelongToSession &&
+        onSessionModel
+      ) {
+        const cleared = replaceTextRange(draftMessage, trigger.rangeStart, trigger.rangeEnd, "");
+        setSelection({ start: cleared.cursor, end: cleared.cursor });
+        onChangeDraftMessage(cleared.text);
+        onSessionModel();
+        return;
+      }
+
       const result = resolveComposerCommandSelection({
         draftMessage,
         trigger,
         item,
         allowInteractionMode:
+          !settingsBelongToSession &&
           onUpdateInteractionMode !== undefined &&
           selectedProviderStatus?.showInteractionModeToggle !== false,
       });
@@ -633,9 +665,11 @@ export function useComposerCommandMenu({
       ownerKey,
       items,
       onChangeDraftMessage,
+      onSessionModel,
       onUpdateInteractionMode,
       onUsageLimits,
       selectedProviderStatus?.showInteractionModeToggle,
+      settingsBelongToSession,
       threadShells,
       trigger,
     ],

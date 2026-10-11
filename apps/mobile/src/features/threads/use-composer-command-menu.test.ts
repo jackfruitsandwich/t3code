@@ -35,6 +35,51 @@ import {
 } from "./use-composer-command-menu";
 
 describe("mobile slash commands", () => {
+  describe("on a thread whose settings belong to its session", () => {
+    const claude = {
+      driver: ProviderDriverKind.make("claudeAgent"),
+      showInteractionModeToggle: true,
+      slashCommands: [
+        { name: "model", description: "Set the AI model for Claude Code" },
+        { name: "compact", description: "Summarize the conversation" },
+      ],
+    };
+    const list = (settingsBelongToSession: boolean, slashCommands = claude.slashCommands) =>
+      buildComposerSlashCommandItems({
+        query: "",
+        atMessageStart: true,
+        hasThread: true,
+        hasCompactableConversation: true,
+        allowInteractionMode: true,
+        settingsBelongToSession,
+        selectedProviderStatus: { ...claude, slashCommands },
+      }).map((item) => `${item.type}:${item.label}`);
+
+    it("lists the session's own /model and none of T3's rows", () => {
+      expect(list(true)).toEqual([
+        "provider-slash-command:/model",
+        "provider-slash-command:/compact",
+      ]);
+    });
+
+    it("keeps T3's /model while the session lists none", () => {
+      expect(list(true, [{ name: "compact", description: "Summarize the conversation" }])).toEqual([
+        "slash-command:/model",
+        "provider-slash-command:/compact",
+      ]);
+    });
+
+    it("lists T3's rows on any other thread", () => {
+      expect(list(false)).toEqual([
+        "slash-command:/model",
+        "slash-command:/plan",
+        "slash-command:/default",
+        "provider-slash-command:/model",
+        "provider-slash-command:/compact",
+      ]);
+    });
+  });
+
   const antigravity = {
     driver: ProviderDriverKind.make("antigravity"),
     showInteractionModeToggle: false,

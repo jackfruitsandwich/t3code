@@ -96,6 +96,7 @@ import type { RemoteClientConnectionState } from "../../lib/connection";
 import { resolveProviderOptionDescriptors } from "../../lib/providerOptions";
 import { ControlPillMenu } from "../../components/ControlPill";
 import type { ActiveTurnComposerAction } from "@t3tools/client-runtime/state/composer-dispatch";
+import { threadSettingsBelongToSession } from "@t3tools/client-runtime/session-owned-settings";
 import type { FollowUpBehavior } from "../../lib/followUpBehavior";
 import {
   resolveComposerSendPresentation,
@@ -483,6 +484,14 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
     return report !== null;
   }, [currentModelSelection.instanceId, onShowUsageLimits, props.serverConfig]);
 
+  // A thread whose session keeps its own model and modes lists the session's
+  // commands, and the session's /model opens the thread's settings.
+  const settingsBelongToSession = threadSettingsBelongToSession({
+    hasStartedThread: true,
+    provider: selectedProviderStatus,
+  });
+  const openSettingsRef = useRef<() => void>(() => {});
+  const openSessionModel = useCallback(() => openSettingsRef.current(), []);
   const composerMenu = useComposerCommandMenu({
     draftMessage: props.draftMessage,
     ownerKey: composerOwnerKey,
@@ -502,6 +511,8 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
       selectedProviderStatus?.showInteractionModeToggle === false
         ? undefined
         : props.onUpdateInteractionMode,
+    settingsBelongToSession,
+    onSessionModel: openSessionModel,
     offersUsageLimits: usageLimitsOffered,
     // With attachments aboard the pick just inserts the text, so it sends as a prompt.
     onUsageLimits:
@@ -678,6 +689,7 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
       onSelectModel: (option) =>
         props.onUpdateModelSelection(withRememberedModelOptions(option.selection)),
       optionDescriptors: providerOptionDescriptors,
+      optionsBelongToSession: settingsBelongToSession,
       onUpdateOptionSelections: (options) => {
         rememberModelOptions(
           currentModelSelection.instanceId,
@@ -696,6 +708,7 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
       props.onUpdateModelSelection,
       props.onUpdateRuntimeMode,
       providerOptionDescriptors,
+      settingsBelongToSession,
       settingsOwnerId,
       threadProviderGroups,
     ],
@@ -704,6 +717,7 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
     settingsRoutePresentation.present(settingsRouteSession);
     settingsSheetPresentation.open();
   }, [settingsRoutePresentation.present, settingsRouteSession, settingsSheetPresentation.open]);
+  openSettingsRef.current = openSettings;
 
   useEffect(() => {
     if (settingsSheetPresentation.isActive) {
