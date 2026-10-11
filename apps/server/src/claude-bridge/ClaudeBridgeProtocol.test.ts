@@ -16,6 +16,8 @@ import {
   isClaudeTypedMidTurnRow,
   claudeContinuedInSession,
   claudeSessionContinuedNotice,
+  claudeSessionNoticeText,
+  isClaudeBridgeNoticeFrame,
   makeClaudeBridgeFrameTranslator,
   parseClaudeBridgeEvent,
   parseClaudeBridgeSessionFile,
@@ -297,6 +299,66 @@ describe("ClaudeBridgeProtocol frame translator", () => {
       );
       // A row that carries no time (the session's settings) is never left out.
       assert.isFalse(frames.isFromBeforeTurn({ type: "permission-mode", permissionMode: "auto" }));
+    }
+  });
+
+  it("passes on what the session says to the person in a row of its own, in its words", () => {
+    const frames = translator();
+    frames.adoptTurn({ turnId: "turn-6", startedAt: 0, transcriptOffset: 0 });
+    const said = (fields: Record<string, unknown>) => ({
+      type: "system",
+      uuid: "00000000-0000-4000-8000-0000000000d1",
+      isSidechain: false,
+      isMeta: false,
+      ...fields,
+    });
+    const carriedOn = said({
+      subtype: "informational",
+      level: "notice",
+      content: "Continuing an interrupted response. Text before the interruption:\n\n1\n2\n3",
+    });
+    const [frame] = frames.onTranscriptRow(carriedOn);
+    assert.isTrue(isClaudeBridgeNoticeFrame(frame));
+    // The row's opening paragraph is the notice, under the row's own id.
+    assert.equal(
+      Reflect.get(frame ?? {}, "content"),
+      "Continuing an interrupted response. Text before the interruption:",
+    );
+    assert.equal(Reflect.get(frame ?? {}, "uuid"), "00000000-0000-4000-8000-0000000000d1");
+    assert.equal(
+      claudeSessionNoticeText(
+        said({
+          subtype: "informational",
+          level: "notice",
+          content: "Usage limit reached · continuing automatically at 2:30am",
+        }),
+      ),
+      "Usage limit reached · continuing automatically at 2:30am",
+    );
+    assert.equal(
+      claudeSessionNoticeText(
+        said({ subtype: "scheduled_task_fire", content: "Claude resuming /loop wakeup" }),
+      ),
+      "Claude resuming /loop wakeup",
+    );
+    // Rows shown another way, a subagent's, bookkeeping, and rows without words.
+    for (const other of [
+      said({
+        subtype: "local_command",
+        content: "<local-command-stdout>ok</local-command-stdout>",
+      }),
+      said({ subtype: "compact_boundary", content: "Conversation compacted" }),
+      said({ subtype: "informational", content: "from a subagent", isSidechain: true }),
+      said({ subtype: "informational", content: "bookkeeping", isMeta: true }),
+      said({ subtype: "turn_duration", durationMs: 5 }),
+      said({ subtype: "model_refusal_no_fallback", content: "" }),
+      {
+        type: "assistant",
+        uuid: "00000000-0000-4000-8000-0000000000d2",
+        content: "not a system row",
+      },
+    ]) {
+      assert.isNull(claudeSessionNoticeText(other));
     }
   });
 

@@ -74,6 +74,8 @@ export type ClaudeBridgeRequestTurnBy = "subagent" | "session";
  * belongs to.
  */
 export const CLAUDE_BRIDGE_COMMAND_OUTPUT_KEY = "t3_command_output";
+/** Marks a frame that carries what the session said to the person in a row of its own. */
+export const CLAUDE_BRIDGE_NOTICE_KEY = "t3_session_notice";
 
 export interface ClaudeBridgeActiveTurn {
   readonly turnId: string;
@@ -768,6 +770,35 @@ const commandRowText = (row: Record<string, unknown>): string | null => {
   return null;
 };
 
+/**
+ * What a `system` row says to the person, in the session's own words: a
+ * usage limit, a hook's warning, a turn carried on after an interruption.
+ * The row's opening paragraph is the notice; some rows go on with detail
+ * (the text an interrupted reply had reached). Null for rows shown another
+ * way (a command's output, a compaction), a subagent's rows, and rows
+ * without words.
+ */
+export const claudeSessionNoticeText = (row: unknown): string | null => {
+  if (!isRecord(row) || row.type !== "system" || typeof row.content !== "string") return null;
+  if (row.subtype === "local_command" || row.subtype === "compact_boundary") return null;
+  if (row.isSidechain === true || row.isMeta === true) return null;
+  const opening =
+    row.content
+      .trim()
+      .split(/\n\s*\n/u)[0]
+      ?.trim() ?? "";
+  return opening.length === 0 ? null : opening;
+};
+
+/** A frame the translator made from such a row. */
+export const isClaudeBridgeNoticeFrame = (
+  message: unknown,
+): message is { readonly uuid: string; readonly content: string } =>
+  isRecord(message) &&
+  Reflect.get(message, CLAUDE_BRIDGE_NOTICE_KEY) === true &&
+  typeof message.uuid === "string" &&
+  typeof message.content === "string";
+
 /** `/name args` of the transcript row Claude Code writes when a slash command runs, else null. */
 export function claudeTranscriptCommandText(row: unknown): string | null {
   if (!isRecord(row)) return null;
@@ -1245,6 +1276,18 @@ export function makeClaudeBridgeFrameTranslator(
           uuid: asUuid(row.uuid),
           session_id: sessionId,
         } as unknown as SDKCompactBoundaryMessage;
+        return [frame];
+      }
+      const notice = claudeSessionNoticeText(row);
+      if (notice !== null) {
+        const frame = {
+          type: "system",
+          subtype: typeof row.subtype === "string" ? row.subtype : "informational",
+          content: notice,
+          uuid: asUuid(row.uuid),
+          session_id: sessionId,
+          [CLAUDE_BRIDGE_NOTICE_KEY]: true,
+        } as unknown as SDKSystemMessage;
         return [frame];
       }
       return [];

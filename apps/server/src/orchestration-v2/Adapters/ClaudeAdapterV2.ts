@@ -96,6 +96,7 @@ import {
   claudeBridgeAskingAgent,
   claudeBridgeWakeDetail,
   claudeBridgeWakeRequest,
+  isClaudeBridgeNoticeFrame,
   isClaudeHarnessPrompt,
   threadModesForClaudePermissionMode,
 } from "../../claude-bridge/ClaudeBridgeProtocol.ts";
@@ -5971,7 +5972,12 @@ export function makeClaudeAdapterV2(
             return;
           }
 
-          if (message.type === "system" && message.subtype === "model_refusal_fallback") {
+          // What the session says to the person in a row of its own: the
+          // SDK's refusal note, and through the bridge every such row.
+          if (
+            (message.type === "system" && message.subtype === "model_refusal_fallback") ||
+            isClaudeBridgeNoticeFrame(message)
+          ) {
             const now = yield* DateTime.now;
             const nativeItemId = message.uuid;
             yield* emitProviderEvent({
