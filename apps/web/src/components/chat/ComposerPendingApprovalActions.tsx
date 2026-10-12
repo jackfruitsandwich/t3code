@@ -172,7 +172,7 @@ export const ComposerPendingApprovalActions = memo(function ComposerPendingAppro
                   {option.warning ? <TriangleAlertIcon className="size-3 text-warning" /> : null}
                   {/* The menu is as wide as its labels laid in a row, so what the
                       choice covers goes under its label and wraps. */}
-                  <span className="flex min-w-0 max-w-72 flex-col items-center whitespace-normal wrap-break-word text-center">
+                  <span className="flex min-w-0 max-w-56 flex-col items-center whitespace-normal wrap-break-word text-center">
                     <span>{option.label}</span>
                     {option.decision === "acceptForSession" && sessionGrant !== undefined ? (
                       <span className="font-normal text-muted-foreground">{sessionGrant}</span>
