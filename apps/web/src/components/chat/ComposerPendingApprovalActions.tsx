@@ -173,7 +173,7 @@ export const ComposerPendingApprovalActions = memo(function ComposerPendingAppro
                   className="mb-1 last:mb-0"
                 >
                   {option.warning ? <TriangleAlertIcon className="size-3 text-warning" /> : null}
-                  <span className="min-w-0 whitespace-normal wrap-break-word">
+                  <span className="min-w-0 max-w-xl whitespace-normal wrap-break-word">
                     {option.decision === "acceptForSession"
                       ? approveForSessionLabel(option.label, sessionGrant)
                       : option.label}
