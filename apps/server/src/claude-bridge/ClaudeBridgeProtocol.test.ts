@@ -32,6 +32,7 @@ import {
   CLAUDE_TERMINAL_DIALOG_MARK,
   parseClaudeBridgeSessionFile,
   parseClaudeBridgeSlashCommands,
+  parseClaudeSlashCommandText,
   readTranscriptRows,
   threadSettingsForClaudeSession,
 } from "./ClaudeBridgeProtocol.ts";
@@ -827,6 +828,26 @@ describe("ClaudeBridgeProtocol parsers", () => {
     const { rows, consumedChars } = readTranscriptRows('{"a":1}\n{"b":2}\n{"c":');
     assert.lengthOf(rows, 2);
     assert.equal(consumedChars, 16);
+  });
+
+  it("takes any first word after the slash as a command name, and a path as no command", () => {
+    assert.deepEqual(parseClaudeSlashCommandText("/model sonnet"), {
+      name: "model",
+      args: "sonnet",
+    });
+    assert.deepEqual(parseClaudeSlashCommandText(" /__remote-workflow "), {
+      name: "__remote-workflow",
+      args: "",
+    });
+    assert.deepEqual(parseClaudeSlashCommandText("/codex:review  fix it\nnow"), {
+      name: "codex:review",
+      args: "fix it\nnow",
+    });
+    assert.isNull(parseClaudeSlashCommandText("/Users/jack/notes.txt"));
+    assert.isNull(parseClaudeSlashCommandText("/tmp/x is the folder"));
+    assert.isNull(parseClaudeSlashCommandText("/"));
+    assert.isNull(parseClaudeSlashCommandText("/model\nsonnet"));
+    assert.isNull(parseClaudeSlashCommandText("see /model"));
   });
 
   it("reads which commands the session's own menu leaves out, and the hint after a name", () => {

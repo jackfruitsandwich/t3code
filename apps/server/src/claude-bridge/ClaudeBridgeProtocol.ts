@@ -710,11 +710,15 @@ export function parseClaudeBridgeSlashCommands(
  * Splits `/name args` the way Claude Code's prompt box does: the name is the
  * first word after the slash, the rest is the arguments as typed. Null for
  * anything that is not one slash command (a path, plain text, `/` alone).
+ *
+ * The name is any word: whether it is a command is the session's to say, by
+ * its own list. Claude Code has names that begin with an underscore, and it
+ * refuses a known command sent as prompt text.
  */
 export function parseClaudeSlashCommandText(
   text: string,
 ): { readonly name: string; readonly args: string } | null {
-  const match = /^\/([A-Za-z0-9][A-Za-z0-9:_-]*)(?:[ \t]+([\s\S]*))?$/u.exec(text.trim());
+  const match = /^\/([^\s/]+)(?:[ \t]+([\s\S]*))?$/u.exec(text.trim());
   if (match === null || match[1] === undefined) return null;
   return { name: match[1], args: (match[2] ?? "").trim() };
 }
