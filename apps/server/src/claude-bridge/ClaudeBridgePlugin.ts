@@ -241,7 +241,34 @@ async function emit($, type, data) {
 
 async function transcriptOffset($) {
   if (!transcriptPath) return 0
+  try { return (await $.fs.stat(transcriptPath)).size } catch {}
+  if (!(await followRecord($))) return 0
   try { return (await $.fs.stat(transcriptPath)).size } catch { return 0 }
+}
+
+// The record's file can move while the session runs: /cd <dir> takes it, as
+// it is, to that directory's project folder (measured: the same file under
+// the same name), and no event says so before the next prompt. When the path
+// held here is gone, the file of that name in a sibling folder is the record.
+// Says whether the path changed.
+async function followRecord($) {
+  if (!transcriptPath) return false
+  try {
+    await $.fs.stat(transcriptPath)
+    return false
+  } catch {}
+  const slash = transcriptPath.lastIndexOf('/')
+  const projects = transcriptPath.slice(0, transcriptPath.lastIndexOf('/', slash - 1))
+  let found = ''
+  try {
+    const listed = await $.process.run(['sh', '-c', 'ls -t "$0"/*/"$1" 2>/dev/null | head -1', projects, transcriptPath.slice(slash + 1)], { timeoutMs: 5000 })
+    found = String(listed.stdout || '').trim()
+  } catch {}
+  if (!found || found === transcriptPath) return false
+  transcriptPath = found
+  if (recordIsOf(sid)) $.store.set('transcript:' + sid, transcriptPath).catch(() => {})
+  await heartbeat($)
+  return true
 }
 
 // What the classic hook payloads say about the session right now. Each names
@@ -771,6 +798,7 @@ async function runSlashCommand($, command) {
     })
   }
   lookAgain()
+  const sentAt = Date.now()
   $.command.run({ command: command.name, args: command.args || '' }).then(async (result) => {
     panelClosed()
     if (settled) return
@@ -782,12 +810,16 @@ async function runSlashCommand($, command) {
     settled = true
     const startedTurn = !mine()
     if (!startedTurn) pendingCommand = null
+    // A command can move the record (/cd): T3 is told where it is now.
+    await followRecord($)
+    let text = result && typeof result.text === 'string' ? result.text : ''
+    if (!text && !startedTurn) text = await printedInRecord($, command.name, sentAt - 2000)
     await emit($, 'command.result', {
       commandId: command.id,
       promptUuid: command.promptUuid,
       ok: true,
       startedTurn: startedTurn,
-      text: result && typeof result.text === 'string' ? result.text : '',
+      text: text,
     })
     await refreshCommands($)
     await heartbeat($)
@@ -798,6 +830,31 @@ async function runSlashCommand($, command) {
     if (mine()) pendingCommand = null
     await emit($, 'command.result', { commandId: command.id, promptUuid: command.promptUuid, ok: false, startedTurn: false, text: String(err) })
   })
+}
+
+// What a slash command printed into the record since a moment. A command can
+// print there and hand nothing back to its caller (/cd <dir>: "Moved to
+// ..."); the terminal shows that row, so T3 shows it too. The record's end is
+// read through a process: a file read stops at 4 MiB.
+async function printedInRecord($, name, since) {
+  if (!transcriptPath) return ''
+  let tail = ''
+  try { tail = String((await $.process.run(['tail', '-c', '65536', transcriptPath], { timeoutMs: 5000 })).stdout || '') } catch { return '' }
+  let ran = false
+  for (const line of tail.split('\\n')) {
+    if (!line.startsWith('{')) continue
+    let row
+    try { row = JSON.parse(line) } catch { continue }
+    if (Date.parse(row.timestamp) < since) continue
+    const raw = typeof row.content === 'string' ? row.content : row.message && typeof row.message.content === 'string' ? row.message.content : ''
+    if (raw.indexOf('<command-name>/' + name + '</command-name>') >= 0) {
+      ran = true
+      continue
+    }
+    const printed = ran ? /^\\s*<local-command-stdout>([\\s\\S]*)<\\/local-command-stdout>\\s*$/.exec(raw) : null
+    if (printed) return printed[1].replace(/\\u001b\\[[0-9;]*m/g, '').trim()
+  }
+  return ''
 }
 
 // The rows Claude Code writes when a slash command that only acts locally is
@@ -811,6 +868,48 @@ async function appendCommandRows($, name, args, printed) {
   } catch {}
 }
 
+// Run in front of a "!" command: when the shell exits somewhere other than
+// where it began, its last line on stderr names that directory.
+const SHELL_CWD_MARK = '__t3bridge_cwd__:'
+const SHELL_CWD_TRAP = "__t3d=$(pwd -P); trap '[ \\"$(pwd -P)\\" = \\"$__t3d\\" ] || { echo >&2; echo \\"" + SHELL_CWD_MARK + "$(pwd -P)\\" >&2; }' EXIT; "
+
+// Takes that line off what the command printed on stderr.
+function takeCwdReport(printed) {
+  const text = String(printed || '')
+  const at = text.lastIndexOf(SHELL_CWD_MARK)
+  if (at < 0) return { stderr: text, dir: null }
+  const end = text.indexOf('\\n', at)
+  const named = text.slice(at + SHELL_CWD_MARK.length, end < 0 ? text.length : end)
+  let before = text.slice(0, at)
+  if (before.endsWith('\\n')) before = before.slice(0, -1)
+  return { stderr: before + (end < 0 ? '' : text.slice(end + 1)), dir: named || null }
+}
+
+// Carries the directory a "!" command ended in over to the session, the way
+// the terminal's own "!" does. A cd Claude Code allows without asking moves
+// the session, by a Bash call of this mod's: it moves the session as a cd of
+// the model's does, opens no dialog and leaves nothing in the record
+// (measured). Any other cd is undone as Claude Code undoes it: the session is
+// put back at its project root, and that directory is returned to be named
+// on stderr.
+async function carryCwdOver($, to) {
+  const cd = (path) => "cd '" + path.split("'").join("'\\\\''") + "'"
+  const go = async (path) => {
+    const verdict = await $.tool.check({ tool: 'Bash', input: { command: cd(path) } })
+    if (!verdict || verdict.decision !== 'allow') return false
+    await $.tool.call({ tool: 'Bash', command: cd(path) })
+    return true
+  }
+  try {
+    if (await go(to)) return ''
+    const root = await $.session.root()
+    if (root !== (await $.session.cwd())) await go(root)
+    return root
+  } catch {
+    return ''
+  }
+}
+
 // "!" in the terminal runs a shell command with no permission prompt, writes
 // the command and what it printed into the record, and hands that output to
 // the model, which replies. The same from T3: run here, recorded the same
@@ -822,7 +921,7 @@ async function runShellCommand($, command) {
   let outcome
   const startedAt = Date.now()
   try {
-    outcome = await $.process.run([shell, '-c', command.command], { timeoutMs: SHELL_COMMAND_TIMEOUT_MS })
+    outcome = await $.process.run([shell, '-c', SHELL_CWD_TRAP + command.command], { timeoutMs: SHELL_COMMAND_TIMEOUT_MS })
   } catch (err) {
     // Cut at the limit, as the terminal cuts it: the record says so in the
     // terminal's words, and the model is handed that like any other output.
@@ -832,7 +931,19 @@ async function runShellCommand($, command) {
     }
     outcome = { stdout: '', stderr: 'Command timed out after ' + Math.floor(SHELL_COMMAND_TIMEOUT_MS / 60000) + 'm ' + Math.floor((SHELL_COMMAND_TIMEOUT_MS % 60000) / 1000) + 's' }
   }
-  const printed = '<bash-stdout>' + String(outcome.stdout || '').trimEnd() + '</bash-stdout><bash-stderr>' + String(outcome.stderr || '').trimEnd() + '</bash-stderr>'
+  // Typed in the terminal, "!" runs in the session's own shell: a cd within
+  // the directories the session may work in moves the session, and one that
+  // leaves them is undone, with the project root named on stderr (measured).
+  // The child process here cannot move the session, so the directory it ended
+  // in is carried over, before the rows are written: they are stamped with
+  // where the session then is, as the terminal's are.
+  const ended = takeCwdReport(outcome.stderr)
+  let stderr = ended.stderr
+  if (ended.dir !== null) {
+    const reset = await carryCwdOver($, ended.dir)
+    if (reset) stderr = stderr + '\\nShell cwd was reset to ' + reset
+  }
+  const printed = '<bash-stdout>' + String(outcome.stdout || '').trimEnd() + '</bash-stdout><bash-stderr>' + stderr.trimEnd() + '</bash-stderr>'
   try {
     await $.session.append({ message: { type: 'user', content: [{ type: 'text', text: '<bash-input>' + command.command + '</bash-input>' }] } })
   } catch {}

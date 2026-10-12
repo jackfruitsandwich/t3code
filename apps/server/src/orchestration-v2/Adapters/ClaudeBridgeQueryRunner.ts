@@ -1103,9 +1103,17 @@ export const layer: Layer.Layer<
             yield* endSession(session?.ended?.reason ?? "process gone");
             return;
           }
-          if (state.transcriptPath.length === 0 && session.transcriptPath.length > 0) {
+          // The session names its record's file, and the file can move while
+          // the session runs: `/cd <dir>` takes it, as it is, to that
+          // directory's project folder. What was read of it stays read.
+          if (
+            session.transcriptPath.length > 0 &&
+            session.transcriptPath !== state.transcriptPath
+          ) {
+            const moved = state.transcriptPath.length > 0;
             state.transcriptPath = session.transcriptPath;
-            state.byteOffset = yield* transcriptSize(state.transcriptPath);
+            const size = yield* transcriptSize(state.transcriptPath);
+            state.byteOffset = moved ? Math.min(state.byteOffset, size) : size;
           }
           if (session.model !== null) translator.setModel(session.model);
           yield* showNativeSettings(nativeSettings(session));

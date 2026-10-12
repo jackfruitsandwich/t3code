@@ -1701,6 +1701,37 @@ describe("ClaudeBridgeQueryRunner messages the terminal drew", () => {
       assert.deepStrictEqual(shape(next), ["result"]);
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
+  it.live("follows the record when the session moves its file, as /cd does", () =>
+    Effect.gen(function* () {
+      const bridge = yield* attach({ protocol: 2, bridgeCanUseTool: () => null, transcript: "" });
+      const fs = yield* FileSystem.FileSystem;
+      const file = bridge.process.session.transcriptPath;
+      yield* bridge.handler(start(bridge), bridge.process);
+      yield* fs.writeFileString(
+        file,
+        row(TEXT_ROW, [{ type: "text", text: "Before the move." }], bridge.now),
+        { flag: "a" },
+      );
+      const before = Array.from(
+        yield* bridge.session.messages.pipe(Stream.take(3), Stream.runCollect),
+      );
+      // The same file under another path, and the session naming it.
+      const moved = file.replace("transcript.jsonl", "moved.jsonl");
+      yield* fs.rename(file, moved);
+      Object.assign(bridge.process.session, { transcriptPath: moved });
+      yield* fs.writeFileString(moved, toolUse(bridge.now), { flag: "a" });
+      const after = Array.from(
+        yield* bridge.session.messages.pipe(Stream.take(1), Stream.runCollect),
+      );
+      // The row read before the move is not shown again; the one written after it is.
+      assert.deepStrictEqual(shape([...before, ...after]), [
+        "user",
+        "system",
+        `${TEXT_ROW}:text`,
+        `${TOOL_ROW}:tool_use`,
+      ]);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
   it.live("shows one once when the record's copy of it arrives seconds later", () =>
     Effect.gen(function* () {
       const bridge = yield* attach({ protocol: 2, bridgeCanUseTool: () => null, transcript: "" });
