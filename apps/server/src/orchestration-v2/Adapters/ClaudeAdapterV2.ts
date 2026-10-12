@@ -98,6 +98,7 @@ import { compileClaudeModelSelection } from "../../claudeModelOptions.ts";
 import {
   claudeBridgeAlsoInTerminal,
   claudeBridgeApproveWithMode,
+  claudeSessionGrant,
   claudeBridgeAskingAgent,
   claudeBridgeSettledElsewhere,
   claudeBridgeWakeDetail,
@@ -4916,6 +4917,7 @@ export function makeClaudeAdapterV2(
           readonly prompt?: string;
           readonly questions?: ReadonlyArray<OrchestrationV2UserInputQuestion>;
           readonly approveWithMode?: string;
+          readonly sessionGrant?: string;
         }) {
           const createdAt = yield* DateTime.now;
           const requestId = yield* idAllocator.allocate.runtimeRequest({
@@ -5005,6 +5007,7 @@ export function makeClaudeAdapterV2(
                   ...(input.approveWithMode === undefined
                     ? {}
                     : { approveWithMode: input.approveWithMode }),
+                  ...(input.sessionGrant === undefined ? {} : { sessionGrant: input.sessionGrant }),
                 }
               : {
                   type: "user_input_request" as const,
@@ -7152,6 +7155,12 @@ export function makeClaudeAdapterV2(
           const prompt = proposedChange === undefined ? asked : `${asked}\n${proposedChange}`;
           const offeredMode =
             origin === "bridge" ? claudeBridgeApproveWithMode(callbackOptions) : undefined;
+          // With nothing suggested, a session the SDK drives is granted the
+          // whole tool (toSessionPermissionUpdates); a bridged one only this
+          // same call again, which needs no name.
+          const sessionGrant =
+            claudeSessionGrant(callbackOptions.suggestions) ??
+            (origin === "sdk" ? toolName : undefined);
           const artifacts = yield* buildApprovalRequestArtifacts({
             context,
             nativeItemId: nativeRequestId,
@@ -7159,6 +7168,7 @@ export function makeClaudeAdapterV2(
             requestKind,
             prompt,
             ...(offeredMode === undefined ? {} : { approveWithMode: offeredMode }),
+            ...(sessionGrant === undefined ? {} : { sessionGrant }),
           });
           const decision = yield* Deferred.make<ProviderApprovalDecision, never>();
           const note = yield* Ref.make<string | undefined>(undefined);

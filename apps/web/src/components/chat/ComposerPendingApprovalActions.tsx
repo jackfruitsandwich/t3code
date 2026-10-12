@@ -3,7 +3,10 @@ import {
   type ProviderApprovalOption,
   type RuntimeRequestId,
 } from "@t3tools/contracts";
-import { approveWithModeLabel } from "@t3tools/client-runtime/state/thread-requests";
+import {
+  approveForSessionLabel,
+  approveWithModeLabel,
+} from "@t3tools/client-runtime/state/thread-requests";
 import { memo, useState } from "react";
 import { EllipsisIcon, TriangleAlertIcon } from "lucide-react";
 import { Button } from "../ui/button";
@@ -21,6 +24,8 @@ interface ComposerPendingApprovalActionsProps {
   declineNote?: boolean | undefined;
   /** A permission mode an approval of the request can also switch the session to. */
   approveWithMode?: string | undefined;
+  /** What approving for the session grants beyond this request. */
+  sessionGrant?: string | undefined;
   onRespondToApproval: (
     requestId: RuntimeRequestId,
     decision: ProviderApprovalDecision,
@@ -43,6 +48,7 @@ export const ComposerPendingApprovalActions = memo(function ComposerPendingAppro
   options = DEFAULT_APPROVAL_OPTIONS,
   declineNote = false,
   approveWithMode,
+  sessionGrant,
   onRespondToApproval,
 }: ComposerPendingApprovalActionsProps) {
   // Mounted per request (keyed by its id), so a note never outlives its request.
@@ -167,7 +173,11 @@ export const ComposerPendingApprovalActions = memo(function ComposerPendingAppro
                   className="mb-1 last:mb-0"
                 >
                   {option.warning ? <TriangleAlertIcon className="size-3 text-warning" /> : null}
-                  <span className="min-w-0 whitespace-normal wrap-break-word">{option.label}</span>
+                  <span className="min-w-0 whitespace-normal wrap-break-word">
+                    {option.decision === "acceptForSession"
+                      ? approveForSessionLabel(option.label, sessionGrant)
+                      : option.label}
+                  </span>
                 </MenuItem>
               );
               return option.warning ? (

@@ -21,6 +21,8 @@ export interface ThreadPendingApproval {
   readonly declineNote?: boolean;
   /** A permission mode an approval can also switch the session to. */
   readonly approveWithMode?: string;
+  /** What approving for the session grants beyond this request, in the provider's words. */
+  readonly sessionGrant?: string;
   readonly responseCapability: "live" | "not_resumable";
 }
 
@@ -96,6 +98,9 @@ export function derivePendingThreadRequests(
       ...(item?.type === "approval_request" && item.approveWithMode !== undefined
         ? { approveWithMode: item.approveWithMode }
         : {}),
+      ...(item?.type === "approval_request" && item.sessionGrant !== undefined
+        ? { sessionGrant: item.sessionGrant }
+        : {}),
       responseCapability: responseCapability === "live" ? "live" : "not_resumable",
     });
   }
@@ -160,6 +165,13 @@ export function createQuestionHistoryProjector() {
     return previousResult;
   };
 }
+
+/**
+ * The choice to approve for the session, saying what it covers where the
+ * request names that, as the provider's own dialog does on that choice.
+ */
+export const approveForSessionLabel = (label: string, sessionGrant: string | undefined): string =>
+  sessionGrant === undefined ? label : `${label}: ${sessionGrant}`;
 
 /**
  * What the choice to approve and switch the session's permission mode is

@@ -4,6 +4,7 @@ import {
   claudeApprovalMode,
   claudeBridgeAlsoInTerminal,
   claudeBridgeApproveWithMode,
+  claudeSessionGrant,
   claudeBridgeAskingAgent,
   claudeBridgeAttachmentPaths,
   claudeBridgeMidTurnWords,
@@ -587,6 +588,46 @@ describe("ClaudeBridgeProtocol record helpers", () => {
     assert.isUndefined(claudeBridgeApproveWithMode({ signal: null }));
     assert.strictEqual(claudeApprovalMode({ behavior: "allow", mode: "auto" }), "auto");
     assert.isUndefined(claudeApprovalMode({ behavior: "allow" }));
+  });
+
+  it("says what approving for the session grants, in the session's own rule words", () => {
+    assert.strictEqual(
+      claudeSessionGrant([
+        {
+          type: "addRules",
+          rules: [
+            { toolName: "Bash", ruleContent: "npm run:*" },
+            { toolName: "mcp__elicit__ask_color" },
+          ],
+          behavior: "allow",
+          destination: "localSettings",
+        },
+      ]),
+      "Bash(npm run:*), mcp__elicit__ask_color",
+    );
+    assert.strictEqual(
+      claudeSessionGrant([
+        { type: "addDirectories", directories: ["/tmp/work"], destination: "session" },
+      ]),
+      "access to /tmp/work",
+    );
+    assert.strictEqual(
+      claudeSessionGrant([{ type: "setMode", mode: "acceptEdits", destination: "session" }]),
+      "accept edits mode",
+    );
+    // Nothing suggested, or nothing that allows: the grant is no wider than the request.
+    assert.isUndefined(claudeSessionGrant(undefined));
+    assert.isUndefined(claudeSessionGrant([]));
+    assert.isUndefined(
+      claudeSessionGrant([
+        {
+          type: "addRules",
+          rules: [{ toolName: "Bash" }],
+          behavior: "deny",
+          destination: "session",
+        },
+      ]),
+    );
   });
 
   it("keeps which kind of subagent a request comes from", () => {

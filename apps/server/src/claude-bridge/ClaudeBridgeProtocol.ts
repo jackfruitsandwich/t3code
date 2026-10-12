@@ -741,6 +741,47 @@ export const claudeBridgeApproveWithMode = (options: unknown): string | undefine
     ? options.approveWithMode
     : undefined;
 /**
+ * What approving a request "for this session" grants, in the session's own
+ * rule words (the notation /permissions lists rules in), read from the
+ * changes its dialog suggests. The terminal's row names it ("Yes, and don't
+ * ask again for: npm run *", "Yes, and always allow access to <dir>"); a
+ * client can only say what the choice covers if the request carries it.
+ * Undefined when nothing is suggested: the grant is then no wider than the
+ * request itself.
+ */
+export const claudeSessionGrant = (
+  suggestions: ReadonlyArray<unknown> | undefined,
+): string | undefined => {
+  const parts: Array<string> = [];
+  for (const suggestion of suggestions ?? []) {
+    if (!isRecord(suggestion)) continue;
+    if (
+      (suggestion.type === "addRules" || suggestion.type === "replaceRules") &&
+      suggestion.behavior === "allow" &&
+      Array.isArray(suggestion.rules)
+    ) {
+      for (const rule of suggestion.rules) {
+        if (!isRecord(rule) || typeof rule.toolName !== "string") continue;
+        parts.push(
+          typeof rule.ruleContent === "string" && rule.ruleContent.length > 0
+            ? `${rule.toolName}(${rule.ruleContent})`
+            : rule.toolName,
+        );
+      }
+    } else if (suggestion.type === "addDirectories" && Array.isArray(suggestion.directories)) {
+      for (const directory of suggestion.directories) {
+        if (typeof directory === "string") parts.push(`access to ${directory}`);
+      }
+    } else if (suggestion.type === "setMode" && typeof suggestion.mode === "string") {
+      parts.push(
+        suggestion.mode === "acceptEdits" ? "accept edits mode" : `${suggestion.mode} mode`,
+      );
+    }
+  }
+  const grant = parts.join(", ").trim();
+  return grant.length === 0 ? undefined : grant;
+};
+/**
  * Why a bridged session's permission callback is aborted when the session
  * settled the request without T3: it was answered in the terminal, or its
  * turn was stopped or ended. The thread then puts the request away at once.

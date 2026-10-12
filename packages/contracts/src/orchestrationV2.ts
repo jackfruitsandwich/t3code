@@ -1510,6 +1510,11 @@ export const OrchestrationV2TurnItem = Schema.Union([
      * approval, as its own dialog offers ("Yes, and switch to auto mode").
      */
     approveWithMode: Schema.optional(TrimmedNonEmptyString),
+    /**
+     * What approving "for the session" grants beyond this one request, in the
+     * provider's own rule words, as its own dialog names it on that choice.
+     */
+    sessionGrant: Schema.optional(TrimmedNonEmptyString),
   }),
   Schema.Struct({
     ...OrchestrationV2TurnItemBaseFields,
@@ -2300,6 +2305,11 @@ export const OrchestrationV2TurnItemJson = Schema.Union([
      * approval, as its own dialog offers ("Yes, and switch to auto mode").
      */
     approveWithMode: Schema.optional(TrimmedNonEmptyString),
+    /**
+     * What approving "for the session" grants beyond this one request, in the
+     * provider's own rule words, as its own dialog names it on that choice.
+     */
+    sessionGrant: Schema.optional(TrimmedNonEmptyString),
   }),
   Schema.Struct({
     ...OrchestrationV2TurnItemJsonBaseFields,
