@@ -131,6 +131,20 @@ export const ProviderAdapterV2Event = Schema.Union([
     driver: ProviderDriverKind,
     turnItem: OrchestrationV2TurnItem,
   }),
+  /**
+   * Where a message sent to steer a running turn stands with a provider that
+   * takes one only when it reaches for it (a Claude Code session the bridge
+   * holds reads it at its next tool boundary, or as its next turn). The
+   * message's row says so: it is `waiting` from the hand-over until the
+   * provider has `taken` it, or `dropped` it without taking it.
+   */
+  Schema.Struct({
+    type: Schema.Literal("user_message.delivery"),
+    driver: ProviderDriverKind,
+    threadId: ThreadId,
+    messageId: MessageId,
+    delivery: Schema.Literals(["waiting", "taken", "dropped"]),
+  }),
   Schema.Struct({
     type: Schema.Literal("runtime_request.updated"),
     driver: ProviderDriverKind,

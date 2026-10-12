@@ -785,12 +785,32 @@ function timelineEntryFoldRunId(entry: TimelineEntry, runlessKey: RunId | null):
   return null;
 }
 
-/** How a user message that did not open a turn is marked. */
+/**
+ * How a user message that did not open a turn is marked. `delivery` is set
+ * while a message sent to steer a turn has not been taken by its session.
+ */
 export function userMessageIntentMarker(
   intent: Exclude<NonNullable<ChatMessage["inputIntent"]>, "turn_start">,
+  delivery?: ChatMessage["delivery"],
 ): { readonly label: string; readonly tooltip: string; readonly isSteer: boolean } {
   if (intent === "queued_turn") {
     return { label: "Queued", tooltip: "Queued behind the active turn", isSteer: false };
+  }
+  if (delivery === "waiting") {
+    return {
+      label: "Steer · waiting",
+      tooltip:
+        "The session has not taken this message yet. It reads it at its next tool call, or when its turn ends.",
+      isSteer: true,
+    };
+  }
+  if (delivery === "not_taken") {
+    return {
+      label: "Steer · not taken",
+      tooltip:
+        "The session was not seen taking this message: it dropped it or ended, or T3 stopped following it first.",
+      isSteer: true,
+    };
   }
   return {
     label: "Steer",

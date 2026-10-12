@@ -8,6 +8,7 @@ import {
   type OrchestrationV2Run,
   type OrchestrationV2ProviderTurn,
   type OrchestrationV2Subagent,
+  type OrchestrationV2TurnItem,
   type ModelSelection,
   type RuntimeMode,
   type ProviderInteractionMode,
@@ -195,6 +196,34 @@ function withPlanStepDurations(
       };
     }),
   };
+}
+
+/**
+ * The status the row of a message sent to steer a turn takes for what its
+ * provider says of it, or null when the row stands as it is: `pending` while
+ * the provider holds the message untaken, `completed` once it has taken it,
+ * `cancelled` when it let go of it untaken. Only a steer's row is touched,
+ * and only "taken" settles a row that something else already closed.
+ */
+export function steerDeliveryStatus(
+  item: OrchestrationV2TurnItem | null,
+  delivery: Extract<ProviderAdapterV2Event, { type: "user_message.delivery" }>["delivery"],
+): "pending" | "completed" | "cancelled" | null {
+  if (
+    item === null ||
+    item.type !== "user_message" ||
+    (item.inputIntent !== "steer" && item.inputIntent !== "promoted_queued_to_steer")
+  ) {
+    return null;
+  }
+  switch (delivery) {
+    case "waiting":
+      return item.status === "completed" ? "pending" : null;
+    case "taken":
+      return item.status === "completed" ? null : "completed";
+    case "dropped":
+      return item.status === "pending" ? "cancelled" : null;
+  }
 }
 
 export interface ProviderEventIngestInput {
@@ -554,6 +583,32 @@ export const layer: Layer.Layer<
                 nodeId: input.event.turnItem.nodeId,
               }),
             ];
+          case "user_message.delivery": {
+            // The row is the orchestrator's: read as it stands, and only its
+            // status and times change, so its place and words are kept.
+            const item = yield* projections.getTurnItem({
+              threadId: input.event.threadId,
+              itemId: idAllocator.derive.userTurnItem({ messageId: input.event.messageId }),
+            });
+            const status = steerDeliveryStatus(item, input.event.delivery);
+            if (item === null || status === null) return [];
+            const occurredAt = yield* DateTime.now;
+            return [
+              yield* makeDomainEvent(input, {
+                type: "turn-item.updated",
+                threadId: item.threadId,
+                runId: item.runId,
+                nodeId: item.nodeId,
+                occurredAt,
+                payload: {
+                  ...item,
+                  status,
+                  completedAt: status === "pending" ? null : occurredAt,
+                  updatedAt: occurredAt,
+                },
+              }),
+            ];
+          }
           case "runtime_request.updated":
             return [
               yield* makeDomainEvent(input, {

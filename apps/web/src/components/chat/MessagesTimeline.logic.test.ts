@@ -341,6 +341,28 @@ describe("userMessageIntentMarker", () => {
   it("marks a queued message as queued", () => {
     expect(userMessageIntentMarker("queued_turn").label).toBe("Queued");
   });
+
+  it("says a steer is waiting until its session has taken it", () => {
+    for (const intent of ["steer", "promoted_queued_to_steer"] as const) {
+      expect(userMessageIntentMarker(intent, "waiting")).toEqual({
+        label: "Steer · waiting",
+        tooltip:
+          "The session has not taken this message yet. It reads it at its next tool call, or when its turn ends.",
+        isSteer: true,
+      });
+      expect(userMessageIntentMarker(intent, "not_taken")).toMatchObject({
+        label: "Steer · not taken",
+        isSteer: true,
+      });
+      // Taken: marked as it always was.
+      expect(userMessageIntentMarker(intent, undefined)).toEqual(userMessageIntentMarker(intent));
+    }
+    expect(userMessageIntentMarker("steer").tooltip).toBe("Steered the active turn");
+  });
+
+  it("leaves a queued message's mark alone whatever is said of its delivery", () => {
+    expect(userMessageIntentMarker("queued_turn", "waiting").label).toBe("Queued");
+  });
 });
 
 describe("shouldPreserveAssistantLineBreaks", () => {

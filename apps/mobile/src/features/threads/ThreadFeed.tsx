@@ -1676,7 +1676,7 @@ function renderFeedEntry(
 
     if (isUser) {
       const enterAnimated = isFreshTimestamp(message.createdAt);
-      const intentBadge = resolveUserMessageIntentBadge(message.inputIntent);
+      const intentBadge = resolveUserMessageIntentBadge(message.inputIntent, message.delivery);
       const referenceIds = new Set(
         collectComposerContextReferences(message.text).map((reference) => reference.contextId),
       );

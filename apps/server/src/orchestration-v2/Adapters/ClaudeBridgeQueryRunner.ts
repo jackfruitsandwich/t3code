@@ -348,6 +348,12 @@ export const layer: Layer.Layer<
           /** What was put in the session's inbox, to put again if the mod is reloaded before taking it. */
           readonly body: ClaudeBridgeCommandBody;
         } | null,
+        /**
+         * Messages put in the session's inbox to steer its running turn that
+         * it has not been heard to take, by prompt uuid. More than one can
+         * wait at once, which `pendingPrompt` cannot say.
+         */
+        heldSteers: new Map<string, { readonly commandId: string }>(),
         approvals: new Map<string, AbortController>(),
         /** Requests the session settled without T3: nothing is sent back for them. */
         settledElsewhere: new Set<string>(),
@@ -413,10 +419,53 @@ export const layer: Layer.Layer<
       /** A turn of the session's own is open in the thread, not one T3 opened to carry a request. */
       const sessionTurnOpen = () => translator.hasOpenTurn() && state.requestTurn === null;
 
+      /** Tells the thread what the session did with a message sent to steer its turn. */
+      const reportDelivery = (
+        promptUuid: string,
+        delivery: ClaudeAdapterV2.ClaudeBridgePromptDelivery["delivery"],
+      ) => input.bridgeOnPromptDelivery?.({ promptUuid, delivery }) ?? Effect.void;
+
+      const heldSteerOfCommand = (commandId: string | undefined) => {
+        if (commandId === undefined) return undefined;
+        for (const [promptUuid, held] of state.heldSteers) {
+          if (held.commandId === commandId) return promptUuid;
+        }
+        return undefined;
+      };
+
+      /**
+       * The session has a prompt: handed to the model inside the turn that
+       * was running, or begun as a turn of its own. Said of any prompt with a
+       * uuid, also one this attachment did not send (T3 may have sent it
+       * before a restart); whoever is told knows which were sent to steer.
+       */
+      const promptTaken = (taken: {
+        readonly promptUuid: string | undefined;
+        readonly commandId: string | undefined;
+      }) =>
+        Effect.gen(function* () {
+          const promptUuid = taken.promptUuid ?? heldSteerOfCommand(taken.commandId);
+          if (promptUuid === undefined) return;
+          state.heldSteers.delete(promptUuid);
+          yield* reportDelivery(promptUuid, "taken");
+        });
+
+      /**
+       * Nothing more will be heard of the messages still held: the session
+       * ended, or T3 stops following it here. They are shown as not taken; a
+       * later attachment that hears one taken says so.
+       */
+      const letGoOfHeldSteers = Effect.gen(function* () {
+        const held = [...state.heldSteers.keys()];
+        state.heldSteers.clear();
+        for (const promptUuid of held) yield* reportDelivery(promptUuid, "dropped");
+      });
+
       const finish = Effect.gen(function* () {
         if (state.closed) return;
         state.closed = true;
         state.requestTurn = null;
+        yield* letGoOfHeldSteers;
         for (const controller of state.approvals.values()) controller.abort();
         state.approvals.clear();
         yield* Queue.end(messages);
@@ -434,6 +483,12 @@ export const layer: Layer.Layer<
       if (bridgeProcess.session.activeTurn !== null) {
         translator.adoptTurn(bridgeProcess.session.activeTurn);
         state.byteOffset = bridgeProcess.session.activeTurn.transcriptOffset;
+        // The turn of a message sent to steer the one before it, begun while
+        // nothing was attached.
+        yield* promptTaken({
+          promptUuid: bridgeProcess.session.activeTurn.promptUuid,
+          commandId: undefined,
+        });
       } else {
         state.byteOffset = yield* transcriptSize(state.transcriptPath);
         // A short turn can be over before the run offered for it attaches.
@@ -455,6 +510,7 @@ export const layer: Layer.Layer<
           });
           state.byteOffset = missedTurn.start.transcriptOffset;
           replayedTurnId = missedTurn.start.turnId;
+          yield* promptTaken({ promptUuid: missedTurn.start.promptUuid, commandId: undefined });
           yield* Effect.logInfo("claude-bridge.missed-turn-replayed", {
             sid,
             turnId: missedTurn.start.turnId,
@@ -978,6 +1034,7 @@ export const layer: Layer.Layer<
             state.pendingComplete = null;
             yield* emit(translator.onTurnComplete(pending.event));
           }
+          yield* letGoOfHeldSteers;
           yield* emit(translator.onEnded(reason));
           yield* finish;
         });
@@ -1283,6 +1340,9 @@ export const layer: Layer.Layer<
               ) {
                 state.pendingPrompt = null;
               }
+              // A message sent to steer the turn before this one met no tool
+              // call there: this turn is the session taking it.
+              yield* promptTaken({ promptUuid: event.promptUuid, commandId: event.commandId });
               yield* emit(translator.onTurnStart(event));
               // Output a slash command printed just before its turn began.
               yield* emit(state.heldOutput.splice(0));
@@ -1336,10 +1396,16 @@ export const layer: Layer.Layer<
                 commandId: event.commandId,
                 turnId: event.turnId,
               });
+              yield* promptTaken({ promptUuid: event.promptUuid, commandId: event.commandId });
               if (state.pendingPrompt?.commandId === event.commandId) state.pendingPrompt = null;
               return;
             }
             case "prompt.dropped": {
+              const droppedSteer = heldSteerOfCommand(event.commandId);
+              if (droppedSteer !== undefined) {
+                state.heldSteers.delete(droppedSteer);
+                yield* reportDelivery(droppedSteer, "dropped");
+              }
               if (state.pendingPrompt?.commandId !== event.commandId) return;
               const promptUuid = state.pendingPrompt.promptUuid;
               state.pendingPrompt = null;
@@ -1585,7 +1651,13 @@ export const layer: Layer.Layer<
             };
             const pending = { commandId: "", promptUuid, label: null, body };
             state.pendingPrompt = pending;
-            pending.commandId = yield* registry.send(bridgeProcess, body);
+            // Held from before it is put in the inbox, so the session taking
+            // it at once is never heard before it is known to be waiting.
+            if (body.midTurn === true) state.heldSteers.set(promptUuid, pending);
+            pending.commandId = yield* registry
+              .send(bridgeProcess, body)
+              .pipe(Effect.tapError(() => Effect.sync(() => state.heldSteers.delete(promptUuid))));
+            if (state.heldSteers.has(promptUuid)) yield* reportDelivery(promptUuid, "waiting");
             yield* logProtocolEvent({
               direction: "outgoing",
               stage: "decoded",

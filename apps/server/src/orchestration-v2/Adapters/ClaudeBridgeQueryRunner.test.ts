@@ -47,6 +47,8 @@ const attach = (input: {
   readonly waiting?: ClaudeBridgeRegistry.ClaudeBridgeProcess["session"]["waiting"];
   /** Another thread already holds the session this one's conversation continued in. */
   readonly heldElsewhere?: boolean;
+  /** The turn the session is running when the runner attaches. */
+  readonly activeTurn?: ClaudeBridgeRegistry.ClaudeBridgeProcess["session"]["activeTurn"];
   readonly bridgeCanUseTool: (
     tool: string,
     toolInput: Record<string, unknown>,
@@ -81,7 +83,7 @@ const attach = (input: {
         permissionMode: "default",
         effort: null,
         commandsRev: 1,
-        activeTurn: null,
+        activeTurn: input.activeTurn ?? null,
         ...(input.waiting === undefined ? {} : { waiting: input.waiting }),
         modVersion: input.modVersion ?? "test",
         ended: null,
@@ -167,6 +169,8 @@ const attach = (input: {
       input: Record<string, unknown>;
       toolUseId: string;
     }> = [];
+    /** What the runner said the session did with messages sent to steer its turn, in order. */
+    const deliveries: Array<string> = [];
     const session = yield* runner.open({
       threadId: ThreadId.make("bridge-thread"),
       providerSessionId: ProviderSessionId.make("bridge-provider-session"),
@@ -187,10 +191,25 @@ const attach = (input: {
           input.bridgeCanUseTool(tool, toolInput, options.toolUseID, options.signal),
         );
       },
+      bridgeOnPromptDelivery: (delivery) =>
+        Effect.sync(() => {
+          deliveries.push(`${delivery.delivery} ${delivery.promptUuid}`);
+        }),
     });
     yield* Effect.addFinalizer(() => session.close.pipe(Effect.orDie));
     const handler = yield* Deferred.await(subscribed);
-    return { session, handler, commands, process, bridgeCalls, counts, now, recordChanges, asked };
+    return {
+      session,
+      handler,
+      commands,
+      process,
+      bridgeCalls,
+      counts,
+      now,
+      recordChanges,
+      asked,
+      deliveries,
+    };
   });
 
 /** Everything the thread is given, as it arrives. */
@@ -1355,6 +1374,162 @@ describe("ClaudeBridgeQueryRunner commands the mod writes into the record", () =
       // The note for the model and the command's markup are not shown.
       assert.isFalse(holds(frames, "local-command-caveat"));
       assert.isFalse(holds(frames, "command-name"));
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+});
+
+describe("ClaudeBridgeQueryRunner messages sent to steer a turn", () => {
+  const FIRST = "00000000-0000-4000-8000-0000000000f1";
+  const SECOND = "00000000-0000-4000-8000-0000000000f2";
+  const steer = (
+    bridge: { readonly session: ClaudeAdapterV2.ClaudeAgentSdkQuerySession },
+    uuid: NonNullable<SDKUserMessage["uuid"]>,
+    text: string,
+  ) => bridge.session.offer({ ...userMessage(text), uuid, priority: "now" });
+  const attached = attach({ protocol: 2, bridgeCanUseTool: () => null });
+
+  it.live("waits until the session hands it to the model inside the turn", () =>
+    Effect.gen(function* () {
+      const bridge = yield* attached;
+      yield* steer(bridge, FIRST, "also check the logs");
+      yield* steer(bridge, SECOND, "and the config");
+      assert.deepStrictEqual(bridge.deliveries, [`waiting ${FIRST}`, `waiting ${SECOND}`]);
+      // The mod names the prompt it handed over; the other still waits.
+      yield* bridge.handler(
+        {
+          seq: 1,
+          at: bridge.now,
+          type: "prompt.delivered",
+          commandId: "command-1",
+          turnId: "turn-a",
+          promptUuid: SECOND,
+        },
+        bridge.process,
+      );
+      assert.deepStrictEqual(bridge.deliveries.slice(2), [`taken ${SECOND}`]);
+      // Said twice (an event read again): once is enough for the one that waits.
+      yield* bridge.handler(
+        {
+          seq: 2,
+          at: bridge.now,
+          type: "prompt.delivered",
+          commandId: "command-1",
+          turnId: "turn-a",
+        },
+        bridge.process,
+      );
+      assert.deepStrictEqual(bridge.deliveries.slice(3), [`taken ${FIRST}`]);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.live("waits until its own turn starts when the turn met no tool call", () =>
+    Effect.gen(function* () {
+      const bridge = yield* attached;
+      yield* steer(bridge, FIRST, "also check the logs");
+      // A turn the terminal started is not the session taking it.
+      yield* bridge.handler(
+        {
+          seq: 1,
+          at: bridge.now,
+          type: "turn.start",
+          turnId: "typed",
+          text: "hi",
+          transcriptOffset: 0,
+        },
+        bridge.process,
+      );
+      assert.deepStrictEqual(bridge.deliveries, [`waiting ${FIRST}`]);
+      yield* bridge.handler(
+        {
+          seq: 2,
+          at: bridge.now,
+          type: "turn.start",
+          turnId: "turn-b",
+          text: "also check the logs",
+          transcriptOffset: 0,
+          commandId: "command-1",
+          promptUuid: FIRST,
+        },
+        bridge.process,
+      );
+      assert.deepStrictEqual(bridge.deliveries, [`waiting ${FIRST}`, `taken ${FIRST}`]);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.live("is not taken when the session drops it", () =>
+    Effect.gen(function* () {
+      const bridge = yield* attached;
+      yield* steer(bridge, FIRST, "also check the logs");
+      yield* bridge.handler(
+        {
+          seq: 1,
+          at: bridge.now,
+          type: "prompt.dropped",
+          commandId: "command-1",
+          reason: "The session is shutting down.",
+        },
+        bridge.process,
+      );
+      assert.deepStrictEqual(bridge.deliveries, [`waiting ${FIRST}`, `dropped ${FIRST}`]);
+      // Nothing is left to let go of when T3 stops following the session.
+      yield* bridge.session.close;
+      assert.strictEqual(bridge.deliveries.length, 2);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.live("is not taken when the session ends while it waits", () =>
+    Effect.gen(function* () {
+      const bridge = yield* attached;
+      yield* steer(bridge, FIRST, "also check the logs");
+      yield* bridge.handler(
+        { seq: 1, at: bridge.now, type: "ended", reason: "exit", sessionId: "bridge-session" },
+        bridge.process,
+      );
+      assert.deepStrictEqual(bridge.deliveries, [`waiting ${FIRST}`, `dropped ${FIRST}`]);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.live("is not taken when T3 stops following the session while it waits", () =>
+    Effect.gen(function* () {
+      const bridge = yield* attached;
+      yield* steer(bridge, FIRST, "also check the logs");
+      yield* bridge.session.close;
+      assert.deepStrictEqual(bridge.deliveries, [`waiting ${FIRST}`, `dropped ${FIRST}`]);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.live("says nothing of a prompt that was not sent to steer a turn", () =>
+    Effect.gen(function* () {
+      const bridge = yield* attached;
+      yield* bridge.session.offer({ ...userMessage("a prompt of its own"), uuid: FIRST });
+      assert.deepStrictEqual(bridge.deliveries, []);
+      yield* bridge.session.close;
+      assert.deepStrictEqual(bridge.deliveries, []);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  // T3 restarted while the session held the message: the attachment that
+  // sent it is gone, and this one hears of a prompt it never sent.
+  it.live("passes on a prompt it never sent that the session says it took", () =>
+    Effect.gen(function* () {
+      const bridge = yield* attach({
+        protocol: 2,
+        bridgeCanUseTool: () => null,
+        activeTurn: { turnId: "turn-b", startedAt: 1, transcriptOffset: 0, promptUuid: SECOND },
+      });
+      assert.deepStrictEqual(bridge.deliveries, [`taken ${SECOND}`]);
+      yield* bridge.handler(
+        {
+          seq: 1,
+          at: bridge.now,
+          type: "prompt.delivered",
+          commandId: "command-9",
+          turnId: "turn-b",
+          promptUuid: FIRST,
+        },
+        bridge.process,
+      );
+      assert.deepStrictEqual(bridge.deliveries, [`taken ${SECOND}`, `taken ${FIRST}`]);
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 });

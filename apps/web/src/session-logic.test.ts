@@ -448,6 +448,57 @@ describe("V2 session presentation", () => {
     }
   });
 
+  it("carries whether a steering message's session has taken it", () => {
+    const now = DateTime.makeUnsafe("2026-06-20T00:00:00.000Z");
+    const threadId = ThreadId.make("thread-steer-delivery");
+    const steer = (
+      key: string,
+      status: OrchestrationV2TurnItem["status"],
+      inputIntent: "steer" | "turn_start" = "steer",
+    ) =>
+      ({
+        id: TurnItemId.make(`item-${key}`),
+        threadId,
+        runId: RunId.make("run-steer-delivery"),
+        nodeId: null,
+        providerThreadId: null,
+        providerTurnId: null,
+        nativeItemRef: null,
+        parentItemId: null,
+        ordinal: 0,
+        status,
+        title: null,
+        startedAt: now,
+        completedAt: status === "pending" ? null : now,
+        updatedAt: now,
+        type: "user_message",
+        messageId: MessageId.make(`message-${key}`),
+        inputIntent,
+        text: key,
+        attachments: [],
+        createdBy: "user",
+        creationSource: "web",
+      }) satisfies OrchestrationV2TurnItem;
+    const entries = deriveTimelineEntriesFromVisibleTurnItems({
+      visibleTurnItems: [
+        steer("waiting", "pending"),
+        steer("dropped", "cancelled"),
+        steer("taken", "completed"),
+        steer("prompt", "pending", "turn_start"),
+      ].map((item, position) => ({
+        position,
+        visibility: "local" as const,
+        sourceThreadId: threadId,
+        sourceItemId: item.id,
+        item,
+      })),
+      optimisticMessages: [],
+    });
+    expect(
+      entries.map((entry) => (entry.kind === "message" ? entry.message.delivery : "not a message")),
+    ).toEqual(["waiting", "not_taken", undefined, undefined]);
+  });
+
   it.each(["pending", "running", "completed"] as const)(
     "keeps %s task progress available to the composer and out of the timeline",
     (stepStatus) => {

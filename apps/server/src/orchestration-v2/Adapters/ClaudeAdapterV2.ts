@@ -42,6 +42,7 @@ import {
   type ChatAttachment,
   ClaudeSettings,
   defaultInstanceIdForDriver,
+  MessageId,
   type ModelSelection,
   type OrchestrationV2ConversationMessage,
   type OrchestrationV2ExecutionNode,
@@ -349,6 +350,32 @@ export interface ClaudeAgentSdkQueryOpenInput {
    * permission mode, at attach and whenever either changes there.
    */
   readonly bridgeOnNativeSettings?: (settings: ClaudeBridgeNativeSettings) => void;
+  /**
+   * Called with what a bridged session has done with a message sent to steer
+   * its running turn, in the order it happened: holds it untaken, has taken
+   * it, or let go of it untaken. The message is named by the uuid it was
+   * offered with.
+   */
+  readonly bridgeOnPromptDelivery?: (delivery: ClaudeBridgePromptDelivery) => Effect.Effect<void>;
+}
+
+export interface ClaudeBridgePromptDelivery {
+  readonly promptUuid: string;
+  readonly delivery: "waiting" | "taken" | "dropped";
+}
+
+const CLAUDE_PROMPT_UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
+
+/**
+ * The uuid a message sent to steer a bridged session's turn is offered with:
+ * the message's own id when it has a uuid's shape, so what the session later
+ * says of that uuid still names the message after T3 has restarted.
+ */
+export function claudeSteerPromptUuid(messageId: string): SDKUserMessage["uuid"] | undefined {
+  return CLAUDE_PROMPT_UUID_PATTERN.test(messageId)
+    ? (messageId as NonNullable<SDKUserMessage["uuid"]>)
+    : undefined;
 }
 
 export interface ClaudeBridgeNativeSettings {
@@ -3151,6 +3178,12 @@ export function makeClaudeAdapterV2(
         const activeTurn = yield* Ref.make<ActiveClaudeTurnContext | null>(null);
         const interruptedTurns = yield* Ref.make(new Set<OrchestrationV2ProviderTurn["id"]>());
         const steeredTurns = yield* Ref.make(new Set<OrchestrationV2ProviderTurn["id"]>());
+        // Messages sent to steer a bridged session's turn that the session has
+        // not been heard to take or let go of, by the uuid they were offered with.
+        const steerMessages = new Map<
+          string,
+          { readonly threadId: ThreadId; readonly messageId: MessageId }
+        >();
         const queryContext = yield* Ref.make<ClaudeLiveQueryContext | null>(null);
         const openedNativeThreads = yield* Ref.make(new Set<string>());
         const latestPlanByKind = yield* Ref.make(new Map<string, OrchestrationV2PlanArtifact>());
@@ -7162,6 +7195,39 @@ export function makeClaudeAdapterV2(
         const bridgeCanUseTool: CanUseTool = (toolName, toolInput, callbackOptions) =>
           runPromise(canUseToolEffect(toolName, toolInput, callbackOptions, "bridge"));
 
+        /**
+         * Passes on what a bridged session did with a message sent to steer
+         * its turn. A uuid this process did not send (T3 restarted while the
+         * session held the message) can only be heard as taken: it is passed
+         * on as the message id it was made from, and changes nothing unless
+         * that message's row is still waiting.
+         */
+        const emitSteerDelivery = (threadId: ThreadId, report: ClaudeBridgePromptDelivery) =>
+          Effect.gen(function* () {
+            const sent = steerMessages.get(report.promptUuid);
+            if (sent !== undefined) {
+              if (report.delivery !== "waiting") steerMessages.delete(report.promptUuid);
+              yield* emitProviderEvent({
+                type: "user_message.delivery",
+                driver: CLAUDE_PROVIDER,
+                threadId: sent.threadId,
+                messageId: sent.messageId,
+                delivery: report.delivery,
+              });
+              return;
+            }
+            if (report.delivery !== "taken") return;
+            if (claudeSteerPromptUuid(report.promptUuid) === undefined) return;
+            if ((yield* Ref.get(activeTurn))?.promptUuid === report.promptUuid) return;
+            yield* emitProviderEvent({
+              type: "user_message.delivery",
+              driver: CLAUDE_PROVIDER,
+              threadId,
+              messageId: MessageId.make(report.promptUuid),
+              delivery: "taken",
+            });
+          });
+
         const bridgeCanUseToolLegacy: CanUseTool = (toolName, toolInput, callbackOptions) =>
           runPromise(canUseToolEffect(toolName, toolInput, callbackOptions, "sdk"));
 
@@ -7453,6 +7519,8 @@ export function makeClaudeAdapterV2(
                   emitObservedNativeSettings(turnInput.threadId, settings).pipe(Effect.ignore),
                 );
               },
+              bridgeOnPromptDelivery: (delivery) =>
+                emitSteerDelivery(turnInput.threadId, delivery).pipe(Effect.ignore),
             })
             .pipe(
               Effect.tapError(() =>
@@ -7847,6 +7915,17 @@ export function makeClaudeAdapterV2(
                 detail: `Claude provider turn ${turnInput.providerTurnId} is not the active turn.`,
               });
             }
+            // A bridged session takes the message when its turn next reaches a
+            // tool call, or after the turn: the message is offered under a
+            // uuid this adapter can name it by when the session says which.
+            const steerUuid =
+              existing.query.applySelection === undefined
+                ? undefined
+                : (claudeSteerPromptUuid(turnInput.message.messageId) ??
+                  (yield* crypto.randomUUIDv4.pipe(
+                    Effect.map((uuid) => uuid as NonNullable<SDKUserMessage["uuid"]>),
+                    Effect.orDie,
+                  )));
             const userMessage = yield* makeClaudeUserMessageWithAttachments({
               text: applyClaudePromptEffortPrefix(
                 turnInput.message.text,
@@ -7857,13 +7936,31 @@ export function makeClaudeAdapterV2(
               attachmentsDir,
               fileSystem,
               skillNames: yield* userInvocableSkillNames(currentTurn.input.runtimePolicy.cwd),
+              ...(steerUuid === undefined ? {} : { uuid: steerUuid }),
             });
+            if (steerUuid !== undefined) {
+              steerMessages.set(steerUuid, {
+                threadId: turnInput.threadId,
+                messageId: turnInput.message.messageId,
+              });
+              // One the session was never heard on (run as a command, say) stays
+              // behind: the oldest go once there are more than can be waiting.
+              if (steerMessages.size > 256) {
+                steerMessages.delete(steerMessages.keys().next().value!);
+              }
+            }
             yield* Ref.update(steeredTurns, (current) => {
               const next = new Set(current);
               next.add(turnInput.providerTurnId);
               return next;
             });
-            yield* existing.query.offer(userMessage);
+            yield* existing.query.offer(userMessage).pipe(
+              Effect.tapError(() =>
+                Effect.sync(() => {
+                  if (steerUuid !== undefined) steerMessages.delete(steerUuid);
+                }),
+              ),
+            );
           },
           (effect, turnInput) =>
             effect.pipe(

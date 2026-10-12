@@ -57,6 +57,10 @@ import {
   formatSearchToolLabel,
 } from "@t3tools/shared/toolActivity";
 import { formatDuration } from "@t3tools/shared/orchestrationTiming";
+import {
+  orchestrationV2SteerDelivery,
+  type OrchestrationV2SteerDelivery,
+} from "@t3tools/shared/orchestrationV2Timeline";
 import type { HtmlRenderReference } from "@t3tools/shared/htmlRender";
 import { compactDynamicToolOutput, htmlRenderFromToolItem } from "@t3tools/shared/toolOutput";
 import * as DateTime from "effect/DateTime";
@@ -120,6 +124,8 @@ export interface ThreadFeedMessage {
   readonly runId: RunId | null;
   readonly streaming: boolean;
   readonly inputIntent?: OrchestrationV2UserMessageInputIntent;
+  /** Set while a message sent to steer a turn has not been taken by its session; see the type. */
+  readonly delivery?: OrchestrationV2SteerDelivery;
   readonly createdBy?: OrchestrationV2Actor;
   readonly creationSource?: OrchestrationV2CreationSource;
   readonly scheduledTaskId?: ScheduledTaskId;
@@ -1748,6 +1754,8 @@ export function buildThreadFeed(
     }
     if (item.type === "user_message" || item.type === "assistant_message") {
       const updatedAt = DateTime.formatIso(item.updatedAt);
+      const delivery =
+        item.type === "user_message" ? orchestrationV2SteerDelivery(item) : undefined;
       const entry: RawThreadFeedEntry = {
         type: "message",
         id: item.messageId,
@@ -1763,6 +1771,7 @@ export function buildThreadFeed(
           ...(item.type === "user_message"
             ? {
                 inputIntent: item.inputIntent,
+                ...(delivery === undefined ? {} : { delivery }),
                 createdBy: item.createdBy,
                 creationSource: item.creationSource,
                 ...(item.scheduledTaskId ? { scheduledTaskId: item.scheduledTaskId } : {}),

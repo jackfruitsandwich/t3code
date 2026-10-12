@@ -2148,7 +2148,7 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
         </p>
       ) : null}
       {row.message.inputIntent && row.message.inputIntent !== "turn_start" ? (
-        <UserMessageIntentMarker intent={row.message.inputIntent} />
+        <UserMessageIntentMarker intent={row.message.inputIntent} delivery={row.message.delivery} />
       ) : null}
       <div className="relative max-w-[80%] rounded-2xl bg-message p-3 text-message-foreground">
         <MessageAuthorHeading>You</MessageAuthorHeading>
@@ -2315,10 +2315,12 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
 
 function UserMessageIntentMarker({
   intent,
+  delivery,
 }: {
   readonly intent: Exclude<NonNullable<ChatMessage["inputIntent"]>, "turn_start">;
+  readonly delivery: ChatMessage["delivery"];
 }) {
-  const presentation = userMessageIntentMarker(intent);
+  const presentation = userMessageIntentMarker(intent, delivery);
   const IntentIcon = presentation.isSteer ? Redo2Icon : null;
   return (
     <Tooltip>
@@ -2327,6 +2329,7 @@ function UserMessageIntentMarker({
           <div
             className="me-1 flex items-center justify-end gap-1 text-xs leading-none text-muted-foreground"
             data-user-message-intent={intent}
+            data-user-message-delivery={delivery}
           />
         }
       >

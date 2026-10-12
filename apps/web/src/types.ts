@@ -105,6 +105,10 @@ export interface ChatMessage {
   readonly createdAt: string;
   readonly updatedAt: string;
   readonly inputIntent?: OrchestrationV2UserMessageInputIntent | undefined;
+  /** Set while a message sent to steer a turn has not been taken by its session; see the type. */
+  readonly delivery?:
+    | import("@t3tools/shared/orchestrationV2Timeline").OrchestrationV2SteerDelivery
+    | undefined;
 }
 
 export interface ProposedPlan {

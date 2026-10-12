@@ -295,7 +295,13 @@ export type ClaudeBridgeEvent = { readonly seq: number; readonly at: number } & 
     }
   | { readonly type: "prompt.dropped"; readonly commandId: string; readonly reason: string }
   /** A prompt sent to steer a running turn was handed to the model inside that turn. */
-  | { readonly type: "prompt.delivered"; readonly commandId: string; readonly turnId: string }
+  | {
+      readonly type: "prompt.delivered";
+      readonly commandId: string;
+      readonly turnId: string;
+      /** The prompt as T3 named it when it sent it; a mod before 0.3.16 never reports this event. */
+      readonly promptUuid?: string;
+    }
   | {
       readonly type: "approval.request";
       readonly toolUseId: string;
@@ -522,6 +528,7 @@ export function parseClaudeBridgeEvent(value: unknown): ClaudeBridgeEvent | null
         type: "prompt.delivered",
         commandId: value.commandId,
         turnId: readOptionalString(value.turnId) ?? "",
+        ...(typeof value.promptUuid === "string" ? { promptUuid: value.promptUuid } : {}),
       };
     case "approval.request":
       if (typeof value.toolUseId !== "string" || typeof value.tool !== "string") return null;

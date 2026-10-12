@@ -1536,6 +1536,9 @@ describe("ClaudeAdapterV2 attachments", () => {
         });
 
         assert.equal(offeredMessages[1]?.priority, "now");
+        // A process T3 runs itself takes the message as it is offered: it is
+        // not named, and nothing is said of its delivery.
+        assert.isUndefined(offeredMessages[1]?.uuid);
         assert.deepEqual(offeredMessages[1]?.message.content, [
           expectedImageBlock,
           {
@@ -1543,6 +1546,141 @@ describe("ClaudeAdapterV2 attachments", () => {
             text: `Ultrathink:\nFocus on the diagram labels.\n\n[Attached image "diagram.png" is saved at: ${expectedAttachmentPath}]\n\n[Attached file "requirements.pdf" is saved at: ${expectedDocumentPath}]`,
           },
         ]);
+      }).pipe(Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+    ),
+  );
+
+  it.effect("says what a session it does not run did with a message sent to steer its turn", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const idAllocator = yield* IdAllocator.IdAllocatorV2;
+        const attachmentsDir = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "t3-claude-v2-steer-delivery-",
+        });
+        const offeredMessages: Array<SDKUserMessage> = [];
+        let said: ClaudeAdapterV2.ClaudeAgentSdkQueryOpenInput["bridgeOnPromptDelivery"];
+        const adapter = ClaudeAdapterV2.makeClaudeAdapterV2({
+          instanceId: ClaudeAdapterV2.CLAUDE_DEFAULT_INSTANCE_ID,
+          settings: DEFAULT_CLAUDE_SETTINGS,
+          environment: {},
+          attachmentsDir,
+          fileSystem,
+          path: yield* Path.Path,
+          crypto: yield* Crypto.Crypto,
+          idAllocator,
+          queryRunner: {
+            allocateSessionId: Effect.succeed("native-thread-claude-steer-delivery"),
+            open: (input) =>
+              Effect.sync(() => {
+                said = input.bridgeOnPromptDelivery;
+                return {
+                  messages: Stream.never,
+                  offer: (message) =>
+                    Effect.sync(() => {
+                      offeredMessages.push(message);
+                    }),
+                  // What marks a session the bridge holds.
+                  applySelection: () => Effect.void,
+                  setModel: () => Effect.void,
+                  setPermissionMode: () => Effect.void,
+                  interrupt: Effect.void,
+                  close: Effect.void,
+                };
+              }),
+            forkSession: () => Effect.die("unused forkSession"),
+            subagentLaunchToolUseId: () => Effect.succeed(null),
+            assertComplete: Effect.void,
+          },
+        });
+        const threadId = ThreadId.make("thread-claude-steer-delivery");
+        const runtime = yield* adapter.openSession({
+          threadId,
+          providerSessionId: ProviderSessionId.make("provider-session-claude-steer-delivery"),
+          modelSelection: CLAUDE_TEST_MODEL_SELECTION,
+          runtimePolicy: CLAUDE_TEST_RUNTIME_POLICY,
+        });
+        const providerThread = yield* runtime.ensureThread({
+          threadId,
+          modelSelection: CLAUDE_TEST_MODEL_SELECTION,
+          runtimePolicy: CLAUDE_TEST_RUNTIME_POLICY,
+        });
+        const attemptId = RunAttemptId.make("attempt-claude-steer-delivery");
+        yield* runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId,
+            providerThread,
+            now: yield* DateTime.now,
+            attemptId,
+            text: "Read the logs.",
+            attachments: [],
+          }),
+        );
+        const steer = (messageId: MessageId) =>
+          runtime.steerTurn({
+            threadId,
+            runId: RunId.make("run-claude-steer-delivery"),
+            providerThread,
+            providerTurnId: idAllocator.derive.providerTurn({
+              driver: ClaudeAdapterV2.CLAUDE_PROVIDER,
+              nativeTurnId: `turn:${attemptId}`,
+            }),
+            message: {
+              createdBy: "user",
+              creationSource: "web",
+              messageId,
+              text: "Also check the config.",
+              attachments: [],
+            },
+          });
+        // A client's message id is a uuid, and names the message to the session.
+        const fromClient = MessageId.make("6f0c5a0e-58a1-4b0c-9a5e-2f3b7c1d9e10");
+        // One made by the server is not: the message goes under a uuid of its own.
+        const fromServer = MessageId.make("message-claude-steer-delivery");
+        yield* steer(fromClient);
+        yield* steer(fromServer);
+        const promptUuid = offeredMessages[0]?.uuid;
+        const serverUuid = offeredMessages[2]?.uuid;
+        assert.equal<string | undefined>(offeredMessages[1]?.uuid, fromClient);
+        assert.isDefined(promptUuid);
+        assert.isDefined(serverUuid);
+        assert.notEqual<string | undefined>(serverUuid, fromServer);
+
+        const say = (uuid: string, delivery: "waiting" | "taken" | "dropped") =>
+          said?.({ promptUuid: uuid, delivery }) ?? Effect.die("The runner was not opened.");
+        yield* say(fromClient, "waiting");
+        yield* say(serverUuid!, "waiting");
+        yield* say(fromClient, "taken");
+        yield* say(serverUuid!, "dropped");
+        // Said again of a message already settled, of the turn's own prompt,
+        // and "waiting" of one this process never sent: nothing to pass on.
+        yield* say(serverUuid!, "dropped");
+        yield* say(promptUuid!, "taken");
+        yield* say("11111111-2222-4333-8444-555555555555", "waiting");
+        yield* say("not-a-uuid", "taken");
+        // Taken, of a uuid this process never sent: T3 may have sent it
+        // before a restart, under the message's own id.
+        yield* say("11111111-2222-4333-8444-555555555555", "taken");
+
+        const deliveries = yield* runtime.events.pipe(
+          Stream.filter((event) => event.type === "user_message.delivery"),
+          Stream.take(5),
+          Stream.runCollect,
+        );
+        assert.deepEqual(
+          Array.from(deliveries).map((event) =>
+            event.type === "user_message.delivery"
+              ? [event.threadId, event.messageId, event.delivery]
+              : [],
+          ),
+          [
+            [threadId, fromClient, "waiting"],
+            [threadId, fromServer, "waiting"],
+            [threadId, fromClient, "taken"],
+            [threadId, fromServer, "dropped"],
+            [threadId, "11111111-2222-4333-8444-555555555555", "taken"],
+          ],
+        );
       }).pipe(Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
     ),
   );

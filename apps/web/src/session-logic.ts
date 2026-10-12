@@ -22,6 +22,7 @@ import {
 } from "@t3tools/shared/toolActivity";
 import type { HtmlRenderReference } from "@t3tools/shared/htmlRender";
 import { htmlRenderFromToolItem } from "@t3tools/shared/toolOutput";
+import { orchestrationV2SteerDelivery } from "@t3tools/shared/orchestrationV2Timeline";
 import {
   contextCompactionLabel,
   workEntryIndicatesToolFailure,
@@ -646,6 +647,8 @@ export function deriveTimelineEntriesFromVisibleTurnItems(
       ) {
         continue;
       }
+      const delivery =
+        item.type === "user_message" ? orchestrationV2SteerDelivery(item) : undefined;
       const message: ChatMessage = {
         id: item.messageId,
         role: item.type === "user_message" ? "user" : "assistant",
@@ -674,6 +677,7 @@ export function deriveTimelineEntriesFromVisibleTurnItems(
         createdAt,
         updatedAt: DateTime.formatIso(item.updatedAt),
         ...(item.type === "user_message" ? { inputIntent: item.inputIntent } : {}),
+        ...(delivery === undefined ? {} : { delivery }),
       };
       committedMessageIds.add(message.id);
       entries.push({

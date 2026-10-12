@@ -648,6 +648,25 @@ describe("ClaudeBridgeProtocol parsers", () => {
       turnId: "turn-3",
     });
     assert.isNull(parseClaudeBridgeEvent({ seq: 4, at: 9, type: "prompt.delivered" }));
+    // The mod names the prompt too: a server that started since has only that to go by.
+    assert.deepEqual(
+      parseClaudeBridgeEvent({
+        seq: 5,
+        at: 9,
+        type: "prompt.delivered",
+        commandId: "command-7",
+        promptUuid: "prompt-7",
+        turnId: "turn-3",
+      }),
+      {
+        seq: 5,
+        at: 9,
+        type: "prompt.delivered",
+        commandId: "command-7",
+        turnId: "turn-3",
+        promptUuid: "prompt-7",
+      },
+    );
   });
 
   it("finds the person's words in the row the mod wrote to steer a running turn", () => {

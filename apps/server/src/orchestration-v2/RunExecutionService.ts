@@ -375,6 +375,10 @@ export function routeProviderEvent(
       return [false, state];
     case "thread_settings.observed":
       return [ownsThread(event.threadId), state];
+    case "user_message.delivery":
+      // Written by the session manager whether or not a run is listening: the
+      // message can be taken after the run it was sent into has ended.
+      return [false, state];
     case "app_thread.created": {
       if (event.appThread.id === input.threadId) {
         return [true, state];

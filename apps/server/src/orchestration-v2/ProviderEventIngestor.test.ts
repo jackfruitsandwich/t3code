@@ -1341,4 +1341,142 @@ layer("ProviderEventIngestorV2", (it) => {
       });
     }),
   );
+
+  it.effect("shows a message sent to steer a turn as waiting until its session takes it", () =>
+    Effect.gen(function* () {
+      const now = yield* DateTime.now;
+      const eventSink = yield* EventSink.EventSinkV2;
+      const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+      const ingestor = yield* ProviderEventIngestor.ProviderEventIngestorV2;
+      const idAllocator = yield* IdAllocator.IdAllocatorV2;
+      const threadEvent = yield* threadCreatedEvent(now);
+      const threadId = threadEvent.threadId;
+      const providerSessionId = yield* idAllocator.allocate.providerSession({
+        providerInstanceId: modelSelection.instanceId,
+        threadId,
+      });
+      const userMessage = (
+        key: string,
+        inputIntent: "steer" | "turn_start",
+        ordinal: number,
+      ): Extract<OrchestrationV2TurnItem, { type: "user_message" }> => {
+        const messageId = MessageId.make(`${threadId}:${key}`);
+        return {
+          createdBy: "user",
+          creationSource: "web",
+          id: idAllocator.derive.userTurnItem({ messageId }),
+          threadId,
+          runId: null,
+          nodeId: null,
+          providerThreadId: null,
+          providerTurnId: null,
+          nativeItemRef: null,
+          parentItemId: null,
+          ordinal,
+          status: "completed",
+          title: null,
+          startedAt: now,
+          completedAt: now,
+          updatedAt: now,
+          type: "user_message",
+          messageId,
+          inputIntent,
+          text: `words of ${key}`,
+          attachments: [],
+        };
+      };
+      const taken = userMessage("taken", "steer", 0);
+      const dropped = userMessage("dropped", "steer", 1);
+      const prompt = userMessage("prompt", "turn_start", 2);
+      const items = [taken, dropped, prompt];
+      const itemEvents: Array<OrchestrationV2DomainEvent> = [];
+      for (const item of items) {
+        itemEvents.push({
+          id: yield* idAllocator.allocate.event({ threadId }),
+          type: "turn-item.updated",
+          threadId,
+          occurredAt: now,
+          payload: item,
+        });
+      }
+      yield* eventSink.write({ events: [threadEvent, ...itemEvents] });
+      const say = (messageId: MessageId, delivery: "waiting" | "taken" | "dropped") =>
+        ingestor
+          .ingestNormalized({
+            providerSessionId,
+            providerInstanceId: modelSelection.instanceId,
+            threadId,
+            event: {
+              type: "user_message.delivery",
+              driver: CODEX_DRIVER,
+              threadId,
+              messageId,
+              delivery,
+            },
+          })
+          .pipe(Effect.map((stored) => stored.length));
+      const shown = (item: OrchestrationV2TurnItem) =>
+        projectionStore.getTurnItem({ threadId, itemId: item.id });
+      const placed = yield* shown(taken);
+
+      // Nothing is written for a row that already says what the session says.
+      assert.equal(yield* say(taken.messageId, "taken"), 0);
+      assert.equal(yield* say(taken.messageId, "dropped"), 0);
+
+      assert.equal(yield* say(taken.messageId, "waiting"), 1);
+      const waiting = yield* shown(taken);
+      assert.equal(waiting?.status, "pending");
+      assert.isNull(waiting?.completedAt);
+      assert.equal(yield* say(taken.messageId, "waiting"), 0);
+
+      assert.equal(yield* say(taken.messageId, "taken"), 1);
+      const after = yield* shown(taken);
+      assert.equal(after?.status, "completed");
+      assert.isNotNull(after?.completedAt);
+      // Only the status and its times change: the row keeps its place and words.
+      assert.deepEqual(
+        { ...after, completedAt: null, updatedAt: null },
+        { ...placed, completedAt: null, updatedAt: null },
+      );
+
+      // Let go of untaken, then heard taken after all: the session's word stands.
+      assert.equal(yield* say(dropped.messageId, "waiting"), 1);
+      assert.equal(yield* say(dropped.messageId, "dropped"), 1);
+      assert.equal((yield* shown(dropped))?.status, "cancelled");
+      assert.equal(yield* say(dropped.messageId, "waiting"), 0);
+      assert.equal(yield* say(dropped.messageId, "taken"), 1);
+      assert.equal((yield* shown(dropped))?.status, "completed");
+
+      // A turn's own prompt, and a message the thread does not hold, are left alone.
+      assert.equal(yield* say(prompt.messageId, "waiting"), 0);
+      assert.equal((yield* shown(prompt))?.status, "completed");
+      assert.equal(yield* say(MessageId.make(`${threadId}:unknown`), "taken"), 0);
+    }),
+  );
+});
+
+it("gives a steering message's row the status its session's word calls for", () => {
+  const row = (
+    status: OrchestrationV2TurnItem["status"],
+    inputIntent: "steer" | "promoted_queued_to_steer" | "turn_start" = "steer",
+  ) => ({ type: "user_message", inputIntent, status }) as unknown as OrchestrationV2TurnItem;
+  const next = ProviderEventIngestor.steerDeliveryStatus;
+  assert.equal(next(row("completed"), "waiting"), "pending");
+  assert.equal(next(row("completed", "promoted_queued_to_steer"), "waiting"), "pending");
+  assert.isNull(next(row("pending"), "waiting"));
+  // Let go of untaken is final for "waiting": only "taken" reopens it.
+  assert.isNull(next(row("cancelled"), "waiting"));
+  assert.equal(next(row("pending"), "taken"), "completed");
+  assert.equal(next(row("cancelled"), "taken"), "completed");
+  assert.isNull(next(row("completed"), "taken"));
+  assert.equal(next(row("pending"), "dropped"), "cancelled");
+  assert.isNull(next(row("completed"), "dropped"));
+  assert.isNull(next(row("completed", "turn_start"), "waiting"));
+  assert.isNull(next(null, "taken"));
+  assert.isNull(
+    next(
+      { type: "assistant_message", status: "pending" } as unknown as OrchestrationV2TurnItem,
+      "taken",
+    ),
+  );
 });

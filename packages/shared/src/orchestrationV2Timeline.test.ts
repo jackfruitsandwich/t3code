@@ -4,6 +4,7 @@ import { describe, expect, it } from "vite-plus/test";
 import {
   createOrchestrationV2TurnItemVisibility,
   isOrchestrationV2TurnItemVisible,
+  orchestrationV2SteerDelivery,
 } from "./orchestrationV2Timeline.ts";
 
 const runId = RunId.make("run:timeline-visibility");
@@ -116,5 +117,22 @@ describe.each([
         items: [{ type: "run_interrupt_result", runId, nodeId }],
       }),
     ).toBe(true);
+  });
+});
+
+describe("steer delivery", () => {
+  it("reads a steering message's row as waiting, not taken, or taken", () => {
+    for (const inputIntent of ["steer", "promoted_queued_to_steer"] as const) {
+      expect(orchestrationV2SteerDelivery({ inputIntent, status: "pending" })).toBe("waiting");
+      expect(orchestrationV2SteerDelivery({ inputIntent, status: "cancelled" })).toBe("not_taken");
+      expect(orchestrationV2SteerDelivery({ inputIntent, status: "completed" })).toBeUndefined();
+    }
+  });
+
+  it("says nothing of a message that was not sent to steer a turn", () => {
+    for (const inputIntent of ["turn_start", "queued_turn", undefined] as const) {
+      expect(orchestrationV2SteerDelivery({ inputIntent, status: "pending" })).toBeUndefined();
+      expect(orchestrationV2SteerDelivery({ inputIntent, status: "cancelled" })).toBeUndefined();
+    }
   });
 });

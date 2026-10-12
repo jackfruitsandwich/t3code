@@ -11,6 +11,26 @@ type TimelineTurnItem = Pick<OrchestrationV2TurnItem, "type" | "runId" | "nodeId
   readonly inputIntent?: OrchestrationV2UserMessageInputIntent;
 };
 
+/**
+ * Where a message sent to steer a turn stands with a session T3 follows but
+ * does not run. `waiting`: the session holds it and takes it at its next tool
+ * call, or when its turn ends. `not_taken`: the session dropped it or ended,
+ * or T3 stopped following it, before it was seen taken.
+ */
+export type OrchestrationV2SteerDelivery = "waiting" | "not_taken";
+
+/** Undefined for a message the session has taken, and for every message not sent to steer a turn. */
+export function orchestrationV2SteerDelivery(item: {
+  readonly inputIntent?: OrchestrationV2UserMessageInputIntent | undefined;
+  readonly status: OrchestrationV2TurnItem["status"];
+}): OrchestrationV2SteerDelivery | undefined {
+  if (item.inputIntent !== "steer" && item.inputIntent !== "promoted_queued_to_steer") {
+    return undefined;
+  }
+  if (item.status === "pending") return "waiting";
+  return item.status === "cancelled" ? "not_taken" : undefined;
+}
+
 export function isOrchestrationV2SupersededInterrupt(input: {
   readonly item: TimelineTurnItem;
   readonly attempts: ReadonlyArray<TimelineRunAttempt>;

@@ -2,6 +2,7 @@ import * as NetAddress from "effect/net/NetAddress";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import {
+  MessageId,
   EnvironmentId,
   type ModelSelection,
   type OrchestrationV2AppThread,
@@ -2902,6 +2903,95 @@ it.effect("ProviderSessionManagerV2 persists session-scoped runtime requests wit
 
     yield* effect.pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 1000 })));
   }),
+);
+
+it.effect(
+  "ProviderSessionManagerV2 writes what a session did with a steering message without a run",
+  () =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      const effect = Effect.gen(function* () {
+        const eventSink = yield* EventSink.EventSinkV2;
+        const idAllocator = yield* IdAllocator.IdAllocatorV2;
+        const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+        const now = yield* DateTime.now;
+        const projectId = yield* idAllocator.allocate.project({
+          fixtureName: "provider-session-manager-steer-delivery",
+        });
+        const threadId = yield* idAllocator.allocate.thread({
+          fixtureName: "provider-session-manager-steer-delivery",
+          projectId,
+        });
+        const providerSessionId = yield* idAllocator.allocate.providerSession({
+          providerInstanceId: modelSelection.instanceId,
+          threadId,
+        });
+        const messageId = MessageId.make(`${threadId}:steer`);
+        const itemId = idAllocator.derive.userTurnItem({ messageId });
+        yield* eventSink.write({
+          events: [
+            yield* makeThreadCreatedEvent({ idAllocator, threadId, now }),
+            {
+              id: yield* idAllocator.allocate.event({ threadId }),
+              type: "turn-item.updated",
+              threadId,
+              occurredAt: now,
+              payload: {
+                createdBy: "user",
+                creationSource: "web",
+                id: itemId,
+                threadId,
+                runId: null,
+                nodeId: null,
+                providerThreadId: null,
+                providerTurnId: null,
+                nativeItemRef: null,
+                parentItemId: null,
+                ordinal: 0,
+                status: "completed",
+                title: null,
+                startedAt: now,
+                completedAt: now,
+                updatedAt: now,
+                type: "user_message",
+                messageId,
+                inputIntent: "steer",
+                text: "Also check the config.",
+                attachments: [],
+              },
+            },
+          ],
+        });
+        yield* manager.open({ threadId, providerSessionId, modelSelection, runtimePolicy });
+        const adapterEvents = (yield* Ref.get(state)).eventQueues.get(String(providerSessionId));
+        assert.isDefined(adapterEvents);
+        // No run is subscribed: the session's own pump writes the row.
+        const said = (delivery: "waiting" | "taken") =>
+          Effect.gen(function* () {
+            const afterSequence = yield* eventSink.latestSequence({ threadId });
+            const written = yield* eventSink.stream({ threadId, afterSequence }).pipe(
+              Stream.filter((stored) => stored.event.type === "turn-item.updated"),
+              Stream.take(1),
+              Stream.runCollect,
+              Effect.forkScoped,
+            );
+            yield* Queue.offer(adapterEvents!, {
+              type: "user_message.delivery",
+              driver: CODEX_DRIVER,
+              threadId,
+              messageId,
+              delivery,
+            });
+            yield* Fiber.join(written);
+            return (yield* projectionStore.getTurnItem({ threadId, itemId }))?.status;
+          });
+        assert.equal(yield* said("waiting"), "pending");
+        assert.equal(yield* said("taken"), "completed");
+      });
+
+      yield* effect.pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 1000 })));
+    }),
 );
 
 it.effect(

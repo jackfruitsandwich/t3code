@@ -254,7 +254,9 @@ function sessionKey(providerSessionId: ProviderSessionId): string {
 /**
  * Runtime requests with no provider turn belong to the live session itself.
  * Their node and transcript item are runless too, so they bypass the normal
- * per-run subscriber and are persisted by the session event pump.
+ * per-run subscriber and are persisted by the session event pump. So is what
+ * a session did with a message sent to steer its turn, which can come after
+ * the run the message was sent into.
  */
 function sessionScopedRuntimeRequestThreadId(event: ProviderAdapterV2Event): ThreadId | undefined {
   switch (event.type) {
@@ -269,6 +271,8 @@ function sessionScopedRuntimeRequestThreadId(event: ProviderAdapterV2Event): Thr
         (event.turnItem.type === "approval_request" || event.turnItem.type === "user_input_request")
         ? event.turnItem.threadId
         : undefined;
+    case "user_message.delivery":
+      return event.threadId;
     default:
       return undefined;
   }
@@ -1626,23 +1630,35 @@ export const layerWithOptions = (
                         sessionKey(entry.runtime.providerSessionId),
                       );
                       if (current?.runtime !== entry.runtime) return;
-                      yield* providerEventIngestor
-                        .ingestNormalized({
-                          providerSessionId: entry.runtime.providerSessionId,
-                          providerInstanceId: entry.runtime.instanceId,
-                          threadId,
-                          event,
-                        })
-                        .pipe(
-                          Effect.mapError(
-                            (cause) =>
-                              new ProviderAdapterEventStreamError({
-                                driver: entry.runtime.driver,
-                                providerSessionId: entry.runtime.providerSessionId,
-                                cause,
-                              }),
+                      const ingested = providerEventIngestor.ingestNormalized({
+                        providerSessionId: entry.runtime.providerSessionId,
+                        providerInstanceId: entry.runtime.instanceId,
+                        threadId,
+                        event,
+                      });
+                      // A note on a row the thread already holds: failing to
+                      // write it must not end the session's events.
+                      if (event.type === "user_message.delivery") {
+                        yield* ingested.pipe(
+                          Effect.catchCause((cause) =>
+                            Effect.logWarning(
+                              "orchestration-v2.provider-session.steer-delivery-not-written",
+                              { providerSessionId: entry.runtime.providerSessionId, cause },
+                            ),
                           ),
                         );
+                        return;
+                      }
+                      yield* ingested.pipe(
+                        Effect.mapError(
+                          (cause) =>
+                            new ProviderAdapterEventStreamError({
+                              driver: entry.runtime.driver,
+                              providerSessionId: entry.runtime.providerSessionId,
+                              cause,
+                            }),
+                        ),
+                      );
                     }).pipe(entry.requestEventPermit.withPermits(1));
                     return;
                   }

@@ -2225,6 +2225,27 @@ it.each(["First paragraph.\n\nSecond paragraph.", ""])(
   },
 );
 
+it("carries whether a steering message's session has taken it", () => {
+  const steer = (key: string, status: OrchestrationV2TurnItem["status"]) => ({
+    ...userMessage(),
+    id: TurnItemId.make(`item-steer-${key}`),
+    messageId: MessageId.make(`message-steer-${key}`),
+    inputIntent: "steer" as const,
+    status,
+  });
+  const feed = buildThreadFeed(
+    [
+      steer("waiting", "pending"),
+      steer("dropped", "cancelled"),
+      steer("taken", "completed"),
+      { ...userMessage(), status: "pending" as const },
+    ].map((item, position) => projected(item, position)),
+  );
+  expect(
+    feed.map((entry) => (entry.type === "message" ? entry.message.delivery : "not a message")),
+  ).toEqual(["waiting", "not_taken", undefined, undefined]);
+});
+
 it("stops stranded thinking after a steer and follows the next thought or tool", () => {
   const at = "2026-06-20T00:00:02.000Z";
   const thought = (id: string): OrchestrationV2TurnItem => ({
