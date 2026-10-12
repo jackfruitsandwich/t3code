@@ -376,20 +376,32 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv> = {
             Effect.flatMap((workspaceSnapshot) =>
               liveClaudeCommandsForCwd(bridgeDir, cwd).pipe(
                 Effect.map((live) => {
+                  // A session's menu leaves some of its commands out until the
+                  // name is typed in full. T3's menu follows the session.
+                  const hidden = new Set(
+                    live.flatMap((entry) => (entry.hidden === true ? [entry.name.trim()] : [])),
+                  );
                   const known = new Set(workspaceSnapshot.slashCommands.map((entry) => entry.name));
+                  const listed = workspaceSnapshot.slashCommands.map((entry) =>
+                    hidden.has(entry.name) ? { ...entry, hidden: true } : entry,
+                  );
                   const added = live.flatMap((entry) => {
                     const name = entry.name.trim();
                     if (name.length === 0 || known.has(name)) return [];
                     known.add(name);
                     const description = entry.description.trim();
-                    return [description.length === 0 ? { name } : { name, description }];
+                    return [
+                      {
+                        name,
+                        ...(description.length > 0 ? { description } : {}),
+                        ...(entry.hint !== undefined ? { input: { hint: entry.hint } } : {}),
+                        ...(entry.hidden === true ? { hidden: true } : {}),
+                      },
+                    ];
                   });
-                  return added.length === 0
+                  return added.length === 0 && hidden.size === 0
                     ? workspaceSnapshot
-                    : {
-                        ...workspaceSnapshot,
-                        slashCommands: [...workspaceSnapshot.slashCommands, ...added],
-                      };
+                    : { ...workspaceSnapshot, slashCommands: [...listed, ...added] };
                 }),
               ),
             ),

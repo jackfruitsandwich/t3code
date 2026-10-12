@@ -51,7 +51,11 @@ export const liveClaudeCommandsForCwd = Effect.fn("liveClaudeCommandsForCwd")(fu
         yield* readJson(path.join(dir, "commands.json")),
       );
       for (const command of commands ?? []) {
-        if (!byName.has(command.name)) byName.set(command.name, command);
+        const seen = byName.get(command.name);
+        // Listed in T3's menu where any session here lists it in its own.
+        if (seen === undefined || (seen.hidden === true && command.hidden !== true)) {
+          byName.set(command.name, command);
+        }
       }
     }
   }

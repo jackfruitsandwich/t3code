@@ -30,7 +30,7 @@ import type {
 import { isRecord, parseJsonlLine } from "../import/sessionImportTypes.ts";
 
 export const CLAUDE_BRIDGE_PROTOCOL_VERSION = 2;
-export const CLAUDE_BRIDGE_MOD_VERSION = "0.3.20";
+export const CLAUDE_BRIDGE_MOD_VERSION = "0.3.21";
 /**
  * The first protocol whose mod runs slash commands, answers questions with
  * their answers and reports the session's own commands. A process still on an
@@ -282,6 +282,8 @@ export const CLAUDE_BARE_PANEL_COMMANDS: ReadonlyArray<string> = [
   "setup-bedrock",
   "setup-vertex",
   "design-login",
+  "ultrareview",
+  "autofix-pr",
 ];
 
 /** One slash command of a session, as its own typeahead lists it. */
@@ -289,6 +291,10 @@ export interface ClaudeBridgeSlashCommand {
   readonly name: string;
   readonly description: string;
   readonly source: string;
+  /** The session's menu leaves it out until its name is typed in full. */
+  readonly hidden?: true;
+  /** What the session's menu draws after the name. */
+  readonly hint?: string;
 }
 
 export type ClaudeBridgeCommand = ClaudeBridgeCommandBody & {
@@ -691,6 +697,10 @@ export function parseClaudeBridgeSlashCommands(
       name: entry.name,
       description: readOptionalString(entry.description) ?? "",
       source: readOptionalString(entry.source) ?? "builtin",
+      ...(entry.hidden === true ? { hidden: true as const } : {}),
+      ...(typeof entry.hint === "string" && entry.hint.trim().length > 0
+        ? { hint: entry.hint.trim() }
+        : {}),
     });
   }
   return commands;

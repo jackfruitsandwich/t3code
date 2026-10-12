@@ -95,6 +95,8 @@ export const ServerProviderSlashCommand = Schema.Struct({
   name: TrimmedNonEmptyString,
   description: Schema.optional(TrimmedNonEmptyString),
   input: Schema.optional(ServerProviderSlashCommandInput),
+  /** The provider's own menu lists it only when its name is typed in full. */
+  hidden: Schema.optional(Schema.Boolean),
 });
 export type ServerProviderSlashCommand = typeof ServerProviderSlashCommand.Type;
 

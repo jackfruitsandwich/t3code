@@ -113,6 +113,7 @@ export function buildComposerSlashCommandItems(input: {
   if (!input.atMessageStart) return items;
   for (const command of input.selectedProviderStatus?.slashCommands ?? []) {
     if (!command.name.toLowerCase().includes(query)) continue;
+    if (command.hidden === true && command.name.toLowerCase() !== query) continue;
     if (command.name === "compact" && !input.hasCompactableConversation) continue;
     // T3's own limits command is answered by the thread composer; New Task has
     // nowhere to show it. A provider's same-named command is left alone.

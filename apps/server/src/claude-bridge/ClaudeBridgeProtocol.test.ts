@@ -31,6 +31,7 @@ import {
   claudeSessionNotificationText,
   CLAUDE_TERMINAL_DIALOG_MARK,
   parseClaudeBridgeSessionFile,
+  parseClaudeBridgeSlashCommands,
   readTranscriptRows,
   threadSettingsForClaudeSession,
 } from "./ClaudeBridgeProtocol.ts";
@@ -826,6 +827,22 @@ describe("ClaudeBridgeProtocol parsers", () => {
     const { rows, consumedChars } = readTranscriptRows('{"a":1}\n{"b":2}\n{"c":');
     assert.lengthOf(rows, 2);
     assert.equal(consumedChars, 16);
+  });
+
+  it("reads which commands the session's own menu leaves out, and the hint after a name", () => {
+    assert.deepEqual(
+      parseClaudeBridgeSlashCommands([
+        { name: "heapdump", description: "Dump the JS heap", source: "builtin", hidden: true },
+        { name: "model", description: "Set the model", source: "builtin", hint: " [model] " },
+        { name: "clear", description: "Start over", source: "builtin", hidden: false, hint: "" },
+        { description: "no name" },
+      ]),
+      [
+        { name: "heapdump", description: "Dump the JS heap", source: "builtin", hidden: true },
+        { name: "model", description: "Set the model", source: "builtin", hint: "[model]" },
+        { name: "clear", description: "Start over", source: "builtin" },
+      ],
+    );
   });
 });
 

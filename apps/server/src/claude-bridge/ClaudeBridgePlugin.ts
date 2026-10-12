@@ -164,6 +164,9 @@ let mcpRequestId = 0
 let effort = null
 let commandsBody = ''
 let commandsRev = 0
+// How the session's own menu presents each command, as Claude Code said when it
+// listed it: left out of the menu or not, and the hint after the name.
+const described = new Map()
 // Terminal clients attached to a background session, by client id.
 const attached = new Set()
 // A session an SDK host drives (T3's own first turn, claude -p, the Agent
@@ -551,7 +554,13 @@ async function refreshCommands($) {
   if (!dir || passive) return
   let list
   try { list = await $.command.list() } catch { return }
-  const body = JSON.stringify(list.map((c) => ({ name: c.name, description: c.description, source: c.source })))
+  const body = JSON.stringify(list.map((c) => {
+    const row = { name: c.name, description: c.description, source: c.source }
+    const shown = described.get(c.name)
+    if (shown && shown.hidden) row.hidden = true
+    if (shown && shown.hint) row.hint = shown.hint
+    return row
+  }))
   if (body === commandsBody) return
   commandsBody = body
   commandsRev += 1
@@ -1234,6 +1243,22 @@ export function register(on) {
       }
     } catch {}
     return next(e)
+  })
+
+  // What the session's menu does with a command is the session's to say: T3's
+  // menu lists what this one lists and leaves out what it leaves out.
+  on('command.describe', async ($, e, next) => {
+    const out = await next(e)
+    try {
+      const name = String((e && e.command) || '')
+      if (name) {
+        described.set(name, {
+          hidden: !!(out && out.isHidden),
+          hint: out && typeof out.argumentHint === 'string' ? out.argumentHint : '',
+        })
+      }
+    } catch {}
+    return out
   })
 
   // A command typed at the terminal is the person speaking from there.

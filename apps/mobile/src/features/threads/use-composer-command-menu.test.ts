@@ -69,6 +69,26 @@ describe("mobile slash commands", () => {
       ]);
     });
 
+    it("leaves out what the session's own menu leaves out, until the name is typed in full", () => {
+      const withHidden = [
+        ...claude.slashCommands,
+        { name: "heapdump", description: "Dump the JS heap", hidden: true },
+      ];
+      const typed = (query: string) =>
+        buildComposerSlashCommandItems({
+          query,
+          atMessageStart: true,
+          hasThread: true,
+          hasCompactableConversation: true,
+          allowInteractionMode: true,
+          settingsBelongToSession: true,
+          selectedProviderStatus: { ...claude, slashCommands: withHidden },
+        }).map((item) => item.label);
+      expect(typed("")).toEqual(["/model", "/compact"]);
+      expect(typed("heap")).toEqual([]);
+      expect(typed("heapdump")).toEqual(["/heapdump"]);
+    });
+
     it("lists T3's rows on any other thread", () => {
       expect(list(false)).toEqual([
         "slash-command:/model",

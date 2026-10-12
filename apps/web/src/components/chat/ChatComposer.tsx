@@ -2723,7 +2723,9 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
           (skill.scope ? `${skill.scope} skill` : ""),
       }));
       const visibleProviderSlashCommandItems = providerSlashCommandItems.filter(
-        (item) => item.command.name !== "compact" || compactSlashCommandAvailable,
+        (item) =>
+          (item.command.name !== "compact" || compactSlashCommandAvailable) &&
+          (item.command.hidden !== true || item.command.name.toLowerCase() === query),
       );
       const slashCommandItems = slashCommandItemsForPromptPosition(
         [...builtInSlashCommandItems, ...visibleProviderSlashCommandItems, ...skillItems],
