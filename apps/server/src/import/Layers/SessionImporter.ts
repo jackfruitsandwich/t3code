@@ -2338,38 +2338,14 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
       },
     );
 
-    const processFile = Effect.fn("SessionImporter.processFile")(function* (input: {
+    /** A file of a sweep that changed since the last one: read whole and imported. */
+    const importChangedFile = Effect.fn("SessionImporter.processFile")(function* (input: {
       readonly driver: ProviderDriverKind;
       readonly filePath: string;
       readonly context: SweepContext;
+      readonly size: number;
     }) {
-      const { driver, filePath, context } = input;
-      const info = yield* fs.stat(filePath);
-      const size = Number(info.size);
-      const mtimeMs = Option.match(info.mtime, {
-        onNone: () => 0,
-        onSome: (mtime) => mtime.getTime(),
-      });
-      const fingerprint = fileFingerprints.get(filePath);
-      if (
-        fingerprint !== undefined &&
-        fingerprint.size === size &&
-        fingerprint.mtimeMs === mtimeMs
-      ) {
-        return;
-      }
-      // Still being written to: skip without recording the fingerprint so
-      // the file is picked up on the first sweep after it settles.
-      if (settleMs > 0) {
-        const nowMs = yield* Clock.currentTimeMillis;
-        if (nowMs - mtimeMs < settleMs) {
-          return;
-        }
-      }
-      // Recorded before importing: a failed import is retried when the file
-      // changes again rather than re-attempted (and re-logged) every sweep.
-      fileFingerprints.set(filePath, { size, mtimeMs });
-
+      const { driver, filePath, context, size } = input;
       if (size > maxFileBytes) {
         yield* Effect.logInfo("session.importer.file-too-large", {
           filePath,
@@ -2612,6 +2588,45 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         return;
       }
       yield* importFreshSession({ driver, sessionId, filePath, parsed, context });
+    });
+
+    /**
+     * One file of a sweep. Nearly every file is as the last sweep left it, so
+     * that check runs outside a span: a span for each of the thousands of
+     * session files, every sweep, was most of what the trace file held.
+     */
+    const processFile = Effect.fnUntraced(function* (input: {
+      readonly driver: ProviderDriverKind;
+      readonly filePath: string;
+      readonly context: SweepContext;
+    }) {
+      const { driver, filePath, context } = input;
+      const info = yield* fs.stat(filePath);
+      const size = Number(info.size);
+      const mtimeMs = Option.match(info.mtime, {
+        onNone: () => 0,
+        onSome: (mtime) => mtime.getTime(),
+      });
+      const fingerprint = fileFingerprints.get(filePath);
+      if (
+        fingerprint !== undefined &&
+        fingerprint.size === size &&
+        fingerprint.mtimeMs === mtimeMs
+      ) {
+        return;
+      }
+      // Still being written to: skip without recording the fingerprint so
+      // the file is picked up on the first sweep after it settles.
+      if (settleMs > 0) {
+        const nowMs = yield* Clock.currentTimeMillis;
+        if (nowMs - mtimeMs < settleMs) {
+          return;
+        }
+      }
+      // Recorded before importing: a failed import is retried when the file
+      // changes again rather than re-attempted (and re-logged) every sweep.
+      fileFingerprints.set(filePath, { size, mtimeMs });
+      yield* importChangedFile({ driver, filePath, context, size });
     });
 
     /** Whether a machine-launched session shares early history with any
