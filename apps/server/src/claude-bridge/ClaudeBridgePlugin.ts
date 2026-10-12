@@ -609,27 +609,32 @@ async function t3InSightSoon($, isOver, alone) {
 // enough that the heartbeat never looked stale: the new process knows nothing
 // of what the old one was asked). Resolves to whether T3 is in sight.
 // The permission mode an approval of this request can also switch the session
-// to. Claude Code's own dialog offers it: "Yes, and switch to auto mode" on a
-// command, "Yes, and use auto mode" on a plan (measured on 2.1.296: an allow
-// with a setMode change switches the session as those options do). The
-// session's settings row says whether it has an auto mode at all; without one
-// a plan's dialog offers to auto-accept edits. A file change's dialog offers
-// accept edits as its "don't ask again", which the suggested rules carry.
+// to, where Claude Code's own dialog offers that (read in 2.1.296's dialogs
+// and measured there: an allow with a setMode change switches the session as
+// the option does). A command's dialog offers "Yes, and switch to auto mode"
+// in manual and accept-edits mode; a plan's offers "Yes, and use auto mode",
+// or to auto-accept edits where the session has no auto mode. No other
+// dialog does: a file change's offers accept edits as its "don't ask again",
+// which the suggested rules carry. The session's settings row says which
+// modes it has; one that can bypass permissions is offered that on a plan
+// instead, which is not passed on.
 let sessionModes = null
 let sessionModesAt = 0
-const FILE_CHANGE_TOOLS = ['Write', 'Edit', 'MultiEdit', 'NotebookEdit']
 async function modeWithApproval($, e) {
   try {
+    if (e.agent_id) return undefined
     const now = String(e.permission_mode || '')
-    if (e.agent_id || now === 'auto' || now === 'bypassPermissions' || now === 'dontAsk') return undefined
-    if (FILE_CHANGE_TOOLS.indexOf(e.tool_name) >= 0) return undefined
+    const plan = e.tool_name === 'ExitPlanMode'
+    const command = e.tool_name === 'Bash' && (now === 'default' || now === 'acceptEdits')
+    if (!plan && !command) return undefined
     if (sessionModes === null || Date.now() - sessionModesAt > 60000) {
       const row = (await $.config.list()).find((entry) => entry.key === 'permissionMode')
       sessionModes = row && Array.isArray(row.options) ? row.options.map(String) : []
       sessionModesAt = Date.now()
     }
+    if (plan && sessionModes.indexOf('bypassPermissions') >= 0) return undefined
     if (sessionModes.indexOf('auto') >= 0) return 'auto'
-    if (e.tool_name === 'ExitPlanMode' && sessionModes.indexOf('acceptEdits') >= 0) return 'acceptEdits'
+    if (plan && sessionModes.indexOf('acceptEdits') >= 0) return 'acceptEdits'
   } catch {}
   return undefined
 }
