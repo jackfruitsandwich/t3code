@@ -9861,7 +9861,12 @@ export default function ChatView(props: ChatViewProps) {
   };
 
   const onRespondToApproval = useCallback(
-    async (requestId: RuntimeRequestId, decision: ProviderApprovalDecision, note?: string) => {
+    async (
+      requestId: RuntimeRequestId,
+      decision: ProviderApprovalDecision,
+      note?: string,
+      mode?: string,
+    ) => {
       if (!activeThreadId) return;
       if (
         pendingApprovals.find((approval) => approval.requestId === requestId)
@@ -9879,6 +9884,7 @@ export default function ChatView(props: ChatViewProps) {
           requestId,
           decision,
           ...(note === undefined ? {} : { note }),
+          ...(mode === undefined ? {} : { mode }),
         },
       });
       if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {

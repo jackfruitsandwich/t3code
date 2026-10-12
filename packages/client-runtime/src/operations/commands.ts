@@ -1,6 +1,7 @@
 import { remapComposerContextAttachments } from "@t3tools/shared/composerContextReferences";
 import {
   type ThreadLinkedPullRequest,
+  APPROVAL_MODE_ANSWER_ID,
   APPROVAL_NOTE_ANSWER_ID,
   CommandId,
   CheckpointId,
@@ -193,6 +194,8 @@ export interface RespondToThreadApprovalInput extends ThreadCommandInput {
   readonly decision: ProviderApprovalDecision;
   /** What the person wrote with a decline, where the request takes it. */
   readonly note?: string;
+  /** The permission mode to switch to with an accept, where the request offers one. */
+  readonly mode?: string;
 }
 
 export interface RespondToThreadUserInputInput extends ThreadCommandInput {
@@ -844,6 +847,9 @@ export const respondToThreadApproval = Effect.fn("EnvironmentCommands.respondToT
       decision: input.decision,
       ...(input.decision === "decline" && input.note !== undefined && input.note.trim().length > 0
         ? { answers: { [APPROVAL_NOTE_ANSWER_ID]: input.note.trim() } }
+        : {}),
+      ...(input.decision === "accept" && input.mode !== undefined
+        ? { answers: { [APPROVAL_MODE_ANSWER_ID]: input.mode } }
         : {}),
     });
   },

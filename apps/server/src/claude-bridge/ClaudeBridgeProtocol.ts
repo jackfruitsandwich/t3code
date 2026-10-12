@@ -30,7 +30,7 @@ import type {
 import { isRecord, parseJsonlLine } from "../import/sessionImportTypes.ts";
 
 export const CLAUDE_BRIDGE_PROTOCOL_VERSION = 2;
-export const CLAUDE_BRIDGE_MOD_VERSION = "0.3.18";
+export const CLAUDE_BRIDGE_MOD_VERSION = "0.3.19";
 /**
  * The first protocol whose mod runs slash commands, answers questions with
  * their answers and reports the session's own commands. A process still on an
@@ -202,6 +202,17 @@ export const claudeRefusalNote = (result: unknown): string | undefined => {
 };
 
 /**
+ * The permission mode an approval also switches the session to, as the
+ * dialog's "Yes, and switch to auto mode" does. The adapter marks such an
+ * approval with the mode; the change itself rides in its `updatedPermissions`,
+ * which the bridge then hands to the session as they are.
+ */
+export const claudeApprovalMode = (result: unknown): string | undefined => {
+  const mode = isRecord(result) ? result.mode : undefined;
+  return typeof mode === "string" && mode.length > 0 ? mode : undefined;
+};
+
+/**
  * Built-in commands that open a panel in the terminal when typed with no
  * argument. The first group was observed on Claude Code 2.1.296 by running
  * every listed built-in bare in a throwaway session and seeing which never
@@ -346,6 +357,11 @@ export type ClaudeBridgeEvent = { readonly seq: number; readonly at: number } & 
       readonly suggestions?: ReadonlyArray<unknown>;
       /** The kind of subagent whose call this is (`general-purpose`), when a subagent asks. */
       readonly agentType?: string;
+      /**
+       * The permission mode the session can be switched to with an approval,
+       * where its own dialog offers that ("Yes, and switch to auto mode").
+       */
+      readonly approveWithMode?: string;
     }
   | {
       readonly type: "approval.resolved";
@@ -574,6 +590,9 @@ export function parseClaudeBridgeEvent(value: unknown): ClaudeBridgeEvent | null
         ...(typeof value.agentType === "string" && value.agentType.length > 0
           ? { agentType: value.agentType }
           : {}),
+        ...(typeof value.approveWithMode === "string" && value.approveWithMode.length > 0
+          ? { approveWithMode: value.approveWithMode }
+          : {}),
       };
     case "approval.resolved":
       if (typeof value.toolUseId !== "string") return null;
@@ -713,6 +732,14 @@ export const claudeBridgeAlsoInTerminal = (options: unknown): boolean =>
  */
 export const claudeBridgeAskingAgent = (options: unknown): string | null =>
   isRecord(options) && typeof options.askedByAgent === "string" ? options.askedByAgent : null;
+/**
+ * The permission mode a bridged session says an approval of this call can
+ * also switch it to, as its own dialog offers.
+ */
+export const claudeBridgeApproveWithMode = (options: unknown): string | undefined =>
+  isRecord(options) && typeof options.approveWithMode === "string" && options.approveWithMode !== ""
+    ? options.approveWithMode
+    : undefined;
 /**
  * Why a bridged session's permission callback is aborted when the session
  * settled the request without T3: it was answered in the terminal, or its

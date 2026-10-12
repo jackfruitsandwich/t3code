@@ -4,6 +4,7 @@ import type {
   ProviderApprovalOption,
   RuntimeRequestId,
 } from "@t3tools/contracts";
+import { approveWithModeLabel } from "@t3tools/client-runtime/state/thread-requests";
 import { useState } from "react";
 import { Platform, ScrollView, View } from "react-native";
 
@@ -17,6 +18,7 @@ export interface PendingApprovalCardProps {
     requestId: RuntimeRequestId,
     decision: ProviderApprovalDecision,
     note?: string,
+    mode?: string,
   ) => Promise<unknown>;
   readonly onInputFocusChange?: (focused: boolean) => void;
 }
@@ -45,6 +47,7 @@ export function PendingApprovalCard(props: PendingApprovalCardProps) {
   // Mounted per request (keyed by its id), so a note never outlives its request.
   const [note, setNote] = useState("");
   const takesNote = canRespond && props.approval.declineNote === true;
+  const withMode = props.approval.approveWithMode;
   return (
     <View className="gap-2.5 rounded-[20px] border border-border bg-card-alt p-4">
       <Text className="font-t3-bold text-2xs uppercase tracking-[1.1px] text-foreground-secondary">
@@ -122,6 +125,16 @@ export function PendingApprovalCard(props: PendingApprovalCardProps) {
             }
           />
         ))}
+        {canRespond && withMode !== undefined ? (
+          <RequestActionButton
+            label={approveWithModeLabel(withMode)}
+            tone="secondary"
+            disabled={disabled}
+            onPress={() =>
+              void props.onRespond(props.approval.requestId, "accept", undefined, withMode)
+            }
+          />
+        ) : null}
       </View>
     </View>
   );

@@ -21,6 +21,7 @@ import {
   claudeBridgeWakeRequest,
   claudeContinuedInSession,
   type ClaudeBridgeCommandBody,
+  claudeBridgeApproveWithMode,
 } from "../../claude-bridge/ClaudeBridgeProtocol.ts";
 import * as ProviderEventLoggers from "../../provider/ProviderEventLoggers.ts";
 import * as ClaudeAdapterV2 from "./ClaudeAdapterV2.ts";
@@ -171,6 +172,8 @@ const attach = (input: {
     }> = [];
     /** What the runner said the session did with messages sent to steer its turn, in order. */
     const deliveries: Array<string> = [];
+    /** The permission mode each request was said to offer with an approval. */
+    const offeredModes: Array<string | undefined> = [];
     const session = yield* runner.open({
       threadId: ThreadId.make("bridge-thread"),
       providerSessionId: ProviderSessionId.make("bridge-provider-session"),
@@ -187,6 +190,7 @@ const attach = (input: {
       },
       bridgeCanUseTool: (tool, toolInput, options) => {
         bridgeCalls.push({ tool, input: toolInput, toolUseId: options.toolUseID });
+        offeredModes.push(claudeBridgeApproveWithMode(options));
         return Promise.resolve(
           input.bridgeCanUseTool(tool, toolInput, options.toolUseID, options.signal),
         );
@@ -209,6 +213,7 @@ const attach = (input: {
       recordChanges,
       asked,
       deliveries,
+      offeredModes,
     };
   });
 
@@ -352,6 +357,41 @@ describe("ClaudeBridgeQueryRunner permissions", () => {
         scope: "session",
         updatedPermissions: [forSession],
       });
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  // The dialog's "Yes, and switch to auto mode", and a plan's "Yes, and use
+  // auto mode": the approval carries the mode change, whether or not the
+  // session suggested any rules for the call.
+  it.effect("hands an approval that switches the permission mode to the session as it is", () =>
+    Effect.gen(function* () {
+      const toAuto = { type: "setMode" as const, mode: "auto", destination: "session" as const };
+      const bridge = yield* attach({
+        protocol: 2,
+        bridgeCanUseTool: () =>
+          ({ behavior: "allow", updatedPermissions: [toAuto], mode: "auto" }) as PermissionResult,
+      });
+      yield* bridge.handler(
+        {
+          type: "approval.request",
+          seq: 1,
+          at: bridge.now,
+          toolUseId: "plan-1",
+          tool: "ExitPlanMode",
+          input: { plan: "1. do it" },
+          alsoInTerminal: true,
+          approveWithMode: "auto",
+        },
+        bridge.process,
+      );
+      assert.deepStrictEqual(yield* Queue.take(bridge.commands), {
+        type: "approval",
+        toolUseId: "plan-1",
+        decision: "allow",
+        updatedPermissions: [toAuto],
+      });
+      // The person was offered what the session said it offers.
+      assert.deepStrictEqual(bridge.offeredModes, ["auto"]);
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 

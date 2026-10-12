@@ -1505,6 +1505,11 @@ export const OrchestrationV2TurnItem = Schema.Union([
      * agent can act on it in the same turn.
      */
     declineNote: Schema.optional(Schema.Boolean),
+    /**
+     * A permission mode the provider can switch the session to together with an
+     * approval, as its own dialog offers ("Yes, and switch to auto mode").
+     */
+    approveWithMode: Schema.optional(TrimmedNonEmptyString),
   }),
   Schema.Struct({
     ...OrchestrationV2TurnItemBaseFields,
@@ -2290,6 +2295,11 @@ export const OrchestrationV2TurnItemJson = Schema.Union([
      * agent can act on it in the same turn.
      */
     declineNote: Schema.optional(Schema.Boolean),
+    /**
+     * A permission mode the provider can switch the session to together with an
+     * approval, as its own dialog offers ("Yes, and switch to auto mode").
+     */
+    approveWithMode: Schema.optional(TrimmedNonEmptyString),
   }),
   Schema.Struct({
     ...OrchestrationV2TurnItemJsonBaseFields,

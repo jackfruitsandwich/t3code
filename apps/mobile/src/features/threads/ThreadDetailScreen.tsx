@@ -226,6 +226,7 @@ export interface ThreadDetailScreenProps {
     requestId: RuntimeRequestId,
     decision: ProviderApprovalDecision,
     note?: string,
+    mode?: string,
   ) => Promise<unknown>;
   readonly onSelectUserInputOption: (
     requestId: RuntimeRequestId,

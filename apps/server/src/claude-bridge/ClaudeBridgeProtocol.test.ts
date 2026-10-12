@@ -1,7 +1,9 @@
 import { assert, describe, it } from "@effect/vitest";
 
 import {
+  claudeApprovalMode,
   claudeBridgeAlsoInTerminal,
+  claudeBridgeApproveWithMode,
   claudeBridgeAskingAgent,
   claudeBridgeAttachmentPaths,
   claudeBridgeMidTurnWords,
@@ -567,6 +569,24 @@ describe("ClaudeBridgeProtocol record helpers", () => {
     ]);
     assert.isTrue(claudeBridgeAlsoInTerminal({ signal: null, alsoInTerminal: true }));
     assert.isFalse(claudeBridgeAlsoInTerminal({ signal: null }));
+  });
+
+  it("keeps the permission mode a request offers with an approval", () => {
+    const event = parseClaudeBridgeEvent({
+      seq: 4,
+      at: 1,
+      type: "approval.request",
+      toolUseId: "toolu_1",
+      tool: "Bash",
+      input: { command: "make" },
+      alsoInTerminal: true,
+      approveWithMode: "auto",
+    });
+    assert.strictEqual(event?.type === "approval.request" ? event.approveWithMode : null, "auto");
+    assert.strictEqual(claudeBridgeApproveWithMode({ approveWithMode: "auto" }), "auto");
+    assert.isUndefined(claudeBridgeApproveWithMode({ signal: null }));
+    assert.strictEqual(claudeApprovalMode({ behavior: "allow", mode: "auto" }), "auto");
+    assert.isUndefined(claudeApprovalMode({ behavior: "allow" }));
   });
 
   it("keeps which kind of subagent a request comes from", () => {

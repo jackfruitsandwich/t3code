@@ -1661,6 +1661,7 @@ export interface ChatComposerProps {
     requestId: RuntimeRequestId,
     decision: ProviderApprovalDecision,
     note?: string,
+    mode?: string,
   ) => Promise<unknown>;
   onSelectActivePendingUserInputOption: (questionId: string, optionValue: string) => void;
   onAdvanceActivePendingUserInput: () => void;
@@ -6706,6 +6707,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                         )}
                         options={activePendingApproval.options}
                         declineNote={activePendingApproval.declineNote}
+                        approveWithMode={activePendingApproval.approveWithMode}
                         canRespond={activePendingApproval.responseCapability === "live"}
                         onRespondToApproval={onRespondToApproval}
                       />

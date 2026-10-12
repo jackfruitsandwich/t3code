@@ -19,6 +19,8 @@ export interface ThreadPendingApproval {
   readonly options?: ReadonlyArray<ProviderApprovalOption>;
   /** A decline may carry the person's own words to the agent. */
   readonly declineNote?: boolean;
+  /** A permission mode an approval can also switch the session to. */
+  readonly approveWithMode?: string;
   readonly responseCapability: "live" | "not_resumable";
 }
 
@@ -91,6 +93,9 @@ export function derivePendingThreadRequests(
       ...(item?.type === "approval_request" && item.declineNote === true
         ? { declineNote: true }
         : {}),
+      ...(item?.type === "approval_request" && item.approveWithMode !== undefined
+        ? { approveWithMode: item.approveWithMode }
+        : {}),
       responseCapability: responseCapability === "live" ? "live" : "not_resumable",
     });
   }
@@ -155,3 +160,14 @@ export function createQuestionHistoryProjector() {
     return previousResult;
   };
 }
+
+/**
+ * What the choice to approve and switch the session's permission mode is
+ * called, after the provider's own dialog ("Yes, and switch to auto mode").
+ */
+export const approveWithModeLabel = (mode: string): string =>
+  mode === "auto"
+    ? "Approve and switch to auto mode"
+    : mode === "acceptEdits"
+      ? "Approve and auto-accept edits"
+      : `Approve and switch to ${mode} mode`;

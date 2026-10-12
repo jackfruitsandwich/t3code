@@ -70,6 +70,12 @@ export type ProviderApprovalOption = typeof ProviderApprovalOption.Type;
  */
 export const APPROVAL_NOTE_ANSWER_ID = "note";
 
+/**
+ * Where an accepted approval carries the permission mode to switch to in the
+ * response's `answers`, for a request whose item names one in `approveWithMode`.
+ */
+export const APPROVAL_MODE_ANSWER_ID = "mode";
+
 export const ProviderUserInputAnswers = Schema.Record(Schema.String, Schema.Unknown);
 export type ProviderUserInputAnswers = typeof ProviderUserInputAnswers.Type;
 

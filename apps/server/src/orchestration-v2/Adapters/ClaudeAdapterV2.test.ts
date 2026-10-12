@@ -907,6 +907,30 @@ describe("ClaudeAdapterV2 session permissions", () => {
     assert.equal(result.interrupt, undefined);
   });
 
+  it("approves and switches the session's permission mode when asked to", () => {
+    const result = ClaudeAdapterV2.permissionResultFromDecision({
+      toolName: "Bash",
+      decision: "accept",
+      toolInput: { command: "make" },
+      toolUseID: "build",
+      mode: "auto",
+    });
+    assert.equal(result.behavior, "allow");
+    if (result.behavior !== "allow") return;
+    assert.deepEqual(result.updatedInput, { command: "make" });
+    assert.deepEqual(result.updatedPermissions, [
+      { type: "setMode", mode: "auto", destination: "session" },
+    ]);
+    // A plain accept changes nothing but this call.
+    const plain = ClaudeAdapterV2.permissionResultFromDecision({
+      toolName: "Bash",
+      decision: "accept",
+      toolInput: { command: "make" },
+      toolUseID: "build",
+    });
+    assert.equal(plain.behavior === "allow" ? plain.updatedPermissions : null, undefined);
+  });
+
   it("forces suggested permission updates to session scope", () => {
     const result = ClaudeAdapterV2.permissionResultFromDecision({
       toolName: "Bash",

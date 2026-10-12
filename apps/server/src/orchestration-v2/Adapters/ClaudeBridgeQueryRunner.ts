@@ -56,6 +56,7 @@ import {
   CLAUDE_BRIDGE_BASH_MOD_VERSION,
   CLAUDE_BRIDGE_DIALOG_REFUSAL_MOD_VERSION,
   claudeConfigModelChoice,
+  claudeApprovalMode,
   claudeRefusalNote,
   makeClaudePlainCommandReader,
   claudeTranscriptCommandText,
@@ -1200,6 +1201,9 @@ export const layer: Layer.Layer<
                 ...(event.alsoInTerminal === true ? { alsoInTerminal: true } : {}),
                 ...(event.suggestions === undefined ? {} : { suggestions: event.suggestions }),
                 ...(event.agentType === undefined ? {} : { askedByAgent: event.agentType }),
+                ...(event.approveWithMode === undefined
+                  ? {}
+                  : { approveWithMode: event.approveWithMode }),
               } as Parameters<CanUseTool>[2]),
             openTurn: openRequestTurn(
               event.toolUseId,
@@ -1234,14 +1238,19 @@ export const layer: Layer.Layer<
             // Claude Code suggested rules for the call (its dialog's "don't
             // ask again" option), those go back and Claude Code applies them
             // itself; otherwise the mod keeps the grant for the same call.
-            const forSession = (decision.updatedPermissions?.length ?? 0) > 0;
+            // An approval that also switches the session's permission mode
+            // carries that change alone, and it goes to the session as it is.
+            const withMode = claudeApprovalMode(decision) !== undefined;
+            const forSession = !withMode && (decision.updatedPermissions?.length ?? 0) > 0;
             const ownRules = forSession && event.suggestions !== undefined;
             yield* registry.send(bridgeProcess, {
               type: "approval",
               toolUseId: event.toolUseId,
               decision: "allow",
               ...(forSession ? { scope: "session" as const } : {}),
-              ...(ownRules ? { updatedPermissions: decision.updatedPermissions ?? [] } : {}),
+              ...(ownRules || withMode
+                ? { updatedPermissions: decision.updatedPermissions ?? [] }
+                : {}),
             });
             return;
           }

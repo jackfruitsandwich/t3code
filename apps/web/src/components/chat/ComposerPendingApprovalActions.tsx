@@ -3,6 +3,7 @@ import {
   type ProviderApprovalOption,
   type RuntimeRequestId,
 } from "@t3tools/contracts";
+import { approveWithModeLabel } from "@t3tools/client-runtime/state/thread-requests";
 import { memo, useState } from "react";
 import { EllipsisIcon, TriangleAlertIcon } from "lucide-react";
 import { Button } from "../ui/button";
@@ -18,10 +19,13 @@ interface ComposerPendingApprovalActionsProps {
   options?: ReadonlyArray<ProviderApprovalOption> | undefined;
   /** The request takes the person's own words with a decline. */
   declineNote?: boolean | undefined;
+  /** A permission mode an approval of the request can also switch the session to. */
+  approveWithMode?: string | undefined;
   onRespondToApproval: (
     requestId: RuntimeRequestId,
     decision: ProviderApprovalDecision,
     note?: string,
+    mode?: string,
   ) => Promise<unknown>;
 }
 
@@ -38,6 +42,7 @@ export const ComposerPendingApprovalActions = memo(function ComposerPendingAppro
   canRespond,
   options = DEFAULT_APPROVAL_OPTIONS,
   declineNote = false,
+  approveWithMode,
   onRespondToApproval,
 }: ComposerPendingApprovalActionsProps) {
   // Mounted per request (keyed by its id), so a note never outlives its request.
@@ -116,7 +121,7 @@ export const ComposerPendingApprovalActions = memo(function ComposerPendingAppro
           button
         );
       })}
-      {moreOptions.length > 0 || declineNote ? (
+      {moreOptions.length > 0 || declineNote || approveWithMode !== undefined ? (
         <Menu>
           <MenuTrigger
             disabled={isResponding}
@@ -125,6 +130,20 @@ export const ComposerPendingApprovalActions = memo(function ComposerPendingAppro
             <EllipsisIcon />
           </MenuTrigger>
           <MenuPopup {...composerFloatingLayerProps} side="top" align="end">
+            {approveWithMode !== undefined ? (
+              <MenuItem
+                disabled={isResponding || !canRespond}
+                onClick={() =>
+                  void onRespondToApproval(requestId, "accept", undefined, approveWithMode)
+                }
+                variant="ghost"
+                className="mb-1 last:mb-0"
+              >
+                <span className="min-w-0 whitespace-normal wrap-break-word">
+                  {approveWithModeLabel(approveWithMode)}
+                </span>
+              </MenuItem>
+            ) : null}
             {declineNote ? (
               <MenuItem
                 disabled={isResponding || !canRespond}

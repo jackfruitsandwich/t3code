@@ -608,6 +608,31 @@ async function t3InSightSoon($, isOver, alone) {
 // when T3 is back or another T3 process has taken its place (a restart quick
 // enough that the heartbeat never looked stale: the new process knows nothing
 // of what the old one was asked). Resolves to whether T3 is in sight.
+// The permission mode an approval of this request can also switch the session
+// to. Claude Code's own dialog offers it: "Yes, and switch to auto mode" on a
+// command, "Yes, and use auto mode" on a plan (measured on 2.1.296: an allow
+// with a setMode change switches the session as those options do). The
+// session's settings row says whether it has an auto mode at all; without one
+// a plan's dialog offers to auto-accept edits. A file change's dialog offers
+// accept edits as its "don't ask again", which the suggested rules carry.
+let sessionModes = null
+let sessionModesAt = 0
+const FILE_CHANGE_TOOLS = ['Write', 'Edit', 'MultiEdit', 'NotebookEdit']
+async function modeWithApproval($, e) {
+  try {
+    const now = String(e.permission_mode || '')
+    if (e.agent_id || now === 'auto' || now === 'bypassPermissions' || now === 'dontAsk') return undefined
+    if (FILE_CHANGE_TOOLS.indexOf(e.tool_name) >= 0) return undefined
+    if (sessionModes === null || Date.now() - sessionModesAt > 60000) {
+      const row = (await $.config.list()).find((entry) => entry.key === 'permissionMode')
+      sessionModes = row && Array.isArray(row.options) ? row.options.map(String) : []
+      sessionModesAt = Date.now()
+    }
+    if (sessionModes.indexOf('auto') >= 0) return 'auto'
+    if (e.tool_name === 'ExitPlanMode' && sessionModes.indexOf('acceptEdits') >= 0) return 'acceptEdits'
+  } catch {}
+  return undefined
+}
 function t3Teller($, announce, retire) {
   let isTold = true
   let pid = t3PidSeen
@@ -1430,7 +1455,7 @@ export function register(on) {
       // T3 does not show; with no terminal it waits for T3 as long as T3 has
       // been around at all.
       if (!(await t3InSightSoon($, () => settledCalls.has(toolUseId), !withTerminal)) && (withTerminal || !t3Expected())) return next(e)
-      const request = { toolUseId: toolUseId, tool: e.tool_name, input: e.tool_input, turnId: activeTurn ? activeTurn.turnId : undefined, alsoInTerminal: true, suggestions: Array.isArray(e.permission_suggestions) ? e.permission_suggestions : undefined, agentType: e.agent_id ? String(e.agent_type || 'subagent') : undefined }
+      const request = { toolUseId: toolUseId, tool: e.tool_name, input: e.tool_input, turnId: activeTurn ? activeTurn.turnId : undefined, alsoInTerminal: true, suggestions: Array.isArray(e.permission_suggestions) ? e.permission_suggestions : undefined, agentType: e.agent_id ? String(e.agent_type || 'subagent') : undefined, approveWithMode: await modeWithApproval($, e) }
       const askT3 = () => emit($, 'approval.request', request)
       await askT3()
       const keepT3Told = t3Teller($, askT3, () => emit($, 'approval.resolved', { toolUseId: toolUseId, decision: 'ask', by: 'detached' }))

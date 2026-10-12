@@ -39,6 +39,7 @@ import {
   formatClaudeResumeCompactionQuestion,
 } from "@t3tools/shared/claudeCompaction";
 import {
+  APPROVAL_MODE_ANSWER_ID,
   APPROVAL_NOTE_ANSWER_ID,
   type ChatAttachment,
   ClaudeSettings,
@@ -96,6 +97,7 @@ import { discoverClaudeSkills } from "../../provider/Drivers/ClaudeSkills.ts";
 import { compileClaudeModelSelection } from "../../claudeModelOptions.ts";
 import {
   claudeBridgeAlsoInTerminal,
+  claudeBridgeApproveWithMode,
   claudeBridgeAskingAgent,
   claudeBridgeSettledElsewhere,
   claudeBridgeWakeDetail,
@@ -2379,7 +2381,24 @@ export function permissionResultFromDecision(input: {
   readonly suggestions?: Parameters<CanUseTool>[2]["suggestions"];
   /** What the person wrote with a decline: Claude is told it and carries on. */
   readonly note?: string;
+  /** The permission mode an accept also switches the session to. */
+  readonly mode?: string;
 }): PermissionResult {
+  if (input.decision === "accept" && input.mode !== undefined) {
+    // Claude Code's own dialog has it: "Yes, and switch to auto mode".
+    const approval = {
+      behavior: "allow",
+      updatedInput: input.toolInput,
+      toolUseID: input.toolUseID,
+      decisionClassification: "user_temporary",
+      updatedPermissions: [
+        { type: "setMode", mode: input.mode, destination: "session" },
+      ] as NonNullable<Extract<PermissionResult, { behavior: "allow" }>["updatedPermissions"]>,
+      mode: input.mode,
+    } satisfies PermissionResult & { readonly mode: string };
+    return approval;
+  }
+
   if (input.decision === "accept" || input.decision === "acceptForSession") {
     return {
       behavior: "allow",
@@ -3022,6 +3041,9 @@ type PendingClaudeRuntimeRequest =
       readonly requestKind: ProviderRequestKind;
       readonly decision: Deferred.Deferred<ProviderApprovalDecision, never>;
       readonly note: Ref.Ref<string | undefined>;
+      /** The permission mode the request offers with an approval, and the one the person took. */
+      readonly offeredMode: string | undefined;
+      readonly mode: Ref.Ref<string | undefined>;
     }
   | {
       readonly type: "user_input";
@@ -4893,6 +4915,7 @@ export function makeClaudeAdapterV2(
           readonly requestKind: OrchestrationV2RuntimeRequest["kind"];
           readonly prompt?: string;
           readonly questions?: ReadonlyArray<OrchestrationV2UserInputQuestion>;
+          readonly approveWithMode?: string;
         }) {
           const createdAt = yield* DateTime.now;
           const requestId = yield* idAllocator.allocate.runtimeRequest({
@@ -4979,6 +5002,9 @@ export function makeClaudeAdapterV2(
                   // Claude Code's own dialog has it: "No, and tell Claude
                   // what to do differently".
                   declineNote: true,
+                  ...(input.approveWithMode === undefined
+                    ? {}
+                    : { approveWithMode: input.approveWithMode }),
                 }
               : {
                   type: "user_input_request" as const,
@@ -7124,15 +7150,19 @@ export function makeClaudeAdapterV2(
               ? proposedClaudeFileChange(claudeNativeToolInputValue(nativeToolInput))
               : undefined;
           const prompt = proposedChange === undefined ? asked : `${asked}\n${proposedChange}`;
+          const offeredMode =
+            origin === "bridge" ? claudeBridgeApproveWithMode(callbackOptions) : undefined;
           const artifacts = yield* buildApprovalRequestArtifacts({
             context,
             nativeItemId: nativeRequestId,
             nativeRequestId,
             requestKind,
             prompt,
+            ...(offeredMode === undefined ? {} : { approveWithMode: offeredMode }),
           });
           const decision = yield* Deferred.make<ProviderApprovalDecision, never>();
           const note = yield* Ref.make<string | undefined>(undefined);
+          const mode = yield* Ref.make<string | undefined>(undefined);
           yield* Ref.update(pendingRuntimeRequests, (current) => {
             const updated = new Map(current);
             updated.set(String(artifacts.request.id), {
@@ -7141,6 +7171,8 @@ export function makeClaudeAdapterV2(
               requestKind,
               decision,
               note,
+              offeredMode,
+              mode,
             });
             return updated;
           });
@@ -7181,12 +7213,14 @@ export function makeClaudeAdapterV2(
           yield* putAwayIfSettledElsewhere(artifacts);
 
           const said = yield* Ref.get(note);
+          const switchTo = yield* Ref.get(mode);
           return permissionResultFromDecision({
             toolName,
             decision: resolvedDecision,
             toolInput,
             toolUseID: callbackOptions.toolUseID,
             ...(said === undefined ? {} : { note: said }),
+            ...(switchTo === undefined ? {} : { mode: switchTo }),
             ...(callbackOptions.suggestions === undefined
               ? {}
               : { suggestions: callbackOptions.suggestions }),
@@ -8189,6 +8223,15 @@ export function makeClaudeAdapterV2(
                 said.trim().length > 0
               ) {
                 yield* Ref.set(pending.note, said.trim());
+              }
+              // Only the mode the request itself offered is taken.
+              const switchTo = requestInput.answers?.[APPROVAL_MODE_ANSWER_ID];
+              if (
+                requestInput.decision === "accept" &&
+                typeof switchTo === "string" &&
+                switchTo === pending.offeredMode
+              ) {
+                yield* Ref.set(pending.mode, switchTo);
               }
               yield* Deferred.succeed(pending.decision, requestInput.decision);
             },
