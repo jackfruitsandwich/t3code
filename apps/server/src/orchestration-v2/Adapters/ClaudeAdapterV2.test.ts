@@ -889,6 +889,24 @@ describe("ClaudeAdapterV2 session permissions", () => {
     assert.equal(result.interrupt, undefined);
   });
 
+  it("refuses with the person's words in Claude Code's own wording", () => {
+    const result = ClaudeAdapterV2.permissionResultFromDecision({
+      toolName: "Bash",
+      decision: "decline",
+      toolInput: { command: "make" },
+      toolUseID: "denied-build",
+      note: "run the tests first",
+    });
+    assert.equal(result.behavior, "deny");
+    if (result.behavior !== "deny") return;
+    assert.equal(result.decisionClassification, "user_reject");
+    assert.equal(
+      result.message,
+      "The user doesn't want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file). To tell you how to proceed, the user said:\nrun the tests first",
+    );
+    assert.equal(result.interrupt, undefined);
+  });
+
   it("forces suggested permission updates to session scope", () => {
     const result = ClaudeAdapterV2.permissionResultFromDecision({
       toolName: "Bash",

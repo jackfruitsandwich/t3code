@@ -309,6 +309,75 @@ describe("parseClaudeSessionJsonl", () => {
     );
   });
 
+  it("shows a command written as plain rows as the command and what it printed", () => {
+    const caveat = "<local-command-caveat>Caveat: the messages below.</local-command-caveat>";
+    const parsed = parseClaudeSessionJsonl(
+      line(userEntry()) +
+        line(assistantEntry()) +
+        line(
+          userEntry({
+            uuid: "note-1",
+            isMeta: true,
+            message: { role: "user", content: caveat },
+          }),
+        ) +
+        line(
+          userEntry({
+            uuid: "command-1",
+            parentUuid: "note-1",
+            message: { role: "user", content: "/keybindings-help" },
+          }),
+        ) +
+        line(
+          userEntry({
+            uuid: "printed-1",
+            parentUuid: "command-1",
+            message: {
+              role: "user",
+              content: "This skill can only be invoked by Claude, not directly by users.",
+            },
+          }),
+        ) +
+        line(
+          userEntry({
+            uuid: "note-2",
+            parentUuid: "printed-1",
+            isMeta: true,
+            message: { role: "user", content: caveat },
+          }),
+        ) +
+        line(
+          userEntry({
+            uuid: "command-2",
+            parentUuid: "note-2",
+            message: { role: "user", content: "/code-review" },
+          }),
+        ) +
+        line({
+          type: "system",
+          subtype: "local_command",
+          uuid: "printed-2",
+          parentUuid: "command-2",
+          sessionId: SESSION_ID,
+          timestamp: "2026-07-01T10:00:09.000Z",
+          isSidechain: false,
+          content:
+            '<local-command-stdout>Running in the background as @code-review</local-command-stdout>\n<forked-skill-launch>{"agentId":"a1","skillName":"code-review","description":"/code-review"}</forked-skill-launch>',
+        }),
+    );
+    assert.deepEqual(
+      parsed.messages.map((message) => [message.role, message.text]),
+      [
+        ["user", "Fix the login bug"],
+        ["assistant", "I found the bug."],
+        ["user", "/keybindings-help"],
+        ["assistant", "This skill can only be invoked by Claude, not directly by users."],
+        ["user", "/code-review"],
+        ["assistant", "Running in the background as @code-review"],
+      ],
+    );
+  });
+
   it("shows /model sent from T3 as the command and what it printed, not the note for the model", () => {
     // As the bridge mod writes them: Claude Code writes none for a model set
     // through the settings row.

@@ -22,6 +22,7 @@ import {
   claudeTranscriptCommandText,
   claudeTranscriptPermissionMode,
   isClaudeBridgeModRow,
+  makeClaudePlainCommandReader,
   stripTerminalStyling,
 } from "../claude-bridge/ClaudeBridgeProtocol.ts";
 import {
@@ -37,7 +38,10 @@ import {
 } from "./sessionImportTypes.ts";
 
 const FORK_SIGNATURE_LENGTH = 5;
-const LOCAL_COMMAND_STDOUT = /^\s*<local-command-stdout>([\s\S]*)<\/local-command-stdout>\s*$/u;
+// What a command printed. A skill that runs in the background follows it, in the
+// same row, with a tag of its own that names the agent: that part is not text.
+const LOCAL_COMMAND_STDOUT =
+  /^\s*<local-command-stdout>([\s\S]*?)<\/local-command-stdout>\s*(?:<forked-skill-launch>[\s\S]*)?$/u;
 
 const TASK_NOTICE_HEAD = "<task-notification>";
 const NOTICE_SUMMARY = /<summary>([\s\S]*?)<\/summary>/u;
@@ -137,6 +141,7 @@ export function parseClaudeSessionJsonl(content: string): ParsedCliSession {
   /** Rows that are slash commands: never a session's title. */
   const commandSourceIds = new Set<string>();
   let bridgeUpkeepOutputDue = false;
+  const plainCommand = makeClaudePlainCommandReader();
   let startedAt: string | undefined;
   let entrypoint: string | undefined;
   let permissionMode: string | undefined;
@@ -155,6 +160,8 @@ export function parseClaudeSessionJsonl(content: string): ParsedCliSession {
     if (!isRecord(entry)) {
       continue;
     }
+    // A command whose rows carry no markup: told by where its rows sit.
+    const plain = plainCommand(entry);
 
     // The record notes each change of permission mode in a row of its own.
     const recordedMode = claudeTranscriptPermissionMode(entry);
@@ -268,13 +275,17 @@ export function parseClaudeSessionJsonl(content: string): ParsedCliSession {
     const sourceId = readString(entry.uuid) ?? `line-${lineIndex}`;
     // The terminal shows a slash command as `/name args` and what it printed
     // as output, not as the markup the transcript wraps them in.
-    const commandText = claudeTranscriptCommandText(entry);
+    const commandText =
+      claudeTranscriptCommandText(entry) ??
+      (plain !== null && "command" in plain ? plain.command : null);
     // A slash command's output, or what a `!` command printed.
     const localOutput = LOCAL_COMMAND_STDOUT.exec(rawText)?.[1];
     const commandOutput = (
-      localOutput === undefined
-        ? (claudeTranscriptCommandOutput(entry) ?? undefined)
-        : stripTerminalStyling(localOutput)
+      plain !== null && "output" in plain
+        ? plain.output
+        : localOutput === undefined
+          ? (claudeTranscriptCommandOutput(entry) ?? undefined)
+          : stripTerminalStyling(localOutput)
     )?.trim();
     if (commandText === null && commandOutput === undefined && localCommand) {
       continue;

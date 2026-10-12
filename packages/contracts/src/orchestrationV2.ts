@@ -1500,6 +1500,11 @@ export const OrchestrationV2TurnItem = Schema.Union([
     appName: Schema.optional(Schema.String),
     /** Approval choices advertised by the provider (#8058). */
     options: Schema.optional(Schema.Array(ProviderApprovalOption)),
+    /**
+     * The provider passes on what the person writes with a decline, so the
+     * agent can act on it in the same turn.
+     */
+    declineNote: Schema.optional(Schema.Boolean),
   }),
   Schema.Struct({
     ...OrchestrationV2TurnItemBaseFields,
@@ -2280,6 +2285,11 @@ export const OrchestrationV2TurnItemJson = Schema.Union([
     appName: Schema.optional(Schema.String),
     /** Approval choices advertised by the provider (#8058). */
     options: Schema.optional(Schema.Array(ProviderApprovalOption)),
+    /**
+     * The provider passes on what the person writes with a decline, so the
+     * agent can act on it in the same turn.
+     */
+    declineNote: Schema.optional(Schema.Boolean),
   }),
   Schema.Struct({
     ...OrchestrationV2TurnItemJsonBaseFields,

@@ -56,6 +56,8 @@ import {
   CLAUDE_BRIDGE_BASH_MOD_VERSION,
   CLAUDE_BRIDGE_DIALOG_REFUSAL_MOD_VERSION,
   claudeConfigModelChoice,
+  claudeRefusalNote,
+  makeClaudePlainCommandReader,
   claudeTranscriptCommandText,
   claudeSessionNoticeFrame,
   claudeSessionNotificationText,
@@ -129,6 +131,8 @@ const LOCAL_COMMAND_QUIET_MS = 1_500;
  */
 const REQUEST_TURN_WAIT_MS = 15_000;
 const REQUEST_TURN_POLL_MS = 250;
+/** How long an agent's request waits for the line of the command that started it. */
+const COMMAND_LINE_WAIT_MS = 3_000;
 
 const runnerError = (cause: unknown, method: string) =>
   new ClaudeAdapterV2.ClaudeAgentSdkQueryRunnerError({ method, cause });
@@ -361,6 +365,7 @@ export const layer: Layer.Layer<
         heldOutput: [] as Array<SDKMessage>,
         heldAt: 0,
         lastCommandText: null as string | null,
+        plainCommand: makeClaudePlainCommandReader(),
         /** Rows that close a turn in the record, read so far; and the count when the open turn began. */
         turnEndsRead: 0,
         turnEndsAtTurnStart: 0,
@@ -688,7 +693,10 @@ export const layer: Layer.Layer<
               yield* registry.noteRecordChange(bridgeProcess, "typed-mid-turn");
             }
             transcriptMode = claudeTranscriptPermissionMode(row) ?? transcriptMode;
-            const commandText = claudeTranscriptCommandText(row);
+            const plain = state.plainCommand(row);
+            const commandText =
+              claudeTranscriptCommandText(row) ??
+              (plain !== null && "command" in plain ? plain.command : null);
             // The mod loading a newer version of itself: nobody asked for it.
             // (The person sending that same command from T3 is another
             // matter, and T3 is then waiting on it by name.)
@@ -921,7 +929,17 @@ export const layer: Layer.Layer<
           return state.asking.size === 0 ? closeRequestTurn(false) : Effect.void;
         });
 
-      /** A turn's worth of frames for a slash command that started no model turn. */
+      /** A background subagent's request is shown in the run that is open. */
+      const agentAskPlaced = () =>
+        [...state.agentAsks].some((toolUseId) => !state.unplaced.has(toolUseId));
+
+      /**
+       * A turn's worth of frames for a slash command that started no model
+       * turn. A command can start an agent in the background instead, and
+       * what that agent asks may already wait in the run that carries the
+       * command: the turn then ends once that is answered, as a turn of the
+       * session's own does.
+       */
       const emitCommandTurn = (input: {
         readonly turnId: string;
         readonly text: string;
@@ -945,20 +963,23 @@ export const layer: Layer.Layer<
           );
           const output = state.heldOutput.splice(0);
           yield* emit(output);
-          yield* emit(
-            translator.onTurnComplete({
-              seq: 0,
-              at: now,
-              type: "turn.complete",
-              turnId: input.turnId,
-              reason: input.ok ? "answer" : "error",
-              answer: input.ok && output.length > 0 ? "" : input.answer,
-              isAborted: false,
-              durationMs: 0,
-              transcriptOffset: 0,
-              ...(input.promptUuid === null ? {} : { promptUuid: input.promptUuid }),
-            }),
-          );
+          const complete = {
+            seq: 0,
+            at: now,
+            type: "turn.complete",
+            turnId: input.turnId,
+            reason: input.ok ? "answer" : "error",
+            answer: input.ok && output.length > 0 ? "" : input.answer,
+            isAborted: false,
+            durationMs: 0,
+            transcriptOffset: 0,
+            ...(input.promptUuid === null ? {} : { promptUuid: input.promptUuid }),
+          } as const;
+          if (agentAskPlaced() && state.pendingComplete === null && !state.closed) {
+            state.pendingComplete = { event: complete, seenAt: now };
+            return;
+          }
+          yield* emit(translator.onTurnComplete(complete));
         });
 
       const settleLocalCommands = Effect.gen(function* () {
@@ -1002,7 +1023,7 @@ export const layer: Layer.Layer<
         if (
           // The run stays open while a background subagent's request waits in
           // it: the request can only be answered from a run that is open.
-          [...state.agentAsks].every((toolUseId) => state.unplaced.has(toolUseId)) &&
+          !agentAskPlaced() &&
           state.byteOffset >= pending.event.transcriptOffset &&
           now - state.lastRowAt >= COMPLETE_QUIET_MS &&
           now - pending.seenAt >= COMPLETE_QUIET_MS
@@ -1130,8 +1151,25 @@ export const layer: Layer.Layer<
         }
       });
 
+      /**
+       * A command sent from T3 can start an agent that asks before the
+       * command has reported what it printed. The terminal prints the
+       * command's line and then asks; the request waits for that line here.
+       */
+      const commandLineShown = Effect.gen(function* () {
+        const deadline = (yield* Clock.currentTimeMillis) + COMMAND_LINE_WAIT_MS;
+        while (
+          !state.closed &&
+          (state.pendingLocal !== null || state.pendingPrompt?.body.type === "command") &&
+          (yield* Clock.currentTimeMillis) < deadline
+        ) {
+          yield* Effect.sleep(`${REQUEST_TURN_POLL_MS} millis`);
+        }
+      });
+
       const resolveApproval = (event: Extract<ClaudeBridgeEvent, { type: "approval.request" }>) =>
         Effect.gen(function* () {
+          if (event.agentType !== undefined) yield* commandLineShown;
           // Settled before T3 came to ask: there is nothing to ask.
           if (state.settledElsewhere.has(event.toolUseId)) return;
           const canUseTool =
@@ -1214,7 +1252,10 @@ export const layer: Layer.Layer<
           const live = (yield* registry.readSession(bridgeProcess)) ?? bridgeProcess.session;
           // (A subagent's request is refused as before: what the dialog's
           // "No" stops there, the subagent or the turn, is not measured.)
+          // Refused with the person's words, the turn goes on with them, as
+          // the dialog's "No, and tell Claude what to do differently" has it.
           const throughDialog =
+            claudeRefusalNote(decision) === undefined &&
             event.alsoInTerminal === true &&
             event.agentType === undefined &&
             claudeBridgeModAtLeast(live.modVersion, CLAUDE_BRIDGE_DIALOG_REFUSAL_MOD_VERSION);

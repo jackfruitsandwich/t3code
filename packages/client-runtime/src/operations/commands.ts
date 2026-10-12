@@ -1,6 +1,7 @@
 import { remapComposerContextAttachments } from "@t3tools/shared/composerContextReferences";
 import {
   type ThreadLinkedPullRequest,
+  APPROVAL_NOTE_ANSWER_ID,
   CommandId,
   CheckpointId,
   CheckpointScopeId,
@@ -190,6 +191,8 @@ export interface InterruptThreadTurnInput extends ThreadCommandInput {
 export interface RespondToThreadApprovalInput extends ThreadCommandInput {
   readonly requestId: RuntimeRequestId;
   readonly decision: ProviderApprovalDecision;
+  /** What the person wrote with a decline, where the request takes it. */
+  readonly note?: string;
 }
 
 export interface RespondToThreadUserInputInput extends ThreadCommandInput {
@@ -839,6 +842,9 @@ export const respondToThreadApproval = Effect.fn("EnvironmentCommands.respondToT
       threadId: input.threadId,
       requestId: input.requestId,
       decision: input.decision,
+      ...(input.decision === "decline" && input.note !== undefined && input.note.trim().length > 0
+        ? { answers: { [APPROVAL_NOTE_ANSWER_ID]: input.note.trim() } }
+        : {}),
     });
   },
 );

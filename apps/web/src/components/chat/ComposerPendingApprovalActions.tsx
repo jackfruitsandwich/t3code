@@ -3,9 +3,10 @@ import {
   type ProviderApprovalOption,
   type RuntimeRequestId,
 } from "@t3tools/contracts";
-import { memo } from "react";
+import { memo, useState } from "react";
 import { EllipsisIcon, TriangleAlertIcon } from "lucide-react";
 import { Button } from "../ui/button";
+import { Input } from "../ui/input";
 import { Menu, MenuItem, MenuPopup, MenuTrigger } from "../ui/menu";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { composerFloatingLayerProps } from "./composerEventScope";
@@ -15,9 +16,12 @@ interface ComposerPendingApprovalActionsProps {
   isResponding: boolean;
   canRespond: boolean;
   options?: ReadonlyArray<ProviderApprovalOption> | undefined;
+  /** The request takes the person's own words with a decline. */
+  declineNote?: boolean | undefined;
   onRespondToApproval: (
     requestId: RuntimeRequestId,
     decision: ProviderApprovalDecision,
+    note?: string,
   ) => Promise<unknown>;
 }
 
@@ -33,14 +37,59 @@ export const ComposerPendingApprovalActions = memo(function ComposerPendingAppro
   isResponding,
   canRespond,
   options = DEFAULT_APPROVAL_OPTIONS,
+  declineNote = false,
   onRespondToApproval,
 }: ComposerPendingApprovalActionsProps) {
+  // Mounted per request (keyed by its id), so a note never outlives its request.
+  const [note, setNote] = useState<string | null>(null);
   const primaryOptions = options.filter(
     (option) => option.decision === "decline" || option.decision === "accept",
   );
   const moreOptions = options.filter(
     (option) => option.decision !== "decline" && option.decision !== "accept",
   );
+
+  if (note !== null) {
+    const declineWithNote = () => void onRespondToApproval(requestId, "decline", note);
+    return (
+      <>
+        <span className="w-64 max-w-full">
+          <Input
+            autoFocus
+            size="sm"
+            aria-label="What to do instead"
+            placeholder="What to do instead"
+            value={note}
+            disabled={isResponding || !canRespond}
+            data-approval-decline-note="true"
+            onChange={(event) => setNote(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Escape") {
+                event.preventDefault();
+                event.stopPropagation();
+                setNote(null);
+              } else if (event.key === "Enter" && !event.nativeEvent.isComposing) {
+                event.preventDefault();
+                event.stopPropagation();
+                declineWithNote();
+              }
+            }}
+          />
+        </span>
+        <Button
+          size="xs"
+          variant="outline"
+          disabled={isResponding || !canRespond}
+          onClick={declineWithNote}
+        >
+          Decline
+        </Button>
+        <Button size="xs" variant="ghost" disabled={isResponding} onClick={() => setNote(null)}>
+          Back
+        </Button>
+      </>
+    );
+  }
 
   return (
     <>
@@ -67,7 +116,7 @@ export const ComposerPendingApprovalActions = memo(function ComposerPendingAppro
           button
         );
       })}
-      {moreOptions.length > 0 ? (
+      {moreOptions.length > 0 || declineNote ? (
         <Menu>
           <MenuTrigger
             disabled={isResponding}
@@ -76,6 +125,18 @@ export const ComposerPendingApprovalActions = memo(function ComposerPendingAppro
             <EllipsisIcon />
           </MenuTrigger>
           <MenuPopup {...composerFloatingLayerProps} side="top" align="end">
+            {declineNote ? (
+              <MenuItem
+                disabled={isResponding || !canRespond}
+                onClick={() => setNote("")}
+                variant="ghost"
+                className="mb-1 last:mb-0"
+              >
+                <span className="min-w-0 whitespace-normal wrap-break-word">
+                  Decline and say what to do instead
+                </span>
+              </MenuItem>
+            ) : null}
             {moreOptions.map((option) => {
               const item = (
                 <MenuItem

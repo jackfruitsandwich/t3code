@@ -22,6 +22,7 @@ import {
   claudeSessionNoticeText,
   isClaudeBridgeNoticeFrame,
   makeClaudeBridgeFrameTranslator,
+  makeClaudePlainCommandReader,
   parseClaudeBridgeEvent,
   claudeSessionNoticeFrame,
   claudeSessionNotificationText,
@@ -502,6 +503,50 @@ describe("ClaudeBridgeProtocol record helpers", () => {
         },
       }),
       "Compacted (ctrl+o to see full summary)",
+    );
+  });
+
+  // Claude Code writes some commands without markup: the note for the model,
+  // then the command as typed, then what it printed, each the child of the one
+  // before. Only that chain is a command; a prompt that starts with "/" is not.
+  it("reads a command written as plain rows, and what it printed", () => {
+    const row = (uuid: string, parentUuid: string | null, content: string, isMeta = false) => ({
+      type: "user",
+      uuid,
+      parentUuid,
+      isSidechain: false,
+      ...(isMeta ? { isMeta: true } : {}),
+      message: { role: "user", content },
+    });
+    const caveat = "<local-command-caveat>Caveat: the messages below.</local-command-caveat>";
+    const refusal = "This skill can only be invoked by Claude, not directly by users.";
+    const read = makeClaudePlainCommandReader();
+    assert.isNull(read(row("a", null, "/keybindings-help")));
+    assert.isNull(read(row("n1", "a", caveat, true)));
+    assert.deepStrictEqual(read(row("c1", "n1", "/keybindings-help")), {
+      command: "/keybindings-help",
+    });
+    assert.deepStrictEqual(read(row("o1", "c1", refusal)), { output: refusal });
+    // What follows the output is the person's again.
+    assert.isNull(read(row("p1", "o1", "and now something else")));
+    // A command that printed nothing as a plain row: the next prompt is not its output.
+    assert.isNull(read(row("n2", "p1", caveat, true)));
+    assert.deepStrictEqual(read(row("c2", "n2", "/code-review")), { command: "/code-review" });
+    assert.isNull(read(row("p2", "x", "a prompt of the person's")));
+    // A command with markup after the note is read by its markup, not here.
+    assert.isNull(read(row("n3", "p2", caveat, true)));
+    assert.isNull(read(row("c3", "n3", "<command-name>/model</command-name>")));
+  });
+
+  it("reads what a skill sent to the background printed, without the row's launch record", () => {
+    assert.strictEqual(
+      claudeTranscriptCommandOutput({
+        type: "system",
+        subtype: "local_command",
+        content:
+          '<local-command-stdout>Running in the background as @code-review</local-command-stdout>\n<forked-skill-launch>{"agentId":"a1","skillName":"code-review","description":"/code-review"}</forked-skill-launch>',
+      }),
+      "Running in the background as @code-review",
     );
   });
 

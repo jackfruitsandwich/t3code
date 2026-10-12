@@ -30,7 +30,7 @@ import type {
 import { isRecord, parseJsonlLine } from "../import/sessionImportTypes.ts";
 
 export const CLAUDE_BRIDGE_PROTOCOL_VERSION = 2;
-export const CLAUDE_BRIDGE_MOD_VERSION = "0.3.17";
+export const CLAUDE_BRIDGE_MOD_VERSION = "0.3.18";
 /**
  * The first protocol whose mod runs slash commands, answers questions with
  * their answers and reports the session's own commands. A process still on an
@@ -191,13 +191,29 @@ export type ClaudeBridgeCommandBody =
   | { readonly type: "interrupt"; readonly turnId?: string };
 
 /**
+ * A refusal with the person's own words is the terminal's "No, and tell Claude
+ * what to do differently": the call is refused, Claude is given the words, and
+ * the turn goes on. The adapter marks such a refusal with the words so the
+ * bridge does not end the turn as the dialog's plain "No" does.
+ */
+export const claudeRefusalNote = (result: unknown): string | undefined => {
+  const note = isRecord(result) ? result.note : undefined;
+  return typeof note === "string" && note.length > 0 ? note : undefined;
+};
+
+/**
  * Built-in commands that open a panel in the terminal when typed with no
  * argument. The first group was observed on Claude Code 2.1.296 by running
  * every listed built-in bare in a throwaway session and seeing which never
  * returned; the second group are pickers, sign-in and setup screens by their
- * nature. A panel can be closed only at that terminal, and everything queued
- * behind it waits, so the mod does not run these bare for T3. Any other command
- * found to wait this way is remembered by the mod itself.
+ * nature; the third were seen to open one in a later sweep of the commands
+ * left. The last group act on the account or on cloud sessions and were never
+ * run here: Claude Code's own definitions give each a screen to draw (kind
+ * `local-jsx`), and a wrong guess costs a trip to the terminal, where a panel
+ * opened from T3 would have sent the person anyway. A panel can be closed only
+ * at that terminal, and everything queued behind it waits, so the mod does not
+ * run these bare for T3. Any other command found to wait this way is
+ * remembered by the mod itself.
  */
 export const CLAUDE_BARE_PANEL_COMMANDS: ReadonlyArray<string> = [
   "add-dir",
@@ -244,6 +260,17 @@ export const CLAUDE_BARE_PANEL_COMMANDS: ReadonlyArray<string> = [
   "install-slack-app",
   "release-notes",
   "skill-doctor",
+  "auto-mode-setup",
+  "powerup",
+  "passes",
+  "rate-limit-options",
+  "pro-trial-expired",
+  "remote-env",
+  "teleport",
+  "web-setup",
+  "setup-bedrock",
+  "setup-vertex",
+  "design-login",
 ];
 
 /** One slash command of a session, as its own typeahead lists it. */
@@ -663,7 +690,10 @@ export function parseClaudeSlashCommandText(
   return { name: match[1], args: (match[2] ?? "").trim() };
 }
 
-const LOCAL_COMMAND_STDOUT = /^\s*<local-command-stdout>([\s\S]*)<\/local-command-stdout>\s*$/u;
+// What a command printed. A skill that runs in the background follows it, in the
+// same row, with a tag of its own that names the agent: that part is not text.
+const LOCAL_COMMAND_STDOUT =
+  /^\s*<local-command-stdout>([\s\S]*?)<\/local-command-stdout>\s*(?:<forked-skill-launch>[\s\S]*)?$/u;
 const COMMAND_NAME = /<command-name>\s*(\/[^<\s]+)\s*<\/command-name>/u;
 /** What `!` leaves in the record: the command, then what it printed. */
 const BASH_INPUT = /^\s*<bash-input>([\s\S]*)<\/bash-input>\s*$/u;
@@ -886,6 +916,44 @@ export const isClaudeBridgeNoticeFrame = (
   Reflect.get(message, CLAUDE_BRIDGE_NOTICE_KEY) === true &&
   typeof message.uuid === "string" &&
   typeof message.content === "string";
+
+/**
+ * Some commands leave rows without the usual markup (a skill only Claude may
+ * call, a skill that runs in the background): after the note for the model
+ * comes the command as typed, then what it printed, each row the child of the
+ * one before. Given the record's rows as they are read, this says which of
+ * the two a row is; null for every other row.
+ */
+export const makeClaudePlainCommandReader = () => {
+  let note: string | null = null;
+  let command: string | null = null;
+  return (row: unknown): { readonly command: string } | { readonly output: string } | null => {
+    if (!isRecord(row) || row.type !== "user" || row.isSidechain === true) return null;
+    const text =
+      isRecord(row.message) && typeof row.message.content === "string" ? row.message.content : null;
+    if (text === null || typeof row.uuid !== "string") return null;
+    if (row.isMeta === true) {
+      if (text.startsWith("<local-command-caveat>")) {
+        note = row.uuid;
+        command = null;
+      }
+      return null;
+    }
+    if (MARKUP_ROW_HEAD.test(text)) return null;
+    if (note !== null && row.parentUuid === note) {
+      note = null;
+      if (!text.startsWith("/")) return null;
+      command = row.uuid;
+      return { command: text.trim() };
+    }
+    if (command !== null && row.parentUuid === command) {
+      command = null;
+      return text.trim().length === 0 ? null : { output: text.trim() };
+    }
+    return null;
+  };
+};
+const MARKUP_ROW_HEAD = /^\s*<[a-z][a-z-]*>/u;
 
 /** `/name args` of the transcript row Claude Code writes when a slash command runs, else null. */
 export function claudeTranscriptCommandText(row: unknown): string | null {
@@ -1167,6 +1235,7 @@ export function makeClaudeBridgeFrameTranslator(
   let turn: TranslatorTurn | null = null;
   let costState: { totalCostUSD: number; modelUsage: Record<string, unknown> } | null = null;
   const sessionId = options.sessionId;
+  const plainCommand = makeClaudePlainCommandReader();
 
   const initFrame = (turnId: string): SDKSystemMessage =>
     ({
@@ -1323,7 +1392,9 @@ export function makeClaudeBridgeFrameTranslator(
         // What a slash command printed. Claude Code reports it to an SDK host
         // as a synthetic assistant message; the same frame here shows the
         // output and feeds the adapter's goal reader ("Goal set: ...").
-        const stdout = claudeTranscriptCommandOutput(row);
+        const plain = plainCommand(row);
+        const stdout =
+          plain !== null && "output" in plain ? plain.output : claudeTranscriptCommandOutput(row);
         if (stdout !== null) {
           if (stdout.trim().length === 0) return [];
           const frame = {

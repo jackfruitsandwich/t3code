@@ -64,6 +64,12 @@ export const ProviderApprovalOption = Schema.Struct({
 });
 export type ProviderApprovalOption = typeof ProviderApprovalOption.Type;
 
+/**
+ * Where a declined approval carries the person's own words in the response's
+ * `answers`, for a request whose item says `declineNote`.
+ */
+export const APPROVAL_NOTE_ANSWER_ID = "note";
+
 export const ProviderUserInputAnswers = Schema.Record(Schema.String, Schema.Unknown);
 export type ProviderUserInputAnswers = typeof ProviderUserInputAnswers.Type;
 

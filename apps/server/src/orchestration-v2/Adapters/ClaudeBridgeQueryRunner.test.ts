@@ -408,6 +408,57 @@ describe("ClaudeBridgeQueryRunner permissions", () => {
       }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
+  // The dialog's other refusal, "No, and tell Claude what to do differently":
+  // the call is refused with the person's words and the turn goes on.
+  it.effect("refuses with the person's words without ending the turn", () =>
+    Effect.gen(function* () {
+      const refusal = ClaudeAdapterV2.permissionResultFromDecision({
+        toolName: "Bash",
+        decision: "decline",
+        toolInput: { command: "pwd" },
+        toolUseID: "tool-1",
+        note: "list the files instead",
+      });
+      const bridge = yield* attach({
+        protocol: 2,
+        modVersion: "0.3.7",
+        bridgeCanUseTool: () => refusal,
+      });
+      yield* bridge.handler(
+        {
+          type: "approval.request",
+          seq: 1,
+          at: bridge.now,
+          toolUseId: "tool-1",
+          tool: "Bash",
+          input: { command: "pwd" },
+          alsoInTerminal: true,
+        },
+        bridge.process,
+      );
+      assert.deepStrictEqual(yield* Queue.take(bridge.commands), {
+        type: "approval",
+        toolUseId: "tool-1",
+        decision: "deny",
+        reason: ClaudeAdapterV2.claudeRefusalWithNote("list the files instead"),
+      });
+      // Nothing follows it: no stop is sent after the refusal.
+      yield* bridge.handler(
+        {
+          type: "approval.request",
+          seq: 2,
+          at: bridge.now,
+          toolUseId: "tool-2",
+          tool: "Bash",
+          input: { command: "ls" },
+          alsoInTerminal: true,
+        },
+        bridge.process,
+      );
+      assert.strictEqual((yield* Queue.take(bridge.commands)).type, "approval");
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
   it.effect("refuses and then stops, as before, for a session whose mod cannot do that", () =>
     Effect.gen(function* () {
       const bridge = yield* attach({
@@ -1094,6 +1145,72 @@ describe("ClaudeBridgeQueryRunner slash commands", () => {
           promptUuid: "00000000-0000-4000-8000-000000000032",
         });
       }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  // A skill that runs in the background starts an agent and no turn. Its
+  // first request can reach T3 while the command's own run is still open.
+  it.effect("keeps a command's run open while the agent it started asks in it", () =>
+    Effect.gen(function* () {
+      let answerNow: (result: PermissionResult) => void = () => {};
+      const answered = new Promise<PermissionResult>((resolve) => {
+        answerNow = resolve;
+      });
+      const bridge = yield* attach({
+        protocol: 2,
+        slashCommands: ["code-review"],
+        bridgeCanUseTool: () => answered,
+      });
+      const frames = yield* shownFrames(bridge);
+      const promptUuid = "00000000-0000-4000-8000-000000000041";
+      yield* bridge.session.offer({ ...userMessage("/code-review"), uuid: promptUuid });
+      yield* Queue.take(bridge.commands);
+      yield* bridge.handler(
+        {
+          type: "approval.request",
+          seq: 1,
+          at: bridge.now,
+          toolUseId: "agent-tool",
+          tool: "Bash",
+          input: { command: "git status" },
+          alsoInTerminal: true,
+          agentType: "code-review",
+        },
+        bridge.process,
+      );
+      // Nothing is asked before the command's own line is shown, as in the terminal.
+      yield* Effect.yieldNow;
+      assert.lengthOf(bridge.bridgeCalls, 0);
+      yield* bridge.handler(
+        {
+          seq: 2,
+          at: bridge.now,
+          type: "command.result",
+          commandId: "command-1",
+          promptUuid,
+          ok: true,
+          startedTurn: false,
+          waitingInTerminal: false,
+          text: "",
+        },
+        bridge.process,
+      );
+      yield* TestClock.adjust("3 seconds");
+      yield* until(() => bridge.bridgeCalls.length === 1, "the request asked");
+      // The command has run; the request waits in its run, which stays open.
+      assert.deepStrictEqual(
+        frames.map((frame) => frame.type),
+        ["system"],
+      );
+      answerNow({ behavior: "allow" });
+      assert.deepStrictEqual(yield* Queue.take(bridge.commands), {
+        type: "approval",
+        toolUseId: "agent-tool",
+        decision: "allow",
+      });
+      yield* TestClock.adjust("3 seconds");
+      yield* until(() => frames.some((frame) => frame.type === "result"), "the run ending");
+      assert.strictEqual(frames.filter((frame) => frame.type === "result").length, 1);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
   it.effect("runs a line that starts with ! as a shell command in the session", () =>

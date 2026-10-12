@@ -4,9 +4,10 @@ import type {
   ProviderApprovalOption,
   RuntimeRequestId,
 } from "@t3tools/contracts";
+import { useState } from "react";
 import { Platform, ScrollView, View } from "react-native";
 
-import { AppText as Text } from "../../components/AppText";
+import { AppText as Text, AppTextInput as TextInput } from "../../components/AppText";
 import type { PendingApproval } from "../../lib/threadActivity";
 
 export interface PendingApprovalCardProps {
@@ -15,7 +16,9 @@ export interface PendingApprovalCardProps {
   readonly onRespond: (
     requestId: RuntimeRequestId,
     decision: ProviderApprovalDecision,
+    note?: string,
   ) => Promise<unknown>;
+  readonly onInputFocusChange?: (focused: boolean) => void;
 }
 
 const DEFAULT_APPROVAL_OPTIONS: ReadonlyArray<ProviderApprovalOption> = [
@@ -39,6 +42,9 @@ export function PendingApprovalCard(props: PendingApprovalCardProps) {
   const firstBreak = detail.indexOf("\n");
   const summary = firstBreak === -1 ? detail : detail.slice(0, firstBreak);
   const change = firstBreak === -1 ? "" : detail.slice(firstBreak + 1);
+  // Mounted per request (keyed by its id), so a note never outlives its request.
+  const [note, setNote] = useState("");
+  const takesNote = canRespond && props.approval.declineNote === true;
   return (
     <View className="gap-2.5 rounded-[20px] border border-border bg-card-alt p-4">
       <Text className="font-t3-bold text-2xs uppercase tracking-[1.1px] text-foreground-secondary">
@@ -79,6 +85,19 @@ export function PendingApprovalCard(props: PendingApprovalCardProps) {
       {warning ? (
         <Text className="font-sans text-xs leading-normal text-warning-foreground">{warning}</Text>
       ) : null}
+      {takesNote ? (
+        <TextInput
+          accessibilityLabel="What to do instead"
+          placeholder="To decline with your own words, say what to do instead"
+          value={note}
+          onChangeText={setNote}
+          editable={!disabled}
+          multiline
+          onFocus={() => props.onInputFocusChange?.(true)}
+          onBlur={() => props.onInputFocusChange?.(false)}
+          className="min-h-[44px] rounded-2xl border border-input-border bg-input px-3.5 py-2.5 font-sans text-base text-foreground"
+        />
+      ) : null}
       <View className="flex-row flex-wrap gap-2.5">
         {options.map((option) => (
           <RequestActionButton
@@ -92,7 +111,15 @@ export function PendingApprovalCard(props: PendingApprovalCardProps) {
                   : "secondary"
             }
             disabled={disabled}
-            onPress={() => void props.onRespond(props.approval.requestId, option.decision)}
+            onPress={() =>
+              void props.onRespond(
+                props.approval.requestId,
+                option.decision,
+                takesNote && option.decision === "decline" && note.trim().length > 0
+                  ? note
+                  : undefined,
+              )
+            }
           />
         ))}
       </View>

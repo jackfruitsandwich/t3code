@@ -145,7 +145,8 @@ const MID_TURN_OPENING = ${JSON.stringify(CLAUDE_MID_TURN_OPENING)}
 const MID_TURN_CLOSING = ${JSON.stringify(CLAUDE_MID_TURN_CLOSING)}
 // Panels commands sent from T3 have opened in the terminal and that are still open.
 let panelsOpen = 0
-// Whether the latest turn was sent from T3 (else typed here, or a wake).
+// Whether the person last spoke from T3: the latest turn or command was sent
+// from there (else typed here, or a wake).
 let lastTurnFromT3 = false
 let inboxSeq = 0
 let eventSeq = 0
@@ -799,6 +800,9 @@ async function runSlashCommand($, command) {
   }
   lookAgain()
   const sentAt = Date.now()
+  // A command may start an agent and no turn (a skill that runs in the
+  // background): what that agent asks is asked where the command came from.
+  lastTurnFromT3 = true
   $.command.run({ command: command.name, args: command.args || '' }).then(async (result) => {
     panelClosed()
     if (settled) return
@@ -1199,6 +1203,12 @@ export function register(on) {
         }
       }
     } catch {}
+    return next(e)
+  })
+
+  // A command typed at the terminal is the person speaking from there.
+  on('command.run', async ($, e, next) => {
+    if (e && e.origin && e.origin.kind === 'composer') lastTurnFromT3 = false
     return next(e)
   })
 

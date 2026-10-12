@@ -39,6 +39,7 @@ import {
   formatClaudeResumeCompactionQuestion,
 } from "@t3tools/shared/claudeCompaction";
 import {
+  APPROVAL_NOTE_ANSWER_ID,
   type ChatAttachment,
   ClaudeSettings,
   defaultInstanceIdForDriver,
@@ -2363,12 +2364,21 @@ function parentToolUseIdFromSdkMessage(message: SDKMessage): string | null {
     : null;
 }
 
+/**
+ * What Claude is told when a call is refused with the person's words, as
+ * Claude Code's own dialog words it.
+ */
+export const claudeRefusalWithNote = (note: string): string =>
+  `The user doesn't want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file). To tell you how to proceed, the user said:\n${note}`;
+
 export function permissionResultFromDecision(input: {
   readonly toolName: string;
   readonly decision: ProviderApprovalDecision;
   readonly toolInput: Record<string, unknown>;
   readonly toolUseID: string;
   readonly suggestions?: Parameters<CanUseTool>[2]["suggestions"];
+  /** What the person wrote with a decline: Claude is told it and carries on. */
+  readonly note?: string;
 }): PermissionResult {
   if (input.decision === "accept" || input.decision === "acceptForSession") {
     return {
@@ -2383,6 +2393,17 @@ export function permissionResultFromDecision(input: {
           }
         : {}),
     };
+  }
+
+  if (input.decision === "decline" && input.note !== undefined) {
+    const refusal = {
+      behavior: "deny",
+      message: claudeRefusalWithNote(input.note),
+      toolUseID: input.toolUseID,
+      decisionClassification: "user_reject",
+      note: input.note,
+    } satisfies PermissionResult & { readonly note: string };
+    return refusal;
   }
 
   return {
@@ -3000,6 +3021,7 @@ type PendingClaudeRuntimeRequest =
       readonly requestId: OrchestrationV2RuntimeRequest["id"];
       readonly requestKind: ProviderRequestKind;
       readonly decision: Deferred.Deferred<ProviderApprovalDecision, never>;
+      readonly note: Ref.Ref<string | undefined>;
     }
   | {
       readonly type: "user_input";
@@ -4954,6 +4976,9 @@ export function makeClaudeAdapterV2(
                   requestId,
                   requestKind: input.requestKind as ProviderRequestKind,
                   ...(input.prompt === undefined ? {} : { prompt: input.prompt }),
+                  // Claude Code's own dialog has it: "No, and tell Claude
+                  // what to do differently".
+                  declineNote: true,
                 }
               : {
                   type: "user_input_request" as const,
@@ -7107,6 +7132,7 @@ export function makeClaudeAdapterV2(
             prompt,
           });
           const decision = yield* Deferred.make<ProviderApprovalDecision, never>();
+          const note = yield* Ref.make<string | undefined>(undefined);
           yield* Ref.update(pendingRuntimeRequests, (current) => {
             const updated = new Map(current);
             updated.set(String(artifacts.request.id), {
@@ -7114,6 +7140,7 @@ export function makeClaudeAdapterV2(
               requestId: artifacts.request.id,
               requestKind,
               decision,
+              note,
             });
             return updated;
           });
@@ -7153,11 +7180,13 @@ export function makeClaudeAdapterV2(
 
           yield* putAwayIfSettledElsewhere(artifacts);
 
+          const said = yield* Ref.get(note);
           return permissionResultFromDecision({
             toolName,
             decision: resolvedDecision,
             toolInput,
             toolUseID: callbackOptions.toolUseID,
+            ...(said === undefined ? {} : { note: said }),
             ...(callbackOptions.suggestions === undefined
               ? {}
               : { suggestions: callbackOptions.suggestions }),
@@ -8152,6 +8181,14 @@ export function makeClaudeAdapterV2(
                     detail: `Claude ${pending.requestKind} request ${requestInput.requestId} requires an approval decision.`,
                   }),
                 });
+              }
+              const said = requestInput.answers?.[APPROVAL_NOTE_ANSWER_ID];
+              if (
+                requestInput.decision === "decline" &&
+                typeof said === "string" &&
+                said.trim().length > 0
+              ) {
+                yield* Ref.set(pending.note, said.trim());
               }
               yield* Deferred.succeed(pending.decision, requestInput.decision);
             },

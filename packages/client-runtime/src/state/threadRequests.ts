@@ -17,6 +17,8 @@ export interface ThreadPendingApproval {
   readonly appName?: string;
   /** Approval choices advertised by the provider (#8058); defaults apply when absent. */
   readonly options?: ReadonlyArray<ProviderApprovalOption>;
+  /** A decline may carry the person's own words to the agent. */
+  readonly declineNote?: boolean;
   readonly responseCapability: "live" | "not_resumable";
 }
 
@@ -85,6 +87,9 @@ export function derivePendingThreadRequests(
       ...(item?.type === "approval_request" && item.appName ? { appName: item.appName } : {}),
       ...(item?.type === "approval_request" && item.options !== undefined
         ? { options: item.options }
+        : {}),
+      ...(item?.type === "approval_request" && item.declineNote === true
+        ? { declineNote: true }
         : {}),
       responseCapability: responseCapability === "live" ? "live" : "not_resumable",
     });
