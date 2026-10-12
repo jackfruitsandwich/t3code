@@ -3,10 +3,7 @@ import {
   type ProviderApprovalOption,
   type RuntimeRequestId,
 } from "@t3tools/contracts";
-import {
-  approveForSessionLabel,
-  approveWithModeLabel,
-} from "@t3tools/client-runtime/state/thread-requests";
+import { approveWithModeLabel } from "@t3tools/client-runtime/state/thread-requests";
 import { memo, useState } from "react";
 import { EllipsisIcon, TriangleAlertIcon } from "lucide-react";
 import { Button } from "../ui/button";
@@ -173,10 +170,13 @@ export const ComposerPendingApprovalActions = memo(function ComposerPendingAppro
                   className="mb-1 last:mb-0"
                 >
                   {option.warning ? <TriangleAlertIcon className="size-3 text-warning" /> : null}
-                  <span className="min-w-0 max-w-xl whitespace-normal wrap-break-word">
-                    {option.decision === "acceptForSession"
-                      ? approveForSessionLabel(option.label, sessionGrant)
-                      : option.label}
+                  {/* The menu is as wide as its labels laid in a row, so what the
+                      choice covers goes under its label and wraps. */}
+                  <span className="flex min-w-0 max-w-72 flex-col items-center whitespace-normal wrap-break-word text-center">
+                    <span>{option.label}</span>
+                    {option.decision === "acceptForSession" && sessionGrant !== undefined ? (
+                      <span className="font-normal text-muted-foreground">{sessionGrant}</span>
+                    ) : null}
                   </span>
                 </MenuItem>
               );

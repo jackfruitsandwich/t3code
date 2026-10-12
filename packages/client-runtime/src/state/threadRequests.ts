@@ -167,13 +167,6 @@ export function createQuestionHistoryProjector() {
 }
 
 /**
- * The choice to approve for the session, saying what it covers where the
- * request names that, as the provider's own dialog does on that choice.
- */
-export const approveForSessionLabel = (label: string, sessionGrant: string | undefined): string =>
-  sessionGrant === undefined ? label : `${label}: ${sessionGrant}`;
-
-/**
  * What the choice to approve and switch the session's permission mode is
  * called, after the provider's own dialog ("Yes, and switch to auto mode").
  */
