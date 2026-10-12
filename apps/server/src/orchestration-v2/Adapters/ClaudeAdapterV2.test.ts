@@ -3522,6 +3522,55 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, IdAllocator.layer))),
   );
 
+  it.effect("says a session is compacting on its running turn, and no longer once it stops", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeWakeHarness;
+      const now = yield* DateTime.now;
+      yield* harness.runtime.startTurn(
+        makeClaudeTestTurnInput({
+          threadId: harness.threadId,
+          providerThread: harness.providerThread,
+          now,
+          attemptId: RunAttemptId.make("attempt-compacting"),
+          text: "Read the big file",
+          attachments: [],
+        }),
+      );
+      const status = (uuid: string, value: "compacting" | null) =>
+        claudeSdkFrame({
+          type: "system",
+          subtype: "status",
+          status: value,
+          uuid,
+          session_id: WAKE_NATIVE_SESSION,
+        });
+      yield* Queue.offer(
+        harness.sdkMessages,
+        status("00000000-0000-4000-8000-000000000301", "compacting"),
+      );
+      yield* Queue.offer(harness.sdkMessages, status("00000000-0000-4000-8000-000000000302", null));
+      yield* Queue.offer(
+        harness.sdkMessages,
+        makeResultFrame({ uuid: "00000000-0000-4000-8000-000000000303", result: "Read it." }),
+      );
+      yield* Queue.take(harness.terminalReceipts);
+
+      const said = harness.events.flatMap((event) =>
+        event.type === "provider_turn.updated"
+          ? [`${event.providerTurn.status}:${event.providerTurn.activity ?? "-"}`]
+          : [],
+      );
+      // The turn begins, compacts, stops compacting, ends: nothing is left on it.
+      assert.deepEqual(said, ["running:-", "running:compacting", "running:-", "completed:-"]);
+      // An interrupted compaction leaves no row in the terminal; this is not one here either.
+      assert.isFalse(
+        harness.events.some(
+          (event) => event.type === "turn_item.updated" && event.turnItem.type === "compaction",
+        ),
+      );
+    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, IdAllocator.layer))),
+  );
+
   it.effect("titles Claude reads, searches, and skills on tool completion", () =>
     Effect.gen(function* () {
       const harness = yield* makeWakeHarness;

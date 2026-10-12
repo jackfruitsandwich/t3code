@@ -389,6 +389,14 @@ export function useThreadComposerState() {
     if (queuedCompact) return true;
     const activeRunId = selectedThreadRuntime?.activeRunId;
     if (!activeRunId || !threadRuntimeIsActive(selectedThreadRuntime)) return false;
+    // A session compacting by itself says so on its running turn.
+    if (
+      selectedThreadProjection?.projection.providerTurns.some(
+        (turn) => turn.status === "running" && turn.activity === "compacting",
+      ) === true
+    ) {
+      return true;
+    }
     const compactMessage = selectedThreadVisibleTurnItems.findLast(
       ({ item }) =>
         item.runId === activeRunId &&
@@ -405,6 +413,7 @@ export function useThreadComposerState() {
     );
   }, [
     dispatchingQueuedMessageId,
+    selectedThreadProjection?.projection.providerTurns,
     selectedThreadQueuedMessages,
     selectedThreadRuntime,
     selectedThreadVisibleTurnItems,

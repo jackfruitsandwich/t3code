@@ -60,6 +60,7 @@ import {
   claudeRefusalNote,
   makeClaudePlainCommandReader,
   claudeTranscriptCommandText,
+  claudeCompactingFrame,
   claudeSessionNoticeFrame,
   claudeSessionNotificationText,
   claudeTranscriptCommandOutput,
@@ -1542,6 +1543,23 @@ export const layer: Layer.Layer<
                   content: claudeSessionNotificationText(event),
                 }),
               ]);
+              return;
+            }
+            case "compact.started":
+            case "compact.ended": {
+              // A state of the turn that is running: with none open here
+              // there is nothing to put it on.
+              const compacting = event.type === "compact.started";
+              const shown = sessionTurnOpen();
+              yield* Effect.logInfo("claude-bridge.compacting", {
+                sid,
+                compacting,
+                ...(event.type === "compact.started" ? { trigger: event.trigger } : {}),
+                shown,
+              });
+              if (!shown) return;
+              const uuid = yield* crypto.randomUUIDv4.pipe(Effect.orDie);
+              yield* emit([claudeCompactingFrame({ uuid, sessionId: sid, compacting })]);
               return;
             }
             case "config.result": {

@@ -1036,6 +1036,11 @@ export const OrchestrationV2ProviderTurn = Schema.Struct({
   completedAt: Schema.NullOr(Schema.DateTimeUtc),
   tokenUsage: Schema.optional(OrchestrationV2ProviderTurnTokenUsage),
   turnTokenUsage: Schema.optional(TurnTokenUsage),
+  /**
+   * What the provider is doing to the conversation itself while the turn
+   * runs. Each update says it anew: one that leaves it out means it is over.
+   */
+  activity: Schema.optional(Schema.Literal("compacting")),
 });
 export type OrchestrationV2ProviderTurn = typeof OrchestrationV2ProviderTurn.Type;
 

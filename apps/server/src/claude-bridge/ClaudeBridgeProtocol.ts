@@ -23,6 +23,7 @@ import type {
   SDKCompactBoundaryMessage,
   SDKMessage,
   SDKResultMessage,
+  SDKStatusMessage,
   SDKSystemMessage,
   SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
@@ -30,7 +31,7 @@ import type {
 import { isRecord, parseJsonlLine } from "../import/sessionImportTypes.ts";
 
 export const CLAUDE_BRIDGE_PROTOCOL_VERSION = 2;
-export const CLAUDE_BRIDGE_MOD_VERSION = "0.3.21";
+export const CLAUDE_BRIDGE_MOD_VERSION = "0.3.22";
 /**
  * The first protocol whose mod runs slash commands, answers questions with
  * their answers and reports the session's own commands. A process still on an
@@ -400,6 +401,13 @@ export type ClaudeBridgeEvent = { readonly seq: number; readonly at: number } & 
       readonly text: string;
     }
   | { readonly type: "ended"; readonly reason: string; readonly sessionId: string }
+  /**
+   * The session began to summarize its conversation, or stopped (done,
+   * interrupted or failed alike). Its terminal draws "Compacting
+   * conversation" between the two.
+   */
+  | { readonly type: "compact.started"; readonly trigger: string }
+  | { readonly type: "compact.ended" }
   | { readonly type: "error"; readonly message: string; readonly commandId?: string }
   /**
    * A message Claude finished writing, as the terminal drew it. The record
@@ -667,6 +675,10 @@ export function parseClaudeBridgeEvent(value: unknown): ClaudeBridgeEvent | null
         kind: readOptionalString(value.kind) ?? "",
         dialog: value.dialog === true,
       };
+    case "compact.started":
+      return { ...base, type: "compact.started", trigger: readOptionalString(value.trigger) ?? "" };
+    case "compact.ended":
+      return { ...base, type: "compact.ended" };
     case "ended":
       return {
         ...base,
@@ -989,6 +1001,22 @@ export const claudeSessionNoticeFrame = (input: {
     session_id: input.sessionId,
     [CLAUDE_BRIDGE_NOTICE_KEY]: true,
   }) as unknown as SDKSystemMessage;
+
+/**
+ * The SDK's own word that a session is compacting its conversation, or no
+ * longer is, for a session that says so through the bridge.
+ */
+export const claudeCompactingFrame = (input: {
+  readonly uuid: string;
+  readonly sessionId: string;
+  readonly compacting: boolean;
+}): SDKStatusMessage => ({
+  type: "system",
+  subtype: "status",
+  status: input.compacting ? "compacting" : null,
+  uuid: asUuid(input.uuid),
+  session_id: input.sessionId,
+});
 
 /** A frame made by claudeSessionNoticeFrame. */
 export const isClaudeBridgeNoticeFrame = (

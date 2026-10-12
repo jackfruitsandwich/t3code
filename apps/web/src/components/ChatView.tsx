@@ -3554,10 +3554,17 @@ export default function ChatView(props: ChatViewProps) {
       item.runId === activeActivityRun?.runId &&
       item.status === "completed",
   );
+  // A session compacting by itself says so on its running turn.
+  const providerIsCompacting =
+    phase === "running" &&
+    serverProjection?.providerTurns.some(
+      (turn) => turn.status === "running" && turn.activity === "compacting",
+    ) === true;
   const isCompacting =
-    (isSendBusy || phase === "connecting" || phase === "running") &&
-    compactRequestIsActive &&
-    !compactionSettled;
+    providerIsCompacting ||
+    ((isSendBusy || phase === "connecting" || phase === "running") &&
+      compactRequestIsActive &&
+      !compactionSettled);
   // A rewind is not agent work: the composer shows "Rewinding conversation"
   // instead of the timeline growing a Thinking row.
   const isWorking =

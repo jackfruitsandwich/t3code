@@ -27,6 +27,7 @@ import {
   makeClaudeBridgeFrameTranslator,
   makeClaudePlainCommandReader,
   parseClaudeBridgeEvent,
+  claudeCompactingFrame,
   claudeSessionNoticeFrame,
   claudeSessionNotificationText,
   CLAUDE_TERMINAL_DIALOG_MARK,
@@ -822,6 +823,29 @@ describe("ClaudeBridgeProtocol parsers", () => {
     });
     assert.isTrue(isClaudeBridgeNoticeFrame(frame));
     assert.isNull(parseClaudeBridgeEvent({ seq: 5, at: 7, type: "notification", message: "  " }));
+  });
+
+  it("reads the session's word that it began to compact, and that it stopped", () => {
+    const started = parseClaudeBridgeEvent({
+      seq: 6,
+      at: 8,
+      type: "compact.started",
+      trigger: "auto",
+    });
+    assert.equal(started?.type, "compact.started");
+    if (started?.type !== "compact.started") return;
+    assert.equal(started.trigger, "auto");
+    assert.equal(
+      parseClaudeBridgeEvent({ seq: 7, at: 9, type: "compact.ended" })?.type,
+      "compact.ended",
+    );
+    // The thread hears it in the SDK's own words.
+    const uuid = "00000000-0000-4000-8000-0000000000e2";
+    assert.equal(
+      claudeCompactingFrame({ uuid, sessionId: "s", compacting: true }).status,
+      "compacting",
+    );
+    assert.isNull(claudeCompactingFrame({ uuid, sessionId: "s", compacting: false }).status);
   });
 
   it("reads only complete JSONL lines", () => {

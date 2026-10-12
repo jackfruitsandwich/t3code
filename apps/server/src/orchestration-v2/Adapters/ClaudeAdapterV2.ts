@@ -2859,6 +2859,12 @@ function formatClaudeUsageLimitWait(waitMs: number): string {
   return minutes === 0 ? `${hours}h` : `${hours}h ${minutes}m`;
 }
 
+/** What a running turn's update says the session is doing to its conversation. */
+const claudeTurnActivity = (context: {
+  readonly compacting: boolean;
+}): Pick<OrchestrationV2ProviderTurn, "activity"> =>
+  context.compacting ? { activity: "compacting" } : {};
+
 interface ActiveClaudeTurnContext {
   readonly input: ProviderAdapter.ProviderAdapterV2TurnInput;
   readonly nativeTurnId: string;
@@ -2890,6 +2896,8 @@ interface ActiveClaudeTurnContext {
   readonly ignoredTaskIds: Set<string>;
   readonly announcedUsageLimits: Set<string>;
   authenticationFailureMessage: string | undefined;
+  /** The session is summarizing its conversation right now. */
+  compacting: boolean;
   readonly rejectedRateLimitTypes: Set<string>;
   readonly rateLimitResetTimes: Map<string, string | null>;
   latestAssistantRateLimited: boolean;
@@ -5990,6 +5998,39 @@ export function makeClaudeAdapterV2(
             }
           }
 
+          // The session summarizing its conversation is a state of the running
+          // turn, not a row: every update of the turn says it again while it
+          // lasts, and it is over with the first that does not.
+          if (
+            message.type === "system" &&
+            message.subtype === "status" &&
+            (message.status === "compacting" || message.status === null) &&
+            (message.status === "compacting") !== context.compacting
+          ) {
+            context.compacting = message.status === "compacting";
+            yield* emitProviderEvent({
+              type: "provider_turn.updated",
+              driver: CLAUDE_PROVIDER,
+              threadId: context.input.threadId,
+              providerTurn: {
+                id: context.providerTurnId,
+                providerThreadId: context.input.providerThread.id,
+                nodeId: context.input.rootNodeId,
+                runAttemptId: context.input.attemptId,
+                nativeTurnRef: {
+                  driver: CLAUDE_PROVIDER,
+                  nativeId: context.nativeTurnId,
+                  strength: "strong",
+                },
+                ordinal: context.providerTurnOrdinal,
+                status: "running",
+                startedAt: context.startedAt,
+                completedAt: null,
+                ...claudeTurnActivity(context),
+              },
+            });
+          }
+
           if (message.type === "system" && message.subtype === "compact_boundary") {
             const now = yield* DateTime.now;
             const nativeItemId = message.uuid;
@@ -6022,6 +6063,7 @@ export function makeClaudeAdapterV2(
                     maxTokens: claudeContextWindow(context.input.modelSelection),
                     updatedAt: DateTime.formatIso(now),
                   },
+                  ...claudeTurnActivity(context),
                 },
               });
             }
@@ -6173,6 +6215,7 @@ export function makeClaudeAdapterV2(
                     context.input.modelSelection,
                     DateTime.formatIso(now),
                   ),
+                  ...claudeTurnActivity(context),
                 },
               });
             }
@@ -7750,6 +7793,7 @@ export function makeClaudeAdapterV2(
               ignoredTaskIds: new Set(),
               announcedUsageLimits: new Set(),
               authenticationFailureMessage: undefined,
+              compacting: false,
               rejectedRateLimitTypes: new Set(),
               rateLimitResetTimes: new Map(),
               latestAssistantRateLimited: false,

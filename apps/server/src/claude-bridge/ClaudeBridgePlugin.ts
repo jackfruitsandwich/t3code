@@ -1261,6 +1261,24 @@ export function register(on) {
     return out
   })
 
+  // The session says when it begins to summarize its conversation and when
+  // that is over, however it ends; its terminal draws "Compacting
+  // conversation" meanwhile. The main conversation's only: a summary prepared
+  // ahead of time installs nothing, and a subagent compacts its own record.
+  on('session.compact', async ($, e, next) => {
+    const drawn = !!e && e.trigger !== 'precompute' && !e.agentId
+    if (drawn) {
+      try { await emit($, 'compact.started', { trigger: String(e.trigger || '') }) } catch {}
+    }
+    try {
+      return await next(e)
+    } finally {
+      if (drawn) {
+        try { await emit($, 'compact.ended', {}) } catch {}
+      }
+    }
+  })
+
   // A command typed at the terminal is the person speaking from there.
   on('command.run', async ($, e, next) => {
     if (e && e.origin && e.origin.kind === 'composer') lastTurnFromT3 = false
