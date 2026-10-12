@@ -20,6 +20,7 @@ import {
   formatReadToolLabel,
   formatSearchToolLabel,
 } from "@t3tools/shared/toolActivity";
+import { claudePromptAsDrawn } from "@t3tools/shared/claudePastedContent";
 import type { HtmlRenderReference } from "@t3tools/shared/htmlRender";
 import { htmlRenderFromToolItem } from "@t3tools/shared/toolOutput";
 import { orchestrationV2SteerDelivery } from "@t3tools/shared/orchestrationV2Timeline";
@@ -652,7 +653,8 @@ export function deriveTimelineEntriesFromVisibleTurnItems(
       const message: ChatMessage = {
         id: item.messageId,
         role: item.type === "user_message" ? "user" : "assistant",
-        text: item.text,
+        // Text pasted into Claude Code's prompt reads as its terminal draws it.
+        text: item.type === "user_message" ? claudePromptAsDrawn(item.text) : item.text,
         ...(item.type === "user_message" && item.context ? { context: item.context } : {}),
         ...((item.attachments?.length ?? 0) > 0
           ? {

@@ -321,6 +321,20 @@ describe("buildThreadFeed", () => {
     });
   });
 
+  it("shows text pasted into a Claude Code prompt as its terminal draws it", () => {
+    const feed = buildThreadFeed([
+      projected(
+        {
+          ...userMessage(),
+          text: 'look at \n\n<pasted_content id="07d8">\nline 1\nline 2\n</pasted_content id="07d8">\n\n and fix it',
+        },
+        0,
+      ),
+    ]);
+    const messageEntry = feed.find((entry) => entry.type === "message");
+    expect(messageEntry?.message.text).toBe("look at\nline 1\nline 2\nand fix it");
+  });
+
   it("keeps the sender of an agent message distinct from its timeline source", () => {
     const feed = buildThreadFeed([
       projected(

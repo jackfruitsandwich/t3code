@@ -351,6 +351,10 @@
       "types": "./src/claudeCompaction.ts",
       "import": "./src/claudeCompaction.ts"
     },
+    "./claudePastedContent": {
+      "types": "./src/claudePastedContent.ts",
+      "import": "./src/claudePastedContent.ts"
+    },
     "./nodeSqliteClient": {
       "types": "./src/nodeSqliteClient.ts",
       "import": "./src/nodeSqliteClient.ts"

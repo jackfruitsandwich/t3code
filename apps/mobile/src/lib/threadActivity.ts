@@ -56,6 +56,7 @@ import {
   formatReadToolLabel,
   formatSearchToolLabel,
 } from "@t3tools/shared/toolActivity";
+import { claudePromptAsDrawn } from "@t3tools/shared/claudePastedContent";
 import { formatDuration } from "@t3tools/shared/orchestrationTiming";
 import {
   orchestrationV2SteerDelivery,
@@ -1763,7 +1764,8 @@ export function buildThreadFeed(
         message: {
           id: item.messageId,
           role: item.type === "user_message" ? "user" : "assistant",
-          text: item.text,
+          // Text pasted into Claude Code's prompt reads as its terminal draws it.
+          text: item.type === "user_message" ? claudePromptAsDrawn(item.text) : item.text,
           ...(item.type === "user_message" && item.context ? { context: item.context } : {}),
           attachments: item.attachments ?? [],
           runId: item.runId,
