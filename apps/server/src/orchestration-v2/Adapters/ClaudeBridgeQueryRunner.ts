@@ -69,8 +69,9 @@ import {
   CLAUDE_BRIDGE_UPKEEP_COMMAND,
   isClaudeBridgeModRow,
   isClaudeTurnEndRow,
+  claudeBridgeReplacesDrawnFrame,
+  claudeNarrationAsText,
   isClaudeTypedMidTurnRow,
-  claudeBridgeShownReplyFrame,
   isClaudeBridgeCommandOutputFrame,
   isClaudeBridgeSessionLive,
   makeClaudeBridgeFrameTranslator,
@@ -85,24 +86,44 @@ import * as ProviderEventLoggers from "../../provider/ProviderEventLoggers.ts";
 import * as ClaudeAdapterV2 from "./ClaudeAdapterV2.ts";
 
 export const CLAUDE_TRANSPORT_ENV = "T3CODE_CLAUDE_TRANSPORT";
+/**
+ * For tests of a record that is behind its terminal. Claude Code writes what
+ * it says in the middle of a turn to its file 0.2 to 5 seconds after its
+ * terminal drew it, unevenly; with a number of milliseconds here, every write
+ * is read that much later.
+ */
+export const CLAUDE_RECORD_LAG_ENV = "T3CODE_CLAUDE_RECORD_LAG_MS";
 const TAIL_INTERVAL_MS = 300;
 /** How long a message the terminal drew waits for the record's row before it is shown without one. */
 const DRAWN_MESSAGE_WAIT_MS = 2_500;
 /** How long a reply row's text is remembered, for a drawn copy that arrives after it. */
 const RECORDED_TEXT_MEMORY_MS = 60_000;
 const normalizeDrawn = (text: string) => text.replace(/\s+/gu, " ").trim();
-/** The text blocks of a reply row of the record. */
+/** The text of a reply row of the record, as the thread shows it. */
 const assistantRowText = (row: Record<string, unknown>): string => {
   const content = isRecord(row.message) ? row.message.content : null;
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
   return content
+    .map(claudeNarrationAsText)
     .flatMap((block) =>
       isRecord(block) && block.type === "text" && typeof block.text === "string"
         ? [block.text]
         : [],
     )
     .join("");
+};
+/** Whether a reply row of the record holds thoughts and nothing else. */
+const isThoughtRow = (row: Record<string, unknown>): boolean => {
+  const content = isRecord(row.message) ? row.message.content : null;
+  return (
+    Array.isArray(content) &&
+    content.length > 0 &&
+    content.every(
+      (block) =>
+        isRecord(block) && (block.type === "thinking" || block.type === "redacted_thinking"),
+    )
+  );
 };
 /**
  * How far ahead another instance's heartbeat must be before the attachment
@@ -205,6 +226,7 @@ export const layer: Layer.Layer<
     const crypto = yield* Crypto.Crypto;
     const hostEnvironment = yield* HostProcessEnvironment;
     const hostCwd = yield* HostProcessWorkingDirectory;
+    const recordLagMs = Math.max(0, Number(hostEnvironment[CLAUDE_RECORD_LAG_ENV] ?? 0) || 0);
     const { native: nativeEventLogger } = yield* ProviderEventLoggers.ProviderEventLoggers;
     const sdkRunner = Context.get(
       yield* Layer.build(ClaudeAdapterV2.layerQueryRunner),
@@ -347,6 +369,8 @@ export const layer: Layer.Layer<
         closed: false,
         transcriptPath: bridgeProcess.session.transcriptPath,
         byteOffset: 0,
+        /** Under `CLAUDE_RECORD_LAG_ENV`: the sizes the record grew to, and when each was first seen. */
+        lagging: [] as Array<{ readonly size: number; readonly at: number }>,
         lastRowAt: 0,
         /**
          * When the record said its conversation carried on under another
@@ -415,8 +439,6 @@ export const layer: Layer.Layer<
         requestTurn: null as { readonly turnId: string; readonly startedAt: number } | null,
         /** Drawn messages already shown: the record's own copy, arriving later, is the same row. */
         shownDrawn: [] as Array<{ readonly messageId: string; readonly text: string }>,
-        /** The record rows such a copy arrived as, this server process and the ones before it. */
-        drawnReplyRows: new Set<string>(),
         /** Texts of the record's recent replies, to tell a drawn message it already holds. */
         recordedTexts: [] as Array<{ readonly text: string; readonly at: number }>,
         /** A slash command T3 ran that started no turn, waiting for its output rows. */
@@ -505,9 +527,6 @@ export const layer: Layer.Layer<
       });
 
       const missedTurn = yield* registry.peekMissedTurn(sid);
-      for (const rowUuid of yield* registry.readDrawnReplyRows(sid)) {
-        state.drawnReplyRows.add(rowUuid);
-      }
       let replayedTurnId: string | null = null;
       if (bridgeProcess.session.activeTurn !== null) {
         translator.adoptTurn(bridgeProcess.session.activeTurn);
@@ -678,6 +697,26 @@ export const layer: Layer.Layer<
           }
         });
 
+      /** How much of the record was written at least `recordLagMs` ago. */
+      const sizeOldEnough = (written: number) =>
+        Effect.gen(function* () {
+          const now = yield* Clock.currentTimeMillis;
+          const latest = state.lagging.at(-1)?.size ?? state.byteOffset;
+          // A smaller file is another file: the session moved its record.
+          if (written < latest) state.lagging = [];
+          if (written !== latest) state.lagging.push({ size: written, at: now });
+          let size = state.byteOffset;
+          for (
+            let oldest = state.lagging[0];
+            oldest !== undefined && now - oldest.at >= recordLagMs;
+            oldest = state.lagging[0]
+          ) {
+            size = oldest.size;
+            state.lagging.shift();
+          }
+          return size;
+        });
+
       /**
        * Translates the record's new rows. With `untilTurnEnd` it stops after
        * the row that closes a turn, leaving the next turn's rows unread.
@@ -685,7 +724,8 @@ export const layer: Layer.Layer<
       const readRows = (untilTurnEnd: boolean) =>
         Effect.gen(function* () {
           if (state.transcriptPath.length === 0) return;
-          const size = yield* transcriptSize(state.transcriptPath);
+          const written = yield* transcriptSize(state.transcriptPath);
+          const size = recordLagMs === 0 ? written : yield* sizeOldEnough(written);
           if (size <= state.byteOffset) return;
           const bytes = yield* readTranscriptBytes(
             state.transcriptPath,
@@ -699,7 +739,7 @@ export const layer: Layer.Layer<
             const newline = bytes.indexOf(0x0a, lineStart);
             if (newline === -1) break;
             const row = parseJsonlLine(decoder.decode(bytes.subarray(lineStart, newline)));
-            let replyShown = false;
+            let replacesDrawn: string | null = null;
             state.byteOffset += newline + 1 - lineStart;
             lineStart = newline + 1;
             state.lastRowAt = yield* Clock.currentTimeMillis;
@@ -754,30 +794,28 @@ export const layer: Layer.Layer<
               continue;
             }
             if (commandText !== null) state.lastCommandText = commandText;
-            // A reply row settles what the terminal drew before it: the same
-            // text is the record's own copy, anything else was written first.
+            // A reply row settles what the terminal drew before it. The same
+            // text is the record's own copy. A tool call says the record has
+            // none: a message's text is written before its tool calls. A
+            // thought says nothing: its message's text is the row after it.
             if (isRecord(row) && row.type === "assistant" && row.isSidechain !== true) {
               const recorded = normalizeDrawn(assistantRowText(row));
               if (recorded.length > 0) {
                 // The record can be seconds behind the terminal, and this
-                // row's text is already showing from what the terminal drew:
-                // that row is the reply, and the record's copy adds nothing
-                // to the thread. Which rows those are is kept with the
-                // session: a restarted T3 reads a running turn again from
-                // its start, and would take one for a reply never shown.
+                // row's text is already showing from what the terminal drew.
+                // The record's row is the reply and takes that copy's place
+                // under its own id (what a restarted T3 would read again).
                 const shown = state.shownDrawn.findIndex((drawn) => drawn.text === recorded);
-                if (shown !== -1 && typeof row.uuid === "string") {
+                if (shown !== -1) {
+                  replacesDrawn = state.shownDrawn[shown]?.messageId ?? null;
                   state.shownDrawn.splice(shown, 1);
-                  state.drawnReplyRows.add(row.uuid);
-                  yield* registry.noteDrawnReplyRow(sid, row.uuid);
                 }
-                replyShown = typeof row.uuid === "string" && state.drawnReplyRows.has(row.uuid);
                 state.recordedTexts.push({ text: recorded, at: state.lastRowAt });
                 if (state.recordedTexts.length > 24) state.recordedTexts.shift();
                 state.drawnMessages = state.drawnMessages.filter(
                   (drawn) => normalizeDrawn(drawn.text) !== recorded,
                 );
-              } else {
+              } else if (!isThoughtRow(row)) {
                 yield* showDrawnMessages(0);
               }
             }
@@ -786,8 +824,18 @@ export const layer: Layer.Layer<
                 state.heldOutput.push(frame);
                 state.heldAt = state.lastRowAt;
               } else {
-                yield* emit([replyShown ? claudeBridgeShownReplyFrame(frame) : frame]);
+                yield* emit([
+                  replacesDrawn === null
+                    ? frame
+                    : claudeBridgeReplacesDrawnFrame(frame, replacesDrawn),
+                ]);
               }
+            }
+            if (replacesDrawn !== null) {
+              // The thread is compared with the record too: a T3 that could
+              // not make the exchange leaves both, and the repair empties one.
+              replacesDrawn = null;
+              yield* registry.noteRecordChange(bridgeProcess, "reply-recorded");
             }
             if (isClaudeTurnEndRow(row)) {
               state.turnEndsRead += 1;
@@ -1059,6 +1107,9 @@ export const layer: Layer.Layer<
           // it: the request can only be answered from a run that is open.
           !agentAskPlaced() &&
           state.byteOffset >= pending.event.transcriptOffset &&
+          // Claude Code's file is level with its terminal when a turn ends:
+          // a record held back for a test is read to its end first.
+          state.lagging.length === 0 &&
           now - state.lastRowAt >= COMPLETE_QUIET_MS &&
           now - pending.seenAt >= COMPLETE_QUIET_MS
         ) {

@@ -22,7 +22,7 @@ import {
   claudeContinuedInSession,
   type ClaudeBridgeCommandBody,
   claudeBridgeApproveWithMode,
-  isClaudeBridgeShownReplyFrame,
+  claudeBridgeReplacedDrawnId,
 } from "../../claude-bridge/ClaudeBridgeProtocol.ts";
 import * as ProviderEventLoggers from "../../provider/ProviderEventLoggers.ts";
 import * as ClaudeAdapterV2 from "./ClaudeAdapterV2.ts";
@@ -51,8 +51,6 @@ const attach = (input: {
   readonly heldElsewhere?: boolean;
   /** The turn the session is running when the runner attaches. */
   readonly activeTurn?: ClaudeBridgeRegistry.ClaudeBridgeProcess["session"]["activeTurn"];
-  /** Record rows an earlier server process knew as replies shown from what the terminal drew. */
-  readonly drawnReplyRows?: ReadonlyArray<string>;
   readonly bridgeCanUseTool: (
     tool: string,
     toolInput: Record<string, unknown>,
@@ -95,7 +93,6 @@ const attach = (input: {
     };
     const commands = yield* Queue.unbounded<ClaudeBridgeCommandBody>();
     const recordChanges: Array<ClaudeBridgeRegistry.ClaudeBridgeRecordChange> = [];
-    const drawnReplyRows = [...(input.drawnReplyRows ?? [])];
     const subscribed = yield* Deferred.make<ClaudeBridgeRegistry.ClaudeBridgeEventHandler>();
     /** The sessions whose live process the runner asked for. */
     const asked: Array<string> = [];
@@ -133,11 +130,6 @@ const attach = (input: {
         }),
       readClientSelection: () => Effect.succeed(null),
       writeClientSelection: () => Effect.void,
-      readDrawnReplyRows: () => Effect.sync(() => [...drawnReplyRows]),
-      noteDrawnReplyRow: (_sid, rowUuid) =>
-        Effect.sync(() => {
-          drawnReplyRows.push(rowUuid);
-        }),
       peekMissedTurn: () => Effect.sync(() => missedTurn),
       takeMissedTurn: () =>
         Effect.sync(() => {
@@ -221,7 +213,6 @@ const attach = (input: {
       counts,
       now,
       recordChanges,
-      drawnReplyRows,
       asked,
       deliveries,
       offeredModes,
@@ -1933,10 +1924,17 @@ describe("ClaudeBridgeQueryRunner messages the terminal drew", () => {
         usage: { input_tokens: 1, output_tokens: 1 },
       },
     })}\n`;
+  const THOUGHT_ROW = "00000000-0000-4000-8000-0000000000b0";
   const TEXT_ROW = "00000000-0000-4000-8000-0000000000b1";
   const TOOL_ROW = "00000000-0000-4000-8000-0000000000b2";
-  const OTHER_ROW = "00000000-0000-4000-8000-0000000000b3";
   const DRAWN = "44444444-4444-4444-8444-444444444444";
+  /** A thinking block's signature as the API writes one, with `kind` where Claude Code reads it. */
+  const signatureOf = (kind: string): string => {
+    const field = (number: number, body: Buffer) =>
+      Buffer.concat([Buffer.from([(number << 3) | 2, body.length]), body]);
+    const header = Buffer.concat([Buffer.from([0x08, 0x01]), field(8, Buffer.from(kind, "utf8"))]);
+    return field(2, field(1, header)).toString("base64");
+  };
   // Built when it is written, inside the turn: a row carries the time it was made.
   const toolUse = (atMs: number) =>
     row(
@@ -1965,11 +1963,6 @@ describe("ClaudeBridgeQueryRunner messages the terminal drew", () => {
       frame.type === "assistant"
         ? `${frame.uuid}:${frame.message.content.map((block) => block.type).join("+")}`
         : frame.type,
-    );
-  /** The record rows passed on as replies the thread already shows. */
-  const alreadyShown = (frames: ReadonlyArray<SDKMessage>) =>
-    frames.flatMap((frame) =>
-      frame.type === "assistant" && isClaudeBridgeShownReplyFrame(frame) ? [frame.uuid] : [],
     );
 
   it.live("shows one the record does not hold, before the tool call it was written before", () =>
@@ -2090,48 +2083,86 @@ describe("ClaudeBridgeQueryRunner messages the terminal drew", () => {
           toolUse(bridge.now),
         { flag: "a" },
       );
-      // The row drawn is the reply. The record's row is passed on as one the
-      // thread already shows, and is remembered with the session.
+      // The record's row is the reply: it is shown under its own id, which is
+      // what a restarted T3 would read again, and names the drawn copy whose
+      // place it takes. The repair is asked for as well.
       const next = Array.from(
         yield* bridge.session.messages.pipe(Stream.take(2), Stream.runCollect),
       );
       assert.deepStrictEqual(shape(next), [`${TEXT_ROW}:text`, `${TOOL_ROW}:tool_use`]);
-      assert.deepStrictEqual(alreadyShown(next), [TEXT_ROW]);
-      assert.deepStrictEqual(bridge.drawnReplyRows, [TEXT_ROW]);
+      assert.deepStrictEqual(next.map(claudeBridgeReplacedDrawnId), [DRAWN, null]);
+      assert.include(bridge.recordChanges, "reply-recorded");
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
-  // A restarted T3 reads a running turn again from its start. The reply an
-  // earlier server process showed as drawn is in the thread under that id.
-  it.live("knows such a row again when it reads the turn from its start after a restart", () =>
+
+  it.live("leaves one to the record when a thought of its message is read before its row", () =>
     Effect.gen(function* () {
-      const bridge = yield* attach({
-        protocol: 2,
-        bridgeCanUseTool: () => null,
-        transcript: "",
-        activeTurn: { turnId: "turn-a", startedAt: 1, transcriptOffset: 0 },
-        drawnReplyRows: [TEXT_ROW],
-      });
-      yield* (yield* FileSystem.FileSystem).writeFileString(
-        bridge.process.session.transcriptPath,
+      const bridge = yield* attach({ protocol: 2, bridgeCanUseTool: () => null, transcript: "" });
+      const fs = yield* FileSystem.FileSystem;
+      const file = bridge.process.session.transcriptPath;
+      yield* bridge.handler(start(bridge), bridge.process);
+      yield* bridge.handler(drawn(bridge, "About to list the files."), bridge.process);
+      // A message's thought is the row before its text: it does not say the
+      // record has gone on without the text, read with that row or before it.
+      yield* fs.writeFileString(
+        file,
+        row(
+          THOUGHT_ROW,
+          [{ type: "thinking", thinking: "Which first?", signature: signatureOf("thinking") }],
+          bridge.now,
+        ),
+        { flag: "a" },
+      );
+      const first = Array.from(
+        yield* bridge.session.messages.pipe(Stream.take(3), Stream.runCollect),
+      );
+      assert.deepStrictEqual(shape(first), ["user", "system", `${THOUGHT_ROW}:thinking`]);
+      yield* fs.writeFileString(
+        file,
         row(TEXT_ROW, [{ type: "text", text: "About to list the files." }], bridge.now) +
-          row(OTHER_ROW, [{ type: "text", text: "Listing them now." }], bridge.now) +
           toolUse(bridge.now),
         { flag: "a" },
       );
-      const replies = Array.from(
-        yield* bridge.session.messages.pipe(
-          Stream.filter((frame) => frame.type === "assistant"),
-          Stream.take(3),
-          Stream.runCollect,
-        ),
+      const next = Array.from(
+        yield* bridge.session.messages.pipe(Stream.take(2), Stream.runCollect),
       );
-      assert.deepStrictEqual(shape(replies), [
+      assert.deepStrictEqual(shape(next), [`${TEXT_ROW}:text`, `${TOOL_ROW}:tool_use`]);
+      assert.deepStrictEqual(next.map(claudeBridgeReplacedDrawnId), [null, null]);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.live("knows the record's row of what the model said between tool calls", () =>
+    Effect.gen(function* () {
+      const bridge = yield* attach({ protocol: 2, bridgeCanUseTool: () => null, transcript: "" });
+      const fs = yield* FileSystem.FileSystem;
+      yield* bridge.handler(start(bridge), bridge.process);
+      yield* bridge.handler(drawn(bridge, "Tests pass; building now."), bridge.process);
+      // The record keeps it as a thinking block; the thread shows it as the
+      // message the terminal drew, and that row is the drawn message's own.
+      yield* fs.writeFileString(
+        bridge.process.session.transcriptPath,
+        row(
+          TEXT_ROW,
+          [
+            {
+              type: "thinking",
+              thinking: "Tests pass; building now.",
+              signature: signatureOf("narration"),
+            },
+          ],
+          bridge.now,
+        ) + toolUse(bridge.now),
+        { flag: "a" },
+      );
+      const frames = Array.from(
+        yield* bridge.session.messages.pipe(Stream.take(4), Stream.runCollect),
+      );
+      assert.deepStrictEqual(shape(frames), [
+        "user",
+        "system",
         `${TEXT_ROW}:text`,
-        `${OTHER_ROW}:text`,
         `${TOOL_ROW}:tool_use`,
       ]);
-      // Only the one that was drawn: a reply the thread lacks is still shown.
-      assert.deepStrictEqual(alreadyShown(replies), [TEXT_ROW]);
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 });

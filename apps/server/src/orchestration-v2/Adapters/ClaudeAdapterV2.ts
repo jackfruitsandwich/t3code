@@ -100,11 +100,11 @@ import {
   claudeBridgeApproveWithMode,
   claudeSessionGrant,
   claudeBridgeAskingAgent,
+  claudeBridgeReplacedDrawnId,
   claudeBridgeSettledElsewhere,
   claudeBridgeWakeDetail,
   claudeBridgeWakeRequest,
   isClaudeBridgeNoticeFrame,
-  isClaudeBridgeShownReplyFrame,
   isClaudeHarnessPrompt,
   threadModesForClaudePermissionMode,
 } from "../../claude-bridge/ClaudeBridgeProtocol.ts";
@@ -5334,6 +5334,8 @@ export function makeClaudeAdapterV2(
           readonly context: ActiveClaudeTurnContext;
           readonly nativeItemId: string;
           readonly text: string;
+          /** The reply the thread shows from what the terminal drew, which this one is the record's row of. */
+          readonly replacesNativeItemId?: string | null;
         }) {
           if (input.context.assistant.emittedNativeItemIds.has(input.nativeItemId)) {
             return;
@@ -5367,6 +5369,14 @@ export function makeClaudeAdapterV2(
                 type: "turn_item.updated",
                 driver: CLAUDE_PROVIDER,
                 turnItem: artifacts.turnItem,
+                ...(typeof input.replacesNativeItemId === "string"
+                  ? {
+                      replacesTurnItemId: idAllocator.derive.turnItemFromProviderItem({
+                        driver: CLAUDE_PROVIDER,
+                        nativeItemId: input.replacesNativeItemId,
+                      }),
+                    }
+                  : {}),
               }),
             ],
             { concurrency: 1 },
@@ -6652,17 +6662,11 @@ export function makeClaudeAdapterV2(
             return;
           }
           if (assistantText !== null && assistantText.text.length > 0) {
-            if (isClaudeBridgeShownReplyFrame(message)) {
-              // The thread shows this reply already, from what the terminal
-              // drew before the record held it: the turn has its reply, and
-              // no second row is made for it.
-              context.assistant.emittedNativeItemIds.add(assistantText.nativeItemId);
-              return;
-            }
             yield* emitAssistantTextArtifacts({
               context,
               nativeItemId: assistantText.nativeItemId,
               text: assistantText.text,
+              replacesNativeItemId: claudeBridgeReplacedDrawnId(message),
             });
             return;
           }

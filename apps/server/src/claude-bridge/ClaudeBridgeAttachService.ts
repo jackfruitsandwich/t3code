@@ -334,7 +334,8 @@ const make = Effect.gen(function* () {
       const state = comparing.get(sid) ?? { passes: 0, running: false };
       comparing.set(sid, state);
       // A turn's own run is still closing just after it ends: once now for
-      // what came before it, once more when the run is over.
+      // what came before it, once more when the run is over. (A reply the
+      // record has caught up on takes one pass: its drawn copy is emptied.)
       state.passes = Math.max(state.passes, change === "turn.complete" ? 2 : 1);
       if (state.running) return;
       state.running = true;

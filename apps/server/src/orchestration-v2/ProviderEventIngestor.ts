@@ -573,8 +573,31 @@ export const layer: Layer.Layer<
                 nodeId: input.event.message.nodeId,
               }),
             ];
-          case "turn_item.updated":
+          case "turn_item.updated": {
+            // T3 cannot take a row out of a thread: the copy this row replaces
+            // is emptied (a reply with nothing in it draws nothing), first and
+            // in the same write, so the reply is in the thread once throughout.
+            const replaced =
+              input.event.replacesTurnItemId === undefined
+                ? null
+                : yield* projections.getTurnItem({
+                    threadId: input.event.turnItem.threadId,
+                    itemId: input.event.replacesTurnItemId,
+                  });
             return [
+              ...(replaced !== null &&
+              replaced.type === "assistant_message" &&
+              replaced.text.length > 0
+                ? [
+                    yield* makeDomainEvent(input, {
+                      type: "turn-item.updated",
+                      threadId: replaced.threadId,
+                      payload: { ...replaced, text: "" },
+                      runId: replaced.runId,
+                      nodeId: replaced.nodeId,
+                    }),
+                  ]
+                : []),
               yield* makeDomainEvent(input, {
                 type: "turn-item.updated",
                 threadId: input.event.turnItem.threadId,
@@ -583,6 +606,7 @@ export const layer: Layer.Layer<
                 nodeId: input.event.turnItem.nodeId,
               }),
             ];
+          }
           case "user_message.delivery": {
             // The row is the orchestrator's: read as it stands, and only its
             // status and times change, so its place and words are kept.

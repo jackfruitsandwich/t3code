@@ -1453,6 +1453,117 @@ layer("ProviderEventIngestorV2", (it) => {
       assert.equal(yield* say(MessageId.make(`${threadId}:unknown`), "taken"), 0);
     }),
   );
+
+  // A Claude Code session's terminal draws a reply seconds before its record
+  // holds it. The thread shows the drawn reply meanwhile, and the record's row
+  // names it when it arrives.
+  it.effect("puts a reply's own row in the place of the copy shown before it, in one write", () =>
+    Effect.gen(function* () {
+      const now = yield* DateTime.now;
+      const eventSink = yield* EventSink.EventSinkV2;
+      const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+      const ingestor = yield* ProviderEventIngestor.ProviderEventIngestorV2;
+      const idAllocator = yield* IdAllocator.IdAllocatorV2;
+      const threadEvent = yield* threadCreatedEvent(now);
+      const threadId = threadEvent.threadId;
+      const providerSessionId = yield* idAllocator.allocate.providerSession({
+        providerInstanceId: modelSelection.instanceId,
+        threadId,
+      });
+      const reply = (
+        nativeItemId: string,
+        text: string,
+        ordinal: number,
+      ): Extract<OrchestrationV2TurnItem, { type: "assistant_message" }> => ({
+        id: idAllocator.derive.turnItemFromProviderItem({ driver: CODEX_DRIVER, nativeItemId }),
+        threadId,
+        runId: null,
+        nodeId: null,
+        providerThreadId: null,
+        providerTurnId: null,
+        nativeItemRef: { driver: CODEX_DRIVER, nativeId: nativeItemId, strength: "strong" },
+        parentItemId: null,
+        ordinal,
+        status: "completed",
+        title: null,
+        startedAt: now,
+        completedAt: now,
+        updatedAt: now,
+        type: "assistant_message",
+        messageId: idAllocator.derive.messageFromProviderItem({
+          driver: CODEX_DRIVER,
+          nativeItemId,
+        }),
+        text,
+        streaming: false,
+      });
+      const drawn = reply("drawn", "The reply.", 0);
+      const other = reply("other", "Another reply.", 1);
+      const seeded: Array<OrchestrationV2DomainEvent> = [];
+      for (const item of [drawn, other]) {
+        seeded.push({
+          id: yield* idAllocator.allocate.event({ threadId }),
+          type: "turn-item.updated",
+          threadId,
+          occurredAt: now,
+          payload: item,
+        });
+      }
+      yield* eventSink.write({ events: [threadEvent, ...seeded] });
+      const arrive = (
+        turnItem: OrchestrationV2TurnItem,
+        replacesTurnItemId?: OrchestrationV2TurnItem["id"],
+      ) =>
+        ingestor.ingestNormalized({
+          providerSessionId,
+          providerInstanceId: modelSelection.instanceId,
+          threadId,
+          event: {
+            type: "turn_item.updated",
+            driver: CODEX_DRIVER,
+            turnItem,
+            ...(replacesTurnItemId === undefined ? {} : { replacesTurnItemId }),
+          },
+        });
+      const text = (item: OrchestrationV2TurnItem) =>
+        projectionStore
+          .getTurnItem({ threadId, itemId: item.id })
+          .pipe(
+            Effect.map((stored) => (stored?.type === "assistant_message" ? stored.text : null)),
+          );
+
+      const placed = yield* projectionStore.getTurnItem({ threadId, itemId: drawn.id });
+
+      // The emptied copy first, then the row, as one write: at no point both.
+      const recorded = reply("recorded", "The reply.", 2);
+      const stored = yield* arrive(recorded, drawn.id);
+      assert.deepStrictEqual(
+        stored.map(({ event }) => (event.type === "turn-item.updated" ? event.payload.id : null)),
+        [drawn.id, recorded.id],
+      );
+      assert.equal(yield* text(drawn), "");
+      assert.equal(yield* text(recorded), "The reply.");
+      // Only its words go: the emptied copy keeps its place and everything else.
+      const emptied = yield* projectionStore.getTurnItem({ threadId, itemId: drawn.id });
+      assert.deepEqual({ ...emptied, text: null }, { ...placed, text: null });
+
+      // Read again (a restarted T3 reads a turn from its start): nothing left to empty.
+      assert.equal((yield* arrive(recorded, drawn.id)).length, 1);
+      // A copy the thread does not hold, and a row that names none: the row alone.
+      assert.equal(
+        (yield* arrive(
+          reply("late", "Later.", 3),
+          idAllocator.derive.turnItemFromProviderItem({
+            driver: CODEX_DRIVER,
+            nativeItemId: "never-shown",
+          }),
+        )).length,
+        1,
+      );
+      assert.equal((yield* arrive(reply("plain", "Plain.", 4))).length, 1);
+      assert.equal(yield* text(other), "Another reply.");
+    }),
+  );
 });
 
 it("gives a steering message's row the status its session's word calls for", () => {

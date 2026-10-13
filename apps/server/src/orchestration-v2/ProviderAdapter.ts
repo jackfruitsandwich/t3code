@@ -32,6 +32,7 @@ import {
   RunAttemptId,
   RunId,
   ThreadId,
+  TurnItemId,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Schema from "effect/Schema";
@@ -126,10 +127,17 @@ export const ProviderAdapterV2Event = Schema.Union([
     driver: ProviderDriverKind,
     message: OrchestrationV2ConversationMessage,
   }),
+  /**
+   * `replacesTurnItemId` names a reply row the thread shows that this row is
+   * the provider's own copy of (a Claude Code session's terminal draws a reply
+   * seconds before its record holds it). That row is emptied in the write that
+   * stores this one, so the thread never shows the reply twice.
+   */
   Schema.Struct({
     type: Schema.Literal("turn_item.updated"),
     driver: ProviderDriverKind,
     turnItem: OrchestrationV2TurnItem,
+    replacesTurnItemId: Schema.optional(TurnItemId),
   }),
   /**
    * Where a message sent to steer a running turn stands with a provider that

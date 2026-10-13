@@ -77,8 +77,12 @@ export type ClaudeBridgeRequestTurnBy = "subagent" | "session";
 export const CLAUDE_BRIDGE_COMMAND_OUTPUT_KEY = "t3_command_output";
 /** Marks a frame that carries what the session said to the person in a row of its own. */
 export const CLAUDE_BRIDGE_NOTICE_KEY = "t3_session_notice";
-/** Set on the frame of a record row whose reply the thread already shows, from what the terminal drew. */
-export const CLAUDE_BRIDGE_SHOWN_REPLY_KEY = "t3_reply_shown";
+/**
+ * Set on the `assistant` frame of a reply row of the record whose text the
+ * thread already shows from what the terminal drew. Its value is that drawn
+ * message's id: the record's row takes its place.
+ */
+export const CLAUDE_BRIDGE_REPLACES_DRAWN_KEY = "t3_replaces_drawn";
 
 export interface ClaudeBridgeActiveTurn {
   readonly turnId: string;
@@ -1139,12 +1143,19 @@ export function isClaudeBridgeCommandOutputFrame(message: SDKMessage): boolean {
   return Reflect.get(message, CLAUDE_BRIDGE_COMMAND_OUTPUT_KEY) === true;
 }
 
-/** The frame of a record row, marked as a reply the thread already shows. */
-export const claudeBridgeShownReplyFrame = (frame: SDKMessage): SDKMessage =>
-  ({ ...frame, [CLAUDE_BRIDGE_SHOWN_REPLY_KEY]: true }) as unknown as SDKMessage;
+/** A reply row's frame, marked as taking the place of the message the terminal drew under `drawnMessageId`. */
+export const claudeBridgeReplacesDrawnFrame = (
+  frame: SDKMessage,
+  drawnMessageId: string,
+): SDKMessage =>
+  frame.type === "assistant"
+    ? Object.assign({ [CLAUDE_BRIDGE_REPLACES_DRAWN_KEY]: drawnMessageId }, frame)
+    : frame;
 
-export function isClaudeBridgeShownReplyFrame(message: SDKMessage): boolean {
-  return Reflect.get(message, CLAUDE_BRIDGE_SHOWN_REPLY_KEY) === true;
+/** The id of the drawn message a reply row's frame takes the place of, when it takes one's. */
+export function claudeBridgeReplacedDrawnId(message: SDKMessage): string | null {
+  const id = Reflect.get(message, CLAUDE_BRIDGE_REPLACES_DRAWN_KEY);
+  return typeof id === "string" && id.length > 0 ? id : null;
 }
 
 /**
