@@ -27,6 +27,9 @@ import {
   makeClaudeBridgeFrameTranslator,
   makeClaudePlainCommandReader,
   parseClaudeBridgeEvent,
+  claudeBridgeWakeOrigin,
+  claudeBridgeWakeSender,
+  isClaudePromptOfThePerson,
   claudeCompactingFrame,
   claudeSessionNoticeFrame,
   claudeSessionNotificationText,
@@ -206,6 +209,65 @@ describe("ClaudeBridgeProtocol frame translator", () => {
       transcriptOffset: 0,
     });
     assert.isNull(claudeBridgeWakeRequest(typed[0]!));
+  });
+
+  it("passes on where the session said a turn's prompt came from, and from which agent", () => {
+    const event = parseClaudeBridgeEvent({
+      seq: 3,
+      at: 5,
+      type: "turn.start",
+      turnId: "turn-5",
+      text: '<agent-message from="a1">\nhello\n</agent-message>',
+      transcriptOffset: 0,
+      origin: "peer",
+      sender: "general-purpose",
+    });
+    assert.isTrue(event?.type === "turn.start");
+    if (event?.type !== "turn.start") return;
+    const opened = translator().onTurnStart(event);
+    assert.equal(claudeBridgeWakeOrigin(opened[0]!), "peer");
+    assert.equal(claudeBridgeWakeSender(opened[0]!), "general-purpose");
+    // A mod that does not say leaves both out.
+    const silent = translator().onTurnStart({
+      seq: 1,
+      at: 1,
+      type: "turn.start",
+      turnId: "turn-6",
+      text: "fix the tests",
+      transcriptOffset: 0,
+    });
+    assert.isNull(claudeBridgeWakeOrigin(silent[0]!));
+    assert.isNull(claudeBridgeWakeSender(silent[0]!));
+  });
+
+  it("takes the session's word for who submitted a prompt, and reads the text only without it", () => {
+    const handBack = '<agent-message from="a1">\n[Subagent hand-back] ...\n</agent-message>';
+    // The session's own word decides.
+    assert.isTrue(isClaudePromptOfThePerson("fix the tests", "composer"));
+    assert.isTrue(isClaudePromptOfThePerson("<system-reminder> what is this tag?", "composer"));
+    assert.isTrue(isClaudePromptOfThePerson("from my phone", "bridge"));
+    for (const origin of [
+      "task-notification",
+      "scheduled-trigger",
+      "peer",
+      "peer-send-message",
+      "projects-relay",
+      "channel",
+      "coordinator",
+      "observer",
+      "observer-activity",
+    ]) {
+      assert.isFalse(isClaudePromptOfThePerson("looks typed", origin), origin);
+    }
+    // A mod that does not say, and origins that say too little: by how the prompt opens.
+    for (const origin of [null, "plugin", "unclassified"]) {
+      assert.isTrue(isClaudePromptOfThePerson("fix the tests", origin));
+      assert.isFalse(isClaudePromptOfThePerson(handBack, origin));
+      assert.isFalse(
+        isClaudePromptOfThePerson("<task-notification>\n<task-id>b1</task-id>", origin),
+      );
+      assert.isFalse(isClaudePromptOfThePerson("Stop hook feedback: keep going", origin));
+    }
   });
 
   it("shows a slash command typed in the terminal that starts a turn as the line, not its markup", () => {

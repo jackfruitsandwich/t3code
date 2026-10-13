@@ -136,6 +136,9 @@ let pendingCommand = null
 // The last "!" command the record took: the turn that follows it is started
 // with what the command printed, and is shown as the command.
 let lastShellInput = null
+// The prompt last submitted and where the session said it came from
+// (prompt.submit's origin kind): the turn it starts is told to T3 with that.
+let submitted = null
 // Commands sent while a turn was running, run when it ends.
 const afterTurn = []
 // Prompts T3 sent to steer the running turn, kept until its next tool
@@ -241,6 +244,19 @@ async function emit($, type, data) {
   eventSeq += 1
   const name = String(eventSeq).padStart(8, '0')
   await writeJson($, dir + '/events/' + name + '.json', Object.assign({ seq: eventSeq, type: type, at: Date.now() }, data))
+}
+
+// Who a message from another agent is from, as the session lists its agents:
+// the terminal names the sender by that ("Message from @general-purpose").
+// The message says the agent's id; nothing when the session has no such agent.
+async function peerSender($, text) {
+  const from = /^<agent-message from="([^"]+)">/.exec(String(text))
+  if (!from) return undefined
+  try {
+    const agents = await $.agent.list()
+    const agent = Array.isArray(agents) ? agents.find((a) => a && a.id === from[1]) : undefined
+    return agent && typeof agent.type === 'string' && agent.type ? agent.type : undefined
+  } catch { return undefined }
 }
 
 async function transcriptOffset($) {
@@ -1296,6 +1312,7 @@ export function register(on) {
         }
       } catch {}
     }
+    submitted = { text: e.text, origin: e.origin && typeof e.origin.kind === 'string' ? e.origin.kind : undefined }
     return next(e)
   })
 
@@ -1317,7 +1334,10 @@ export function register(on) {
       text = '! ' + lastShellInput
       lastShellInput = null
     }
-    await emit($, 'turn.start', { turnId: e.turnId, text: text, transcriptOffset: offset, commandId: commandId, promptUuid: promptUuid })
+    const origin = submitted !== null && submitted.text === e.text ? submitted.origin : undefined
+    submitted = null
+    const sender = origin === 'peer' ? await peerSender($, e.text) : undefined
+    await emit($, 'turn.start', { turnId: e.turnId, text: text, transcriptOffset: offset, commandId: commandId, promptUuid: promptUuid, origin: origin, sender: sender })
     await heartbeat($)
     return next(e)
   })

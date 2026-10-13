@@ -108,6 +108,45 @@ export function claudeTaskNotification(text: string | null): OrchestrationV2Noti
   return { source: { kind: "background_task" }, outcome: notice.outcome, summary: notice.summary };
 }
 
+const PEER_MESSAGE = /^\s*<agent-message from="([^"]*)">\n([\s\S]*?)\n?<\/agent-message>\s*$/u;
+/** The line Claude Code puts before a subagent's report when it hands one back. */
+const HAND_BACK_HEAD = /^\[Subagent hand-back\][^\n]*\n/u;
+const PEER_NAME_MAX = 64;
+
+/**
+ * The notice a turn shows when another agent's message opened it: the line
+ * the terminal draws for one, "Message from @<name>", with what was sent as
+ * its detail. A subagent handing back its report sends the report under a
+ * line of the harness's, every line indented; the detail is the report as the
+ * terminal shows it opened, without either. `sender` is the agent's name
+ * where the session gave one; without it the name is the id the message
+ * carries, as in the terminal. Null for any other prompt.
+ */
+export function claudePeerMessageNotification(
+  text: string | null,
+  sender: string | null,
+): OrchestrationV2Notification | null {
+  const match = text === null ? null : PEER_MESSAGE.exec(text);
+  if (match === null) return null;
+  const sent = match[2] ?? "";
+  const handBack = HAND_BACK_HEAD.test(sent);
+  const lines = sent.replace(HAND_BACK_HEAD, "").split("\n");
+  const body = (
+    handBack && lines.every((line) => line.startsWith("  "))
+      ? lines.map((line) => line.slice(2))
+      : lines
+  ).join("\n");
+  const name = [...(sender ?? match[1] ?? "").replace(/[\p{Cc}\p{Cf}]/gu, "").trim()]
+    .slice(0, PEER_NAME_MAX)
+    .join("");
+  return {
+    source: { kind: handBack ? "subagent" : "background_task" },
+    outcome: "updated",
+    summary: `Message from @${name.length > 0 ? name : "agent"}`,
+    ...(body.trim().length === 0 ? {} : { detail: body }),
+  };
+}
+
 /**
  * Extract the concatenated text-block content from a Claude message
  * `content` value, which is either a plain string or an array of typed

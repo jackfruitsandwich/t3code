@@ -31,7 +31,7 @@ import type {
 import { isRecord, parseJsonlLine } from "../import/sessionImportTypes.ts";
 
 export const CLAUDE_BRIDGE_PROTOCOL_VERSION = 2;
-export const CLAUDE_BRIDGE_MOD_VERSION = "0.3.22";
+export const CLAUDE_BRIDGE_MOD_VERSION = "0.3.23";
 /**
  * The first protocol whose mod runs slash commands, answers questions with
  * their answers and reports the session's own commands. A process still on an
@@ -68,6 +68,13 @@ export const CLAUDE_BRIDGE_WAKE_DETAIL_KEY = "t3_wake_detail";
  * who asks. Nobody typed such a turn: the adapter files it as activity.
  */
 export const CLAUDE_BRIDGE_WAKE_REQUEST_KEY = "t3_wake_request";
+/**
+ * Set beside the detail when the mod said where the turn's prompt came from:
+ * the session's own word for it (`prompt.submit`'s origin kind), and for a
+ * message from another agent, who sent it.
+ */
+export const CLAUDE_BRIDGE_WAKE_ORIGIN_KEY = "t3_wake_origin";
+export const CLAUDE_BRIDGE_WAKE_SENDER_KEY = "t3_wake_sender";
 export type ClaudeBridgeRequestTurnBy = "subagent" | "session";
 /**
  * Set on the synthesized `assistant` frame that carries a slash command's
@@ -331,6 +338,14 @@ export type ClaudeBridgeEvent = { readonly seq: number; readonly at: number } & 
       readonly transcriptOffset: number;
       readonly commandId?: string;
       readonly promptUuid?: string;
+      /**
+       * Where the prompt came from, as the session told the mod: the kind of
+       * its `prompt.submit` origin (`composer`, `task-notification`, `peer`,
+       * ...). Absent from a mod that does not say.
+       */
+      readonly origin?: string;
+      /** For a message from another agent: its name as the session lists it. */
+      readonly sender?: string;
     }
   | {
       readonly type: "turn.complete";
@@ -555,6 +570,12 @@ export function parseClaudeBridgeEvent(value: unknown): ClaudeBridgeEvent | null
         transcriptOffset: readNumber(value.transcriptOffset) ?? 0,
         ...(typeof value.commandId === "string" ? { commandId: value.commandId } : {}),
         ...(typeof value.promptUuid === "string" ? { promptUuid: value.promptUuid } : {}),
+        ...(typeof value.origin === "string" && value.origin.length > 0
+          ? { origin: value.origin }
+          : {}),
+        ...(typeof value.sender === "string" && value.sender.length > 0
+          ? { sender: value.sender }
+          : {}),
       };
     }
     case "turn.complete": {
@@ -1221,22 +1242,66 @@ export function threadSettingsForClaudeSession(session: {
 
 /**
  * Whether a turn's prompt came from the Claude Code harness rather than the
- * person: task-completion notices, hook feedback, interruptions.
+ * person: task-completion notices, another agent's message, hook feedback,
+ * interruptions.
  */
 export function isClaudeHarnessPrompt(text: string): boolean {
   const head = text.trimStart();
   return (
     head.startsWith("<task-notification>") ||
+    head.startsWith("<agent-message ") ||
     head.startsWith("<system-reminder>") ||
     head.startsWith("Stop hook feedback:") ||
     head.startsWith("[Request interrupted")
   );
 }
 
+/** Origins the session names as the person's own submission. */
+const CLAUDE_ORIGINS_OF_THE_PERSON: ReadonlySet<string> = new Set(["composer", "bridge"]);
+/**
+ * Origins the session names as someone else's: a task's notice, a schedule
+ * firing, another session or agent, a relayed channel. The rest (a plugin's,
+ * one the session could not classify) say too little, and are read by text.
+ */
+const CLAUDE_ORIGINS_NOT_OF_THE_PERSON: ReadonlySet<string> = new Set([
+  "task-notification",
+  "scheduled-trigger",
+  "peer",
+  "peer-send-message",
+  "projects-relay",
+  "channel",
+  "coordinator",
+  "observer",
+  "observer-activity",
+]);
+
+/**
+ * Whether the person submitted a turn's prompt themselves. The session's own
+ * word for where it came from decides where the mod relayed one; a session
+ * whose mod does not is told by how the prompt opens.
+ */
+export function isClaudePromptOfThePerson(text: string, origin: string | null): boolean {
+  if (origin !== null && CLAUDE_ORIGINS_OF_THE_PERSON.has(origin)) return true;
+  if (origin !== null && CLAUDE_ORIGINS_NOT_OF_THE_PERSON.has(origin)) return false;
+  return !isClaudeHarnessPrompt(text);
+}
+
 /** The continuation text a bridge `user` frame carries, if any. */
 export function claudeBridgeWakeDetail(message: SDKMessage): string | null {
   const detail = Reflect.get(message, CLAUDE_BRIDGE_WAKE_DETAIL_KEY);
   return typeof detail === "string" && detail.length > 0 ? detail : null;
+}
+
+/** Where the session said a bridge `user` frame's prompt came from, if its mod relayed it. */
+export function claudeBridgeWakeOrigin(message: SDKMessage): string | null {
+  const origin = Reflect.get(message, CLAUDE_BRIDGE_WAKE_ORIGIN_KEY);
+  return typeof origin === "string" && origin.length > 0 ? origin : null;
+}
+
+/** The agent a bridge `user` frame's message is from, as the session lists it, if known. */
+export function claudeBridgeWakeSender(message: SDKMessage): string | null {
+  const sender = Reflect.get(message, CLAUDE_BRIDGE_WAKE_SENDER_KEY);
+  return typeof sender === "string" && sender.length > 0 ? sender : null;
 }
 
 /** Who asks, when a bridge `user` frame opens a turn T3 made to carry a request; null for any other frame. */
@@ -1467,6 +1532,8 @@ export function makeClaudeBridgeFrameTranslator(
           uuid: asUuid(`bridge-user-${event.turnId}`),
           session_id: sessionId,
           [CLAUDE_BRIDGE_WAKE_DETAIL_KEY]: typed,
+          ...(event.origin === undefined ? {} : { [CLAUDE_BRIDGE_WAKE_ORIGIN_KEY]: event.origin }),
+          ...(event.sender === undefined ? {} : { [CLAUDE_BRIDGE_WAKE_SENDER_KEY]: event.sender }),
           ...(turnOptions?.request === undefined
             ? {}
             : { [CLAUDE_BRIDGE_WAKE_REQUEST_KEY]: turnOptions.request }),
