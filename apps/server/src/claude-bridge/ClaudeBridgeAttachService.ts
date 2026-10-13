@@ -355,6 +355,10 @@ const make = Effect.gen(function* () {
   yield* Effect.gen(function* () {
     yield* afterStartupRecovery;
     const live = yield* registry.listLiveProcesses;
+    yield* Effect.logInfo("claude-bridge.startup-scan", {
+      live: live.length,
+      running: live.filter((entry) => entry.session.activeTurn !== null).map((entry) => entry.sid),
+    });
     for (const entry of live) {
       if (entry.session.activeTurn !== null) {
         yield* offerTurn(entry, { ...entry.session.activeTurn, text: "" });
