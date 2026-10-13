@@ -1,12 +1,23 @@
 import { assert, describe, it } from "@effect/vitest";
+import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
+import * as Schema from "effect/Schema";
+import * as SqlClient from "effect/sql/SqlClient";
 
+import * as SessionImporter from "../import/Services/SessionImporter.ts";
+import { CLAUDE_PROVIDER } from "../orchestration-v2/Adapters/ClaudeAdapterV2.ts";
+import * as ProviderContinuationRequests from "../orchestration-v2/ProviderContinuationRequests.ts";
+import * as ProviderRuntimeRecoveryService from "../orchestration-v2/ProviderRuntimeRecoveryService.ts";
+import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import {
   CLAUDE_BRIDGE_REQUEST_RUN_OFFERS,
   CLAUDE_BRIDGE_REQUEST_RUN_SETTLE_MS,
   claudeBridgeRequestToOffer,
   isHarnessPrompt,
+  layer as attachLayer,
 } from "./ClaudeBridgeAttachService.ts";
 import { parseClaudeBridgeSessionFile } from "./ClaudeBridgeProtocol.ts";
+import * as ClaudeBridgeRegistry from "./ClaudeBridgeRegistry.ts";
 
 describe("isHarnessPrompt", () => {
   it("recognises prompts the harness injects into a terminal session", () => {
@@ -104,4 +115,131 @@ describe("what a session lists as waiting", () => {
     assert.isUndefined(file(undefined)?.waiting);
     assert.isUndefined(file([{ kind: "approval" }, "noise"])?.waiting);
   });
+});
+
+describe("the first turn of a session that carries a conversation on", () => {
+  const at = "2026-10-13T13:39:05.000Z";
+  // The session left behind has a thread; the one its conversation went on in has none of its own.
+  const encodePayload = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
+  const threadOfEarlierSession = Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const payload = yield* encodePayload({
+      driver: CLAUDE_PROVIDER,
+      nativeThreadRef: { nativeId: "old" },
+    });
+    yield* sql`
+      INSERT INTO orchestration_v2_projection_threads (
+        thread_id, project_id, title, default_provider, runtime_mode, interaction_mode,
+        created_at, updated_at, payload_json
+      ) VALUES (
+        'thread-old', 'project-1', 'old', ${CLAUDE_PROVIDER}, 'full-access', 'default',
+        ${at}, ${at}, '{}'
+      )
+    `;
+    yield* sql`
+      INSERT INTO orchestration_v2_projection_provider_threads (
+        provider_thread_id, thread_id, provider, status, updated_at, payload_json
+      ) VALUES (
+        'provider-thread-old', 'thread-old', ${CLAUDE_PROVIDER}, 'idle', ${at}, ${payload}
+      )
+    `;
+  });
+
+  /** What became of a `turn.start` from session "new", whose own record leads back to nothing. */
+  const firstTurn = (earlier: ReadonlyArray<ClaudeBridgeRegistry.ClaudeBridgeEarlierSession>) =>
+    Effect.gen(function* () {
+      yield* threadOfEarlierSession;
+      const offered: Array<string> = [];
+      const adopted: Array<string> = [];
+      let onEvent: ClaudeBridgeRegistry.ClaudeBridgeEventHandler | null = null;
+      const none = yield* ClaudeBridgeRegistry.ClaudeBridgeRegistry.pipe(
+        Effect.provide(ClaudeBridgeRegistry.layerTest),
+      );
+      yield* Layer.build(attachLayer).pipe(
+        Effect.provideService(
+          ClaudeBridgeRegistry.ClaudeBridgeRegistry,
+          ClaudeBridgeRegistry.ClaudeBridgeRegistry.of({
+            ...none,
+            onUnattachedEvent: (handler) =>
+              Effect.sync(() => {
+                onEvent = handler;
+              }),
+            liveSessionsContinuedIn: (sid) => Effect.succeed(sid === "new" ? earlier : []),
+          }),
+        ),
+        Effect.provideService(
+          SessionImporter.SessionImporter,
+          SessionImporter.SessionImporter.of({
+            start: () => Effect.void,
+            sweepNow: () => Effect.void,
+            adoptLiveClaudeSession: (input) =>
+              Effect.sync(() => {
+                adopted.push(input.sessionId);
+              }),
+            healLiveClaudeSession: () => Effect.void,
+            // Claude Code makes the new record a moment after the session starts its turn.
+            claudeConversationHolder: () => Effect.succeed(null),
+            claudeSessionHeldElsewhere: () => Effect.succeed(false),
+          }),
+        ),
+        Effect.provideService(
+          ProviderRuntimeRecoveryService.ProviderRuntimeRecoveryService,
+          ProviderRuntimeRecoveryService.ProviderRuntimeRecoveryService.of({
+            reconcile: () => Effect.die("unused"),
+            prepareForShutdown: Effect.void,
+            recover: Effect.die("unused"),
+            awaitStartupRecovery: Effect.void,
+          }),
+        ),
+        Effect.provideService(ProviderContinuationRequests.ProviderContinuationRequests, {
+          offer: (request) =>
+            Effect.sync(() => {
+              offered.push(request.threadId);
+            }),
+          take: Effect.never,
+        }),
+      );
+      const session = parseClaudeBridgeSessionFile({
+        sid: "new",
+        instanceId: "instance-new",
+        heartbeatAt: 1_750_000_000_000,
+        isInteractive: true,
+        transcriptPath: "/records/new.jsonl",
+      });
+      assert.isNotNull(session);
+      assert.isNotNull(onEvent);
+      if (session === null || onEvent === null) return { offered, adopted };
+      yield* (onEvent as ClaudeBridgeRegistry.ClaudeBridgeEventHandler)(
+        {
+          seq: 1,
+          at: 1_750_000_000_000,
+          type: "turn.start",
+          turnId: "turn-1",
+          text: "carry on",
+          transcriptOffset: 0,
+        },
+        { sid: "new", instanceId: "instance-new", dir: "/bridge/new/instance-new", session },
+      );
+      return { offered, adopted };
+    }).pipe(Effect.scoped, Effect.provide(SqlitePersistence.layerMemory));
+
+  it.effect(
+    "goes to the conversation's thread although the session's record is not on disk yet",
+    () =>
+      Effect.gen(function* () {
+        const { offered, adopted } = yield* firstTurn([
+          { sid: "old", transcriptPath: "/records/old.jsonl" },
+        ]);
+        assert.deepStrictEqual(offered, ["thread-old"]);
+        assert.deepStrictEqual(adopted, []);
+      }),
+  );
+
+  it.effect("makes a session no earlier session leads to a thread of its own", () =>
+    Effect.gen(function* () {
+      const { offered, adopted } = yield* firstTurn([]);
+      assert.deepStrictEqual(adopted, ["new"]);
+      assert.deepStrictEqual(offered, []);
+    }),
+  );
 });
