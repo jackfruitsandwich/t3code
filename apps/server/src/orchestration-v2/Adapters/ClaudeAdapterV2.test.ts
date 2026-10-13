@@ -6298,6 +6298,95 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     ),
   );
 
+  // A turn typed in the terminal can begin with a compaction: the session
+  // says so before the run for that turn has opened here.
+  it.effect("says a typed turn is compacting when that began before its run opened", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        const now = yield* DateTime.now;
+        const status = (uuid: string, value: "compacting" | null) =>
+          claudeSdkFrame({
+            type: "system",
+            subtype: "status",
+            status: value,
+            uuid,
+            session_id: WAKE_NATIVE_SESSION,
+          });
+
+        yield* harness.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now,
+            attemptId: RunAttemptId.make("attempt-claude-typed-compacting-1"),
+            text: "Hello.",
+            attachments: [],
+          }),
+        );
+        yield* Queue.offer(harness.sdkMessages, turnOneResult);
+        yield* awaitUntil(() => harness.terminalEvents().length === 1, "first turn terminal");
+
+        // Between turns it is nobody's: there is no turn for it to be a state of.
+        yield* Queue.offer(
+          harness.sdkMessages,
+          status("00000000-0000-4000-8000-000000000310", "compacting"),
+        );
+        yield* Queue.offer(
+          harness.sdkMessages,
+          claudeSdkFrame({
+            type: "user",
+            message: { role: "user", content: "read the big file" },
+            parent_tool_use_id: null,
+            uuid: "00000000-0000-4000-8000-000000000311",
+            session_id: WAKE_NATIVE_SESSION,
+            t3_wake_detail: "read the big file",
+          }),
+        );
+        yield* Queue.offer(harness.sdkMessages, wakeTurnInit);
+        yield* Queue.offer(
+          harness.sdkMessages,
+          status("00000000-0000-4000-8000-000000000312", "compacting"),
+        );
+        yield* awaitUntil(() => harness.continuationRequests.length === 1, "typed continuation");
+        let quietYields = 0;
+        yield* awaitUntil(() => quietYields++ >= 50, "the status to settle into the buffer");
+        assert.lengthOf(harness.continuationRequests, 1);
+
+        const before = harness.events.length;
+        yield* harness.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now,
+            attemptId: RunAttemptId.make("attempt-claude-typed-compacting-2"),
+            text: "read the big file",
+            attachments: [],
+            messageCreatedBy: "user",
+            messageCreationSource: "provider",
+          }),
+        );
+        yield* Queue.offer(
+          harness.sdkMessages,
+          status("00000000-0000-4000-8000-000000000313", null),
+        );
+        yield* Queue.offer(
+          harness.sdkMessages,
+          makeResultFrame({ uuid: "00000000-0000-4000-8000-000000000314", result: "Read it." }),
+        );
+        yield* awaitUntil(() => harness.terminalEvents().length === 2, "typed turn terminal");
+        const said = harness.events
+          .slice(before)
+          .flatMap((event) =>
+            event.type === "provider_turn.updated"
+              ? [`${event.providerTurn.status}:${event.providerTurn.activity ?? "-"}`]
+              : [],
+          );
+        assert.deepEqual(said, ["running:-", "running:compacting", "running:-", "completed:-"]);
+      }).pipe(Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+    ),
+  );
+
   // A subagent sent to the background asks for permission after the turn that
   // started it has ended. The bridge opens a turn of its own for the request;
   // nobody typed it.

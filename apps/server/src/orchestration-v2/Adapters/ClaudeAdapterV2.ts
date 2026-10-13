@@ -5497,6 +5497,14 @@ export function makeClaudeAdapterV2(
           // arrived; the offer gate below keeps them from requesting a
           // continuation on their own.
           const isWakeTurnStart = isClaudeTurnStartMessage(message);
+          // The session saying it is compacting, or has stopped, between a
+          // turn's first frame and that turn's run opening (a turn typed in
+          // the terminal can begin with a compaction): it parks with the
+          // turn's output, so the run says it too. It requests no run itself.
+          const isStatusOfBufferedTurn =
+            message.type === "system" &&
+            message.subtype === "status" &&
+            bufferedMessages.some(isClaudeTurnStartMessage);
           const isWakeEvidence =
             isPendingTaskNotification ||
             isPendingSubagentNotification ||
@@ -5504,6 +5512,7 @@ export function makeClaudeAdapterV2(
             isKnownSubagentTaskStarted ||
             isNewSubagentTaskStarted ||
             isWakeTurnStart ||
+            isStatusOfBufferedTurn ||
             message.type === "assistant" ||
             message.type === "user" ||
             message.type === "result" ||
