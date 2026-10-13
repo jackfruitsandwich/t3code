@@ -111,6 +111,11 @@ const assistantRowText = (row: Record<string, unknown>): string => {
 const RELOADED_MOD_LEAD_MS = 6_500;
 /** A turn's result waits this long after the last transcript row, so a late row cannot land after it. */
 const COMPLETE_QUIET_MS = 400;
+/**
+ * How long the session's own word that a turn ended is waited for once its
+ * record says the conversation carried on under another session id.
+ */
+const CONTINUED_TURN_WAIT_MS = 2_000;
 /** How long a turn's closing row is waited for when the next turn has already begun. */
 const TURN_END_ROW_POLL_MS = 50;
 const TURN_END_ROW_ATTEMPTS = 30;
@@ -342,6 +347,11 @@ export const layer: Layer.Layer<
         transcriptPath: bridgeProcess.session.transcriptPath,
         byteOffset: 0,
         lastRowAt: 0,
+        /**
+         * When the record said its conversation carried on under another
+         * session id. Null again once this session writes to the record.
+         */
+        continuedAt: null as number | null,
         pendingComplete: null as {
           readonly event: Extract<ClaudeBridgeEvent, { type: "turn.complete" }>;
           readonly seenAt: number;
@@ -682,6 +692,17 @@ export const layer: Layer.Layer<
             lineStart = newline + 1;
             state.lastRowAt = yield* Clock.currentTimeMillis;
             if (row === undefined) continue;
+            if (isRecord(row)) {
+              if (
+                row.type === "continued-in" &&
+                typeof row.continuedInSessionId === "string" &&
+                row.continuedInSessionId.length > 0
+              ) {
+                state.continuedAt = state.lastRowAt;
+              } else if (row.type === "user" || row.type === "assistant") {
+                state.continuedAt = null;
+              }
+            }
             // Another session's conversation, copied into this record after
             // the turn began: not this turn's replies, tools or turn ends.
             if (translator.isFromBeforeTurn(row)) {
@@ -1035,6 +1056,25 @@ export const layer: Layer.Layer<
         }
       });
 
+      /**
+       * Closes the turn this process was running when its conversation
+       * carried on under another session id. Sent to the background while a
+       * tool ran, the process says nothing more of the turn: the rest of it
+       * is the new session's, and the thread follows once this run is over.
+       */
+      const closeTurnLeftBehind = Effect.gen(function* () {
+        if (state.continuedAt === null || !sessionTurnOpen() || state.pendingComplete !== null) {
+          return;
+        }
+        const now = yield* Clock.currentTimeMillis;
+        if (now - state.continuedAt < CONTINUED_TURN_WAIT_MS) return;
+        yield* Effect.logInfo("claude-bridge.turn-left-behind", { sid });
+        for (const toolUseId of state.approvals.keys()) {
+          if (!state.agentAsks.has(toolUseId)) yield* settleElsewhere(toolUseId);
+        }
+        yield* emit(translator.onContinuedElsewhere(now));
+      });
+
       const endSession = (reason: string) =>
         Effect.gen(function* () {
           yield* readNewRows.pipe(Effect.ignore);
@@ -1148,6 +1188,7 @@ export const layer: Layer.Layer<
           // A drawn message no reply row followed (a long tool run comes next).
           yield* showDrawnMessages(DRAWN_MESSAGE_WAIT_MS);
           yield* settlePendingComplete;
+          yield* closeTurnLeftBehind;
           yield* settleLocalCommands;
           yield* Effect.sleep(`${TAIL_INTERVAL_MS} millis`);
         }
@@ -1410,6 +1451,9 @@ export const layer: Layer.Layer<
               return;
             }
             case "turn.complete": {
+              // The session's late word of a turn already closed here, when
+              // its conversation carried on elsewhere: it closes nothing.
+              if (state.continuedAt !== null && !translator.hasOpenTurn()) return;
               // Whatever this turn's own loop still asked is over with it.
               for (const toolUseId of state.approvals.keys()) {
                 if (!state.agentAsks.has(toolUseId)) yield* settleElsewhere(toolUseId);

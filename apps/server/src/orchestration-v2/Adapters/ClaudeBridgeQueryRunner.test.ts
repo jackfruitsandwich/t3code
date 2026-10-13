@@ -1411,6 +1411,112 @@ describe("ClaudeBridgeQueryRunner slash commands", () => {
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
+  // Sent to the background while a tool ran, the process reports no end for
+  // the turn it was running: the new session carries the turn on.
+  it.live("closes the turn its conversation left behind, so the thread can follow it", () =>
+    Effect.gen(function* () {
+      const bridge = yield* attach({ protocol: 2, bridgeCanUseTool: () => null, transcript: "" });
+      const base = { seq: 1, at: bridge.now, transcriptOffset: 0 };
+      yield* bridge.handler(
+        { ...base, type: "turn.start", turnId: "turn-a", text: "count to 5000" },
+        bridge.process,
+      );
+      const fs = yield* FileSystem.FileSystem;
+      yield* fs.writeFileString(bridge.process.session.transcriptPath, continuedInRow, {
+        flag: "a",
+      });
+      const frames = Array.from(
+        yield* bridge.session.messages.pipe(Stream.take(3), Stream.runCollect),
+      );
+      assert.deepStrictEqual(
+        frames.map((frame) => frame.type),
+        ["user", "system", "result"],
+      );
+      const closed = frames[2];
+      assert.strictEqual(
+        closed?.type === "result" && closed.subtype === "success" ? closed.result : null,
+        "",
+        describe(closed),
+      );
+      assert.notProperty(closed, "terminal_reason");
+      // The process's own late word of that turn closes nothing a second time.
+      yield* bridge.handler(
+        {
+          ...base,
+          seq: 2,
+          type: "turn.complete",
+          turnId: "turn-a",
+          reason: "aborted",
+          answer: "",
+          isAborted: true,
+          durationMs: 10,
+        },
+        bridge.process,
+      );
+      yield* Effect.sleep("900 millis");
+      yield* bridge.handler(
+        { ...base, seq: 3, type: "turn.start", turnId: "turn-b", text: "next" },
+        bridge.process,
+      );
+      const next = Array.from(
+        yield* bridge.session.messages.pipe(Stream.take(2), Stream.runCollect),
+      );
+      assert.deepStrictEqual(
+        next.map((frame) => frame.type),
+        ["user", "system"],
+      );
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.live("leaves a turn the process itself reports ended to that report", () =>
+    Effect.gen(function* () {
+      const bridge = yield* attach({ protocol: 2, bridgeCanUseTool: () => null, transcript: "" });
+      const base = { seq: 1, at: bridge.now, transcriptOffset: 0 };
+      yield* bridge.handler(
+        { ...base, type: "turn.start", turnId: "turn-a", text: "count to 5000" },
+        bridge.process,
+      );
+      const fs = yield* FileSystem.FileSystem;
+      yield* fs.writeFileString(bridge.process.session.transcriptPath, continuedInRow, {
+        flag: "a",
+      });
+      yield* bridge.handler(
+        {
+          ...base,
+          seq: 2,
+          type: "turn.complete",
+          turnId: "turn-a",
+          reason: "aborted",
+          answer: "1 2 3",
+          isAborted: true,
+          durationMs: 10,
+        },
+        bridge.process,
+      );
+      const frames = Array.from(
+        yield* bridge.session.messages.pipe(Stream.take(3), Stream.runCollect),
+      );
+      const closed = frames[2];
+      assert.strictEqual(
+        closed?.type === "result" && closed.subtype === "success" ? closed.result : null,
+        "1 2 3",
+        describe(closed),
+      );
+      yield* Effect.sleep("2600 millis");
+      yield* bridge.handler(
+        { ...base, seq: 3, type: "turn.start", turnId: "turn-b", text: "next" },
+        bridge.process,
+      );
+      const next = Array.from(
+        yield* bridge.session.messages.pipe(Stream.take(2), Stream.runCollect),
+      );
+      assert.deepStrictEqual(
+        next.map((frame) => frame.type),
+        ["user", "system"],
+      );
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
   it.effect("sends text that only looks like a command to the model as written", () =>
     Effect.gen(function* () {
       const bridge = yield* attach({

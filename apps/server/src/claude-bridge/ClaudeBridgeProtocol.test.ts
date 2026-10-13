@@ -274,6 +274,20 @@ describe("ClaudeBridgeProtocol frame translator", () => {
     assert.lengthOf(frames.onEnded("again"), 0);
   });
 
+  it("closes the open turn with nothing more said when its conversation carried on elsewhere", () => {
+    const frames = translator();
+    frames.adoptTurn({ turnId: "turn-4", startedAt: 1_000, transcriptOffset: 100 });
+    const closed = frames.onContinuedElsewhere(4_000)[0];
+    assert.equal(closed?.type, "result");
+    if (closed?.type !== "result" || closed.subtype !== "success") return;
+    assert.equal(closed.result, "");
+    assert.isFalse(closed.is_error);
+    assert.equal(closed.duration_ms, 3_000);
+    assert.notProperty(closed, "terminal_reason");
+    assert.isFalse(frames.hasOpenTurn());
+    assert.lengthOf(frames.onContinuedElsewhere(5_000), 0);
+  });
+
   it("leaves out rows older than the open turn: another session's conversation, copied in after it began", () => {
     const began = Date.parse("2026-10-11T10:29:19.794Z");
     const said = (uuid: string, text: string, timestamp: string) => ({

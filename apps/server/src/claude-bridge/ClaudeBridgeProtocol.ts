@@ -1301,6 +1301,12 @@ export interface ClaudeBridgeFrameTranslator {
   /** A `result` for a turn this server interrupted and the mod never reported. */
   readonly onEnded: (reason: string) => ReadonlyArray<SDKMessage>;
   /**
+   * A `result` for the turn this process was running when its conversation
+   * carried on under another session id. The rest of the turn is that
+   * session's; this one closes with nothing more said.
+   */
+  readonly onContinuedElsewhere: (at: number) => ReadonlyArray<SDKMessage>;
+  /**
    * Takes over a turn already running when this server attached. No frames:
    * the adapter's continuation turn is already open for them, and a second
    * `init` would request another continuation.
@@ -1619,6 +1625,18 @@ export function makeClaudeBridgeFrameTranslator(
         answer: `Claude Code session ended (${reason}).`,
         isAborted: true,
         durationMs: 0,
+      });
+      turn = null;
+      return [frame];
+    },
+    onContinuedElsewhere: (at) => {
+      if (turn === null) return [];
+      const frame = resultFrame({
+        turnId: turn.turnId,
+        reason: "answer",
+        answer: "",
+        isAborted: false,
+        durationMs: turn.startedAt > 0 ? Math.max(0, at - turn.startedAt) : 0,
       });
       turn = null;
       return [frame];
