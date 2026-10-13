@@ -116,6 +116,16 @@ const make = Effect.gen(function* () {
       Effect.orElseSucceed(() => null),
     );
 
+  /** The thread of an earlier session the record says this conversation came through. */
+  const threadHeldEarlier = (sid: string, transcriptPath: string) =>
+    Effect.gen(function* () {
+      if (transcriptPath.length === 0) return null;
+      const holder = yield* importer.claudeConversationHolder({ sessionId: sid, transcriptPath });
+      if (holder === null || holder === sid) return null;
+      const thread = yield* lookupThread(holder);
+      return thread === null ? null : { thread, holder };
+    });
+
   /**
    * The thread that holds a live session's conversation: its own, or the
    * thread of the session it carried on from (a session sent to the
@@ -126,21 +136,30 @@ const make = Effect.gen(function* () {
       const own = yield* lookupThread(entry.sid);
       if (own !== null) return own;
       const session = (yield* registry.readSession(entry)) ?? entry.session;
-      if (session.transcriptPath.length === 0) return null;
-      const holder = yield* importer.claudeConversationHolder({
-        sessionId: entry.sid,
-        transcriptPath: session.transcriptPath,
-      });
-      if (holder === null || holder === entry.sid) return null;
-      const thread = yield* lookupThread(holder);
-      if (thread !== null) {
-        yield* Effect.logInfo("claude-bridge.conversation-followed", {
-          sid: entry.sid,
-          continuedFrom: holder,
-          threadId: thread.threadId,
-        });
+      let held = yield* threadHeldEarlier(entry.sid, session.transcriptPath);
+      const readFrom = held === null ? "earlier-session" : "own-record";
+      if (held === null) {
+        // The new session can report its first turn before its own record is
+        // on disk, and nothing leads back from a record that is not there.
+        // The session it carried on from is still running, and its record
+        // says where the conversation went.
+        for (const earlier of yield* registry.liveSessionsContinuedIn(entry.sid)) {
+          const thread = yield* lookupThread(earlier.sid);
+          held =
+            thread === null
+              ? yield* threadHeldEarlier(earlier.sid, earlier.transcriptPath)
+              : { thread, holder: earlier.sid };
+          if (held !== null) break;
+        }
       }
-      return thread;
+      if (held === null) return null;
+      yield* Effect.logInfo("claude-bridge.conversation-followed", {
+        sid: entry.sid,
+        continuedFrom: held.holder,
+        threadId: held.thread.threadId,
+        readFrom,
+      });
+      return held.thread;
     });
 
   // One offer per native turn: the pump can replay nothing, but a restart

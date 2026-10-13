@@ -62,6 +62,16 @@ describe("where a Claude conversation went when it carried on under another sess
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
+  it.live("leads forward to a session whose own record is not on disk yet", () =>
+    Effect.gen(function* () {
+      const { reader, record, write } = yield* folderOfRecords;
+      // Claude Code makes the new record a moment after the new session starts its turn.
+      yield* write("old", said("a1") + continuedIn("old", "new"));
+      assert.deepStrictEqual(yield* reader.continuedThrough(record("new")), []);
+      assert.strictEqual(yield* reader.continuationOf(record("old")), "new");
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
   it.live("takes a session taken up again in its own right as not continued", () =>
     Effect.gen(function* () {
       const { reader, record, write } = yield* folderOfRecords;

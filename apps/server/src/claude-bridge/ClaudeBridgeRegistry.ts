@@ -313,6 +313,15 @@ export class ClaudeBridgeRegistry extends Context.Service<
       sid: string,
       configDir: string,
     ) => Effect.Effect<ClaudeBridgeContinuation | null>;
+    /**
+     * The live sessions whose records say their conversation now lives in
+     * `sid`. A session can report its first turn before its own record is on
+     * disk, and nothing leads back from a record that is not there; the
+     * session it carried on from has said where its conversation went by then.
+     */
+    readonly liveSessionsContinuedIn: (
+      sid: string,
+    ) => Effect.Effect<ReadonlyArray<ClaudeBridgeEarlierSession>>;
     /** Who says whether another thread already holds the session a conversation continued in. */
     readonly judgeContinuations: (judge: ClaudeBridgeContinuationJudge) => Effect.Effect<void>;
   }
@@ -321,6 +330,11 @@ export class ClaudeBridgeRegistry extends Context.Service<
 export interface ClaudeBridgeContinuation {
   readonly sid: string;
   readonly heldElsewhere: boolean;
+}
+
+export interface ClaudeBridgeEarlierSession {
+  readonly sid: string;
+  readonly transcriptPath: string;
 }
 
 export type ClaudeBridgeContinuationJudge = (input: {
@@ -666,6 +680,19 @@ const make = Effect.gen(function* () {
       .filter((entry) => isClaudeBridgeSessionLive(entry.session, now))
       .sort((a, b) => b.session.heartbeatAt - a.session.heartbeatAt);
   });
+
+  const liveSessionsContinuedIn = (sid: string) =>
+    Effect.gen(function* () {
+      const earlier: Array<ClaudeBridgeEarlierSession> = [];
+      for (const other of yield* listLiveProcesses) {
+        if (other.sid === sid || earlier.some((found) => found.sid === other.sid)) continue;
+        const transcriptPath = yield* findTranscript(other.session);
+        if ((yield* continuations.continuationOf(transcriptPath)) === sid) {
+          earlier.push({ sid: other.sid, transcriptPath });
+        }
+      }
+      return earlier;
+    });
 
   const findLiveProcess = (sid: string) =>
     Effect.gen(function* () {
@@ -1218,6 +1245,7 @@ const make = Effect.gen(function* () {
     findTerminalHome,
     findSessionHome,
     continuationOf,
+    liveSessionsContinuedIn,
     judgeContinuations: (judge) =>
       Effect.sync(() => {
         continuationJudge = judge;
@@ -1265,6 +1293,7 @@ export const layerTest = Layer.succeed(
     findTerminalHome: () => Effect.succeed(null),
     findSessionHome: () => Effect.succeed(null),
     continuationOf: () => Effect.succeed(null),
+    liveSessionsContinuedIn: () => Effect.succeed([]),
     judgeContinuations: () => Effect.void,
   }),
 );

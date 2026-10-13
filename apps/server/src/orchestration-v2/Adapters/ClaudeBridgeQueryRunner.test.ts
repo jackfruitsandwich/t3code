@@ -152,6 +152,7 @@ const attach = (input: {
               }),
               Effect.orElseSucceed(() => null),
             ),
+      liveSessionsContinuedIn: () => Effect.succeed([]),
       judgeContinuations: () => Effect.void,
     });
     const services = yield* Layer.build(ClaudeBridgeQueryRunner.layer).pipe(
