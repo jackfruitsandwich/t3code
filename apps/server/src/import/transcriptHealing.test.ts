@@ -106,6 +106,26 @@ describe("planTranscriptHealing", () => {
     assert.deepEqual(plan(rows, midFlight, [{ id: "run-1", ordinal: 1, minute: 1 }]), ["0:u1"]);
   });
 
+  it("counts it as shown too when the turn's reply kept the id the terminal drew it with", () => {
+    const rows = [
+      row("user", "u1", "look at this [Image #1]", 0),
+      row("assistant", "a1", "I see a cat.", 1),
+    ];
+    // The terminal drew the reply before the record held it: T3's row for it
+    // carries the terminal's id, and the record's row is that row.
+    const known = [
+      shown("t3-a", "user", "look at this", 0, "run-1"),
+      shown(
+        "message:provider:claudeAgent:native-item:drawn-1",
+        "assistant",
+        "I see a cat.",
+        1,
+        "run-1",
+      ),
+    ];
+    assert.deepEqual(plan(rows, known, [{ id: "run-1", ordinal: 1, minute: 0 }]), []);
+  });
+
   it("shows what a command printed with the command, and never adds the harness's own rows", () => {
     const rows = [
       row("user", "c1", "/rename zed", 0, true),

@@ -132,10 +132,14 @@ export function planTranscriptHealing(input: {
     });
   });
   const taken = new Set<number>();
+  // A reply shown from what the terminal drew stays under the id it was drawn
+  // with: the record's row for it is that message, whatever its id.
+  const shownUnderOwnId = new Map<number, HealingKnownMessage>();
   for (const pair of pairs.toSorted((left, right) => left.distance - right.distance)) {
     if (shown[pair.row] || taken.has(pair.candidate)) continue;
     shown[pair.row] = true;
     taken.add(pair.candidate);
+    shownUnderOwnId.set(pair.row, candidates[pair.candidate]!.message);
   }
   const runStartsById = new Map(runs.map((run) => [run.id, run.startedAtMs]));
   const runsWithPrompt = new Set(
@@ -163,7 +167,10 @@ export function planTranscriptHealing(input: {
       for (let next = index + 1; row.midTurn !== true && next < rows.length; next += 1) {
         const later = rows[next]!;
         if (later.role === "user" && later.command !== true) break;
-        const live = later.role === "assistant" ? knownByNative.get(later.sourceId) : undefined;
+        const live =
+          later.role === "assistant"
+            ? (knownByNative.get(later.sourceId) ?? shownUnderOwnId.get(next))
+            : undefined;
         if (live === undefined) continue;
         if (live.runId === null) return;
         const startedAtMs = runStartsById.get(live.runId);

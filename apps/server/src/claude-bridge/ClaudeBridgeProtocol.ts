@@ -77,6 +77,8 @@ export type ClaudeBridgeRequestTurnBy = "subagent" | "session";
 export const CLAUDE_BRIDGE_COMMAND_OUTPUT_KEY = "t3_command_output";
 /** Marks a frame that carries what the session said to the person in a row of its own. */
 export const CLAUDE_BRIDGE_NOTICE_KEY = "t3_session_notice";
+/** Set on the frame of a record row whose reply the thread already shows, from what the terminal drew. */
+export const CLAUDE_BRIDGE_SHOWN_REPLY_KEY = "t3_reply_shown";
 
 export interface ClaudeBridgeActiveTurn {
   readonly turnId: string;
@@ -1135,6 +1137,14 @@ export function claudeTranscriptPermissionMode(row: unknown): string | null {
 
 export function isClaudeBridgeCommandOutputFrame(message: SDKMessage): boolean {
   return Reflect.get(message, CLAUDE_BRIDGE_COMMAND_OUTPUT_KEY) === true;
+}
+
+/** The frame of a record row, marked as a reply the thread already shows. */
+export const claudeBridgeShownReplyFrame = (frame: SDKMessage): SDKMessage =>
+  ({ ...frame, [CLAUDE_BRIDGE_SHOWN_REPLY_KEY]: true }) as unknown as SDKMessage;
+
+export function isClaudeBridgeShownReplyFrame(message: SDKMessage): boolean {
+  return Reflect.get(message, CLAUDE_BRIDGE_SHOWN_REPLY_KEY) === true;
 }
 
 /**

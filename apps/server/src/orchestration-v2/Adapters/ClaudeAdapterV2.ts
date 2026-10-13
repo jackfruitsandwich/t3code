@@ -104,6 +104,7 @@ import {
   claudeBridgeWakeDetail,
   claudeBridgeWakeRequest,
   isClaudeBridgeNoticeFrame,
+  isClaudeBridgeShownReplyFrame,
   isClaudeHarnessPrompt,
   threadModesForClaudePermissionMode,
 } from "../../claude-bridge/ClaudeBridgeProtocol.ts";
@@ -6651,6 +6652,13 @@ export function makeClaudeAdapterV2(
             return;
           }
           if (assistantText !== null && assistantText.text.length > 0) {
+            if (isClaudeBridgeShownReplyFrame(message)) {
+              // The thread shows this reply already, from what the terminal
+              // drew before the record held it: the turn has its reply, and
+              // no second row is made for it.
+              context.assistant.emittedNativeItemIds.add(assistantText.nativeItemId);
+              return;
+            }
             yield* emitAssistantTextArtifacts({
               context,
               nativeItemId: assistantText.nativeItemId,

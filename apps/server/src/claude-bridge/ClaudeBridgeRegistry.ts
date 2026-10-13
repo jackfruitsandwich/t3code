@@ -55,6 +55,8 @@ const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 /** A process dir whose heartbeat is this old is removed. */
 const DEAD_PROCESS_SWEEP_MS = 120_000;
 const INBOX_HISTORY = 64;
+/** More than one long turn's worth of replies the record was late with. */
+const DRAWN_REPLY_ROWS_KEPT = 256;
 /** How often a session whose record was not found is looked for again. */
 const TRANSCRIPT_LOOKUP_RETRY_MS = 5_000;
 /** How far back from the end of a record a turn's first row is searched for. */
@@ -180,8 +182,6 @@ export type ClaudeBridgeRecordChange =
   | "turn.start"
   | "turn.complete"
   | "typed-mid-turn"
-  /** The record's row arrived for a reply already shown from what the terminal drew. */
-  | "reply-recorded"
   /** Rows older than the turn being shown turned up in the record: history, for the comparison to take in. */
   | "older-rows";
 
@@ -249,6 +249,14 @@ export class ClaudeBridgeRegistry extends Context.Service<
       sid: string,
       selection: ClaudeBridgeClientSelection,
     ) => Effect.Effect<void>;
+    /**
+     * The record rows of this session whose reply was already in the thread,
+     * from what the terminal drew, when the row arrived. Kept beside the
+     * session's bridge files so it outlives this server process: a restarted
+     * T3 reads a running turn again from its start, and must know them.
+     */
+    readonly readDrawnReplyRows: (sid: string) => Effect.Effect<ReadonlyArray<string>>;
+    readonly noteDrawnReplyRow: (sid: string, rowUuid: string) => Effect.Effect<void>;
     /** Routes the session's events to `handler` until the scope closes. One subscriber per session. */
     readonly subscribe: (
       sid: string,
@@ -804,6 +812,32 @@ const make = Effect.gen(function* () {
   const writeClientSelection = (sid: string, selection: ClaudeBridgeClientSelection) =>
     fs.writeFileString(clientSelectionFile(sid), encodeJson(selection)).pipe(Effect.ignore);
 
+  const drawnReplyRowsFile = (sid: string) => path.join(claudeDir, sid, "drawn-reply-rows.json");
+  const readDrawnReplyRows = (sid: string) =>
+    readJson(drawnReplyRowsFile(sid)).pipe(
+      Effect.map((value) =>
+        isRecord(value) && Array.isArray(value.rows)
+          ? value.rows.filter((row): row is string => typeof row === "string")
+          : [],
+      ),
+    );
+  // Moved over the file whole: a restart can land in the middle of a write.
+  const noteDrawnReplyRow = (sid: string, rowUuid: string) =>
+    readDrawnReplyRows(sid).pipe(
+      Effect.flatMap((rows) =>
+        rows.includes(rowUuid)
+          ? Effect.void
+          : writeFileStringAtomically({
+              filePath: drawnReplyRowsFile(sid),
+              contents: encodeJson({ rows: [...rows, rowUuid].slice(-DRAWN_REPLY_ROWS_KEPT) }),
+            }).pipe(
+              Effect.provideService(FileSystem.FileSystem, fs),
+              Effect.provideService(Path.Path, path),
+            ),
+      ),
+      Effect.ignore,
+    );
+
   const clearHeartbeat = (entry: ClaudeBridgeProcess) =>
     fs
       .remove(path.join(entry.dir, "t3.json"))
@@ -1258,6 +1292,8 @@ const make = Effect.gen(function* () {
     noteRecordChange,
     readClientSelection,
     writeClientSelection,
+    readDrawnReplyRows,
+    noteDrawnReplyRow,
     peekMissedTurn,
     takeMissedTurn,
     launch,
@@ -1303,6 +1339,8 @@ export const layerTest = Layer.succeed(
     noteRecordChange: () => Effect.void,
     readClientSelection: () => Effect.succeed(null),
     writeClientSelection: () => Effect.void,
+    readDrawnReplyRows: () => Effect.succeed([]),
+    noteDrawnReplyRow: () => Effect.void,
     peekMissedTurn: () => Effect.succeed(null),
     takeMissedTurn: () => Effect.succeed(null),
     launch: (input) =>

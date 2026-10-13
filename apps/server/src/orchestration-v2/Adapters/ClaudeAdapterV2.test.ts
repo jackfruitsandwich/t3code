@@ -68,7 +68,10 @@ import {
 } from "../ProviderAdapter.ts";
 import type { ProviderContinuationRequest } from "../ProviderContinuationRequests.ts";
 import { makeProviderFailure } from "../ProviderFailure.ts";
-import { CLAUDE_BRIDGE_SETTLED_ELSEWHERE } from "../../claude-bridge/ClaudeBridgeProtocol.ts";
+import {
+  CLAUDE_BRIDGE_SETTLED_ELSEWHERE,
+  claudeBridgeShownReplyFrame,
+} from "../../claude-bridge/ClaudeBridgeProtocol.ts";
 import * as ClaudeAdapterV2 from "./ClaudeAdapterV2.ts";
 import * as IdAllocator from "../IdAllocator.ts";
 
@@ -5902,6 +5905,51 @@ describe("ClaudeAdapterV2 background wake turns", () => {
             (event) => event.type === "message.updated" && event.message.text === fallbackText,
           ),
         );
+      }).pipe(Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+    ),
+  );
+
+  // Through the bridge, a session's record can be seconds behind its terminal.
+  // A reply shown from what the terminal drew is the reply; the record's row
+  // for it arrives marked as one the thread already shows.
+  it.effect("makes no second row for a reply the thread already shows", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        const now = yield* DateTime.now;
+        const reply = "The reply the terminal drew.";
+        const replies = () =>
+          harness.events.flatMap((event) =>
+            event.type === "message.updated" && event.message.role === "assistant"
+              ? [event.message.text]
+              : [],
+          );
+
+        yield* harness.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now,
+            attemptId: RunAttemptId.make("attempt-claude-reply-already-shown"),
+            text: "Go on.",
+            attachments: [],
+          }),
+        );
+        yield* awaitUntil(() => harness.offeredMessages.length === 1, "prompt offered");
+        yield* Queue.offer(
+          harness.sdkMessages,
+          claudeBridgeShownReplyFrame(
+            makeAssistantTextFrame({ uuid: "00000000-0000-4000-8000-000000000201", text: reply }),
+          ),
+        );
+        // The turn has its reply: its end does not put the same words in a row either.
+        yield* Queue.offer(
+          harness.sdkMessages,
+          makeResultFrame({ uuid: "00000000-0000-4000-8000-000000000202", result: reply }),
+        );
+        yield* awaitUntil(() => harness.terminalEvents().length === 1, "turn terminal");
+        assert.equal(harness.terminalEvents()[0]?.status, "completed");
+        assert.deepStrictEqual(replies(), []);
       }).pipe(Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
     ),
   );

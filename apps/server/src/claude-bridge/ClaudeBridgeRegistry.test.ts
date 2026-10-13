@@ -314,3 +314,33 @@ describe("the sessions that count as live", () => {
     },
   );
 });
+
+describe("the record rows shown from what the terminal drew", () => {
+  it.effect("are kept with the session, each once, for the server process that comes next", () =>
+    Effect.gen(function* () {
+      const registry = yield* ClaudeBridgeRegistry;
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      // A session that has reported has its folder.
+      yield* fs.makeDirectory(path.join(registry.bridgeDir, "claude", "session-1", "instance-1"), {
+        recursive: true,
+      });
+      assert.deepStrictEqual(yield* registry.readDrawnReplyRows("session-1"), []);
+      yield* registry.noteDrawnReplyRow("session-1", "row-a");
+      yield* registry.noteDrawnReplyRow("session-1", "row-b");
+      yield* registry.noteDrawnReplyRow("session-1", "row-a");
+      // Read from the file each time: nothing of it lives in this process.
+      assert.deepStrictEqual(yield* registry.readDrawnReplyRows("session-1"), ["row-a", "row-b"]);
+      assert.deepStrictEqual(yield* registry.readDrawnReplyRows("session-2"), []);
+    }).pipe(
+      Effect.provide(
+        registryLayer.pipe(
+          Layer.provide(
+            ServerConfig.layerTest(process.cwd(), { prefix: "t3-bridge-registry-test-" }),
+          ),
+          Layer.provideMerge(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
+        ),
+      ),
+    ),
+  );
+});

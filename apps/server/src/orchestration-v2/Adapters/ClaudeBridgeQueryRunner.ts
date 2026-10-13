@@ -70,6 +70,7 @@ import {
   isClaudeBridgeModRow,
   isClaudeTurnEndRow,
   isClaudeTypedMidTurnRow,
+  claudeBridgeShownReplyFrame,
   isClaudeBridgeCommandOutputFrame,
   isClaudeBridgeSessionLive,
   makeClaudeBridgeFrameTranslator,
@@ -414,6 +415,8 @@ export const layer: Layer.Layer<
         requestTurn: null as { readonly turnId: string; readonly startedAt: number } | null,
         /** Drawn messages already shown: the record's own copy, arriving later, is the same row. */
         shownDrawn: [] as Array<{ readonly messageId: string; readonly text: string }>,
+        /** The record rows such a copy arrived as, this server process and the ones before it. */
+        drawnReplyRows: new Set<string>(),
         /** Texts of the record's recent replies, to tell a drawn message it already holds. */
         recordedTexts: [] as Array<{ readonly text: string; readonly at: number }>,
         /** A slash command T3 ran that started no turn, waiting for its output rows. */
@@ -502,6 +505,9 @@ export const layer: Layer.Layer<
       });
 
       const missedTurn = yield* registry.peekMissedTurn(sid);
+      for (const rowUuid of yield* registry.readDrawnReplyRows(sid)) {
+        state.drawnReplyRows.add(rowUuid);
+      }
       let replayedTurnId: string | null = null;
       if (bridgeProcess.session.activeTurn !== null) {
         translator.adoptTurn(bridgeProcess.session.activeTurn);
@@ -693,7 +699,7 @@ export const layer: Layer.Layer<
             const newline = bytes.indexOf(0x0a, lineStart);
             if (newline === -1) break;
             const row = parseJsonlLine(decoder.decode(bytes.subarray(lineStart, newline)));
-            let replyRecorded = false;
+            let replyShown = false;
             state.byteOffset += newline + 1 - lineStart;
             lineStart = newline + 1;
             state.lastRowAt = yield* Clock.currentTimeMillis;
@@ -754,15 +760,18 @@ export const layer: Layer.Layer<
               const recorded = normalizeDrawn(assistantRowText(row));
               if (recorded.length > 0) {
                 // The record can be seconds behind the terminal, and this
-                // row's text is already showing from what the terminal drew.
-                // The record's row is the reply and takes its place under
-                // its own id (what a restarted T3 would read again); the
-                // drawn copy is emptied by the repair this asks for.
+                // row's text is already showing from what the terminal drew:
+                // that row is the reply, and the record's copy adds nothing
+                // to the thread. Which rows those are is kept with the
+                // session: a restarted T3 reads a running turn again from
+                // its start, and would take one for a reply never shown.
                 const shown = state.shownDrawn.findIndex((drawn) => drawn.text === recorded);
-                if (shown !== -1) {
+                if (shown !== -1 && typeof row.uuid === "string") {
                   state.shownDrawn.splice(shown, 1);
-                  replyRecorded = true;
+                  state.drawnReplyRows.add(row.uuid);
+                  yield* registry.noteDrawnReplyRow(sid, row.uuid);
                 }
+                replyShown = typeof row.uuid === "string" && state.drawnReplyRows.has(row.uuid);
                 state.recordedTexts.push({ text: recorded, at: state.lastRowAt });
                 if (state.recordedTexts.length > 24) state.recordedTexts.shift();
                 state.drawnMessages = state.drawnMessages.filter(
@@ -777,12 +786,8 @@ export const layer: Layer.Layer<
                 state.heldOutput.push(frame);
                 state.heldAt = state.lastRowAt;
               } else {
-                yield* emit([frame]);
+                yield* emit([replyShown ? claudeBridgeShownReplyFrame(frame) : frame]);
               }
-            }
-            if (replyRecorded) {
-              replyRecorded = false;
-              yield* registry.noteRecordChange(bridgeProcess, "reply-recorded");
             }
             if (isClaudeTurnEndRow(row)) {
               state.turnEndsRead += 1;

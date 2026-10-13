@@ -22,6 +22,7 @@ import {
   claudeContinuedInSession,
   type ClaudeBridgeCommandBody,
   claudeBridgeApproveWithMode,
+  isClaudeBridgeShownReplyFrame,
 } from "../../claude-bridge/ClaudeBridgeProtocol.ts";
 import * as ProviderEventLoggers from "../../provider/ProviderEventLoggers.ts";
 import * as ClaudeAdapterV2 from "./ClaudeAdapterV2.ts";
@@ -50,6 +51,8 @@ const attach = (input: {
   readonly heldElsewhere?: boolean;
   /** The turn the session is running when the runner attaches. */
   readonly activeTurn?: ClaudeBridgeRegistry.ClaudeBridgeProcess["session"]["activeTurn"];
+  /** Record rows an earlier server process knew as replies shown from what the terminal drew. */
+  readonly drawnReplyRows?: ReadonlyArray<string>;
   readonly bridgeCanUseTool: (
     tool: string,
     toolInput: Record<string, unknown>,
@@ -92,6 +95,7 @@ const attach = (input: {
     };
     const commands = yield* Queue.unbounded<ClaudeBridgeCommandBody>();
     const recordChanges: Array<ClaudeBridgeRegistry.ClaudeBridgeRecordChange> = [];
+    const drawnReplyRows = [...(input.drawnReplyRows ?? [])];
     const subscribed = yield* Deferred.make<ClaudeBridgeRegistry.ClaudeBridgeEventHandler>();
     /** The sessions whose live process the runner asked for. */
     const asked: Array<string> = [];
@@ -129,6 +133,11 @@ const attach = (input: {
         }),
       readClientSelection: () => Effect.succeed(null),
       writeClientSelection: () => Effect.void,
+      readDrawnReplyRows: () => Effect.sync(() => [...drawnReplyRows]),
+      noteDrawnReplyRow: (_sid, rowUuid) =>
+        Effect.sync(() => {
+          drawnReplyRows.push(rowUuid);
+        }),
       peekMissedTurn: () => Effect.sync(() => missedTurn),
       takeMissedTurn: () =>
         Effect.sync(() => {
@@ -212,6 +221,7 @@ const attach = (input: {
       counts,
       now,
       recordChanges,
+      drawnReplyRows,
       asked,
       deliveries,
       offeredModes,
@@ -1925,6 +1935,7 @@ describe("ClaudeBridgeQueryRunner messages the terminal drew", () => {
     })}\n`;
   const TEXT_ROW = "00000000-0000-4000-8000-0000000000b1";
   const TOOL_ROW = "00000000-0000-4000-8000-0000000000b2";
+  const OTHER_ROW = "00000000-0000-4000-8000-0000000000b3";
   const DRAWN = "44444444-4444-4444-8444-444444444444";
   // Built when it is written, inside the turn: a row carries the time it was made.
   const toolUse = (atMs: number) =>
@@ -1954,6 +1965,11 @@ describe("ClaudeBridgeQueryRunner messages the terminal drew", () => {
       frame.type === "assistant"
         ? `${frame.uuid}:${frame.message.content.map((block) => block.type).join("+")}`
         : frame.type,
+    );
+  /** The record rows passed on as replies the thread already shows. */
+  const alreadyShown = (frames: ReadonlyArray<SDKMessage>) =>
+    frames.flatMap((frame) =>
+      frame.type === "assistant" && isClaudeBridgeShownReplyFrame(frame) ? [frame.uuid] : [],
     );
 
   it.live("shows one the record does not hold, before the tool call it was written before", () =>
@@ -2074,14 +2090,48 @@ describe("ClaudeBridgeQueryRunner messages the terminal drew", () => {
           toolUse(bridge.now),
         { flag: "a" },
       );
-      // The record's row is the reply: it is shown under its own id, which is
-      // what a restarted T3 would read again, and the drawn copy is left to
-      // the repair the runner asks for.
+      // The row drawn is the reply. The record's row is passed on as one the
+      // thread already shows, and is remembered with the session.
       const next = Array.from(
         yield* bridge.session.messages.pipe(Stream.take(2), Stream.runCollect),
       );
       assert.deepStrictEqual(shape(next), [`${TEXT_ROW}:text`, `${TOOL_ROW}:tool_use`]);
-      assert.include(bridge.recordChanges, "reply-recorded");
+      assert.deepStrictEqual(alreadyShown(next), [TEXT_ROW]);
+      assert.deepStrictEqual(bridge.drawnReplyRows, [TEXT_ROW]);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+  // A restarted T3 reads a running turn again from its start. The reply an
+  // earlier server process showed as drawn is in the thread under that id.
+  it.live("knows such a row again when it reads the turn from its start after a restart", () =>
+    Effect.gen(function* () {
+      const bridge = yield* attach({
+        protocol: 2,
+        bridgeCanUseTool: () => null,
+        transcript: "",
+        activeTurn: { turnId: "turn-a", startedAt: 1, transcriptOffset: 0 },
+        drawnReplyRows: [TEXT_ROW],
+      });
+      yield* (yield* FileSystem.FileSystem).writeFileString(
+        bridge.process.session.transcriptPath,
+        row(TEXT_ROW, [{ type: "text", text: "About to list the files." }], bridge.now) +
+          row(OTHER_ROW, [{ type: "text", text: "Listing them now." }], bridge.now) +
+          toolUse(bridge.now),
+        { flag: "a" },
+      );
+      const replies = Array.from(
+        yield* bridge.session.messages.pipe(
+          Stream.filter((frame) => frame.type === "assistant"),
+          Stream.take(3),
+          Stream.runCollect,
+        ),
+      );
+      assert.deepStrictEqual(shape(replies), [
+        `${TEXT_ROW}:text`,
+        `${OTHER_ROW}:text`,
+        `${TOOL_ROW}:tool_use`,
+      ]);
+      // Only the one that was drawn: a reply the thread lacks is still shown.
+      assert.deepStrictEqual(alreadyShown(replies), [TEXT_ROW]);
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 });
