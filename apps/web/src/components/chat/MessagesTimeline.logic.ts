@@ -471,6 +471,7 @@ export type TimelineLatestRun = Pick<
 >;
 
 const LIVE_ACTIVITY_ROW_ID = "live-activity-row";
+const LIVE_COMPACTION_ROW_ID = "live-compaction-row";
 
 export type MessagesTimelineRow = MessagesTimelineRowContent & {
   readonly continuesWorkLog?: boolean;
@@ -1245,6 +1246,12 @@ export function deriveMessagesTimelineRows(input: {
   expandedWorkGroupIds?: ReadonlySet<string>;
   isWorking: boolean;
   /**
+   * The conversation is being compacted and may have no row for it yet. The
+   * work under the running turn then ends with one; with nothing under the
+   * working header, the header says it instead.
+   */
+  isCompacting?: boolean;
+  /**
    * The live work has no app run (a provider-native subagent thread), so
    * runless entries are the current response instead of settled history.
    */
@@ -1790,6 +1797,21 @@ export function deriveMessagesTimelineRows(input: {
   const hasWorkingRow = nextRows.some((row) => row.kind === "working");
   if (input.isWorking && !hasWorkingRow && activeTurnHeaderIndex === timelineEntries.length) {
     appendWorkingRow();
+  }
+  if (
+    input.isCompacting &&
+    input.isWorking &&
+    !hasActiveCompaction &&
+    activeTurnHeaderIndex < timelineEntries.length
+  ) {
+    nextRows.push({
+      kind: "context-compaction",
+      id: LIVE_COMPACTION_ROW_ID,
+      createdAt: input.activeTurnStartedAt ?? timelineEntries.at(-1)!.createdAt,
+      label: "Compacting context",
+      active: true,
+    });
+    hasActiveCompaction = true;
   }
   if (
     input.isWorking &&

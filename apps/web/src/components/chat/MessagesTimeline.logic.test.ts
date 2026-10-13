@@ -647,6 +647,59 @@ describe("resolveAssistantMessageCopyState", () => {
 });
 
 describe("deriveMessagesTimelineRows", () => {
+  it("says a running turn is compacting where its work ends, or in its header with nothing under it", () => {
+    const at = "2026-10-12T10:00:00.000Z";
+    const runId = RunId.make("run-compacting");
+    const prompt: TimelineEntry = {
+      kind: "message",
+      id: "prompt",
+      createdAt: at,
+      message: {
+        id: MessageId.make("prompt"),
+        role: "user",
+        text: "Read the big file",
+        runId,
+        streaming: false,
+        createdAt: at,
+        updatedAt: at,
+      },
+    };
+    const tool: TimelineEntry = {
+      kind: "work",
+      id: "tool",
+      createdAt: at,
+      entry: {
+        id: "tool",
+        runId,
+        createdAt: at,
+        label: "Read big.txt",
+        tone: "tool",
+        toolLifecycleStatus: "completed",
+      },
+    };
+    const rows = (timelineEntries: ReadonlyArray<TimelineEntry>, isCompacting: boolean) =>
+      deriveMessagesTimelineRows({
+        timelineEntries,
+        runningRunId: runId,
+        isWorking: true,
+        isCompacting,
+        activeTurnStartedAt: at,
+        turnDiffSummaries: [],
+        supportsConversationRollback: false,
+      });
+    expect(rows([prompt, tool], true).at(-1)).toMatchObject({
+      kind: "context-compaction",
+      label: "Compacting context",
+      active: true,
+    });
+    expect(rows([prompt, tool], false).some((row) => row.kind === "context-compaction")).toBe(
+      false,
+    );
+    const bare = rows([prompt], true);
+    expect(bare.some((row) => row.kind === "context-compaction")).toBe(false);
+    expect(bare.at(-2)?.kind).toBe("working");
+  });
+
   it("stops stranded thinking after a steer and follows the next thought or tool", () => {
     const runId = RunId.make("steered-run");
     const at = "2026-10-01T06:19:10Z";
