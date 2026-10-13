@@ -352,6 +352,12 @@ export const layer: Layer.Layer<
          * session id. Null again once this session writes to the record.
          */
         continuedAt: null as number | null,
+        /**
+         * The session began compacting with no turn of its own open here. A
+         * turn can begin with a compaction, and the session reports the
+         * compaction first: the turn that opens before it stops says so.
+         */
+        compactingUnsaid: false,
         pendingComplete: null as {
           readonly event: Extract<ClaudeBridgeEvent, { type: "turn.complete" }>;
           readonly seenAt: number;
@@ -1444,6 +1450,11 @@ export const layer: Layer.Layer<
               // call there: this turn is the session taking it.
               yield* promptTaken({ promptUuid: event.promptUuid, commandId: event.commandId });
               yield* emit(translator.onTurnStart(event));
+              if (state.compactingUnsaid) {
+                state.compactingUnsaid = false;
+                const uuid = yield* crypto.randomUUIDv4.pipe(Effect.orDie);
+                yield* emit([claudeCompactingFrame({ uuid, sessionId: sid, compacting: true })]);
+              }
               // Output a slash command printed just before its turn began.
               yield* emit(state.heldOutput.splice(0));
               const live = yield* registry.readSession(bridgeProcess);
@@ -1592,9 +1603,10 @@ export const layer: Layer.Layer<
             case "compact.started":
             case "compact.ended": {
               // A state of the turn that is running: with none open here
-              // there is nothing to put it on.
+              // there is nothing to put it on, unless one opens while it lasts.
               const compacting = event.type === "compact.started";
               const shown = sessionTurnOpen();
+              state.compactingUnsaid = compacting && !shown;
               yield* Effect.logInfo("claude-bridge.compacting", {
                 sid,
                 compacting,

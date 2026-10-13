@@ -1800,6 +1800,66 @@ describe("ClaudeBridgeQueryRunner messages sent to steer a turn", () => {
 describe("ClaudeBridgeQueryRunner turns that follow at once", () => {
   // A message queued behind a turn starts the next one the instant the first
   // ends, before the first has been closed out.
+  // A session over its limit compacts before the turn's first model call,
+  // and reports the compaction before it reports the turn.
+  it.live("says a turn that begins with a compaction is compacting, once the turn has opened", () =>
+    Effect.gen(function* () {
+      const bridge = yield* attach({ protocol: 2, bridgeCanUseTool: () => null, transcript: "" });
+      const base = { seq: 1, at: bridge.now, transcriptOffset: 0 };
+      yield* bridge.handler({ ...base, type: "compact.started", trigger: "auto" }, bridge.process);
+      yield* bridge.handler(
+        { ...base, seq: 2, type: "turn.start", turnId: "turn-a", text: "and the rest" },
+        bridge.process,
+      );
+      yield* bridge.handler({ ...base, seq: 3, type: "compact.ended" }, bridge.process);
+      const frames = Array.from(
+        yield* bridge.session.messages.pipe(Stream.take(4), Stream.runCollect),
+      );
+      assert.deepStrictEqual(
+        frames.map((frame) =>
+          frame.type === "system" && frame.subtype === "status"
+            ? `status:${frame.status}`
+            : frame.type,
+        ),
+        ["user", "system", "status:compacting", "status:null"],
+      );
+      // One that began and stopped between turns is no turn's state.
+      yield* bridge.handler(
+        {
+          ...base,
+          seq: 4,
+          type: "turn.complete",
+          turnId: "turn-a",
+          reason: "answer",
+          answer: "done",
+          isAborted: false,
+          durationMs: 10,
+        },
+        bridge.process,
+      );
+      const ended = Array.from(
+        yield* bridge.session.messages.pipe(Stream.take(1), Stream.runCollect),
+      );
+      assert.strictEqual(ended[0]?.type, "result");
+      yield* bridge.handler(
+        { ...base, seq: 5, type: "compact.started", trigger: "manual" },
+        bridge.process,
+      );
+      yield* bridge.handler({ ...base, seq: 6, type: "compact.ended" }, bridge.process);
+      yield* bridge.handler(
+        { ...base, seq: 7, type: "turn.start", turnId: "turn-b", text: "next" },
+        bridge.process,
+      );
+      const next = Array.from(
+        yield* bridge.session.messages.pipe(Stream.take(2), Stream.runCollect),
+      );
+      assert.deepStrictEqual(
+        next.map((frame) => frame.type),
+        ["user", "system"],
+      );
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
   it.live("closes the turn that ended before starting the one that follows it", () =>
     Effect.gen(function* () {
       const bridge = yield* attach({ protocol: 2, bridgeCanUseTool: () => null, transcript: "" });
