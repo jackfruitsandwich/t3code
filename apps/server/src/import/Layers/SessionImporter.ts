@@ -47,6 +47,7 @@ import {
   type OrchestrationV2ProviderThread,
   type ServerSettings,
 } from "@t3tools/contracts";
+import { claudePromptAsDrawn } from "@t3tools/shared/claudePastedContent";
 import { HostProcessEnvironment } from "@t3tools/shared/hostProcess";
 import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
@@ -3057,7 +3058,7 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
             title:
               parsed.title ??
               (input.promptText.trim().length > 0
-                ? truncateSessionTitle(input.promptText.trim())
+                ? truncateSessionTitle(claudePromptAsDrawn(input.promptText))
                 : undefined),
           },
           context,

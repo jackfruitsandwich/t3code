@@ -14,6 +14,7 @@
  * @module import/claudeSessionParser
  */
 import type { OrchestrationV2Notification } from "@t3tools/contracts";
+import { claudePromptAsDrawn } from "@t3tools/shared/claudePastedContent";
 
 import {
   claudeBridgeMidTurnWords,
@@ -365,7 +366,9 @@ export function parseClaudeSessionJsonl(content: string): ParsedCliSession {
     )?.text ?? messages.find((message) => message.role === "user")?.text;
   const title =
     (aiTitle !== undefined ? truncateSessionTitle(aiTitle) : undefined) ??
-    (firstUserText !== undefined ? truncateSessionTitle(firstUserText) : undefined);
+    (firstUserText !== undefined
+      ? truncateSessionTitle(claudePromptAsDrawn(firstUserText))
+      : undefined);
   // Entry uuids are copied verbatim when Claude forks a session, so the
   // earliest ones identify the conversation across all its branches.
   const forkSignature = messages

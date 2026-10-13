@@ -175,6 +175,37 @@ it.layer(layerTest)("ThreadSearch", (it) => {
     }),
   );
 
+  it.effect("shows a prompt with pasted text without Claude Code's paste tags", () =>
+    Effect.gen(function* () {
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const search = yield* ThreadSearch.ThreadSearch;
+      const project = ProjectId.make("project:search-paste");
+      const threadId = ThreadId.make("thread:pasted");
+      yield* createProject(project);
+      yield* Effect.forEach(
+        [
+          thread(threadId, project),
+          message(
+            threadId,
+            "pasted-user",
+            "user",
+            'compare \n\n<pasted_content id="158e">\nfirst haystack line\nsecond haystack line\n</pasted_content id="158e">\n\n with yesterday',
+          ),
+        ],
+        projections.apply,
+        { discard: true },
+      );
+
+      assert.deepEqual(
+        (yield* search.search({ query: "haystack" })).matches.map((match) => [
+          match.threadId,
+          match.snippet,
+        ]),
+        [[threadId, "compare first haystack line second haystack line with yesterday"]],
+      );
+    }),
+  );
+
   it.effect("reports an unreadable match as a decode failure", () =>
     Effect.gen(function* () {
       const projections = yield* ProjectionStore.ProjectionStoreV2;

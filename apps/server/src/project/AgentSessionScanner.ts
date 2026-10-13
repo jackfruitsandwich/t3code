@@ -39,6 +39,7 @@ import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 
+import { claudePromptAsDrawn } from "@t3tools/shared/claudePastedContent";
 import {
   normalizeGitRemoteUrl,
   parseGitHubRepositoryNameWithOwnerFromRemoteUrl,
@@ -492,7 +493,12 @@ function parseAgentSessionRecords(
   const retainedMessages = firstUserMessageRetained
     ? visibleMessages
     : [visibleFirstUserMessage, ...visibleMessages.slice(-(MAX_IMPORTED_MESSAGES - 1))];
-  const derivedTitle = visibleFirstUserMessage.text.trim().split("\n")[0]?.slice(0, 100).trim();
+  // Claude Code keeps pasted text between tags that its terminal never shows.
+  const firstPrompt =
+    input.source === "claudeAgent"
+      ? claudePromptAsDrawn(visibleFirstUserMessage.text)
+      : visibleFirstUserMessage.text;
+  const derivedTitle = firstPrompt.trim().split("\n")[0]?.slice(0, 100).trim();
 
   return {
     source: input.source,

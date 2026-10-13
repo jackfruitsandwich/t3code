@@ -145,6 +145,16 @@ describe("parseClaudeSessionJsonl", () => {
     assert.equal(parseClaudeSessionJsonl(withoutTitle).title, "x".repeat(60));
   });
 
+  it("titles a session whose first prompt begins with pasted text without the paste tags", () => {
+    const prompt =
+      '<pasted_content id="158e">\nFix the login bug\nand the logout one\n</pasted_content id="158e">\n\n Then test it';
+    const parsed = parseClaudeSessionJsonl(
+      line(userEntry({ message: { role: "user", content: prompt } })),
+    );
+    assert.equal(parsed.title, "Fix the login bug\nand the logout one\nThen test it");
+    assert.equal(parsed.messages[0]?.text, prompt);
+  });
+
   it("ignores unknown line types and counts malformed lines without throwing", () => {
     const content =
       `not-json\n` +

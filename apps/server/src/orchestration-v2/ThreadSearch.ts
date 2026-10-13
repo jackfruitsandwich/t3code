@@ -6,6 +6,7 @@ import {
   ProjectId,
   ThreadId,
 } from "@t3tools/contracts";
+import { claudePromptAsDrawn } from "@t3tools/shared/claudePastedContent";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -155,7 +156,10 @@ export const make = Effect.gen(function* () {
           threadId: row.threadId,
           projectId: row.projectId,
           source: row.source,
-          snippet: buildSearchSnippet(row.matchText, input.query),
+          snippet: buildSearchSnippet(
+            row.source === "user" ? claudePromptAsDrawn(row.matchText) : row.matchText,
+            input.query,
+          ),
           messageCreatedAt: row.messageCreatedAt,
         })),
       };

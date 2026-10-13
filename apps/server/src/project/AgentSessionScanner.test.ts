@@ -2668,6 +2668,37 @@ describe("parseAgentSessionTranscript", () => {
     });
   });
 
+  it("titles a Claude session whose first prompt begins with pasted text without the paste tags", () => {
+    const prompt =
+      '<pasted_content id="158e">\nFix authentication\nand the logout flow\n</pasted_content id="158e">\n\n Then test it';
+    const thread = AgentSessionScanner.parseAgentSessionTranscript({
+      contents: [
+        JSON.stringify({
+          type: "user",
+          sessionId: "claude-session",
+          timestamp: "2026-08-24T10:00:00.000Z",
+          message: { role: "user", content: prompt },
+        }),
+        JSON.stringify({
+          type: "assistant",
+          sessionId: "claude-session",
+          message: {
+            role: "assistant",
+            model: "claude-sonnet-5",
+            content: [{ type: "text", text: "Updated the login flow" }],
+          },
+        }),
+      ].join("\n"),
+      source: "claudeAgent",
+      providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+      fallbackSessionId: "fallback",
+      lastActiveAtMs: Date.parse("2026-08-24T12:00:00.000Z"),
+    });
+
+    expect(thread?.title).toBe("Fix authentication");
+    expect(thread?.messages[0]?.text).toBe(prompt);
+  });
+
   it("drops injected Codex instructions while keeping the visible user event", () => {
     const thread = AgentSessionScanner.parseAgentSessionTranscript({
       contents: [
