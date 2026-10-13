@@ -673,13 +673,34 @@ const make = Effect.gen(function* () {
     return processes;
   });
 
-  const listLiveProcesses = Effect.gen(function* () {
-    const processes = yield* listProcesses;
+  /**
+   * Every process a mod reports, and whether it is live. The clock is read
+   * before the files are. Read after them, a server kept from carrying on
+   * for some seconds in between (a long query at startup) would age every
+   * heartbeat it had just read and take running sessions for gone: a turn
+   * running across a restart would not be picked up, and the pump would
+   * discard the events of a session that is still there.
+   */
+  const listProcessesAsOfNow = Effect.gen(function* () {
     const now = yield* Clock.currentTimeMillis;
-    return processes
-      .filter((entry) => isClaudeBridgeSessionLive(entry.session, now))
-      .sort((a, b) => b.session.heartbeatAt - a.session.heartbeatAt);
+    const processes = yield* listProcesses;
+    return {
+      now,
+      processes: processes.map((entry) => ({
+        entry,
+        live: isClaudeBridgeSessionLive(entry.session, now),
+      })),
+    };
   });
+
+  const listLiveProcesses = listProcessesAsOfNow.pipe(
+    Effect.map(({ processes }) =>
+      processes
+        .filter(({ live }) => live)
+        .map(({ entry }) => entry)
+        .sort((a, b) => b.session.heartbeatAt - a.session.heartbeatAt),
+    ),
+  );
 
   const liveSessionsContinuedIn = (sid: string) =>
     Effect.gen(function* () {
@@ -889,10 +910,8 @@ const make = Effect.gen(function* () {
     });
 
   const pumpOnce = Effect.gen(function* () {
-    const processes = yield* listProcesses;
-    const now = yield* Clock.currentTimeMillis;
-    for (const entry of processes) {
-      const live = isClaudeBridgeSessionLive(entry.session, now);
+    const { now, processes } = yield* listProcessesAsOfNow;
+    for (const { entry, live } of processes) {
       yield* pumpProcess(entry, live);
       const waiting = entry.session.waiting ?? [];
       if (live && waiting.length > 0 && !subscribers.has(entry.sid)) {

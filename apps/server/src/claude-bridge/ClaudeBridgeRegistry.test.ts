@@ -1,13 +1,25 @@
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
+import * as Clock from "effect/Clock";
+import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
+import * as Layer from "effect/Layer";
+import * as Path from "effect/Path";
+import * as Schema from "effect/Schema";
+import * as TestClock from "effect/testing/TestClock";
 
+import * as ServerConfig from "../config.ts";
 import {
   CLAUDE_BRIDGE_MISSED_TURN_REPLAY_MS,
+  ClaudeBridgeRegistry,
   claudeBridgeStaleTurnEvents,
   claudeBridgeTurnAwaitingRunSince,
   claudeHomesToScan,
   claudeLaunchArgs,
   claudeLaunchEnvironment,
   isClaudeBridgeSessionRecord,
+  layer as registryLayer,
   pickSessionHome,
   type ClaudeBridgeLaunchInput,
   type ClaudeBridgeMissedTurn,
@@ -236,4 +248,69 @@ describe("turns that were over long before T3 read of them", () => {
     const events = [start("t1", at), result, complete("t1", at + 1_000), start("t2", at + 60_000)];
     assert.deepEqual([...claudeBridgeStaleTurnEvents(events, at + 70_000)], [0, 2]);
   });
+});
+
+const encodeJson = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
+
+describe("the sessions that count as live", () => {
+  it.effect(
+    "include one whose heartbeat was fresh when read, however long the server then stood still",
+    () => {
+      let stallAfterNextRead = false;
+      // A server kept from carrying on right after it has read a session's file
+      // (seen: a query at startup holding everything for seven seconds).
+      const stallingFileSystem = Layer.effect(
+        FileSystem.FileSystem,
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          return {
+            ...fs,
+            readFileString: (file: string, encoding?: string) =>
+              fs.readFileString(file, encoding).pipe(
+                Effect.tap(() => {
+                  if (!stallAfterNextRead || !file.endsWith("session.json")) return Effect.void;
+                  stallAfterNextRead = false;
+                  return TestClock.adjust("13 seconds");
+                }),
+              ),
+          };
+        }),
+      ).pipe(Layer.provide(NodeServices.layer));
+      const platform = Layer.mergeAll(NodeServices.layer, NodeCrypto.layer);
+      return Effect.gen(function* () {
+        const registry = yield* ClaudeBridgeRegistry;
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const dir = path.join(registry.bridgeDir, "claude", "session-1", "instance-1");
+        yield* fs.makeDirectory(dir, { recursive: true });
+        yield* fs.writeFileString(
+          path.join(dir, "session.json"),
+          yield* encodeJson({
+            sid: "session-1",
+            instanceId: "instance-1",
+            // A home of its own: the session's record is not looked for in the real one.
+            configDir: path.join(registry.bridgeDir, "home"),
+            heartbeatAt: yield* Clock.currentTimeMillis,
+          }),
+        );
+        stallAfterNextRead = true;
+        const live = yield* registry.listLiveProcesses;
+        assert.isFalse(stallAfterNextRead);
+        assert.deepStrictEqual(
+          live.map((entry) => entry.sid),
+          ["session-1"],
+        );
+      }).pipe(
+        Effect.provide(
+          registryLayer.pipe(
+            Layer.provide(stallingFileSystem),
+            Layer.provide(
+              ServerConfig.layerTest(process.cwd(), { prefix: "t3-bridge-registry-test-" }),
+            ),
+            Layer.provideMerge(platform),
+          ),
+        ),
+      );
+    },
+  );
 });
