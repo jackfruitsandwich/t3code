@@ -126,6 +126,14 @@ describe("planTranscriptHealing", () => {
     assert.deepEqual(plan(rows, known, [{ id: "run-1", ordinal: 1, minute: 0 }]), []);
   });
 
+  it("puts a reply T3 missed below its prompt when a later run shows that prompt", () => {
+    // The turn was typed and answered before T3 took the session in; the run
+    // that picked it up started after both rows were written, and shows the prompt.
+    const rows = [row("user", "u1", "first prompt", 0), row("assistant", "a1", "first reply", 1)];
+    const known = [shown("t3-adopted", "user", "first prompt", 5, "run-1")];
+    assert.deepEqual(plan(rows, known, [{ id: "run-1", ordinal: 1, minute: 5 }]), ["1:a1"]);
+  });
+
   it("shows what a command printed with the command, and never adds the harness's own rows", () => {
     const rows = [
       row("user", "c1", "/rename zed", 0, true),

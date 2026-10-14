@@ -151,9 +151,21 @@ export function planTranscriptHealing(input: {
   // Second pass: a turn's rows stand or fall together where ids cannot tell.
   const missing: Array<HealingPlacement> = [];
   let commandShown = false;
+  // A reply goes no higher than its prompt. A run that picked a turn up after
+  // it ended started later than the turn's own rows were written, and shows
+  // its prompt: by time alone the reply would land above it.
+  const runOrdinals = new Map(runs.map((run) => [run.id, run.ordinal]));
+  let promptBand = 0;
   rows.forEach((row, index) => {
     if (row.role === "user") {
       if (row.command === true) commandShown = shown[index] === true;
+      else if (row.notice === undefined && !isClaudeHarnessPrompt(row.text)) {
+        const holder = shownAs(row) ?? shownUnderOwnId.get(index);
+        promptBand =
+          holder !== undefined && holder.runId !== null
+            ? (runOrdinals.get(holder.runId) ?? 0)
+            : bandForTime(runs, timeMs(row.timestamp));
+      }
       if (shown[index]) return;
       if (row.notice !== undefined || isClaudeHarnessPrompt(row.text)) return;
       // A prompt T3 shows in other words: the turn it started ran in T3, and
@@ -187,7 +199,11 @@ export function planTranscriptHealing(input: {
       // What a command printed is shown with the command.
       if (row.command === true && commandShown) return;
     }
-    missing.push({ message: row, band: bandForTime(runs, timeMs(row.timestamp)) });
+    const band = bandForTime(runs, timeMs(row.timestamp));
+    missing.push({
+      message: row,
+      band: row.role === "assistant" ? Math.max(band, promptBand) : band,
+    });
   });
   return missing;
 }
