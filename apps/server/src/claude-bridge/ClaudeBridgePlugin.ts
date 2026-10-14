@@ -1316,7 +1316,11 @@ export function register(on) {
     return next(e)
   })
 
+  // Since Claude Code 2.1.299 a subagent's run raises turn.start too
+  // (e.agentId). T3 follows the main loop: a subagent's work reaches it through
+  // the Agent call's rows, and its requests through tool.check.
   on('turn.start', async ($, e, next) => {
+    if (e.agentId) return next(e)
     const offset = await transcriptOffset($)
     let commandId
     let promptUuid
