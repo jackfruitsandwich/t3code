@@ -3,6 +3,7 @@ import { assert, describe, it } from "@effect/vitest";
 import {
   CLAUDE_MID_TURN_CLOSING,
   CLAUDE_MID_TURN_OPENING,
+  claudeHookNoticeText,
 } from "../claude-bridge/ClaudeBridgeProtocol.ts";
 import {
   claudeTaskNotice,
@@ -684,6 +685,65 @@ describe("parseClaudeSessionJsonl", () => {
     );
     assert.deepEqual(parsed.forkSignature, ["user-uuid-1", "assistant-uuid-1"]);
     assert.strictEqual(parsed.title, "Fix the login bug");
+  });
+
+  it("reads a hook's result as a notice, in the words a followed turn shows it in", () => {
+    const at = "2026-07-01T11:00:00.000Z";
+    const base = { parentUuid: null, isSidechain: false, sessionId: SESSION_ID, timestamp: at };
+    const hookError = (uuid: string, overrides = {}) =>
+      line({
+        ...base,
+        type: "attachment",
+        uuid,
+        attachment: {
+          type: "hook_non_blocking_error",
+          hookName: "UserPromptSubmit",
+          hookEvent: "UserPromptSubmit",
+          stderr: "rig-hook-fail\n",
+          stdout: "",
+          exitCode: 1,
+        },
+        ...overrides,
+      });
+    const stops = (uuid: string, hookErrors: ReadonlyArray<string>) =>
+      line({
+        ...base,
+        type: "system",
+        subtype: "stop_hook_summary",
+        uuid,
+        hookCount: 1,
+        hookErrors,
+        hookAdditionalContext: [],
+        preventedContinuation: false,
+        stopReason: "",
+      });
+    const parsed = parseClaudeSessionJsonl(
+      line(userEntry()) +
+        hookError("hook-error-1") +
+        line(assistantEntry()) +
+        stops("stops-1", ["[sh -c 'exit 2']: rig-stop-said\n"]) +
+        stops("stops-clean", []) +
+        hookError("hook-error-side", { isSidechain: true }),
+    );
+    assert.deepEqual(
+      parsed.systemNotices?.map((notice) => [notice.sourceId, notice.subtype, notice.lineIndex]),
+      [
+        ["hook-error-1", "hook", 1],
+        ["stops-1", "hook", 3],
+      ],
+    );
+    assert.deepEqual(
+      parsed.systemNotices?.map((notice) => notice.text),
+      [
+        claudeHookNoticeText(JSON.parse(hookError("hook-error-1"))),
+        claudeHookNoticeText(JSON.parse(stops("stops-1", ["[sh -c 'exit 2']: rig-stop-said\n"]))),
+      ],
+    );
+    assert.match(parsed.systemNotices?.[1]?.text ?? "", /^Ran 1 stop hook\nStop hook error: /);
+    assert.deepEqual(
+      parsed.messages.map((message) => message.sourceId),
+      ["user-uuid-1", "assistant-uuid-1"],
+    );
   });
 });
 

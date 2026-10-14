@@ -19,6 +19,7 @@ import { claudePromptAsDrawn } from "@t3tools/shared/claudePastedContent";
 
 import {
   claudeBridgeMidTurnWords,
+  claudeHookNoticeText,
   claudeNarrationAsText,
   claudeSessionNoticeText,
   claudeTranscriptCommandOutput,
@@ -326,6 +327,18 @@ export function parseClaudeSessionJsonl(content: string): ParsedCliSession {
       if (title !== undefined) {
         customTitle = title;
         aiTitle = title;
+      }
+      continue;
+    }
+
+    // A hook's result, in the words the terminal shows it in: a turn T3
+    // followed showed it as it came, and one T3 did not is given it from here.
+    const hookNotice = claudeHookNoticeText(entry);
+    if (hookNotice !== null) {
+      const sourceId = readString(entry.uuid);
+      const timestamp = readString(entry.timestamp);
+      if (sourceId !== undefined && timestamp !== undefined) {
+        systemNotices.push({ subtype: "hook", text: hookNotice, sourceId, timestamp, lineIndex });
       }
       continue;
     }

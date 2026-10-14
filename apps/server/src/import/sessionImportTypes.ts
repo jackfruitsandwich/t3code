@@ -49,13 +49,14 @@ export interface ParsedSessionNotice {
 /**
  * A row the harness writes between turns and the terminal draws in the
  * conversation as a dim line of its own: the recap after time away, a notice
- * (Remote Control disconnected), a scheduled task firing. Not a message: it
- * is kept apart so titles, turn counts and imports never see it.
+ * (Remote Control disconnected), a scheduled task firing. Or a hook's result,
+ * which a turn T3 followed shows as it comes ("hook"). Not a message: it is
+ * kept apart so titles, turn counts and imports never see it.
  */
 export interface ParsedSessionSystemNotice {
   /** The row's uuid. */
   readonly sourceId: string;
-  readonly subtype: "away_summary" | "informational" | "scheduled_task_fire";
+  readonly subtype: "away_summary" | "informational" | "scheduled_task_fire" | "hook";
   /** What the terminal draws, in the row's own words. */
   readonly text: string;
   readonly timestamp: string;

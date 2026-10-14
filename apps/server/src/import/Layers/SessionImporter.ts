@@ -953,6 +953,8 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
     // Cheap change detection between sweeps; per spec a stale entry only
     // delays a file until it changes again, so process-local state is fine.
     const fileFingerprints = new Map<string, { size: number; mtimeMs: number }>();
+    // A session that began after this moment was seen by T3 from its start.
+    const importerStartedAtMs = yield* Clock.currentTimeMillis;
 
     const resolveClaudeProjectsDir = (settings: ServerSettings) => {
       // Mirrors ClaudeSkills' config-dir precedence: the instance homePath
@@ -1089,12 +1091,24 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
           ? [{ sourceId: item.turn_item_id.slice(itemPrefix.length), ordinal: item.ordinal }]
           : [],
       );
+      // A notice added after the rows around it went to the end of its band:
+      // it takes its place among them by when it was written, as a row does.
+      const notices = new Map(
+        (input.parsed.systemNotices ?? []).map((notice) => [notice.sourceId, notice]),
+      );
+      const noticeRows = [...notices.values()].map((notice): ParsedSessionMessage => ({
+        role: "assistant",
+        sourceId: notice.sourceId,
+        text: notice.text,
+        timestamp: notice.timestamp,
+        lineIndex: notice.lineIndex,
+      }));
       // Rows in the wrong band move to theirs; within a band, rows that sit
       // above rows written before them go back in the order they were written.
       const reseats =
         input.pass === "bands"
           ? planImportedRowReseating({ rows: input.parsed.messages, imported, runs: input.runs })
-          : planImportedRowOrdering({ rows: input.parsed.messages, imported });
+          : planImportedRowOrdering({ rows: [...input.parsed.messages, ...noticeRows], imported });
       if (reseats.length === 0) return;
       const events: Array<OrchestrationV2DomainEvent> = [];
       for (const reseat of reseats) {
@@ -1104,7 +1118,11 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
             AND turn_item_id = ${importedTurnItemId(threadId, reseat.message.sourceId)}
         `;
         const position = yield* placeImportedRow(threadId, reseat);
-        const item = messageEvents({ threadId, sessionId, message: reseat.message })[1]!;
+        const notice = notices.get(reseat.message.sourceId);
+        const item =
+          notice === undefined
+            ? messageEvents({ threadId, sessionId, message: reseat.message })[1]!
+            : noticeEvent(threadId, notice);
         events.push({
           ...item,
           // A row can be moved more than once: each place it is given is its own event.
@@ -1917,13 +1935,51 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         importedMessageId: (sourceId) => importedMessageId(sessionId, sourceId),
       });
       // The harness's notices between turns are shown from where the record
-      // ended when this thread was first compared with it, never before.
+      // ended when this thread was first compared with it, never before; of a
+      // session that began while this server ran, from its first line (a turn
+      // T3 was too late to follow keeps its hook results).
       const noticeFloors = readNoticeFloors(
         Option.getOrUndefined(yield* runtimes.getByThreadId({ threadId }))?.runtimePayload,
       );
-      const noticesFrom = noticeFloors[sessionId];
+      const bornWhileRunning =
+        parsed.startedAt !== undefined &&
+        DateTime.toEpochMillis(dateTime(parsed.startedAt)) >= importerStartedAtMs;
+      const noticesFrom = noticeFloors[sessionId] ?? (bornWhileRunning ? 0 : undefined);
       const noticesFromLine = noticesFrom ?? Number.POSITIVE_INFINITY;
-      const systemNotices = parsed.systemNotices ?? [];
+      // A hook's result is written inside its turn. A turn T3 followed shows it
+      // itself, its run maybe seconds behind the record; a turn T3 took in
+      // from the record is given it here, once the record has been quiet as
+      // long as a run can lag it (the sweep looks again until then).
+      const newestMs = Math.max(
+        ...[...parsed.messages, ...(parsed.systemNotices ?? [])].map((row) =>
+          Date.parse(row.timestamp),
+        ),
+      );
+      const recordFresh = Math.abs((yield* Clock.currentTimeMillis) - newestMs) < FRESH_TURN_MS;
+      // A prompt taken in from the record holds the id made from its row.
+      const takenIn = new Set([
+        ...known.map((message) => message.message_id),
+        ...missing.map((placement) => importedMessageId(sessionId, placement.message.sourceId)),
+      ]);
+      const turnTakenIn = (line: number): boolean => {
+        let prompt: ParsedSessionMessage | undefined;
+        for (const message of parsed.messages) {
+          if (message.lineIndex >= line) break;
+          if (message.role === "user" && message.midTurn !== true) prompt = message;
+        }
+        return prompt === undefined || takenIn.has(importedMessageId(sessionId, prompt.sourceId));
+      };
+      const systemNotices = (parsed.systemNotices ?? []).filter(
+        (notice) => notice.subtype !== "hook" || (!recordFresh && turnTakenIn(notice.lineIndex)),
+      );
+      if (
+        recordFresh &&
+        parsed.systemNotices?.some(
+          (notice) => notice.subtype === "hook" && notice.lineIndex >= noticesFromLine,
+        )
+      ) {
+        fileFingerprints.delete(input.filePath);
+      }
       // One a run showed carries the row's uuid; one added here, the imported id.
       const shownNotices = !systemNotices.some((notice) => notice.lineIndex >= noticesFromLine)
         ? []
@@ -2067,12 +2123,19 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         });
       }
       // Where the record ends at this thread's first settled comparison is
-      // where its notices start: none the record held before are added.
-      if (noticesFrom === undefined && settledBeforeMs === undefined && commandInFlight === 0) {
+      // where its notices start, none the record held before added; for a
+      // session that began while this server ran, its first line.
+      if (
+        noticeFloors[sessionId] === undefined &&
+        settledBeforeMs === undefined &&
+        commandInFlight === 0
+      ) {
         yield* mergeBinding({
           threadId,
           provider: input.driver,
-          runtimePayload: { importNoticesFrom: { ...noticeFloors, [sessionId]: parsed.lineCount } },
+          runtimePayload: {
+            importNoticesFrom: { ...noticeFloors, [sessionId]: noticesFrom ?? parsed.lineCount },
+          },
         });
       }
       // Held rows are taken in by a later pass; a command that prints
