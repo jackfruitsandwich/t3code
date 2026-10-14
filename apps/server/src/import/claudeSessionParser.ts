@@ -7,7 +7,8 @@
  * way the terminal shows them (`/name args`, then what they printed), whether
  * they wrote user rows or local system rows; everything else (mode changes,
  * file-history snapshots, attachments, system lines, unknown future types) is
- * skipped silently so a format drift never breaks the importer. Sidechain and
+ * skipped silently so a format drift never breaks the importer, except the
+ * harness's notices between turns, which are read apart. Sidechain and
  * meta entries are agent plumbing, not the human conversation, and are
  * skipped too.
  *
@@ -19,6 +20,7 @@ import { claudePromptAsDrawn } from "@t3tools/shared/claudePastedContent";
 import {
   claudeBridgeMidTurnWords,
   claudeNarrationAsText,
+  claudeSessionNoticeText,
   claudeTranscriptCommandOutput,
   claudeTranscriptCommandText,
   claudeTranscriptPermissionMode,
@@ -36,6 +38,7 @@ import {
   type ParsedCliSession,
   type ParsedSessionMessage,
   type ParsedSessionNotice,
+  type ParsedSessionSystemNotice,
 } from "./sessionImportTypes.ts";
 
 const FORK_SIGNATURE_LENGTH = 5;
@@ -148,6 +151,29 @@ export function claudePeerMessageNotification(
 }
 
 /**
+ * What a row the harness wrote between turns says, as the terminal draws it
+ * in the conversation (a dim line of its own): the recap after time away,
+ * under the terminal's own label; a notice; a scheduled task firing. Null for
+ * any other row.
+ */
+export function claudeBetweenTurnsNotice(
+  entry: unknown,
+): Pick<ParsedSessionSystemNotice, "subtype" | "text"> | null {
+  if (!isRecord(entry) || entry.type !== "system") return null;
+  const { subtype } = entry;
+  if (
+    subtype !== "away_summary" &&
+    subtype !== "informational" &&
+    subtype !== "scheduled_task_fire"
+  ) {
+    return null;
+  }
+  const said = claudeSessionNoticeText(entry);
+  if (said === null) return null;
+  return { subtype, text: subtype === "away_summary" ? `recap: ${said}` : said };
+}
+
+/**
  * Extract the concatenated text-block content from a Claude message
  * `content` value, which is either a plain string or an array of typed
  * blocks. Non-text blocks (tool_use, tool_result, thinking, images) are
@@ -174,6 +200,7 @@ function extractTextContent(content: unknown): string {
 export function parseClaudeSessionJsonl(content: string): ParsedCliSession {
   const lines = splitCompleteJsonlLines(content);
   const messages: ParsedSessionMessage[] = [];
+  const systemNotices: ParsedSessionSystemNotice[] = [];
   let sessionId: string | undefined;
   let cwd: string | undefined;
   let aiTitle: string | undefined;
@@ -269,6 +296,17 @@ export function parseClaudeSessionJsonl(content: string): ParsedCliSession {
           lineIndex,
           midTurn: true,
         });
+      }
+      continue;
+    }
+
+    // The harness's notices between turns are kept apart from the conversation.
+    const notice = claudeBetweenTurnsNotice(entry);
+    if (notice !== null) {
+      const sourceId = readString(entry.uuid);
+      const timestamp = readString(entry.timestamp);
+      if (sourceId !== undefined && timestamp !== undefined) {
+        systemNotices.push({ ...notice, sourceId, timestamp, lineIndex });
       }
       continue;
     }
@@ -426,5 +464,6 @@ export function parseClaudeSessionJsonl(content: string): ParsedCliSession {
     launch: entrypoint === undefined || entrypoint === "cli" ? "human" : "machine",
     forkSignature,
     ...(permissionMode === undefined ? {} : { permissionMode }),
+    ...(systemNotices.length === 0 ? {} : { systemNotices }),
   };
 }

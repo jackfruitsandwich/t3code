@@ -16,7 +16,7 @@
  * @module import/transcriptHealing
  */
 import { isClaudeHarnessPrompt } from "../claude-bridge/ClaudeBridgeProtocol.ts";
-import type { ParsedSessionMessage } from "./sessionImportTypes.ts";
+import type { ParsedSessionMessage, ParsedSessionSystemNotice } from "./sessionImportTypes.ts";
 
 /** Turn items of run N sit at N * RUN_BAND + 1 and up; items without a run below RUN_BAND. */
 export const RUN_BAND = 1_000_000;
@@ -206,6 +206,36 @@ export function planTranscriptHealing(input: {
     });
   });
   return missing;
+}
+
+export interface NoticePlacement {
+  readonly notice: ParsedSessionSystemNotice;
+  /** The run whose items the notice follows; 0 puts it before every run. */
+  readonly band: number;
+}
+
+/**
+ * The harness's notices between turns (a recap, a notice, a scheduled task
+ * firing) the thread does not show, oldest first, each after the run that
+ * was the latest when it was written. Only rows from line `fromLine` on: the
+ * record before it is history the thread was never given, and stays out. A
+ * run that was open when a notice was written shows it itself, under the
+ * row's uuid (`shownIds`); while a turn is running, notices from
+ * `settledBeforeMs` on are left to it.
+ */
+export function planNoticeHealing(input: {
+  readonly notices: ReadonlyArray<ParsedSessionSystemNotice>;
+  readonly fromLine: number;
+  readonly shownIds: ReadonlySet<string>;
+  readonly runs: ReadonlyArray<HealingRun>;
+  readonly settledBeforeMs?: number;
+}): ReadonlyArray<NoticePlacement> {
+  return input.notices.flatMap((notice) => {
+    const atMs = timeMs(notice.timestamp);
+    if (notice.lineIndex < input.fromLine || input.shownIds.has(notice.sourceId)) return [];
+    if (input.settledBeforeMs !== undefined && atMs >= input.settledBeforeMs) return [];
+    return [{ notice, band: bandForTime(input.runs, atMs) }];
+  });
 }
 
 /**

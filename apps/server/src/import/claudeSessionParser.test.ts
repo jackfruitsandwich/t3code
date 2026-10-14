@@ -621,6 +621,70 @@ describe("parseClaudeSessionJsonl", () => {
       [["/d7-echo kiwi 91dbf", true]],
     );
   });
+
+  it("reads the harness's notices between turns apart from the conversation, as the terminal draws them", () => {
+    const system = (uuid: string, subtype: string, content: string, overrides = {}) =>
+      line({
+        type: "system",
+        subtype,
+        content,
+        uuid,
+        parentUuid: null,
+        isSidechain: false,
+        isMeta: false,
+        sessionId: SESSION_ID,
+        timestamp: "2026-07-01T11:00:00.000Z",
+        ...overrides,
+      });
+    const parsed = parseClaudeSessionJsonl(
+      system("fire-1", "scheduled_task_fire", "Claude resuming /loop wakeup (Sep 16 2:36am)") +
+        line(userEntry()) +
+        line(assistantEntry()) +
+        system(
+          "recap-1",
+          "away_summary",
+          "Goal was to fix the login bug; it is fixed. (disable recaps in /config)",
+        ) +
+        system(
+          "info-1",
+          "informational",
+          "Remote Control disconnected — run /remote-control to reconnect",
+          { level: "warning" },
+        ) +
+        system("side-1", "away_summary", "A subagent's recap.", { isSidechain: true }) +
+        system("hook-1", "stop_hook_summary", "Stop hooks ran."),
+    );
+    assert.deepEqual(parsed.systemNotices, [
+      {
+        sourceId: "fire-1",
+        subtype: "scheduled_task_fire",
+        text: "Claude resuming /loop wakeup (Sep 16 2:36am)",
+        timestamp: "2026-07-01T11:00:00.000Z",
+        lineIndex: 0,
+      },
+      {
+        sourceId: "recap-1",
+        subtype: "away_summary",
+        text: "recap: Goal was to fix the login bug; it is fixed. (disable recaps in /config)",
+        timestamp: "2026-07-01T11:00:00.000Z",
+        lineIndex: 3,
+      },
+      {
+        sourceId: "info-1",
+        subtype: "informational",
+        text: "Remote Control disconnected — run /remote-control to reconnect",
+        timestamp: "2026-07-01T11:00:00.000Z",
+        lineIndex: 4,
+      },
+    ]);
+    // Not conversation: the session's messages, title and history are its own.
+    assert.deepEqual(
+      parsed.messages.map((message) => message.sourceId),
+      ["user-uuid-1", "assistant-uuid-1"],
+    );
+    assert.deepEqual(parsed.forkSignature, ["user-uuid-1", "assistant-uuid-1"]);
+    assert.strictEqual(parsed.title, "Fix the login bug");
+  });
 });
 
 describe("what the terminal draws that is not a text block", () => {

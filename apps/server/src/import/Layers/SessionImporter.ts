@@ -98,6 +98,7 @@ import {
   type ParsedCliSession,
   type ParsedSessionMessage,
   type ParsedSessionNotice,
+  type ParsedSessionSystemNotice,
   truncateSessionTitle,
 } from "../sessionImportTypes.ts";
 import { SessionImporter, type SessionImporterShape } from "../Services/SessionImporter.ts";
@@ -108,6 +109,7 @@ import {
   type HealingRun,
   planImportedRowOrdering,
   planImportedRowReseating,
+  planNoticeHealing,
   planRecordSeating,
   planTranscriptHealing,
   recordKeyOfTurnItem,
@@ -429,6 +431,20 @@ function readImportCursor(runtimePayload: unknown): ImportCursor | undefined {
   };
 }
 
+/**
+ * For each session the thread shows, the record line its notices between
+ * turns are shown from: where the record ended when T3 first compared it.
+ * The record before that is history, which the thread never takes in.
+ */
+function readNoticeFloors(runtimePayload: unknown): Readonly<Record<string, number>> {
+  if (!isRecord(runtimePayload) || !isRecord(runtimePayload.importNoticesFrom)) return {};
+  return Object.fromEntries(
+    Object.entries(runtimePayload.importNoticesFrom).filter((entry): entry is [string, number] =>
+      Number.isInteger(entry[1]),
+    ),
+  );
+}
+
 function readForkSignature(runtimePayload: unknown): ReadonlyArray<string> | undefined {
   if (!isRecord(runtimePayload) || !Array.isArray(runtimePayload.importForkSig)) {
     return undefined;
@@ -567,6 +583,39 @@ function messageEvents(input: {
               },
     },
   ];
+}
+
+/** The timeline row for a notice the harness wrote between turns, as a live run shows one. */
+function noticeEvent(
+  threadId: ThreadId,
+  notice: ParsedSessionSystemNotice,
+): OrchestrationV2DomainEvent {
+  const at = dateTime(notice.timestamp);
+  return {
+    id: importEventId(threadId, `notice:${notice.sourceId}`),
+    type: "turn-item.updated",
+    threadId,
+    occurredAt: at,
+    payload: {
+      id: importedTurnItemId(threadId, notice.sourceId),
+      threadId,
+      runId: null,
+      nodeId: null,
+      providerThreadId: null,
+      providerTurnId: null,
+      nativeItemRef: null,
+      parentItemId: null,
+      // EventSink assigns the real position: the place allocated for it.
+      ordinal: 0,
+      status: "completed",
+      title: notice.text,
+      startedAt: at,
+      completedAt: at,
+      updatedAt: at,
+      type: "system_notice",
+      message: notice.text,
+    },
+  };
 }
 
 const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
@@ -1803,15 +1852,69 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         runs: input.runs,
         importedMessageId: (sourceId) => importedMessageId(sessionId, sourceId),
       });
-      if (missing.length > 0) {
-        for (const placement of missing) yield* placeImportedRow(threadId, placement);
+      // The harness's notices between turns are shown from where the record
+      // ended when this thread was first compared with it, never before.
+      const noticeFloors = readNoticeFloors(
+        Option.getOrUndefined(yield* runtimes.getByThreadId({ threadId }))?.runtimePayload,
+      );
+      const noticesFrom = noticeFloors[sessionId];
+      const noticesFromLine = noticesFrom ?? Number.POSITIVE_INFINITY;
+      const systemNotices = parsed.systemNotices ?? [];
+      // One a run showed carries the row's uuid; one added here, the imported id.
+      const shownNotices = !systemNotices.some((notice) => notice.lineIndex >= noticesFromLine)
+        ? []
+        : yield* sql<{ readonly turn_item_id: string; readonly native_id: string | null }>`
+            SELECT
+              turn_item_id,
+              json_extract(payload_json, '$.nativeItemRef.nativeId') AS native_id
+            FROM orchestration_v2_projection_turn_items
+            WHERE thread_id = ${threadId} AND type = 'system_notice'
+          `;
+      const notices = planNoticeHealing({
+        notices: systemNotices,
+        fromLine: noticesFromLine,
+        shownIds: new Set(
+          shownNotices.flatMap((row) =>
+            [row.native_id, recordKeyOfTurnItem(row.turn_item_id)].filter(
+              (id): id is string => id !== null,
+            ),
+          ),
+        ),
+        runs: input.runs,
+        ...(settledBeforeMs === undefined ? {} : { settledBeforeMs }),
+      });
+      if (missing.length > 0 || notices.length > 0) {
+        // Rows and notices take their places in the order the record wrote them.
+        const places = [
+          ...missing.map((placement) => ({
+            line: placement.message.lineIndex,
+            place: placeImportedRow(threadId, placement),
+          })),
+          ...notices.map((placement) => ({
+            line: placement.notice.lineIndex,
+            place: turnItemPositions.allocate({
+              threadId,
+              turnItemId: importedTurnItemId(threadId, placement.notice.sourceId),
+              runId: null,
+              runOrdinal: placement.band,
+            }),
+          })),
+        ].toSorted((left, right) => left.line - right.line);
+        for (const { place } of places) yield* place;
         const records = yield* threads.getThreadRecords(threadId, []);
         const thread = records.thread;
-        const newest = dateTime(missing[missing.length - 1]!.message.timestamp);
-        const events: Array<OrchestrationV2DomainEvent> = missing.flatMap((placement) =>
-          messageEvents({ threadId, sessionId, message: placement.message }),
-        );
-        if (DateTime.toEpochMillis(newest) > DateTime.toEpochMillis(thread.updatedAt)) {
+        const events: Array<OrchestrationV2DomainEvent> = [
+          ...missing.flatMap((placement) =>
+            messageEvents({ threadId, sessionId, message: placement.message }),
+          ),
+          ...notices.map((placement) => noticeEvent(threadId, placement.notice)),
+        ];
+        const newest =
+          missing.length === 0 ? null : dateTime(missing[missing.length - 1]!.message.timestamp);
+        if (
+          newest !== null &&
+          DateTime.toEpochMillis(newest) > DateTime.toEpochMillis(thread.updatedAt)
+        ) {
           events.push({
             id: importEventId(threadId, `recency:${missing[missing.length - 1]!.message.sourceId}`),
             type: "thread.metadata-updated",
@@ -1828,6 +1931,7 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
           sessionId,
           threadId,
           addedCount: missing.length,
+          noticeCount: notices.length,
           live: input.live,
         });
       }
@@ -1846,6 +1950,15 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
           threadId,
           parsed,
           filePath: input.filePath,
+        });
+      }
+      // Where the record ends at this thread's first settled comparison is
+      // where its notices start: none the record held before are added.
+      if (noticesFrom === undefined && settledBeforeMs === undefined && commandInFlight === 0) {
+        yield* mergeBinding({
+          threadId,
+          provider: input.driver,
+          runtimePayload: { importNoticesFrom: { ...noticeFloors, [sessionId]: parsed.lineCount } },
         });
       }
       // Held rows are taken in by a later pass; a command that prints

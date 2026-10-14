@@ -39,6 +39,22 @@ export interface ParsedSessionNotice {
   readonly outcome: "completed" | "failed" | "cancelled" | "updated";
 }
 
+/**
+ * A row the harness writes between turns and the terminal draws in the
+ * conversation as a dim line of its own: the recap after time away, a notice
+ * (Remote Control disconnected), a scheduled task firing. Not a message: it
+ * is kept apart so titles, turn counts and imports never see it.
+ */
+export interface ParsedSessionSystemNotice {
+  /** The row's uuid. */
+  readonly sourceId: string;
+  readonly subtype: "away_summary" | "informational" | "scheduled_task_fire";
+  /** What the terminal draws, in the row's own words. */
+  readonly text: string;
+  readonly timestamp: string;
+  readonly lineIndex: number;
+}
+
 export interface ParsedCliSession {
   readonly sessionId: string | undefined;
   readonly cwd: string | undefined;
@@ -83,6 +99,8 @@ export interface ParsedCliSession {
   readonly forkSignature?: ReadonlyArray<string>;
   /** The permission mode the session's record last names (Claude). */
   readonly permissionMode?: string;
+  /** The harness's notices between turns, in record order (Claude). */
+  readonly systemNotices?: ReadonlyArray<ParsedSessionSystemNotice>;
 }
 
 const MAX_TITLE_LENGTH = 60;

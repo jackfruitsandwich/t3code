@@ -81,6 +81,7 @@ import {
   type ClaudeBridgeEvent,
   type ClaudeBridgeRequestTurnBy,
 } from "../../claude-bridge/ClaudeBridgeProtocol.ts";
+import { claudeBetweenTurnsNotice } from "../../import/claudeSessionParser.ts";
 import { isRecord, parseJsonlLine } from "../../import/sessionImportTypes.ts";
 import * as ProviderEventLoggers from "../../provider/ProviderEventLoggers.ts";
 import * as ClaudeAdapterV2 from "./ClaudeAdapterV2.ts";
@@ -740,6 +741,7 @@ export const layer: Layer.Layer<
           const decoder = new TextDecoder();
           let lineStart = 0;
           let olderRows = 0;
+          let noticesBetweenTurns = 0;
           for (;;) {
             const newline = bytes.indexOf(0x0a, lineStart);
             if (newline === -1) break;
@@ -845,6 +847,11 @@ export const layer: Layer.Layer<
               replacesDrawn = null;
               yield* registry.noteRecordChange(bridgeProcess, "reply-recorded");
             }
+            // What the harness says between turns (a recap, a notice) no run
+            // is open to show: the thread takes it from the record.
+            if (!sessionTurnOpen() && claudeBetweenTurnsNotice(row) !== null) {
+              noticesBetweenTurns += 1;
+            }
             if (isClaudeTurnEndRow(row)) {
               state.turnEndsRead += 1;
               if (untilTurnEnd) break;
@@ -857,6 +864,9 @@ export const layer: Layer.Layer<
               sid,
               rows: olderRows,
             });
+            yield* registry.noteRecordChange(bridgeProcess, "older-rows");
+          } else if (noticesBetweenTurns > 0) {
+            // Compared now, so the notice shows while it is news, not at the next sweep.
             yield* registry.noteRecordChange(bridgeProcess, "older-rows");
           }
         });

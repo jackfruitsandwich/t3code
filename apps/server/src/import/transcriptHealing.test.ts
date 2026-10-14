@@ -1,11 +1,12 @@
 import { assert, describe, it } from "@effect/vitest";
 
-import type { ParsedSessionMessage } from "./sessionImportTypes.ts";
+import type { ParsedSessionMessage, ParsedSessionSystemNotice } from "./sessionImportTypes.ts";
 import {
   claudeRecordLines,
   type HealingKnownMessage,
   planImportedRowOrdering,
   planImportedRowReseating,
+  planNoticeHealing,
   planRecordSeating,
   planTranscriptHealing,
   recordKeyOfTurnItem,
@@ -204,6 +205,41 @@ describe("planTranscriptHealing: a message typed into a running turn", () => {
     };
     const known = [shown("cli-import-s-q1", "user", "also check the logs", 11)];
     assert.deepEqual(plan([typed], known, [{ id: "run-1", ordinal: 1, minute: 10 }]), []);
+  });
+});
+
+describe("planNoticeHealing", () => {
+  const notice = (sourceId: string, minute: number): ParsedSessionSystemNotice => ({
+    sourceId,
+    subtype: "away_summary",
+    text: `recap: ${sourceId}`,
+    timestamp: at(minute),
+    lineIndex: minute,
+  });
+  const notices = [
+    notice("before-t3", 2),
+    notice("between-runs", 15),
+    notice("a-run-showed", 25),
+    notice("in-the-running-turn", 41),
+  ];
+  const runs = [
+    { id: "run-1", ordinal: 1, startedAtMs: ms(10) },
+    { id: "run-2", ordinal: 2, startedAtMs: ms(20) },
+    { id: "run-3", ordinal: 3, startedAtMs: ms(40) },
+  ];
+  const planned = (input: { readonly fromLine: number; readonly settledBeforeMs?: number }) =>
+    planNoticeHealing({ notices, shownIds: new Set(["a-run-showed"]), runs, ...input }).map(
+      (placement) => `${placement.band}:${placement.notice.sourceId}`,
+    );
+
+  it("adds the notices no run showed after the run that preceded each, none from the history", () => {
+    assert.deepEqual(planned({ fromLine: 5 }), ["1:between-runs", "3:in-the-running-turn"]);
+    // A thread first compared after every notice was written adds none.
+    assert.deepEqual(planned({ fromLine: 50 }), []);
+  });
+
+  it("leaves a running turn's notices to its run", () => {
+    assert.deepEqual(planned({ fromLine: 5, settledBeforeMs: ms(40) }), ["1:between-runs"]);
   });
 });
 

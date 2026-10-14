@@ -23,6 +23,7 @@ import {
   type ClaudeBridgeCommandBody,
   claudeBridgeApproveWithMode,
   claudeBridgeReplacedDrawnId,
+  isClaudeBridgeNoticeFrame,
 } from "../../claude-bridge/ClaudeBridgeProtocol.ts";
 import * as ProviderEventLoggers from "../../provider/ProviderEventLoggers.ts";
 import * as ClaudeAdapterV2 from "./ClaudeAdapterV2.ts";
@@ -2265,6 +2266,71 @@ describe("ClaudeBridgeQueryRunner messages the terminal drew", () => {
         `${TEXT_ROW}:text`,
         `${TOOL_ROW}:tool_use`,
       ]);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+});
+
+describe("ClaudeBridgeQueryRunner notices between turns", () => {
+  // Claude Code writes a recap when the person comes back to the terminal,
+  // with no turn running: no run shows it, so the thread takes it from the record.
+  const recap = (uuid: string, atMs: number) =>
+    `${JSON.stringify({
+      type: "system",
+      subtype: "away_summary",
+      content: "Goal was to fix the login bug; it is fixed. (disable recaps in /config)",
+      uuid,
+      parentUuid: null,
+      isSidechain: false,
+      isMeta: false,
+      timestamp: stamp(atMs),
+    })}\n`;
+  const noticeShown = (bridge: { readonly session: ClaudeAdapterV2.ClaudeAgentSdkQuerySession }) =>
+    bridge.session.messages.pipe(
+      Stream.filter(isClaudeBridgeNoticeFrame),
+      Stream.take(1),
+      Stream.runCollect,
+    );
+
+  it.live("has the thread compared with the record when one is written with no turn running", () =>
+    Effect.gen(function* () {
+      const bridge = yield* attach({ protocol: 2, bridgeCanUseTool: () => null, transcript: "" });
+      const fs = yield* FileSystem.FileSystem;
+      yield* fs.writeFileString(
+        bridge.process.session.transcriptPath,
+        recap("00000000-0000-4000-8000-0000000000c1", bridge.now),
+        { flag: "a" },
+      );
+      yield* noticeShown(bridge);
+      yield* until(() => bridge.recordChanges.includes("older-rows"), "the comparison");
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.live("leaves one written inside a turn to that turn's run", () =>
+    Effect.gen(function* () {
+      const bridge = yield* attach({ protocol: 2, bridgeCanUseTool: () => null, transcript: "" });
+      const fs = yield* FileSystem.FileSystem;
+      const file = bridge.process.session.transcriptPath;
+      yield* bridge.handler(
+        {
+          seq: 1,
+          at: bridge.now,
+          type: "turn.start",
+          turnId: "turn-a",
+          text: "go",
+          transcriptOffset: 0,
+        },
+        bridge.process,
+      );
+      yield* fs.writeFileString(file, recap("00000000-0000-4000-8000-0000000000c2", bridge.now), {
+        flag: "a",
+      });
+      yield* noticeShown(bridge);
+      // A later row is read on a later pass, after this one's is over.
+      yield* fs.writeFileString(file, recap("00000000-0000-4000-8000-0000000000c3", bridge.now), {
+        flag: "a",
+      });
+      yield* noticeShown(bridge);
+      assert.notInclude(bridge.recordChanges, "older-rows");
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 });
