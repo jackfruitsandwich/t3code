@@ -23,6 +23,8 @@ import {
   claudeContinuedInSession,
   claudeSessionContinuedNotice,
   claudeSessionNoticeText,
+  claudeBridgeCompactSummary,
+  claudeHookNoticeText,
   isClaudeBridgeNoticeFrame,
   makeClaudeBridgeFrameTranslator,
   makeClaudePlainCommandReader,
@@ -449,6 +451,180 @@ describe("ClaudeBridgeProtocol frame translator", () => {
     ]) {
       assert.isNull(claudeSessionNoticeText(other));
     }
+  });
+
+  it("passes on a hook's result where Claude Code's terminal shows one, in its words", () => {
+    const frames = translator();
+    frames.adoptTurn({ turnId: "turn-7", startedAt: 0, transcriptOffset: 0 });
+    const attached = (
+      attachment: Record<string, unknown>,
+      fields: Record<string, unknown> = {},
+    ) => ({
+      type: "attachment",
+      uuid: "00000000-0000-4000-8000-0000000000e1",
+      isSidechain: false,
+      attachment: { toolUseID: "tu-hook", ...attachment },
+      ...fields,
+    });
+    const failed = attached({
+      type: "hook_non_blocking_error",
+      hookName: "UserPromptSubmit",
+      hookEvent: "UserPromptSubmit",
+      stderr:
+        "\n  Failed with non-blocking status code: /bin/zsh: can't open input file: hl\nsecond line\n\nExpected schema: {}",
+      stdout: "",
+      exitCode: 127,
+    });
+    const [frame] = frames.onTranscriptRow(failed);
+    assert.isTrue(isClaudeBridgeNoticeFrame(frame));
+    assert.equal(Reflect.get(frame ?? {}, "uuid"), "00000000-0000-4000-8000-0000000000e1");
+    // The hook's name, then its output's first line.
+    assert.equal(
+      Reflect.get(frame ?? {}, "content"),
+      "UserPromptSubmit hook error\nFailed with non-blocking status code: /bin/zsh: can't open input file: hl",
+    );
+    assert.equal(
+      claudeHookNoticeText(
+        attached({
+          type: "hook_non_blocking_error",
+          hookName: "PreToolUse:Bash",
+          hookEvent: "PreToolUse",
+          stderr: "  ",
+          stdout: `${"x".repeat(210)}\nmore`,
+        }),
+      ),
+      `PreToolUse:Bash hook error\n${"x".repeat(200)}…`,
+    );
+    assert.equal(
+      claudeHookNoticeText(
+        attached({
+          type: "hook_cancelled",
+          hookName: "UserPromptSubmit",
+          hookEvent: "UserPromptSubmit",
+          command: "hl hook",
+          timedOut: true,
+          timeoutMs: 30000,
+        }),
+      ),
+      `UserPromptSubmit hook [hl hook] timed out after 30s — output discarded. Raise the hook's "timeout" to allow more time.`,
+    );
+    assert.equal(
+      claudeHookNoticeText(
+        attached({
+          type: "hook_system_message",
+          hookName: "PostToolUse:Bash",
+          hookEvent: "PostToolUse",
+          content: "Tip: Run /ultrareview before you push.",
+        }),
+      ),
+      "PostToolUse:Bash says: Tip: Run /ultrareview before you push.",
+    );
+    const stopped = (fields: Record<string, unknown>) => ({
+      type: "system",
+      subtype: "stop_hook_summary",
+      uuid: "00000000-0000-4000-8000-0000000000e2",
+      isSidechain: false,
+      hookCount: 2,
+      hookInfos: [{ command: "a" }, { command: "b" }],
+      hookErrors: [],
+      hookAdditionalContext: [],
+      preventedContinuation: false,
+      stopReason: "",
+      hasOutput: true,
+      level: "suggestion",
+      ...fields,
+    });
+    assert.equal(
+      claudeHookNoticeText(
+        stopped({
+          hookErrors: ["exit 2: lint failed"],
+          hookAdditionalContext: ["tests are red"],
+          preventedContinuation: true,
+          stopReason: "Goal not met",
+        }),
+      ),
+      "Ran 2 stop hooks\nGoal not met\nStop hook error: exit 2: lint failed\nStop hook feedback: tests are red",
+    );
+    // What the terminal leaves out: stop hooks that ran clean, a Stop hook's
+    // own error, a cancel that was not a timeout, a subagent's hook.
+    for (const hidden of [
+      stopped({}),
+      stopped({ level: "info" }),
+      attached({
+        type: "hook_non_blocking_error",
+        hookName: "Stop",
+        hookEvent: "Stop",
+        stderr: "boom",
+      }),
+      attached({
+        type: "hook_cancelled",
+        hookName: "UserPromptSubmit",
+        hookEvent: "UserPromptSubmit",
+        timedOut: false,
+        timeoutMs: 30000,
+      }),
+      attached({
+        type: "hook_cancelled",
+        hookName: "PreToolUse:Bash",
+        hookEvent: "PreToolUse",
+        timedOut: true,
+      }),
+      attached(
+        { type: "hook_system_message", hookName: "PostToolUse:Bash", content: "from a subagent" },
+        { isSidechain: true },
+      ),
+    ]) {
+      assert.isNull(claudeHookNoticeText(hidden));
+      assert.lengthOf(frames.onTranscriptRow(hidden), 0);
+    }
+  });
+
+  it("puts the summary a compacted session goes on from on its compaction's frame", () => {
+    const frames = translator();
+    frames.adoptTurn({ turnId: "turn-8", startedAt: 0, transcriptOffset: 0 });
+    const boundaryUuid = "00000000-0000-4000-8000-0000000000f1";
+    const [boundary] = frames.onTranscriptRow({
+      type: "system",
+      subtype: "compact_boundary",
+      uuid: boundaryUuid,
+      parentUuid: null,
+      isSidechain: false,
+      content: "Conversation compacted",
+      level: "info",
+      compactMetadata: { trigger: "auto", preTokens: 235317, postTokens: 13677 },
+    });
+    assert.isUndefined(claudeBridgeCompactSummary(boundary));
+    // The instructions a compaction reloads can come between it and its summary.
+    for (const type of ["instructions", "session_context", "date"]) {
+      frames.onTranscriptRow({
+        type: "attachment",
+        uuid: `attachment-${type}`,
+        isSidechain: false,
+        attachment: { type },
+      });
+    }
+    const summary =
+      "This session is being continued from a previous conversation that ran out of context.\n\nSummary:\n1. Primary Request and Intent: read the big file.";
+    const summaryRow = {
+      type: "user",
+      uuid: "00000000-0000-4000-8000-0000000000fa",
+      parentUuid: "00000000-0000-4000-8000-0000000000f4",
+      isSidechain: false,
+      isCompactSummary: true,
+      isVisibleInTranscriptOnly: true,
+      message: { role: "user", content: summary },
+    };
+    const [again] = frames.onTranscriptRow(summaryRow);
+    // The compaction's own frame, under its own id, now with the summary.
+    assert.equal(Reflect.get(again ?? {}, "subtype"), "compact_boundary");
+    assert.equal(Reflect.get(again ?? {}, "uuid"), boundaryUuid);
+    assert.deepEqual(
+      Reflect.get(again ?? {}, "compact_metadata"),
+      Reflect.get(boundary ?? {}, "compact_metadata"),
+    );
+    assert.equal(claudeBridgeCompactSummary(again), summary);
+    // A summary row with no compaction before it goes nowhere.
+    assert.lengthOf(frames.onTranscriptRow({ ...summaryRow, uuid: "summary-again" }), 0);
   });
 
   it("maps an error completion to an error result", () => {

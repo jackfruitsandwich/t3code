@@ -69,6 +69,7 @@ import {
 import type { ProviderContinuationRequest } from "../ProviderContinuationRequests.ts";
 import { makeProviderFailure } from "../ProviderFailure.ts";
 import {
+  CLAUDE_BRIDGE_COMPACT_SUMMARY_KEY,
   CLAUDE_BRIDGE_SETTLED_ELSEWHERE,
   claudeBridgeReplacesDrawnFrame,
 } from "../../claude-bridge/ClaudeBridgeProtocol.ts";
@@ -3523,6 +3524,55 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           });
         }
       }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, IdAllocator.layer))),
+  );
+
+  it.effect("puts the summary a compaction's frame comes again with on the same compaction", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeWakeHarness;
+      const now = yield* DateTime.now;
+      yield* harness.runtime.startTurn(
+        makeClaudeTestTurnInput({
+          threadId: harness.threadId,
+          providerThread: harness.providerThread,
+          now,
+          attemptId: RunAttemptId.make("claude-compact-summary-attempt"),
+          text: "Read the big file",
+          attachments: [],
+        }),
+      );
+      const boundary = {
+        type: "system",
+        subtype: "compact_boundary",
+        compact_metadata: { trigger: "auto", pre_tokens: 1500, post_tokens: 400 },
+        uuid: "00000000-0000-4000-8000-000000000211",
+        session_id: WAKE_NATIVE_SESSION,
+      };
+      const summary = "Summary:\n1. Primary Request and Intent: read the big file.";
+      yield* Queue.offer(harness.sdkMessages, claudeSdkFrame(boundary));
+      yield* Queue.offer(
+        harness.sdkMessages,
+        claudeSdkFrame({ ...boundary, [CLAUDE_BRIDGE_COMPACT_SUMMARY_KEY]: summary }),
+      );
+      yield* Queue.offer(
+        harness.sdkMessages,
+        makeResultFrame({ uuid: "00000000-0000-4000-8000-000000000212", result: "Read it." }),
+      );
+      yield* Queue.take(harness.terminalReceipts);
+
+      const compactions = harness.events.flatMap((event) =>
+        event.type === "turn_item.updated" && event.turnItem.type === "compaction"
+          ? [event.turnItem]
+          : [],
+      );
+      assert.lengthOf(compactions, 2);
+      // One compaction, told twice: the second time with what it summarized.
+      assert.equal(compactions[0]?.id, compactions[1]?.id);
+      assert.equal(compactions[0]?.ordinal, compactions[1]?.ordinal);
+      assert.isUndefined(compactions[0]?.summary);
+      assert.equal(compactions[1]?.summary, summary);
+      assert.equal(compactions[1]?.beforeTokenCount, 1500);
+      assert.equal(compactions[1]?.afterTokenCount, 400);
+    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, IdAllocator.layer))),
   );
 
   it.effect("says a session is compacting on its running turn, and no longer once it stops", () =>

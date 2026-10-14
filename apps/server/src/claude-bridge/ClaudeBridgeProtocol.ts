@@ -85,6 +85,12 @@ export const CLAUDE_BRIDGE_COMMAND_OUTPUT_KEY = "t3_command_output";
 /** Marks a frame that carries what the session said to the person in a row of its own. */
 export const CLAUDE_BRIDGE_NOTICE_KEY = "t3_session_notice";
 /**
+ * Set on a `compact_boundary` frame sent again once the record's summary row
+ * has come: the summary the session went on from, the text Claude Code shows
+ * when its "Compact summary" row is expanded.
+ */
+export const CLAUDE_BRIDGE_COMPACT_SUMMARY_KEY = "t3_compact_summary";
+/**
  * Set on the `assistant` frame of a reply row of the record whose text the
  * thread already shows from what the terminal drew. Its value is that drawn
  * message's id: the record's row takes its place.
@@ -1003,6 +1009,84 @@ export const claudeSessionNoticeText = (row: unknown): string | null => {
   return opening.length === 0 ? null : opening;
 };
 
+/** The line Claude Code shows under a hook's error: its output's first line, at most 200 characters. */
+const hookErrorReason = (stderr: unknown, stdout: unknown): string => {
+  const output =
+    typeof stderr === "string" && stderr.trim().length > 0
+      ? stderr
+      : typeof stdout === "string" && stdout.trim().length > 0
+        ? stdout
+        : "";
+  const line =
+    (output.split("\n\nExpected schema:")[0] ?? "")
+      .split("\n")
+      .map((part) => part.trim())
+      .find((part) => part.length > 0) ?? "";
+  return line.length > 200 ? `${line.slice(0, 200)}…` : line;
+};
+
+const strings = (value: unknown): ReadonlyArray<string> =>
+  Array.isArray(value) ? value.filter((entry) => typeof entry === "string") : [];
+
+/**
+ * What Claude Code's terminal shows for a hook's result, in its words: stop
+ * hooks that failed, gave feedback or ended the turn; another hook's error,
+ * a prompt hook's timeout, a hook's message. Null for the hook rows the
+ * terminal leaves out (stop hooks that ran clean, a Stop hook's own error, a
+ * cancel that was not a timeout), a subagent's rows, and every other row.
+ */
+export const claudeHookNoticeText = (row: unknown): string | null => {
+  if (!isRecord(row) || row.isSidechain === true) return null;
+  if (row.type === "system" && row.subtype === "stop_hook_summary") {
+    const count = readNumber(row.hookCount) ?? 0;
+    const hooks = count === 1 ? "hook" : "hooks";
+    if (typeof row.hookLabel === "string" && row.hookLabel.length > 0) {
+      return `Ran ${count} ${row.hookLabel} ${hooks}`;
+    }
+    const errors = strings(row.hookErrors);
+    const feedback = strings(row.hookAdditionalContext);
+    const prevented = row.preventedContinuation === true;
+    if (errors.length === 0 && feedback.length === 0 && !prevented) return null;
+    return [
+      `Ran ${count} stop ${hooks}`,
+      ...(prevented && typeof row.stopReason === "string" && row.stopReason.length > 0
+        ? [row.stopReason]
+        : []),
+      ...errors.map((error) => `Stop hook error: ${error}`),
+      ...feedback.map((text) => `Stop hook feedback: ${text}`),
+    ].join("\n");
+  }
+  if (row.type !== "attachment" || !isRecord(row.attachment)) return null;
+  const hook = row.attachment;
+  if (typeof hook.hookName !== "string") return null;
+  switch (hook.type) {
+    case "hook_non_blocking_error": {
+      if (hook.hookEvent === "Stop" || hook.hookEvent === "SubagentStop") return null;
+      const reason = hookErrorReason(hook.stderr, hook.stdout);
+      return reason.length === 0
+        ? `${hook.hookName} hook error`
+        : `${hook.hookName} hook error\n${reason}`;
+    }
+    case "hook_cancelled": {
+      if (hook.hookEvent !== "UserPromptSubmit" || hook.timedOut !== true) return null;
+      const ms = readNumber(hook.timeoutMs);
+      const after =
+        ms === undefined || ms === 0
+          ? ""
+          : ` after ${ms < 1000 ? `${ms}ms` : `${Math.round(ms / 1000)}s`}`;
+      const command =
+        typeof hook.command === "string" && hook.command.length > 0 ? ` [${hook.command}]` : "";
+      return `${hook.hookName} hook${command} timed out${after} — output discarded. Raise the hook's "timeout" to allow more time.`;
+    }
+    case "hook_system_message":
+      return typeof hook.content === "string" && hook.content.trim().length > 0
+        ? `${hook.hookName} says: ${hook.content}`
+        : null;
+    default:
+      return null;
+  }
+};
+
 /**
  * What T3 adds to a call for the person's attention that it holds no card
  * for while a dialog is open in the session's terminal: the door is there only.
@@ -1059,6 +1143,14 @@ export const isClaudeBridgeNoticeFrame = (
   Reflect.get(message, CLAUDE_BRIDGE_NOTICE_KEY) === true &&
   typeof message.uuid === "string" &&
   typeof message.content === "string";
+
+/** The summary on a `compact_boundary` frame the translator sent again with it. */
+export const claudeBridgeCompactSummary = (message: unknown): string | undefined => {
+  const summary = isRecord(message)
+    ? Reflect.get(message, CLAUDE_BRIDGE_COMPACT_SUMMARY_KEY)
+    : undefined;
+  return typeof summary === "string" ? summary : undefined;
+};
 
 /**
  * Some commands leave rows without the usual markup (a skill only Claude may
@@ -1442,6 +1534,8 @@ export function makeClaudeBridgeFrameTranslator(
   let model = options.model;
   let turn: TranslatorTurn | null = null;
   let costState: { totalCostUSD: number; modelUsage: Record<string, unknown> } | null = null;
+  // The last compaction's frame, until its summary row comes.
+  let compaction: SDKCompactBoundaryMessage | null = null;
   const sessionId = options.sessionId;
   const plainCommand = makeClaudePlainCommandReader();
 
@@ -1641,6 +1735,21 @@ export function makeClaudeBridgeFrameTranslator(
           } as unknown as SDKUserMessage;
           return [frame];
         }
+        // The summary a compacted session goes on from comes after its
+        // boundary (next, or after the instructions it reloads): the
+        // compaction's frame again, now with the summary.
+        if (row.isCompactSummary === true) {
+          const boundary = compaction;
+          compaction = null;
+          return boundary === null || text === null
+            ? []
+            : [
+                {
+                  ...boundary,
+                  [CLAUDE_BRIDGE_COMPACT_SUMMARY_KEY]: text,
+                } as SDKCompactBoundaryMessage,
+              ];
+        }
         // Typed prompts come through the mod's turn.start; only tool results
         // carry anything else the adapter renders.
         if (row.isMeta === true || !hasToolResultBlock(row.message.content)) return [];
@@ -1669,7 +1778,22 @@ export function makeClaudeBridgeFrameTranslator(
           uuid: asUuid(row.uuid),
           session_id: sessionId,
         } as unknown as SDKCompactBoundaryMessage;
+        compaction = frame;
         return [frame];
+      }
+      const hookNotice = claudeHookNoticeText(row);
+      if (hookNotice !== null) {
+        return [
+          claudeSessionNoticeFrame({
+            uuid: row.uuid,
+            sessionId,
+            subtype:
+              isRecord(row.attachment) && typeof row.attachment.type === "string"
+                ? row.attachment.type
+                : "stop_hook_summary",
+            content: hookNotice,
+          }),
+        ];
       }
       const notice = claudeSessionNoticeText(row);
       if (notice !== null) {

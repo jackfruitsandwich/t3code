@@ -100,6 +100,7 @@ import {
   claudeBridgeApproveWithMode,
   claudeSessionGrant,
   claudeBridgeAskingAgent,
+  claudeBridgeCompactSummary,
   claudeBridgeReplacedDrawnId,
   claudeBridgeSettledElsewhere,
   claudeBridgeWakeDetail,
@@ -6080,6 +6081,8 @@ export function makeClaudeAdapterV2(
           if (message.type === "system" && message.subtype === "compact_boundary") {
             const now = yield* DateTime.now;
             const nativeItemId = message.uuid;
+            // Through the bridge the same boundary comes again with its summary.
+            const summary = claudeBridgeCompactSummary(message);
             const postTokens = message.compact_metadata.post_tokens;
             const afterTokenCount =
               typeof postTokens === "number" && Number.isFinite(postTokens) && postTokens > 0
@@ -6140,6 +6143,7 @@ export function makeClaudeAdapterV2(
                 startedAt: now,
                 completedAt: now,
                 updatedAt: now,
+                ...(summary === undefined ? {} : { summary }),
                 ...(message.compact_metadata.pre_tokens === undefined
                   ? {}
                   : { beforeTokenCount: message.compact_metadata.pre_tokens }),
