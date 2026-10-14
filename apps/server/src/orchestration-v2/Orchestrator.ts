@@ -1260,12 +1260,19 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       // Hold the queue so the user decides when to resume it. Validation
       // failures (setup, unsupported handoff) belong to that message alone,
       // and a message queued for another provider is how users recover.
+      // A turn the provider's own session has already begun (a prompt typed
+      // into it, a task reporting back) is not ours to hold: it runs there
+      // either way, and held here it would only go unseen.
       const failedRun = latestExecutedRun(projection.runs);
       const failureClass =
         failedRun?.id === options?.failedRunId
           ? latestRootProviderFailure(failedRun, projection.turnItems)?.class
           : undefined;
+      const begunByProvider =
+        projection.messages.find((message) => message.id === queuedRun.userMessageId)
+          ?.creationSource === "provider";
       if (
+        !begunByProvider &&
         failureClass !== undefined &&
         failureClass !== "validation_error" &&
         failedRun?.providerInstanceId === queuedRun.providerInstanceId

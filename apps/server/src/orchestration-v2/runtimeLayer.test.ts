@@ -3899,6 +3899,131 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
     }),
   );
 
+  // A prompt typed into the provider's own session while its turn was failing
+  // starts there the moment that turn ends. The session runs it either way;
+  // held here, nothing of that turn would be shown.
+  it.effect(
+    "starts a turn the provider already began after a provider failure, without holding it",
+    () =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const eventSink = yield* EventSink.EventSinkV2;
+        const threadId = ThreadId.make("runtime-layer-failed-queue-begun-by-provider");
+
+        yield* orchestrator.dispatch({
+          type: "thread.create",
+          createdBy: "user",
+          creationSource: "web",
+          commandId: CommandId.make(`${threadId}:create`),
+          threadId,
+          projectId: ProjectId.make(`${threadId}:project`),
+          title: "Failed queue, begun by the provider",
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: process.cwd(),
+        });
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          createdBy: "user",
+          creationSource: "web",
+          commandId: CommandId.make(`${threadId}:message:0`),
+          threadId,
+          messageId: MessageId.make(`${threadId}:message:0`),
+          text: "Active",
+          attachments: [],
+          modelSelection,
+          dispatchMode: { type: "start_immediately" },
+        });
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          createdBy: "user",
+          creationSource: "provider",
+          commandId: CommandId.make(`${threadId}:message:1`),
+          threadId,
+          messageId: MessageId.make(`${threadId}:message:1`),
+          text: "Typed into the session meanwhile",
+          attachments: [],
+          modelSelection,
+          dispatchMode: { type: "queue_after_active" },
+        });
+
+        const before = yield* orchestrator.getThreadProjection(threadId);
+        const activeRun = before.runs.find((run) => run.status === "starting");
+        const queuedRun = before.runs.find((run) => run.status === "queued");
+        assert.isDefined(activeRun);
+        assert.isDefined(queuedRun);
+        assert.isNotNull(activeRun.rootNodeId);
+
+        const outcomes = yield* Queue.unbounded<"started" | "held">();
+        const afterSequence = yield* orchestrator.getThreadEventSequence(threadId);
+        yield* eventSink.stream({ threadId, afterSequence }).pipe(
+          Stream.runForEach((stored) =>
+            stored.event.type !== "run.updated" || stored.event.payload.id !== queuedRun.id
+              ? Effect.void
+              : stored.event.payload.status === "starting"
+                ? Queue.offer(outcomes, "started")
+                : stored.event.payload.queueHeld === true
+                  ? Queue.offer(outcomes, "held")
+                  : Effect.void,
+          ),
+          Effect.forkScoped,
+        );
+        yield* Effect.yieldNow;
+
+        const now = yield* DateTime.now;
+        yield* eventSink.write({
+          events: [
+            {
+              id: EventId.make(`${threadId}:error`),
+              type: "turn-item.updated",
+              threadId,
+              runId: activeRun.id,
+              nodeId: activeRun.rootNodeId,
+              providerInstanceId: activeRun.providerInstanceId,
+              occurredAt: now,
+              payload: {
+                id: TurnItemId.make(`${threadId}:error`),
+                type: "error",
+                threadId,
+                runId: activeRun.id,
+                nodeId: activeRun.rootNodeId,
+                providerThreadId: activeRun.providerThreadId,
+                providerTurnId: null,
+                nativeItemRef: null,
+                parentItemId: null,
+                ordinal: 2,
+                status: "failed",
+                title: "Provider failure",
+                startedAt: now,
+                completedAt: now,
+                updatedAt: now,
+                failure: {
+                  class: "provider_error",
+                  message: "Provider failed.",
+                  code: "provider_failed",
+                  retryable: null,
+                },
+              },
+            },
+            {
+              id: EventId.make(`${threadId}:failed`),
+              type: "run.updated",
+              threadId,
+              runId: activeRun.id,
+              nodeId: activeRun.rootNodeId,
+              providerInstanceId: activeRun.providerInstanceId,
+              occurredAt: now,
+              payload: { ...activeRun, status: "failed", completedAt: now },
+            },
+          ],
+        });
+
+        assert.equal(yield* Queue.take(outcomes), "started");
+      }),
+  );
+
   it.effect.each(["usage_limit", "provider_error"] as const)(
     "handles a queued message after a %s failure",
     (failureClass) =>
