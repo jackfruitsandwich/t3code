@@ -238,6 +238,100 @@ export function planNoticeHealing(input: {
   });
 }
 
+/** A background task's notice the thread shows. */
+export interface HealingShownTaskNotice {
+  /** The record row it was added from; null for one a live run showed. */
+  readonly sourceId: string | null;
+  readonly summary: string;
+  readonly atMs: number;
+}
+
+/**
+ * The background tasks' notices the record has and the thread does not
+ * show, oldest first, each after the run that was the latest when it was
+ * written: a notice written while no turn T3 followed was open (T3 was down,
+ * or the session delivered it with the next prompt). A notice that opened a
+ * turn T3 ran is that run's to show, in its words or as background activity,
+ * and is never added; one still last in the record may be opening a turn
+ * now, and waits. Only rows from line `fromLine` on: the record before it is
+ * history the thread was never given, and stays out.
+ */
+export function planTaskNoticeHealing(input: {
+  readonly rows: ReadonlyArray<ParsedSessionMessage>;
+  readonly known: ReadonlyArray<HealingKnownMessage>;
+  readonly shown: ReadonlyArray<HealingShownTaskNotice>;
+  readonly runs: ReadonlyArray<HealingRun>;
+  readonly fromLine: number;
+}): ReadonlyArray<HealingPlacement> {
+  const { rows } = input;
+  const replyIds = new Set(
+    input.known.flatMap((message) => {
+      const colon = message.messageId.lastIndexOf(":");
+      return message.role === "assistant" && colon !== -1
+        ? [message.messageId.slice(colon + 1)]
+        : [];
+    }),
+  );
+  const replies = input.known
+    .filter((message) => message.role === "assistant")
+    .map((message) => ({ text: normalize(message.text), atMs: message.atMs }));
+  const replyShown = (row: ParsedSessionMessage) =>
+    replyIds.has(row.sourceId) ||
+    replies.some(
+      (reply) =>
+        reply.text === normalize(row.text) &&
+        Math.abs(reply.atMs - timeMs(row.timestamp)) <= SAME_REPLY_WINDOW_MS,
+    );
+  const addedIds = new Set(input.shown.flatMap((notice) => notice.sourceId ?? []));
+  const candidates: Array<number> = [];
+  rows.forEach((row, index) => {
+    if (row.role !== "user" || row.notice === undefined) return;
+    if (row.lineIndex < input.fromLine || addedIds.has(row.sourceId)) return;
+    // What follows it up to the next prompt: nothing yet (it may be opening
+    // a turn now), or the turn it opened, which is T3's to show if T3 ran it.
+    let next = index + 1;
+    let ranInT3 = false;
+    for (; next < rows.length; next += 1) {
+      const later = rows[next]!;
+      if (later.role === "user" && later.command !== true) break;
+      if (later.role === "assistant" && later.command !== true && replyShown(later)) ranInT3 = true;
+    }
+    if (index === rows.length - 1 || ranInT3) return;
+    candidates.push(index);
+  });
+  if (candidates.length === 0) return [];
+  // A live run's notice carries no row id: it stands for the row it is
+  // nearest in time to, one row each, the same words first, then a notice
+  // T3 showed without the task's words.
+  const live = input.shown
+    .filter((notice) => notice.sourceId === null)
+    .map((notice) => ({ notice, taken: false }));
+  const matched = new Set<number>();
+  for (const sameWords of [true, false]) {
+    const pairs = candidates.flatMap((index) => {
+      if (matched.has(index)) return [];
+      const row = rows[index]!;
+      const atMs = timeMs(row.timestamp);
+      return live.flatMap((entry, entryIndex) => {
+        const distance = Math.abs(entry.notice.atMs - atMs);
+        if (distance > SAME_TURN_WINDOW_MS) return [];
+        if (sameWords && entry.notice.summary !== row.notice?.summary) return [];
+        return [{ index, entryIndex, distance }];
+      });
+    });
+    for (const pair of pairs.toSorted((left, right) => left.distance - right.distance)) {
+      if (matched.has(pair.index) || live[pair.entryIndex]!.taken) continue;
+      matched.add(pair.index);
+      live[pair.entryIndex]!.taken = true;
+    }
+  }
+  return candidates.flatMap((index) => {
+    if (matched.has(index)) return [];
+    const message = rows[index]!;
+    return [{ message, band: bandForTime(input.runs, timeMs(message.timestamp)) }];
+  });
+}
+
 /**
  * Rows imported earlier that sit in the wrong place: they were all put before
  * the thread's first run, whenever they were written. Returns them oldest

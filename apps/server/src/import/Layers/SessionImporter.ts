@@ -106,10 +106,12 @@ import {
   bandForTime,
   claudeRecordLines,
   type HealingPlacement,
+  type HealingKnownMessage,
   type HealingRun,
   planImportedRowOrdering,
   planImportedRowReseating,
   planNoticeHealing,
+  planTaskNoticeHealing,
   planRecordSeating,
   planTranscriptHealing,
   recordKeyOfTurnItem,
@@ -1834,21 +1836,22 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         });
         if (!holdsTranscriptReply) return false;
       }
+      const knownMessages: ReadonlyArray<HealingKnownMessage> = known.flatMap((message) =>
+        message.role === "user" || message.role === "assistant"
+          ? [
+              {
+                messageId: message.message_id,
+                role: message.role,
+                text: message.text ?? "",
+                atMs: DateTime.toEpochMillis(dateTime(message.created_at)),
+                runId: message.run_id,
+              },
+            ]
+          : [],
+      );
       const missing = planTranscriptHealing({
         rows,
-        known: known.flatMap((message) =>
-          message.role === "user" || message.role === "assistant"
-            ? [
-                {
-                  messageId: message.message_id,
-                  role: message.role,
-                  text: message.text ?? "",
-                  atMs: DateTime.toEpochMillis(dateTime(message.created_at)),
-                  runId: message.run_id,
-                },
-              ]
-            : [],
-        ),
+        known: knownMessages,
         runs: input.runs,
         importedMessageId: (sourceId) => importedMessageId(sessionId, sourceId),
       });
@@ -1883,10 +1886,42 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         runs: input.runs,
         ...(settledBeforeMs === undefined ? {} : { settledBeforeMs }),
       });
-      if (missing.length > 0 || notices.length > 0) {
+      // A background task's notice written while no turn T3 followed was
+      // open: the thread shows it as a live run would, from the same floor.
+      const shownTaskNotices = !rows.some(
+        (row) => row.notice !== undefined && row.lineIndex >= noticesFromLine,
+      )
+        ? []
+        : yield* sql<{
+            readonly turn_item_id: string;
+            readonly summary: string | null;
+            readonly started_at: string;
+          }>`
+            SELECT
+              turn_item_id,
+              json_extract(payload_json, '$.summary') AS summary,
+              coalesce(json_extract(payload_json, '$.startedAt'), updated_at) AS started_at
+            FROM orchestration_v2_projection_turn_items
+            WHERE thread_id = ${threadId} AND type = 'notification'
+          `;
+      const importedPrefix = importedTurnItemId(threadId, "");
+      const taskNotices = planTaskNoticeHealing({
+        rows,
+        known: knownMessages,
+        shown: shownTaskNotices.map((item) => ({
+          sourceId: item.turn_item_id.startsWith(importedPrefix)
+            ? item.turn_item_id.slice(importedPrefix.length)
+            : null,
+          summary: item.summary ?? "",
+          atMs: DateTime.toEpochMillis(dateTime(item.started_at)),
+        })),
+        runs: input.runs,
+        fromLine: noticesFromLine,
+      });
+      if (missing.length > 0 || notices.length > 0 || taskNotices.length > 0) {
         // Rows and notices take their places in the order the record wrote them.
         const places = [
-          ...missing.map((placement) => ({
+          ...[...missing, ...taskNotices].map((placement) => ({
             line: placement.message.lineIndex,
             place: placeImportedRow(threadId, placement),
           })),
@@ -1908,6 +1943,9 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
             messageEvents({ threadId, sessionId, message: placement.message }),
           ),
           ...notices.map((placement) => noticeEvent(threadId, placement.notice)),
+          ...taskNotices.flatMap((placement) =>
+            messageEvents({ threadId, sessionId, message: placement.message }),
+          ),
         ];
         const newest =
           missing.length === 0 ? null : dateTime(missing[missing.length - 1]!.message.timestamp);
@@ -1931,7 +1969,7 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
           sessionId,
           threadId,
           addedCount: missing.length,
-          noticeCount: notices.length,
+          noticeCount: notices.length + taskNotices.length,
           live: input.live,
         });
       }

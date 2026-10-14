@@ -8,6 +8,7 @@ import {
   planImportedRowReseating,
   planNoticeHealing,
   planRecordSeating,
+  planTaskNoticeHealing,
   planTranscriptHealing,
   recordKeyOfTurnItem,
   type SeatingRow,
@@ -240,6 +241,102 @@ describe("planNoticeHealing", () => {
 
   it("leaves a running turn's notices to its run", () => {
     assert.deepEqual(planned({ fromLine: 5, settledBeforeMs: ms(40) }), ["1:between-runs"]);
+  });
+});
+
+describe("planTaskNoticeHealing", () => {
+  const task = (sourceId: string, minute: number, summary = `Task ${sourceId} finished`) => ({
+    ...row("user", sourceId, `<task-notification>\n<summary>${summary}</summary>\n`, minute),
+    notice: { summary, outcome: "completed" as const },
+  });
+  const runs = [
+    { id: "run-1", ordinal: 1, startedAtMs: ms(10) },
+    { id: "run-2", ordinal: 2, startedAtMs: ms(31) },
+  ];
+  const planned = (input: {
+    readonly rows: ReadonlyArray<ParsedSessionMessage>;
+    readonly known?: ReadonlyArray<HealingKnownMessage>;
+    readonly shown?: ReadonlyArray<{ sourceId: string | null; summary: string; minute: number }>;
+    readonly fromLine?: number;
+  }) =>
+    planTaskNoticeHealing({
+      rows: input.rows,
+      known: input.known ?? [],
+      shown: (input.shown ?? []).map((notice) => ({
+        sourceId: notice.sourceId,
+        summary: notice.summary,
+        atMs: ms(notice.minute),
+      })),
+      runs,
+      fromLine: input.fromLine ?? 0,
+    }).map((placement) => `${placement.band}:${placement.message.sourceId}`);
+
+  it("adds a notice the session delivered with the next prompt, after the run before it", () => {
+    // After a restart: the notice is written, then the person's prompt opens the turn T3 follows.
+    const rows = [task("stopped", 30), row("user", "u2", "mac died, how long ago?", 31)];
+    assert.deepEqual(planned({ rows }), ["1:stopped"]);
+    // Shown already: added before, or shown by a live run in the same words.
+    assert.deepEqual(
+      planned({ rows, shown: [{ sourceId: "stopped", summary: "x", minute: 30 }] }),
+      [],
+    );
+    assert.deepEqual(
+      planned({ rows, shown: [{ sourceId: null, summary: "Task stopped finished", minute: 30 }] }),
+      [],
+    );
+  });
+
+  it("leaves a notice that opened a turn T3 ran to that run, in words or not", () => {
+    const rows = [
+      task("woke", 30),
+      row("assistant", "a-woke", "on it", 30),
+      row("user", "u2", "next", 35),
+    ];
+    // The run's reply carries the row's id: T3 ran the turn the notice opened.
+    const known = [shown("message:thread:t:a-woke", "assistant", "on it", 30, "run-2")];
+    assert.deepEqual(planned({ rows, known }), []);
+    // A turn T3 never saw (it was down): its notice is added with its replies.
+    assert.deepEqual(planned({ rows }), ["1:woke"]);
+    // A live run showed it without the task's words, at the same moment.
+    assert.deepEqual(
+      planned({
+        rows,
+        shown: [{ sourceId: null, summary: "Background activity updated", minute: 30 }],
+      }),
+      [],
+    );
+    // One shown long before stands for some other notice.
+    assert.deepEqual(
+      planned({
+        rows,
+        shown: [{ sourceId: null, summary: "Background activity updated", minute: 5 }],
+      }),
+      ["1:woke"],
+    );
+  });
+
+  it("pairs a notice shown in its words with its own row, not the nearest one", () => {
+    const rows = [
+      task("first", 30),
+      task("second", 31, "Task second finished"),
+      row("user", "u2", "next", 32),
+    ];
+    // Shown live at the second's moment, in the first's words: the second is the one missing.
+    assert.deepEqual(
+      planned({ rows, shown: [{ sourceId: null, summary: "Task first finished", minute: 31 }] }),
+      ["2:second"],
+    );
+  });
+
+  it("waits on a notice still last in the record, and adds none from the history", () => {
+    assert.deepEqual(planned({ rows: [row("user", "u1", "hi", 20), task("just-now", 30)] }), []);
+    const rows = [
+      task("old", 5),
+      row("user", "u1", "hi", 6),
+      task("new", 30),
+      row("user", "u2", "x", 31),
+    ];
+    assert.deepEqual(planned({ rows, fromLine: 20 }), ["1:new"]);
   });
 });
 
