@@ -21,6 +21,7 @@
  * transport.
  */
 import * as NodeOS from "node:os";
+import * as NodeUtil from "node:util";
 
 import type {
   CanUseTool,
@@ -206,6 +207,9 @@ export function claudeBridgeImageNote(imageCount: number): string {
  * session's value wins.
  */
 const shownNativeSettings = new Map<string, ClaudeAdapterV2.ClaudeBridgeNativeSettings>();
+
+/** What each bridged session last reported of its effort and status line, as last passed on. */
+const shownNativeState = new Map<string, ClaudeAdapterV2.ClaudeBridgeNativeState>();
 
 /** How many trailing bytes of a transcript are read to find the session's current permission mode. */
 const PERMISSION_MODE_SCAN_BYTES = 262_144;
@@ -611,6 +615,23 @@ export const layer: Layer.Layer<
           input.bridgeOnNativeSettings?.(settings);
         });
 
+      /**
+       * Passes on what the session reports of its effort and its status
+       * line's figures when any of it changes. A mod before 0.3.26 says none.
+       */
+      const showNativeState = (session: ClaudeBridgeRegistry.ClaudeBridgeProcess["session"]) =>
+        Effect.sync(() => {
+          if (session.sessionEffort === undefined && session.usage === undefined) return;
+          const state: ClaudeAdapterV2.ClaudeBridgeNativeState = {
+            sessionEffort: session.sessionEffort ?? null,
+            lastTurnEffort: session.effort,
+            usage: session.usage ?? null,
+          };
+          if (NodeUtil.isDeepStrictEqual(shownNativeState.get(sid), state)) return;
+          shownNativeState.set(sid, state);
+          input.bridgeOnNativeState?.(state);
+        });
+
       // A setting changed in T3 since it last showed the session's value is
       // the person's change: apply it in the session, where the mod confirms
       // it and the next heartbeat shows it. Anything else follows the session.
@@ -677,6 +698,7 @@ export const layer: Layer.Layer<
         { model: options.model, permissionMode: options.permissionMode },
         bridgeProcess.session,
       );
+      yield* showNativeState(bridgeProcess.session);
 
       /**
        * Shows the messages the terminal drew at least `olderThanMs` ago and
@@ -1266,6 +1288,7 @@ export const layer: Layer.Layer<
           }
           if (session.model !== null) translator.setModel(session.model);
           yield* showNativeSettings(nativeSettings(session));
+          yield* showNativeState(session);
           yield* readNewRows.pipe(
             Effect.catchCause((cause) =>
               Effect.logWarning("claude-bridge.transcript-read-failed", { sid, cause }),

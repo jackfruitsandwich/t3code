@@ -31,7 +31,7 @@ import type {
 import { isRecord, parseJsonlLine } from "../import/sessionImportTypes.ts";
 
 export const CLAUDE_BRIDGE_PROTOCOL_VERSION = 2;
-export const CLAUDE_BRIDGE_MOD_VERSION = "0.3.25";
+export const CLAUDE_BRIDGE_MOD_VERSION = "0.3.26";
 /**
  * The first protocol whose mod runs slash commands, answers questions with
  * their answers and reports the session's own commands. A process still on an
@@ -115,6 +115,60 @@ export interface ClaudeBridgeWaitingRequest {
   readonly agentType?: string;
 }
 
+/**
+ * What Claude Code's status line counts for a session (`$.session.usage()`):
+ * the context window's fill, the account's rate-limit windows and the cost.
+ */
+export interface ClaudeBridgeSessionUsage {
+  readonly context: {
+    /** Input tokens the last response was answered over; absent until the live window's first response. */
+    readonly tokens?: number;
+    /** The context window of the session's model, in tokens. */
+    readonly window: number;
+    /** `tokens` over `window`, a whole percentage. */
+    readonly percent?: number;
+  };
+  /** `five_hour`, `seven_day`, a gateway's `spend_limit`; empty off a subscription. */
+  readonly rateLimits: ReadonlyArray<{
+    readonly kind: string;
+    readonly percentUsed: number;
+    readonly resetsAt?: string;
+  }>;
+  /** US dollars, as /cost totals it. */
+  readonly cost?: { readonly usd: number };
+}
+
+const readSessionUsage = (value: unknown): ClaudeBridgeSessionUsage | undefined => {
+  if (!isRecord(value) || !isRecord(value.context)) return undefined;
+  const window = readNumber(value.context.window);
+  if (window === undefined) return undefined;
+  const tokens = readNumber(value.context.tokens);
+  const percent = readNumber(value.context.percent);
+  const rateLimits: Array<ClaudeBridgeSessionUsage["rateLimits"][number]> = [];
+  for (const limit of Array.isArray(value.rateLimits) ? value.rateLimits : []) {
+    if (!isRecord(limit) || typeof limit.kind !== "string" || limit.kind.length === 0) continue;
+    const percentUsed = readNumber(limit.percentUsed);
+    if (percentUsed === undefined) continue;
+    rateLimits.push({
+      kind: limit.kind,
+      percentUsed,
+      ...(typeof limit.resetsAt === "string" && limit.resetsAt.length > 0
+        ? { resetsAt: limit.resetsAt }
+        : {}),
+    });
+  }
+  const usd = isRecord(value.cost) ? readNumber(value.cost.usd) : undefined;
+  return {
+    context: {
+      window,
+      ...(tokens === undefined ? {} : { tokens }),
+      ...(percent === undefined ? {} : { percent }),
+    },
+    rateLimits,
+    ...(usd === undefined ? {} : { cost: { usd } }),
+  };
+};
+
 export interface ClaudeBridgeSessionFile {
   readonly protocol: number;
   readonly sid: string;
@@ -129,7 +183,19 @@ export interface ClaudeBridgeSessionFile {
   readonly model: string | null;
   /** The session's live permission mode, once a hook payload has named it. */
   readonly permissionMode: string | null;
+  /**
+   * The effort the session's own loop last reported: the latest turn's, a
+   * per-message level (`/high <message>`) included.
+   */
   readonly effort: string | null;
+  /**
+   * The session's own effort: what a turn that sets none of its own runs at,
+   * as such a turn first reported it. Null before one ran, and on a model
+   * without effort levels; absent from a mod before 0.3.26.
+   */
+  readonly sessionEffort?: string | null;
+  /** What the session's status line counts, as the mod last read it; absent from a mod before 0.3.26. */
+  readonly usage?: ClaudeBridgeSessionUsage;
   /** Bumped each time the mod rewrites `commands.json`. */
   readonly commandsRev: number;
   /** Whether a person can see this process's own dialogs (a terminal runs or is attached to it). */
@@ -515,6 +581,7 @@ export function parseClaudeBridgeSessionFile(value: unknown): ClaudeBridgeSessio
         }
       : null;
   const ended = isRecord(value.ended) ? value.ended : null;
+  const usage = readSessionUsage(value.usage);
   const waiting: Array<ClaudeBridgeWaitingRequest> = [];
   for (const entry of Array.isArray(value.waiting) ? value.waiting : []) {
     if (!isRecord(entry) || typeof entry.toolUseId !== "string") continue;
@@ -540,6 +607,10 @@ export function parseClaudeBridgeSessionFile(value: unknown): ClaudeBridgeSessio
     model: readOptionalString(value.model) ?? null,
     permissionMode: readOptionalString(value.permissionMode) ?? null,
     effort: readOptionalString(value.effort) ?? null,
+    ...(value.sessionEffort === undefined
+      ? {}
+      : { sessionEffort: readOptionalString(value.sessionEffort) ?? null }),
+    ...(usage === undefined ? {} : { usage }),
     commandsRev: readNumber(value.commandsRev) ?? 0,
     // An older mod does not say; its interactive flag is the best reading.
     terminalPresent:

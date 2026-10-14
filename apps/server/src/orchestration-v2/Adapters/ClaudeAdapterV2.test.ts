@@ -2299,6 +2299,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         >();
       let openedOptions: ClaudeAdapterV2.ClaudeAgentSdkQueryOptions | undefined;
       let bridgeCanUseTool: ClaudeAdapterV2.ClaudeAgentSdkQueryOpenInput["bridgeCanUseTool"];
+      let bridgeOnNativeState: ClaudeAdapterV2.ClaudeAgentSdkQueryOpenInput["bridgeOnNativeState"];
       const adapter = ClaudeAdapterV2.makeClaudeAdapterV2({
         instanceId: ClaudeAdapterV2.CLAUDE_DEFAULT_INSTANCE_ID,
         settings: DEFAULT_CLAUDE_SETTINGS,
@@ -2320,6 +2321,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
             Effect.sync(() => {
               openedOptions = input.options;
               bridgeCanUseTool = input.bridgeCanUseTool;
+              bridgeOnNativeState = input.bridgeOnNativeState;
               return {
                 messages: Stream.fromQueue(sdkMessages).pipe(
                   Stream.flatMap((message) =>
@@ -2413,6 +2415,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         runtimeRequestReceipts,
         getOpenedOptions: () => openedOptions,
         getBridgeCanUseTool: () => bridgeCanUseTool,
+        getBridgeOnNativeState: () => bridgeOnNativeState,
         terminalEvents,
         hasPendingBackgroundWork,
       };
@@ -9167,6 +9170,93 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       }).pipe(Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
     ),
   );
+
+  describe("what a bridged session reports of itself", () => {
+    const reported: ClaudeAdapterV2.ClaudeBridgeNativeState = {
+      sessionEffort: "low",
+      lastTurnEffort: "high",
+      usage: {
+        context: { tokens: 52_000, window: 200_000, percent: 26 },
+        rateLimits: [{ kind: "five_hour", percentUsed: 12.5, resetsAt: "2026-10-14T15:00:00Z" }],
+        cost: { usd: 1.25 },
+      },
+    };
+    const reportedFields = {
+      contextUsage: {
+        usedTokens: 52_000,
+        inputTokens: 52_000,
+        maxTokens: 200_000,
+        cost: { amount: 1.25, currency: "USD" },
+      },
+      nativeStatus: {
+        sessionEffort: "low",
+        lastTurnEffort: "high",
+        rateLimits: [{ kind: "five_hour", percentUsed: 12.5, resetsAt: "2026-10-14T15:00:00Z" }],
+      },
+    };
+
+    it("maps the report onto the provider thread's context usage and native status", () => {
+      assert.deepEqual(ClaudeAdapterV2.claudeNativeProviderThreadFields(reported), reportedFields);
+      // A window with no fill yet clears the meter; an older mod's report leaves it alone.
+      assert.deepEqual(
+        ClaudeAdapterV2.claudeNativeProviderThreadFields({
+          sessionEffort: null,
+          lastTurnEffort: null,
+          usage: { context: { window: 200_000 }, rateLimits: [] },
+        }),
+        { contextUsage: null, nativeStatus: { rateLimits: [] } },
+      );
+      assert.deepEqual(
+        ClaudeAdapterV2.claudeNativeProviderThreadFields({
+          sessionEffort: "medium",
+          lastTurnEffort: "medium",
+          usage: null,
+        }),
+        { nativeStatus: { sessionEffort: "medium", lastTurnEffort: "medium" } },
+      );
+    });
+
+    it.effect(
+      "writes the report onto the provider thread and keeps it there when the turn ends",
+      () =>
+        Effect.gen(function* () {
+          const harness = yield* makeWakeHarness;
+          yield* harness.runtime.startTurn(
+            makeClaudeTestTurnInput({
+              threadId: harness.threadId,
+              providerThread: harness.providerThread,
+              now: yield* DateTime.now,
+              attemptId: RunAttemptId.make("native-state-attempt"),
+              text: "Reply with exactly: ok",
+              attachments: [],
+            }),
+          );
+          const onNativeState = harness.getBridgeOnNativeState();
+          assert.isDefined(onNativeState);
+          onNativeState?.(reported);
+          for (const frame of [
+            makeAssistantTextFrame({ uuid: "native-state-reply", text: "ok" }),
+            makeResultFrame({ uuid: "native-state-result", result: "ok" }),
+          ]) {
+            yield* Queue.offer(harness.sdkMessages, frame);
+          }
+          yield* Queue.take(harness.terminalReceipts);
+          const written = harness.events.flatMap((event) =>
+            event.type === "provider_thread.updated" && event.providerThread.nativeStatus != null
+              ? [
+                  {
+                    contextUsage: event.providerThread.contextUsage,
+                    nativeStatus: event.providerThread.nativeStatus,
+                  },
+                ]
+              : [],
+          );
+          assert.isAtLeast(written.length, 2);
+          // The thread the turn's end writes keeps what the session reported.
+          assert.deepEqual(written.at(-1), reportedFields);
+        }).pipe(Effect.scoped, Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+    );
+  });
 
   describe("native goals", () => {
     const syntheticFrame = (uuid: string, text: string) =>

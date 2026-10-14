@@ -904,6 +904,35 @@ export const OrchestrationV2ProviderGoal = Schema.Struct({
 });
 export type OrchestrationV2ProviderGoal = typeof OrchestrationV2ProviderGoal.Type;
 
+/**
+ * One rate-limit window as a native session reports it (Claude Code:
+ * `five_hour`, `seven_day`, a gateway's `spend_limit`).
+ */
+export const OrchestrationV2ProviderRateLimit = Schema.Struct({
+  kind: TrimmedNonEmptyString,
+  /** How much of the window is used, 0 to 100; past 100 on an exceeded spend limit. */
+  percentUsed: Schema.Number.check(Schema.isFinite()),
+  /** When the window resets, as an ISO 8601 timestamp. */
+  resetsAt: Schema.optional(TrimmedNonEmptyString),
+});
+export type OrchestrationV2ProviderRateLimit = typeof OrchestrationV2ProviderRateLimit.Type;
+
+/**
+ * What a native session reports about itself that T3 shows and does not set
+ * (Claude Code: its effort levels and the account's rate-limit windows, as
+ * its status line has them). Each part is absent until the session said it.
+ */
+export const OrchestrationV2ProviderThreadNativeStatus = Schema.Struct({
+  /** The session's own effort level: what a turn that sets none of its own runs at. */
+  sessionEffort: Schema.optional(TrimmedNonEmptyString),
+  /** The level the latest turn ran at, a per-message level (`/high <message>`) included. */
+  lastTurnEffort: Schema.optional(TrimmedNonEmptyString),
+  /** The account's rate-limit windows; empty off a subscription. */
+  rateLimits: Schema.optional(Schema.Array(OrchestrationV2ProviderRateLimit)),
+});
+export type OrchestrationV2ProviderThreadNativeStatus =
+  typeof OrchestrationV2ProviderThreadNativeStatus.Type;
+
 export const OrchestrationV2ProviderThread = Schema.Struct({
   id: ProviderThreadId,
   driver: ProviderDriverKind,
@@ -936,6 +965,10 @@ export const OrchestrationV2ProviderThread = Schema.Struct({
   ),
   /** Native goal on this provider thread; rows written before goals decode to null. */
   goal: Schema.optional(Schema.NullOr(OrchestrationV2ProviderGoal)).pipe(
+    Schema.withDecodingDefault(Effect.succeed(null)),
+  ),
+  /** What the native session reports about itself; rows written before it decode to null. */
+  nativeStatus: Schema.optional(Schema.NullOr(OrchestrationV2ProviderThreadNativeStatus)).pipe(
     Schema.withDecodingDefault(Effect.succeed(null)),
   ),
   createdAt: Schema.DateTimeUtc,

@@ -963,6 +963,55 @@ describe("a record that says its conversation continued under another session", 
 });
 
 describe("ClaudeBridgeProtocol parsers", () => {
+  it("reads the session's own effort and its status line's figures, and leaves out what an older mod does not say", () => {
+    const session = parseClaudeBridgeSessionFile({
+      protocol: 2,
+      sid: SID,
+      instanceId: "abc",
+      heartbeatAt: 1000,
+      effort: "high",
+      sessionEffort: "low",
+      usage: {
+        context: { tokens: 52_000, window: 200_000, percent: 26 },
+        rateLimits: [
+          { kind: "five_hour", percentUsed: 12.5, resetsAt: "2026-10-14T15:00:00Z" },
+          { kind: "seven_day", percentUsed: 40 },
+          { kind: "", percentUsed: 3 },
+          { kind: "spend_limit", percentUsed: "a lot" },
+        ],
+        cost: { usd: 1.25 },
+      },
+    });
+    assert.equal(session?.effort, "high");
+    assert.equal(session?.sessionEffort, "low");
+    assert.deepEqual(session?.usage, {
+      context: { tokens: 52_000, window: 200_000, percent: 26 },
+      rateLimits: [
+        { kind: "five_hour", percentUsed: 12.5, resetsAt: "2026-10-14T15:00:00Z" },
+        { kind: "seven_day", percentUsed: 40 },
+      ],
+      cost: { usd: 1.25 },
+    });
+    // A fresh window has no fill yet; a model without effort levels has no session effort.
+    const fresh = parseClaudeBridgeSessionFile({
+      sid: SID,
+      instanceId: "abc",
+      heartbeatAt: 1000,
+      sessionEffort: null,
+      usage: { context: { window: 200_000 }, rateLimits: [] },
+    });
+    assert.isNull(fresh?.sessionEffort);
+    assert.deepEqual(fresh?.usage, { context: { window: 200_000 }, rateLimits: [] });
+    const older = parseClaudeBridgeSessionFile({
+      sid: SID,
+      instanceId: "abc",
+      heartbeatAt: 1000,
+      usage: null,
+    });
+    assert.isFalse(older !== null && "sessionEffort" in older);
+    assert.isFalse(older !== null && "usage" in older);
+  });
+
   it("parses a session file and a turn.complete event with partial usage", () => {
     const session = parseClaudeBridgeSessionFile({
       protocol: 1,

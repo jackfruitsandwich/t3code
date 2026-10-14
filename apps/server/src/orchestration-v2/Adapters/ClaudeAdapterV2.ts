@@ -110,6 +110,7 @@ import {
   isClaudeBridgeNoticeFrame,
   isClaudePromptOfThePerson,
   threadModesForClaudePermissionMode,
+  type ClaudeBridgeSessionUsage,
 } from "../../claude-bridge/ClaudeBridgeProtocol.ts";
 import * as ServerConfig from "../../config.ts";
 import {
@@ -362,6 +363,12 @@ export interface ClaudeAgentSdkQueryOpenInput {
    */
   readonly bridgeOnNativeSettings?: (settings: ClaudeBridgeNativeSettings) => void;
   /**
+   * Called with what a bridged session reports about itself that T3 shows
+   * and does not set (its effort levels, its status line's figures), at
+   * attach and whenever any of it changes there.
+   */
+  readonly bridgeOnNativeState?: (state: ClaudeBridgeNativeState) => void;
+  /**
    * Called with what a bridged session has done with a message sent to steer
    * its running turn, in the order it happened: holds it untaken, has taken
    * it, or let go of it untaken. The message is named by the uuid it was
@@ -392,6 +399,60 @@ export function claudeSteerPromptUuid(messageId: string): SDKUserMessage["uuid"]
 export interface ClaudeBridgeNativeSettings {
   readonly model: string | null;
   readonly permissionMode: string | null;
+}
+
+/** What a bridged session's mod reports of its effort and its status line's figures. */
+export interface ClaudeBridgeNativeState {
+  /** The session's own effort level; null before a turn that set none of its own reported it. */
+  readonly sessionEffort: string | null;
+  /** The level the latest turn ran at, a per-message level included. */
+  readonly lastTurnEffort: string | null;
+  /** Null from a mod that does not report it. */
+  readonly usage: ClaudeBridgeSessionUsage | null;
+}
+
+/**
+ * The provider-thread fields a bridged session's report fills: the context
+ * window's fill and the session's cost on `contextUsage`, as the status line
+ * counts them, and the effort levels and rate-limit windows on `nativeStatus`.
+ * A report without usage (an older mod) leaves `contextUsage` as it was; one
+ * whose window has no fill yet (a fresh or just-compacted session) clears it.
+ */
+export function claudeNativeProviderThreadFields(
+  state: ClaudeBridgeNativeState,
+): Pick<OrchestrationV2ProviderThread, "contextUsage" | "nativeStatus"> {
+  const usage = state.usage;
+  const nativeStatus = {
+    ...(state.sessionEffort === null ? {} : { sessionEffort: state.sessionEffort }),
+    ...(state.lastTurnEffort === null ? {} : { lastTurnEffort: state.lastTurnEffort }),
+    ...(usage === null
+      ? {}
+      : {
+          rateLimits: usage.rateLimits.map((limit) => ({
+            kind: limit.kind,
+            percentUsed: limit.percentUsed,
+            ...(limit.resetsAt === undefined ? {} : { resetsAt: limit.resetsAt }),
+          })),
+        }),
+  };
+  if (usage === null) return { nativeStatus };
+  const tokens = usage.context.tokens;
+  return {
+    nativeStatus,
+    contextUsage:
+      tokens === undefined || !Number.isInteger(tokens) || tokens < 0
+        ? null
+        : {
+            usedTokens: tokens,
+            inputTokens: tokens,
+            ...(Number.isInteger(usage.context.window) && usage.context.window > 0
+              ? { maxTokens: usage.context.window }
+              : {}),
+            ...(usage.cost === undefined
+              ? {}
+              : { cost: { amount: usage.cost.usd, currency: "USD" } }),
+          },
+  };
 }
 
 export interface ClaudeAgentSdkQuerySession {
@@ -3296,6 +3357,12 @@ export function makeClaudeAdapterV2(
         );
         // Native `/goal` per session, seeded from the persisted provider thread.
         const goalsByNativeThread = new Map<string, OrchestrationV2ProviderGoal | null>();
+        // What each bridged session last reported about itself (its effort,
+        // its status line's figures), kept on every write of its provider thread.
+        const nativeFieldsByNativeThread = new Map<
+          string,
+          Pick<OrchestrationV2ProviderThread, "contextUsage" | "nativeStatus">
+        >();
         // Turns whose model output met an active goal's Stop hook check at its end.
         const goalCheckedTurns = new Set<string>();
         // Subagent registry that survives turn settle: a background subagent
@@ -3717,6 +3784,7 @@ export function makeClaudeAdapterV2(
             ...(goalsByNativeThread.has(input.nativeThreadId)
               ? { goal: goalsByNativeThread.get(input.nativeThreadId) ?? null }
               : {}),
+            ...nativeFieldsByNativeThread.get(input.nativeThreadId),
             updatedAt: now,
           };
           yield* rememberProviderThread(providerThread);
@@ -3750,6 +3818,26 @@ export function makeClaudeAdapterV2(
           );
           if (providerThread === undefined) return;
           const updated = { ...providerThread, goal: next, updatedAt: yield* DateTime.now };
+          yield* rememberProviderThread(updated);
+          yield* emitProviderEvent({
+            type: "provider_thread.updated",
+            driver: CLAUDE_PROVIDER,
+            providerThread: updated,
+          });
+        });
+
+        /** Writes what a bridged session reports about itself onto its provider thread. */
+        const applyClaudeNativeState = Effect.fnUntraced(function* (
+          nativeThreadId: string,
+          state: ClaudeBridgeNativeState,
+        ) {
+          const fields = claudeNativeProviderThreadFields(state);
+          nativeFieldsByNativeThread.set(nativeThreadId, fields);
+          const providerThread = (yield* Ref.get(lastProviderThreadByNativeThread)).get(
+            nativeThreadId,
+          );
+          if (providerThread === undefined) return;
+          const updated = { ...providerThread, ...fields, updatedAt: yield* DateTime.now };
           yield* rememberProviderThread(updated);
           yield* emitProviderEvent({
             type: "provider_thread.updated",
@@ -5310,6 +5398,9 @@ export function makeClaudeAdapterV2(
                   ...(nativeThreadId !== null && goalsByNativeThread.has(nativeThreadId)
                     ? { goal: goalsByNativeThread.get(nativeThreadId) ?? null }
                     : {}),
+                  ...(nativeThreadId === null
+                    ? {}
+                    : nativeFieldsByNativeThread.get(nativeThreadId)),
                   firstRunOrdinal:
                     input.context.input.providerThread.firstRunOrdinal ??
                     input.context.input.runOrdinal,
@@ -7685,6 +7776,9 @@ export function makeClaudeAdapterV2(
                 void runPromise(
                   emitObservedNativeSettings(turnInput.threadId, settings).pipe(Effect.ignore),
                 );
+              },
+              bridgeOnNativeState: (state) => {
+                void runPromise(applyClaudeNativeState(nativeThreadId, state).pipe(Effect.ignore));
               },
               bridgeOnPromptDelivery: (delivery) =>
                 emitSteerDelivery(turnInput.threadId, delivery).pipe(Effect.ignore),

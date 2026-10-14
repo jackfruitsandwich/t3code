@@ -167,6 +167,20 @@ const settledCalls = new Set()
 let mcpSession = null
 let mcpRequestId = 0
 let effort = null
+// The session's own effort. A command with an effort of its own
+// (/high <message>) runs its turn at that level and every hook of that turn
+// reports it, so this is read only in a turn no command started: its first
+// reading, before any tool of the turn has run.
+let sessionEffort = null
+// The turn those readings belong to, kept past its end (its Stop hook may
+// come after it): whether a command started it, and whether it was read.
+let effortTurn = null
+// A slash command ran since the last plain prompt: a turn starting now is its.
+let commandPending = false
+// What the session's status line counts ($.session.usage()): the context
+// window's fill, the account's rate-limit windows and the session's cost.
+let usage = null
+let usageAsks = 0
 let commandsBody = ''
 let commandsRev = 0
 // How the session's own menu presents each command, as Claude Code said when it
@@ -299,11 +313,39 @@ async function followRecord($) {
 function noteClassic($, e) {
   if (!e) return
   if (typeof e.permission_mode === 'string') permissionMode = e.permission_mode
-  if (e.effort && typeof e.effort.level === 'string') effort = e.effort.level
+  // A subagent's hooks report its own effort, not the session's.
+  if (e.effort && typeof e.effort.level === 'string' && !e.agent_id) effort = e.effort.level
   if (typeof e.transcript_path === 'string' && e.transcript_path && e.transcript_path !== transcriptPath) {
     transcriptPath = e.transcript_path
     if (recordIsOf(sid)) $.store.set('transcript:' + sid, transcriptPath).catch(() => {})
   }
+}
+
+// The first effort the main loop reports in a turn no command started is the
+// session's own. Read from the hooks that carry it on a model with effort
+// levels (PreToolUse, Stop); one without it reports none.
+function noteSessionEffort(e) {
+  if (!e || e.agent_id || !effortTurn || effortTurn.byCommand || effortTurn.read) return
+  effortTurn.read = true
+  sessionEffort = e.effort && typeof e.effort.level === 'string' ? e.effort.level : null
+}
+
+// The status line's figures, as $.session.usage() and session.measure give
+// them, without the breakdown.
+function noteUsage(u) {
+  if (!u || !u.context || typeof u.context.window !== 'number') return
+  const context = { window: u.context.window }
+  if (typeof u.context.tokens === 'number') context.tokens = u.context.tokens
+  if (typeof u.context.percent === 'number') context.percent = u.context.percent
+  const rateLimits = []
+  for (const limit of Array.isArray(u.rateLimits) ? u.rateLimits : []) {
+    if (!limit || typeof limit.kind !== 'string' || typeof limit.percentUsed !== 'number') continue
+    const entry = { kind: limit.kind, percentUsed: limit.percentUsed }
+    if (typeof limit.resetsAt === 'string') entry.resetsAt = limit.resetsAt
+    rateLimits.push(entry)
+  }
+  usage = { context: context, rateLimits: rateLimits }
+  if (u.cost && typeof u.cost.usd === 'number') usage.cost = { usd: u.cost.usd }
 }
 
 // A session's record is the file named after its id. While this process is
@@ -469,6 +511,12 @@ async function heartbeat($) {
   } catch { surfaces = [] }
   let model = null
   try { model = await $.session.model() } catch {}
+  // session.measure pushes the figures after each turn; a mod loaded into a
+  // session already running reads them once (the plain call costs nothing).
+  if (usage === null && usageAsks < 3) {
+    usageAsks += 1
+    try { noteUsage(await $.session.usage()) } catch {}
+  }
   await writeJson($, dir + '/session.json', {
     protocol: PROTOCOL,
     sid: sid,
@@ -484,6 +532,8 @@ async function heartbeat($) {
     model: model,
     permissionMode: permissionMode,
     effort: effort,
+    sessionEffort: sessionEffort,
+    usage: usage,
     commandsRev: commandsRev,
     activeTurn: activeTurn,
     waiting: Array.from(waiting.values()),
@@ -864,6 +914,8 @@ async function runSlashCommand($, command) {
   // A command may start an agent and no turn (a skill that runs in the
   // background): what that agent asks is asked where the command came from.
   lastTurnFromT3 = true
+  // Its turn is the command's, whether or not this mod's own hooks hear the run.
+  commandPending = true
   $.command.run({ command: command.name, args: command.args || '' }).then(async (result) => {
     panelClosed()
     if (settled) return
@@ -1196,11 +1248,21 @@ export function register(on) {
 
   on('classic.PreToolUse', async ($, e, next) => {
     noteClassic($, e)
+    noteSessionEffort(e)
     return next(e)
   })
 
   on('classic.Stop', async ($, e, next) => {
     noteClassic($, e)
+    noteSessionEffort(e)
+    return next(e)
+  })
+
+  // The status line's figures as they move: after each turn of the main
+  // loop, and when a rate-limit window moves a whole point.
+  on('session.measure', async ($, e, next) => {
+    noteUsage(e)
+    try { await heartbeat($) } catch {}
     return next(e)
   })
 
@@ -1304,6 +1366,7 @@ export function register(on) {
   // A command typed at the terminal is the person speaking from there.
   on('command.run', async ($, e, next) => {
     if (e && e.origin && e.origin.kind === 'composer') lastTurnFromT3 = false
+    commandPending = true
     return next(e)
   })
 
@@ -1319,6 +1382,8 @@ export function register(on) {
       } catch {}
     }
     submitted = { text: e.text, origin: e.origin && typeof e.origin.kind === 'string' ? e.origin.kind : undefined }
+    // A plain prompt: the turn it starts is no command's.
+    if (typeof e.text === 'string' && e.text.trim().charAt(0) !== '/') commandPending = false
     return next(e)
   })
 
@@ -1327,6 +1392,8 @@ export function register(on) {
   // the Agent call's rows, and its requests through tool.check.
   on('turn.start', async ($, e, next) => {
     if (e.agentId) return next(e)
+    effortTurn = { byCommand: commandPending, read: false }
+    commandPending = false
     const offset = await transcriptOffset($)
     let commandId
     let promptUuid

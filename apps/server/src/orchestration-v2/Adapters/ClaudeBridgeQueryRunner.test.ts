@@ -52,6 +52,11 @@ const attach = (input: {
   readonly heldElsewhere?: boolean;
   /** The turn the session is running when the runner attaches. */
   readonly activeTurn?: ClaudeBridgeRegistry.ClaudeBridgeProcess["session"]["activeTurn"];
+  /** What the session's mod reports of its effort and status line. */
+  readonly reported?: Pick<
+    ClaudeBridgeRegistry.ClaudeBridgeProcess["session"],
+    "effort" | "sessionEffort" | "usage"
+  >;
   readonly bridgeCanUseTool: (
     tool: string,
     toolInput: Record<string, unknown>,
@@ -85,6 +90,7 @@ const attach = (input: {
         model: "claude-sonnet-4-6",
         permissionMode: "default",
         effort: null,
+        ...input.reported,
         commandsRev: 1,
         activeTurn: input.activeTurn ?? null,
         ...(input.waiting === undefined ? {} : { waiting: input.waiting }),
@@ -177,6 +183,8 @@ const attach = (input: {
     const deliveries: Array<string> = [];
     /** The permission mode each request was said to offer with an approval. */
     const offeredModes: Array<string | undefined> = [];
+    /** What the runner passed on of the session's effort and status line, in order. */
+    const nativeStates = yield* Queue.unbounded<ClaudeAdapterV2.ClaudeBridgeNativeState>();
     const session = yield* runner.open({
       threadId: ThreadId.make("bridge-thread"),
       providerSessionId: ProviderSessionId.make("bridge-provider-session"),
@@ -202,6 +210,9 @@ const attach = (input: {
         Effect.sync(() => {
           deliveries.push(`${delivery.delivery} ${delivery.promptUuid}`);
         }),
+      bridgeOnNativeState: (state) => {
+        Queue.offerUnsafe(nativeStates, state);
+      },
     });
     yield* Effect.addFinalizer(() => session.close.pipe(Effect.orDie));
     const handler = yield* Deferred.await(subscribed);
@@ -217,6 +228,7 @@ const attach = (input: {
       asked,
       deliveries,
       offeredModes,
+      nativeStates,
     };
   });
 
@@ -2331,6 +2343,91 @@ describe("ClaudeBridgeQueryRunner notices between turns", () => {
       });
       yield* noticeShown(bridge);
       assert.notInclude(bridge.recordChanges, "older-rows");
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+});
+
+describe("ClaudeBridgeQueryRunner what the session reports of itself", () => {
+  const usage = (tokens: number, fiveHour: number) => ({
+    context: { tokens, window: 200_000, percent: Math.round((tokens / 200_000) * 100) },
+    rateLimits: [{ kind: "five_hour", percentUsed: fiveHour, resetsAt: "2026-10-14T15:00:00Z" }],
+    cost: { usd: 1.25 },
+  });
+  const report = (
+    bridge: { readonly process: ClaudeBridgeRegistry.ClaudeBridgeProcess },
+    reported: Partial<ClaudeBridgeRegistry.ClaudeBridgeProcess["session"]>,
+  ) => Object.assign(bridge.process, { session: { ...bridge.process.session, ...reported } });
+  const recapRow = (uuid: string, atMs: number) =>
+    `${JSON.stringify({
+      type: "system",
+      subtype: "away_summary",
+      content: "Back to the login bug.",
+      uuid,
+      parentUuid: null,
+      isSidechain: false,
+      isMeta: false,
+      timestamp: stamp(atMs),
+    })}\n`;
+  /**
+   * A row the tail shows as a notice, waited for: the pass that read it read
+   * the session's report first.
+   */
+  const passRead = (
+    bridge: {
+      readonly process: ClaudeBridgeRegistry.ClaudeBridgeProcess;
+      readonly session: ClaudeAdapterV2.ClaudeAgentSdkQuerySession;
+      readonly now: number;
+    },
+    uuid: string,
+  ) =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      yield* fs.writeFileString(bridge.process.session.transcriptPath, recapRow(uuid, bridge.now), {
+        flag: "a",
+      });
+      yield* bridge.session.messages.pipe(
+        Stream.filter(isClaudeBridgeNoticeFrame),
+        Stream.take(1),
+        Stream.runCollect,
+      );
+    });
+
+  it.live("passes on its effort and status line at attach, and again only when they change", () =>
+    Effect.gen(function* () {
+      const bridge = yield* attach({
+        protocol: 2,
+        bridgeCanUseTool: () => null,
+        transcript: "",
+        reported: { effort: "high", sessionEffort: "low", usage: usage(40_000, 12) },
+      });
+      assert.deepStrictEqual(yield* Queue.take(bridge.nativeStates), {
+        sessionEffort: "low",
+        lastTurnEffort: "high",
+        usage: usage(40_000, 12),
+      });
+      report(bridge, { effort: "low", usage: usage(52_000, 13) });
+      assert.deepStrictEqual(yield* Queue.take(bridge.nativeStates), {
+        sessionEffort: "low",
+        lastTurnEffort: "low",
+        usage: usage(52_000, 13),
+      });
+      // Later passes read the same report and pass on nothing.
+      yield* passRead(bridge, "00000000-0000-4000-8000-0000000000d1");
+      yield* passRead(bridge, "00000000-0000-4000-8000-0000000000d2");
+      assert.strictEqual(yield* Queue.size(bridge.nativeStates), 0);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.live("passes on nothing from a mod that does not report it", () =>
+    Effect.gen(function* () {
+      const bridge = yield* attach({
+        protocol: 2,
+        bridgeCanUseTool: () => null,
+        reported: { effort: "high" },
+        transcript: "",
+      });
+      yield* passRead(bridge, "00000000-0000-4000-8000-0000000000d3");
+      assert.strictEqual(yield* Queue.size(bridge.nativeStates), 0);
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 });
