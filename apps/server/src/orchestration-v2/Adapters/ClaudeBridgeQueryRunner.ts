@@ -404,6 +404,11 @@ export const layer: Layer.Layer<
         approvals: new Map<string, AbortController>(),
         /** Requests the session settled without T3: nothing is sent back for them. */
         settledElsewhere: new Set<string>(),
+        /**
+         * A slash command sent from T3 that waits in a dialog of its own in
+         * the terminal: its run is open here, saying so, until it settles.
+         */
+        commandWaiting: null as string | null,
         /** Printed command output read while no turn was open, kept for whatever it belongs to. */
         heldOutput: [] as Array<SDKMessage>,
         heldAt: 0,
@@ -820,7 +825,10 @@ export const layer: Layer.Layer<
               }
             }
             for (const frame of translator.onTranscriptRow(row)) {
-              if (isClaudeBridgeCommandOutputFrame(frame) && !sessionTurnOpen()) {
+              if (
+                isClaudeBridgeCommandOutputFrame(frame) &&
+                (!sessionTurnOpen() || state.commandWaiting !== null)
+              ) {
                 state.heldOutput.push(frame);
                 state.heldAt = state.lastRowAt;
               } else {
@@ -1032,17 +1040,23 @@ export const layer: Layer.Layer<
         Effect.gen(function* () {
           yield* closeRequestTurn(true);
           const now = yield* Clock.currentTimeMillis;
-          yield* emit(
-            translator.onTurnStart({
-              seq: 0,
-              at: now,
-              type: "turn.start",
-              turnId: input.turnId,
-              text: input.text,
-              transcriptOffset: 0,
-              ...(input.promptUuid === null ? {} : { promptUuid: input.promptUuid }),
-            }),
-          );
+          // A command that waited in a terminal dialog has its turn open already.
+          const opened =
+            state.commandWaiting !== null && input.turnId === `command-${state.commandWaiting}`;
+          if (opened) state.commandWaiting = null;
+          if (!opened) {
+            yield* emit(
+              translator.onTurnStart({
+                seq: 0,
+                at: now,
+                type: "turn.start",
+                turnId: input.turnId,
+                text: input.text,
+                transcriptOffset: 0,
+                ...(input.promptUuid === null ? {} : { promptUuid: input.promptUuid }),
+              }),
+            );
+          }
           const output = state.heldOutput.splice(0);
           yield* emit(output);
           const complete = {
@@ -1502,6 +1516,8 @@ export const layer: Layer.Layer<
               ) {
                 state.pendingPrompt = null;
               }
+              // A turn begins: whatever a waiting command had open gives way to it.
+              state.commandWaiting = null;
               // A message sent to steer the turn before this one met no tool
               // call there: this turn is the session taking it.
               yield* promptTaken({ promptUuid: event.promptUuid, commandId: event.commandId });
@@ -1530,6 +1546,35 @@ export const layer: Layer.Layer<
             }
             case "command.result": {
               if (state.pendingPrompt?.commandId !== event.commandId) return;
+              if (event.interim) {
+                // It waits in a dialog of its own in the terminal. Its run
+                // opens now and says so; it settles when the dialog closes,
+                // with what it printed there.
+                if (state.commandWaiting === event.commandId) return;
+                const waiting = state.pendingPrompt;
+                state.commandWaiting = event.commandId;
+                yield* emit(
+                  translator.onTurnStart({
+                    seq: 0,
+                    at: event.at,
+                    type: "turn.start",
+                    turnId: `command-${event.commandId}`,
+                    text: waiting.label ?? "(slash command)",
+                    transcriptOffset: 0,
+                    promptUuid: waiting.promptUuid,
+                  }),
+                );
+                const uuid = yield* crypto.randomUUIDv4.pipe(Effect.orDie);
+                yield* emit([
+                  claudeSessionNoticeFrame({
+                    uuid,
+                    sessionId: sid,
+                    subtype: "notification",
+                    content: event.text,
+                  }),
+                ]);
+                return;
+              }
               const pending = state.pendingPrompt;
               state.pendingPrompt = null;
               if (event.startedTurn) return;

@@ -243,6 +243,7 @@ describe("turns that were over long before T3 read of them", () => {
       ok: true,
       startedTurn: false,
       waitingInTerminal: false,
+      interim: false,
       text: "done",
     } as const;
     const events = [start("t1", at), result, complete("t1", at + 1_000), start("t2", at + 60_000)];

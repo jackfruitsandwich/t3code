@@ -117,8 +117,10 @@ const COMMAND_PANEL_WAIT_MS = 6000
 // closed by the person at that terminal and everything queued behind it waits,
 // so these are not run from T3 without an argument. Commands found to behave
 // this way later are remembered in the plugin store.
-// Commands that ask in a dialog even when typed with their argument (observed).
-const ARGUMENT_PANELS = new Set(['add-dir'])
+// Commands that ask in a dialog even when typed with an argument: /add-dir
+// (observed), and the screens that take no argument at all, so one typed
+// after them changes nothing (Claude Code 2.1.299's own definitions).
+const ARGUMENT_PANELS = new Set(['add-dir', 'usage-credits', 'extra-usage', 'stop'])
 const KNOWN_PANELS = new Set([${CLAUDE_BARE_PANEL_COMMANDS.map((name) => `'${name}'`).join(", ")}])
 
 const instanceId = Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8)
@@ -765,7 +767,7 @@ async function runSlashCommand($, command) {
     return
   }
   if (ARGUMENT_PANELS.has(command.name)) {
-    await report({ ok: true, text: 'Not run: ' + label + ' asks in a dialog in the Claude Code terminal even when given its argument, and only that terminal can show and answer it. Run it there.' })
+    await report({ ok: true, text: 'Not run: ' + label + ' asks in a dialog in the Claude Code terminal even when given an argument, and only that terminal can show and answer it. Run it there.' })
     return
   }
   if (!command.args && (await opensPanel($, command.name))) {
@@ -842,15 +844,19 @@ async function runSlashCommand($, command) {
       lookAgain()
       return
     }
-    settled = true
-    pendingCommand = null
+    // It asks in a dialog of its own (/effort <level> mid-conversation since
+    // Claude Code 2.1.299). T3 is told it waits there; the command settles
+    // when the dialog closes, with what it printed, so the record's rows for
+    // it are this command's and not another one typed in the terminal.
+    if (holdsPanel) return
     holdsPanel = true
     panelsOpen += 1
     $.store.set('panel:' + MOD_VERSION + ':' + command.name, true).catch(() => {})
     await report({
       ok: true,
       waitingInTerminal: true,
-      text: label + ' opened a panel in the Claude Code terminal and is waiting there. Close it in that terminal (Esc); nothing else runs in this session until then.',
+      interim: true,
+      text: label + ' opened a panel in the Claude Code terminal and is waiting there for an answer only that terminal can give. Nothing else runs in this session until then.',
     })
   }
   lookAgain()

@@ -31,7 +31,7 @@ import type {
 import { isRecord, parseJsonlLine } from "../import/sessionImportTypes.ts";
 
 export const CLAUDE_BRIDGE_PROTOCOL_VERSION = 2;
-export const CLAUDE_BRIDGE_MOD_VERSION = "0.3.24";
+export const CLAUDE_BRIDGE_MOD_VERSION = "0.3.25";
 /**
  * The first protocol whose mod runs slash commands, answers questions with
  * their answers and reports the session's own commands. A process still on an
@@ -419,6 +419,11 @@ export type ClaudeBridgeEvent = { readonly seq: number; readonly at: number } & 
       readonly ok: boolean;
       readonly startedTurn: boolean;
       readonly waitingInTerminal: boolean;
+      /**
+       * Not the end: the command opened a dialog of its own in the terminal
+       * and waits there. Its result follows once that closes.
+       */
+      readonly interim: boolean;
       readonly text: string;
     }
   | { readonly type: "ended"; readonly reason: string; readonly sessionId: string }
@@ -671,6 +676,7 @@ export function parseClaudeBridgeEvent(value: unknown): ClaudeBridgeEvent | null
         ok: value.ok === true,
         startedTurn: value.startedTurn === true,
         waitingInTerminal: value.waitingInTerminal === true,
+        interim: value.interim === true,
         text: readOptionalString(value.text) ?? "",
       };
     case "config.result":
