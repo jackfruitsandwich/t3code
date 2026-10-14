@@ -780,3 +780,127 @@ describe("what the terminal draws that is not a text block", () => {
     assert.isNull(claudePeerMessageNotification(null, null));
   });
 });
+
+describe("a prompt the session took back", () => {
+  const prompt = (uuid: string, parentUuid: string | null, minute: number, content: string) =>
+    line(
+      userEntry({
+        uuid,
+        parentUuid,
+        timestamp: `2026-07-01T10:${String(minute).padStart(2, "0")}:00.000Z`,
+        message: { role: "user", content },
+      }),
+    );
+  const reply = (uuid: string, parentUuid: string, minute: number, text: string) =>
+    line(
+      assistantEntry({
+        uuid,
+        parentUuid,
+        timestamp: `2026-07-01T10:${String(minute).padStart(2, "0")}:30.000Z`,
+        message: { role: "assistant", content: [{ type: "text", text }] },
+      }),
+    );
+  const withdrawn = (content: string) =>
+    parseClaudeSessionJsonl(content)
+      .messages.filter((message) => message.withdrawn === true)
+      .map((message) => message.sourceId);
+
+  it("is marked when what was sent next goes on from where it did and nothing answered it", () => {
+    const parsed = parseClaudeSessionJsonl(
+      line(userEntry()) +
+        line(assistantEntry()) +
+        prompt("taken-back", "assistant-uuid-1", 1, "Put the rig under git") +
+        // Esc writes no reply: only the harness's own rows hang off the prompt.
+        line({
+          type: "attachment",
+          uuid: "hook-cancelled",
+          parentUuid: "taken-back",
+          isSidechain: false,
+          timestamp: "2026-07-01T10:01:01.000Z",
+          attachment: { type: "hook_cancelled" },
+        }) +
+        prompt("resent", "assistant-uuid-1", 2, "Put the rig under git, then the fresh cases") +
+        reply("resent-reply", "resent", 2, "Done."),
+    );
+    assert.deepEqual(
+      parsed.messages.map((message) => [message.sourceId, message.withdrawn === true]),
+      [
+        ["user-uuid-1", false],
+        ["assistant-uuid-1", false],
+        ["taken-back", true],
+        ["resent", false],
+        ["resent-reply", false],
+      ],
+    );
+    assert.strictEqual(parsed.title, "Fix the login bug");
+  });
+
+  it("is marked when it was the session's first prompt", () => {
+    assert.deepEqual(
+      withdrawn(
+        prompt("first", null, 0, "Fix the login bug") +
+          prompt("first-again", null, 1, "Fix the login bug") +
+          reply("answer", "first-again", 1, "Fixed."),
+      ),
+      ["first"],
+    );
+  });
+
+  it("is not a prompt something answered, before a /rewind went back past it", () => {
+    assert.deepEqual(
+      withdrawn(
+        line(userEntry()) +
+          line(assistantEntry()) +
+          prompt("answered", "assistant-uuid-1", 1, "Try the other way") +
+          reply("answered-reply", "answered", 1, "Tried it.") +
+          prompt("after-rewind", "assistant-uuid-1", 2, "Try a third way") +
+          reply("after-rewind-reply", "after-rewind", 2, "Tried that too."),
+      ),
+      [],
+    );
+  });
+
+  it("is not a prompt stopped mid-turn, which the next one goes on from", () => {
+    assert.deepEqual(
+      withdrawn(
+        line(userEntry()) +
+          line(assistantEntry()) +
+          prompt("stopped", "assistant-uuid-1", 1, "Run the whole suite") +
+          prompt("interrupt", "stopped", 1, "[Request interrupted by user]") +
+          // Its turn still going: nothing below the stopped prompt has answered yet.
+          prompt("next", "interrupt", 2, "Only the parser tests"),
+      ),
+      [],
+    );
+  });
+
+  it("is never told in a record that names no row's parent", () => {
+    assert.deepEqual(
+      withdrawn(
+        prompt("first", null, 0, "Fix the login bug") +
+          prompt("second", null, 1, "And the logout bug") +
+          line(assistantEntry({ uuid: "answer", parentUuid: null })),
+      ),
+      [],
+    );
+  });
+
+  it("is never a command, nor the last prompt while its turn is still going", () => {
+    assert.deepEqual(
+      withdrawn(
+        line(userEntry()) +
+          line(assistantEntry()) +
+          prompt(
+            "command",
+            "assistant-uuid-1",
+            1,
+            "<command-name>/compact</command-name>\n<command-message>compact</command-message>\n<command-args></command-args>",
+          ) +
+          prompt("after-command", "assistant-uuid-1", 2, "Go on") +
+          reply("after-command-reply", "after-command", 2, "Going on.") +
+          prompt("in-flight", "after-command-reply", 3, "And then?"),
+      ),
+      [],
+    );
+  });
+});

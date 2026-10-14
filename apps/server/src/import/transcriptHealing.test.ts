@@ -10,6 +10,7 @@ import {
   planRecordSeating,
   planTaskNoticeHealing,
   planTranscriptHealing,
+  planWithdrawnRuns,
   recordKeyOfTurnItem,
   type SeatingRow,
   sentPromptLines,
@@ -572,5 +573,91 @@ describe("the record's lines", () => {
         ["sent-3", { line: 20, atMs: ms(20) }],
       ],
     );
+  });
+});
+
+describe("a prompt the session took back", () => {
+  const sent = (
+    sourceId: string,
+    text: string,
+    minute: number,
+    second: number,
+    withdrawn = false,
+  ): ParsedSessionMessage => ({
+    role: "user",
+    sourceId,
+    text,
+    timestamp: at(minute, second),
+    lineIndex: minute * 60 + second,
+    ...(withdrawn ? { withdrawn: true as const } : {}),
+  });
+  const copy = (
+    messageId: string,
+    role: "user" | "assistant",
+    text: string,
+    minute: number,
+    second: number,
+    runId: string,
+  ): HealingKnownMessage => ({ messageId, role, text, atMs: ms(minute, second), runId });
+  // Sent, taken back with Esc, and sent again in the same words a minute on.
+  const rows = [
+    row("user", "u1", "first prompt", 0),
+    row("assistant", "a1", "first reply", 0),
+    sent("taken-back", "put the rig under git", 1, 0, true),
+    sent("resent", "put the rig under git", 2, 0),
+    { ...row("assistant", "resent-reply", "done", 3), lineIndex: 180 },
+  ];
+  const known = [
+    copy("m1", "user", "first prompt", 0, 0, "run-1"),
+    copy("m2", "assistant", "first reply", 0, 0, "run-1"),
+    // T3 may hold the copies in any order: the one closest in time is each row's.
+    copy("m5", "assistant", "done", 3, 0, "run-3"),
+    copy("m4", "user", "put the rig under git", 2, 1, "run-3"),
+    copy("m3", "user", "put the rig under git", 1, 1, "run-2"),
+  ];
+  const runsWith = (second: string) => [
+    { id: "run-1", status: "completed" },
+    { id: "run-2", status: second },
+    { id: "run-3", status: "completed" },
+  ];
+  const takenBack = (
+    input: {
+      known?: ReadonlyArray<HealingKnownMessage>;
+      second?: string;
+      fromLine?: number;
+    } = {},
+  ) =>
+    planWithdrawnRuns({
+      rows,
+      known: input.known ?? known,
+      runs: runsWith(input.second ?? "interrupted"),
+      fromLine: input.fromLine ?? 0,
+    });
+
+  it("is not added to the thread", () => {
+    assert.deepEqual(plan(rows, []), ["0:u1", "0:a1", "0:resent", "0:resent-reply"]);
+  });
+
+  it("takes back the run T3 started for it, not the resend's", () => {
+    assert.deepEqual(takenBack(), ["run-2"]);
+    assert.deepEqual(takenBack({ second: "cancelled" }), ["run-2"]);
+  });
+
+  it("leaves a run that has not ended, ended as its own turn, or was already taken back", () => {
+    assert.deepEqual(takenBack({ second: "running" }), []);
+    assert.deepEqual(takenBack({ second: "completed" }), []);
+    assert.deepEqual(takenBack({ second: "rolled_back" }), []);
+  });
+
+  it("leaves a run that holds more than the prompt", () => {
+    assert.deepEqual(
+      takenBack({ known: [...known, copy("m6", "assistant", "half a reply", 1, 20, "run-2")] }),
+      [],
+    );
+  });
+
+  it("takes back nothing written before the thread's floor", () => {
+    assert.deepEqual(takenBack({ fromLine: 61 }), []);
+    assert.deepEqual(takenBack({ fromLine: 60 }), ["run-2"]);
   });
 });

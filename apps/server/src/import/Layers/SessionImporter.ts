@@ -112,6 +112,7 @@ import {
   planImportedRowReseating,
   planNoticeHealing,
   planTaskNoticeHealing,
+  planWithdrawnRuns,
   planRecordSeating,
   planTranscriptHealing,
   recordKeyOfTurnItem,
@@ -1252,6 +1253,66 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
      * message. Nobody typed them. Where the session's record has no such
      * prompt, the row becomes the notice a background wake shows.
      */
+    /**
+     * Takes back the runs T3 holds for prompts the session took back before
+     * answering them, as a rewind of T3's own does: the run and its root
+     * node are marked rolled back, which every client leaves out of the
+     * thread; nothing is deleted.
+     */
+    const takeBackWithdrawnRuns = Effect.fn("SessionImporter.takeBackWithdrawnRuns")(
+      function* (input: {
+        readonly threadId: ThreadId;
+        readonly rows: ReadonlyArray<ParsedSessionMessage>;
+        readonly known: ReadonlyArray<HealingKnownMessage>;
+        readonly fromLine: number;
+      }) {
+        const { threadId } = input;
+        const records = yield* threads.getThreadRecords(threadId, ["runs", "nodes"]);
+        const takenBack = new Set(
+          planWithdrawnRuns({
+            rows: input.rows,
+            known: input.known,
+            runs: records.runs.map((run) => ({ id: run.id, status: run.status })),
+            fromLine: input.fromLine,
+          }),
+        );
+        if (takenBack.size === 0) return;
+        const now = yield* DateTime.now;
+        const events: Array<OrchestrationV2DomainEvent> = [];
+        for (const run of records.runs) {
+          if (!takenBack.has(run.id)) continue;
+          const root = records.nodes.find((node) => node.id === run.rootNodeId);
+          events.push({
+            id: importEventId(threadId, `withdrawn:${run.id}`),
+            type: "run.updated",
+            threadId,
+            runId: run.id,
+            ...(root === undefined ? {} : { nodeId: root.id }),
+            providerInstanceId: run.providerInstanceId,
+            occurredAt: now,
+            payload: { ...run, status: "rolled_back" },
+          });
+          if (root !== undefined) {
+            events.push({
+              id: importEventId(threadId, `withdrawn-node:${run.id}`),
+              type: "node.updated",
+              threadId,
+              runId: run.id,
+              nodeId: root.id,
+              providerInstanceId: run.providerInstanceId,
+              occurredAt: now,
+              payload: { ...root, status: "rolled_back" },
+            });
+          }
+        }
+        yield* eventSink.write({ events });
+        yield* Effect.logInfo("session.importer.withdrawn-prompts-taken-back", {
+          threadId,
+          runIds: [...takenBack],
+        });
+      },
+    );
+
     const retireInventedPrompts = Effect.fn("SessionImporter.retireInventedPrompts")(
       function* (input: {
         readonly threadId: ThreadId;
@@ -1971,6 +2032,21 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
           addedCount: missing.length,
           noticeCount: notices.length + taskNotices.length,
           live: input.live,
+        });
+      }
+      // A prompt the session took back (Esc put it back in the input box) is
+      // not in its conversation: the run T3 started for it is taken back as
+      // T3's own rewind takes a run back, its rows kept. From the same floor.
+      if (
+        parsed.messages.some(
+          (message) => message.withdrawn === true && message.lineIndex >= noticesFromLine,
+        )
+      ) {
+        yield* takeBackWithdrawnRuns({
+          threadId,
+          rows: parsed.messages,
+          known: knownMessages,
+          fromLine: noticesFromLine,
         });
       }
       yield* retireInventedPrompts({ threadId, rows: parsed.messages });

@@ -32,6 +32,13 @@ export interface ParsedSessionMessage {
    * what the notice says, in the row's own words. `text` stays the row's.
    */
   readonly notice?: ParsedSessionNotice;
+  /**
+   * A prompt the session took back before answering it (Esc put it back in
+   * the input box): a later prompt or command goes on from where this one
+   * did, and nothing answered it. It is in the record but not in the
+   * conversation, and the terminal no longer draws it (Claude).
+   */
+  readonly withdrawn?: true;
 }
 
 export interface ParsedSessionNotice {

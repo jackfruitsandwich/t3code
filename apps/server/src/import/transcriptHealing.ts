@@ -168,6 +168,8 @@ export function planTranscriptHealing(input: {
       }
       if (shown[index]) return;
       if (row.notice !== undefined || isClaudeHarnessPrompt(row.text)) return;
+      // Taken back before anything answered it: not in the conversation.
+      if (row.withdrawn === true) return;
       // A prompt T3 shows in other words: the turn it started ran in T3, and
       // that run has its prompt. Only a run known to have none (one that
       // picked the turn up after it began) leaves the prompt to be added.
@@ -236,6 +238,65 @@ export function planNoticeHealing(input: {
     if (input.settledBeforeMs !== undefined && atMs >= input.settledBeforeMs) return [];
     return [{ notice, band: bandForTime(input.runs, atMs) }];
   });
+}
+
+/** A run of the thread and how it ended. */
+export interface HealingRunState {
+  readonly id: string;
+  readonly status: string;
+}
+
+/**
+ * The runs T3 holds for prompts the session took back (Esc put the prompt
+ * back in the input box before anything answered it): each such run ended
+ * with nothing but that prompt, which is no longer in the conversation. The
+ * thread takes them back as it takes back a run of its own on a rewind.
+ * A prompt pairs with T3's copy by its words, closest in time first, each
+ * copy standing for one row; a run that holds a reply or another prompt, or
+ * has not ended, stays. Only rows from line `fromLine` on.
+ */
+export function planWithdrawnRuns(input: {
+  readonly rows: ReadonlyArray<ParsedSessionMessage>;
+  readonly known: ReadonlyArray<HealingKnownMessage>;
+  readonly runs: ReadonlyArray<HealingRunState>;
+  readonly fromLine: number;
+}): ReadonlyArray<string> {
+  const { rows, known } = input;
+  if (!rows.some((row) => row.withdrawn === true && row.lineIndex >= input.fromLine)) return [];
+  const prompts = rows.flatMap((row, index) =>
+    row.role === "user" && row.command !== true && row.notice === undefined ? [index] : [],
+  );
+  const copies = known.filter((message) => message.role === "user" && message.runId !== null);
+  const pairs = prompts.flatMap((index) => {
+    const row = rows[index]!;
+    const text = normalize(row.text);
+    const atMs = timeMs(row.timestamp);
+    return copies.flatMap((copy, copyIndex) => {
+      const distance = Math.abs(copy.atMs - atMs);
+      return distance <= SAME_TURN_WINDOW_MS && samePrompt(normalize(copy.text), text)
+        ? [{ index, copyIndex, distance }]
+        : [];
+    });
+  });
+  const copyOf = new Map<number, HealingKnownMessage>();
+  const taken = new Set<number>();
+  for (const pair of pairs.toSorted((left, right) => left.distance - right.distance)) {
+    if (copyOf.has(pair.index) || taken.has(pair.copyIndex)) continue;
+    copyOf.set(pair.index, copies[pair.copyIndex]!);
+    taken.add(pair.copyIndex);
+  }
+  const statuses = new Map(input.runs.map((run) => [run.id, run.status]));
+  const takenBack = new Set<string>();
+  for (const [index, copy] of copyOf) {
+    const row = rows[index]!;
+    if (row.withdrawn !== true || row.lineIndex < input.fromLine || copy.runId === null) continue;
+    const status = statuses.get(copy.runId);
+    if (status !== "interrupted" && status !== "cancelled") continue;
+    const held = known.filter((message) => message.runId === copy.runId);
+    if (held.length !== 1) continue;
+    takenBack.add(copy.runId);
+  }
+  return [...takenBack];
 }
 
 /** A background task's notice the thread shows. */

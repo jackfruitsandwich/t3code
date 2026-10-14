@@ -25,6 +25,7 @@ import {
   claudeTranscriptCommandText,
   claudeTranscriptPermissionMode,
   isClaudeBridgeModRow,
+  isClaudeHarnessPrompt,
   makeClaudePlainCommandReader,
   stripTerminalStyling,
 } from "../claude-bridge/ClaudeBridgeProtocol.ts";
@@ -197,6 +198,66 @@ function extractTextContent(content: unknown): string {
   return parts.join("\n\n");
 }
 
+/**
+ * The prompts the session took back before answering them. Esc right after
+ * sending puts the prompt back in the input box and takes it out of the
+ * conversation: the record keeps its row, but what is sent next goes on from
+ * where that prompt did, as its sibling, and the terminal no longer draws it.
+ * A prompt something answered (a reply, a tool call, an error) is a turn of
+ * its own, and /rewind's branches are not told here.
+ */
+function withdrawnPrompts(
+  messages: ReadonlyArray<ParsedSessionMessage>,
+  parentOf: ReadonlyMap<string, string | null>,
+  childrenOf: ReadonlyMap<string, ReadonlyArray<string>>,
+  answers: ReadonlySet<string>,
+): ReadonlySet<string> {
+  // A record that names no row's parent says nothing of where each went on from.
+  if (childrenOf.size === 0) return new Set();
+  // The lines of what the person (or the harness) sent next, by the row each goes on from.
+  const sentFrom = new Map<string | null, Array<number>>();
+  for (const message of messages) {
+    if (message.role !== "user" || message.midTurn === true || !parentOf.has(message.sourceId)) {
+      continue;
+    }
+    const parent = parentOf.get(message.sourceId) ?? null;
+    const lines = sentFrom.get(parent);
+    if (lines === undefined) sentFrom.set(parent, [message.lineIndex]);
+    else lines.push(message.lineIndex);
+  }
+  const answered = (rowId: string) => {
+    const queue = [rowId];
+    const seen = new Set(queue);
+    for (let next = queue.pop(); next !== undefined; next = queue.pop()) {
+      for (const child of childrenOf.get(next) ?? []) {
+        if (answers.has(child)) return true;
+        if (!seen.has(child)) {
+          seen.add(child);
+          queue.push(child);
+        }
+      }
+    }
+    return false;
+  };
+  const withdrawn = new Set<string>();
+  for (const message of messages) {
+    if (
+      message.role !== "user" ||
+      message.command === true ||
+      message.midTurn === true ||
+      message.notice !== undefined ||
+      !parentOf.has(message.sourceId) ||
+      isClaudeHarnessPrompt(message.text)
+    ) {
+      continue;
+    }
+    const parent = parentOf.get(message.sourceId) ?? null;
+    const sentLater = (sentFrom.get(parent) ?? []).some((line) => line > message.lineIndex);
+    if (sentLater && !answered(message.sourceId)) withdrawn.add(message.sourceId);
+  }
+  return withdrawn;
+}
+
 export function parseClaudeSessionJsonl(content: string): ParsedCliSession {
   const lines = splitCompleteJsonlLines(content);
   const messages: ParsedSessionMessage[] = [];
@@ -213,6 +274,11 @@ export function parseClaudeSessionJsonl(content: string): ParsedCliSession {
   let entrypoint: string | undefined;
   let permissionMode: string | undefined;
   let malformedLineCount = 0;
+  // Where each row of the main conversation goes on from, to tell the prompts
+  // the session took back from the ones it went on with.
+  const parentOf = new Map<string, string | null>();
+  const childrenOf = new Map<string, Array<string>>();
+  const answers = new Set<string>();
 
   for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
     const line = lines[lineIndex] ?? "";
@@ -226,6 +292,17 @@ export function parseClaudeSessionJsonl(content: string): ParsedCliSession {
     }
     if (!isRecord(entry)) {
       continue;
+    }
+    const rowId = readString(entry.uuid);
+    if (rowId !== undefined && entry.isSidechain !== true) {
+      const parent = readString(entry.parentUuid) ?? null;
+      parentOf.set(rowId, parent);
+      if (parent !== null) {
+        const children = childrenOf.get(parent);
+        if (children === undefined) childrenOf.set(parent, [rowId]);
+        else children.push(rowId);
+      }
+      if (entry.type === "assistant") answers.add(rowId);
     }
     // A command whose rows carry no markup: told by where its rows sit.
     const plain = plainCommand(entry);
@@ -430,6 +507,13 @@ export function parseClaudeSessionJsonl(content: string): ParsedCliSession {
       lineIndex,
       ...(commandOutput !== undefined || commandText !== null ? { command: true as const } : {}),
       ...(taskNotice ? { notice: claudeTaskNotice(rawText) } : {}),
+    });
+  }
+
+  const withdrawn = withdrawnPrompts(messages, parentOf, childrenOf, answers);
+  if (withdrawn.size > 0) {
+    messages.forEach((message, index) => {
+      if (withdrawn.has(message.sourceId)) messages[index] = { ...message, withdrawn: true };
     });
   }
 

@@ -33,6 +33,8 @@ import * as Path from "effect/Path";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 
+import { isOrchestrationV2TurnItemVisible } from "@t3tools/shared/orchestrationV2Timeline";
+
 import * as CheckpointStore from "../src/checkpointing/CheckpointStore.ts";
 import * as ServerConfig from "../src/config.ts";
 import * as GitWorkflow from "../src/git/GitWorkflowService.ts";
@@ -2057,6 +2059,159 @@ runtimeTest(
       const twice = yield* heal("2026-07-01T10:53:00.000Z");
       assert.strictEqual(lines(twice, "/compact"), 2);
       assert.strictEqual(lines(twice, "Compacted (ctrl+o to see full summary)"), 2);
+    }),
+);
+
+runtimeTest(
+  "a prompt the session took back leaves the thread as a run T3 rewinds does, from the thread's floor on",
+  (h) =>
+    Effect.gen(function* () {
+      const bridgeDir = yield* h.makeDir("bridge");
+      const importer = yield* h.importer({ bridgeDir });
+      const at = (iso: string) => DateTime.toEpochMillis(DateTime.makeUnsafe(iso));
+      const session = (claudeId: string) => {
+        const c = claudeSession({ sessionId: claudeId, cwd: h.workspace });
+        const threadId = importedThreadId(claudeId);
+        const claudePath = h.claudeFile(claudeId);
+        const after = (parentUuid: string, row: Entry): Entry => ({ ...row, parentUuid });
+        return {
+          threadId,
+          claudePath,
+          history: [
+            c.user("user-1", "Fix the login bug please", "2026-07-01T10:00:00.000Z"),
+            after("user-1", c.assistant("assistant-1", "Fixed.", "2026-07-01T10:00:05.000Z")),
+          ],
+          // Sent, taken back with Esc (the record keeps the row, and the
+          // harness's own rows after it), then sent again in more words from
+          // where it had been sent.
+          takenBack: [
+            after(
+              "assistant-1",
+              c.user("taken-back", "Put the rig under git", "2026-07-01T10:05:00.000Z"),
+            ),
+            {
+              type: "attachment",
+              uuid: "hook-cancelled",
+              parentUuid: "taken-back",
+              sessionId: claudeId,
+              timestamp: "2026-07-01T10:05:01.000Z",
+              isSidechain: false,
+              attachment: { type: "hook_cancelled" },
+            },
+            after(
+              "assistant-1",
+              c.user(
+                "resent",
+                "Put the rig under git, then the fresh cases",
+                "2026-07-01T10:05:40.000Z",
+              ),
+            ),
+            after("resent", c.assistant("resent-reply", "Done.", "2026-07-01T10:05:50.000Z")),
+          ],
+          heal: (now: string) =>
+            Effect.gen(function* () {
+              yield* TestClock.setTime(at(now));
+              yield* liveSessionFile(h, claudeId);
+              yield* importer.healLiveClaudeSession({
+                sessionId: claudeId,
+                transcriptPath: claudePath,
+              });
+            }),
+          // What the bridge left: a run stopped with nothing but the prompt,
+          // then the resend's run with its reply.
+          seedRuns: Effect.gen(function* () {
+            const stopped = seedRunPayload(threadId, CLAUDE, "completed", {
+              ordinal: 2,
+              iso: "2026-07-01T10:05:00.300Z",
+            });
+            yield* h.eventSink.write({
+              events: [
+                {
+                  id: EventId.make(`seed:${threadId}:run:2`),
+                  type: "run.created",
+                  threadId,
+                  runId: stopped.runId,
+                  driver: CLAUDE,
+                  providerInstanceId: stopped.instanceId,
+                  occurredAt: stopped.at,
+                  payload: { ...stopped.payload, status: "interrupted" },
+                },
+              ],
+            });
+            yield* seedT3Prompt(
+              h,
+              threadId,
+              2,
+              "Put the rig under git",
+              "2026-07-01T10:05:00.300Z",
+            );
+            yield* seedShownTurn(h, threadId, {
+              runOrdinal: 3,
+              prompt: "Put the rig under git, then the fresh cases",
+              iso: "2026-07-01T10:05:40.300Z",
+              replies: [{ rowId: "resent-reply", text: "Done.", iso: "2026-07-01T10:05:50.000Z" }],
+            });
+          }),
+          shown: h.threads.getThreadRecords(threadId, ["runs", "attempts", "turnItems"]).pipe(
+            Effect.map((records) => ({
+              runs: records.runs
+                .toSorted((left, right) => left.ordinal - right.ordinal)
+                .map((run) => `${run.ordinal}: ${run.status}`),
+              said: records.turnItems
+                .filter(
+                  (item) =>
+                    item.type === "user_message" &&
+                    isOrchestrationV2TurnItemVisible({
+                      item,
+                      runs: records.runs,
+                      attempts: records.attempts,
+                      items: records.turnItems,
+                    }),
+                )
+                .toSorted((left, right) => left.ordinal - right.ordinal)
+                .map((item) => (item.type === "user_message" ? item.text : "")),
+            })),
+          ),
+        };
+      };
+
+      // Taken back after the thread was first compared with the record.
+      const live = session("aaaaaaaa-1111-4111-8111-1111111111e5");
+      yield* h.write(live.claudePath, live.history);
+      yield* importer.sweepNow();
+      // A turn T3 ran, then the thread is first compared with the record: its floor.
+      yield* seedT3Run(h, live.threadId, CLAUDE, "completed", {
+        ordinal: 1,
+        iso: "2026-07-01T10:01:00.000Z",
+      });
+      yield* live.heal("2026-07-01T10:01:00.000Z");
+      yield* h.append(live.claudePath, live.takenBack);
+      yield* live.seedRuns;
+      yield* live.heal("2026-07-01T10:07:00.000Z");
+      assert.deepEqual(yield* live.shown, {
+        runs: ["1: completed", "2: rolled_back", "3: completed"],
+        said: ["Fix the login bug please", "Put the rig under git, then the fresh cases"],
+      });
+      const settled = yield* h.sequence;
+      yield* live.heal("2026-07-01T10:08:00.000Z");
+      assert.strictEqual(yield* h.sequence, settled);
+
+      // Taken back before: the thread's history stays as it was.
+      const before = session("aaaaaaaa-1111-4111-8111-1111111111e6");
+      yield* h.write(before.claudePath, [...before.history, ...before.takenBack]);
+      yield* importer.sweepNow();
+      yield* seedT3Run(h, before.threadId, CLAUDE, "completed", {
+        ordinal: 1,
+        iso: "2026-07-01T10:01:00.000Z",
+      });
+      yield* before.seedRuns;
+      yield* before.heal("2026-07-01T10:07:00.000Z");
+      yield* before.heal("2026-07-01T10:08:00.000Z");
+      assert.deepEqual((yield* before.shown).runs, [
+        "1: completed",
+        "2: interrupted",
+        "3: completed",
+      ]);
     }),
 );
 
