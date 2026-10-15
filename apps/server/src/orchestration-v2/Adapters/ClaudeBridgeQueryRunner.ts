@@ -175,11 +175,13 @@ const MISSED_TURN_REPLAY_MS = 15_000;
 const LOCAL_COMMAND_QUIET_MS = 1_500;
 
 /**
- * A typed command whose output the turn it starts shows: what `/goal` prints
- * is how T3 learns the goal (the adapter reads it from that turn).
+ * A typed command whose output the turn it starts shows. What `/goal` prints
+ * is how T3 learns the goal (the adapter reads it from that turn). What a `!`
+ * line printed goes to the model, which answers it in a turn whose prompt is
+ * the line (Claude Code 2.1.300): the record would show the line twice.
  */
 const startsItsOwnTurn = (command: string | null) =>
-  command !== null && /^\/goal(?:\s|$)/u.test(command);
+  command !== null && (/^\/goal(?:\s|$)/u.test(command) || command.startsWith("! "));
 
 /** The record row a frame was read from, by uuid. */
 const frameRowUuid = (frame: SDKMessage): string | null => {

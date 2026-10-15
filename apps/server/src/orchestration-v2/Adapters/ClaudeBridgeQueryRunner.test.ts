@@ -2724,6 +2724,34 @@ describe("ClaudeBridgeQueryRunner a command typed in the terminal", () => {
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
+  // d6_bang.py in gate 0.0.90: the model answers what a `!` line printed, in
+  // a turn whose prompt is the line; the record showed the line a second time.
+  it.live("holds what a typed `!` line printed for the model's turn that follows it", () =>
+    Effect.gen(function* () {
+      const bridge = yield* attach({ protocol: 2, bridgeCanUseTool: () => null, transcript: "" });
+      const fs = yield* FileSystem.FileSystem;
+      const frames = yield* shownFrames(bridge);
+      const now = yield* Clock.currentTimeMillis;
+      yield* fs.writeFileString(
+        bridge.process.session.transcriptPath,
+        said("00000000-0000-4000-8000-0000000000b0", "<bash-input>pwd</bash-input>", now) +
+          said(
+            "00000000-0000-4000-8000-0000000000b1",
+            "<bash-stdout>/work/bangdir</bash-stdout><bash-stderr></bash-stderr>",
+            now,
+          ),
+        { flag: "a" },
+      );
+      yield* Effect.sleep("700 millis");
+      assert.deepStrictEqual(kinds(frames), []);
+      yield* turnStarts(bridge, { turnId: "turn-bang", text: "! pwd" });
+      yield* Effect.sleep("300 millis");
+      assert.deepStrictEqual(kinds(frames), ["user", "system:init", "assistant"]);
+      assert.isTrue(holds(frames, "/work/bangdir"));
+      assert.deepStrictEqual(bridge.leftToRecord, []);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
   // The adapter learns a goal from what /goal printed, inside a run.
   it.live("holds what a typed /goal printed for the turn it starts", () =>
     Effect.gen(function* () {
