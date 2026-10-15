@@ -5629,6 +5629,23 @@ export function makeClaudeAdapterV2(
               message.subtype === "compact_boundary" ||
               isClaudeBridgeNoticeFrame(message)) &&
             bufferedMessages.some(isClaudeTurnStartMessage);
+          // A hook's word on that turn (a blocked Stop hook) can also come
+          // before its start does: the mod can report the start seconds after
+          // the record has the turn's reply. Following the turn's own output,
+          // it parks with that output in its place. (Notices of other kinds
+          // with no turn begun are the record's to place.) A notice's subtype
+          // is its row's own, wider than the SDK's.
+          const noticeSubtype: unknown = isClaudeBridgeNoticeFrame(message)
+            ? Reflect.get(message, "subtype")
+            : undefined;
+          const isHookNoticeOfBufferedOutput =
+            typeof noticeSubtype === "string" &&
+            (noticeSubtype === "stop_hook_summary" || noticeSubtype.startsWith("hook_")) &&
+            bufferedMessages.some(
+              (entry) =>
+                (entry.type === "assistant" || entry.type === "user") &&
+                parentToolUseIdFromSdkMessage(entry) === null,
+            );
           const isWakeEvidence =
             isPendingTaskNotification ||
             isPendingSubagentNotification ||
@@ -5637,6 +5654,7 @@ export function makeClaudeAdapterV2(
             isNewSubagentTaskStarted ||
             isWakeTurnStart ||
             isStatusOfBufferedTurn ||
+            isHookNoticeOfBufferedOutput ||
             message.type === "assistant" ||
             message.type === "user" ||
             message.type === "result" ||

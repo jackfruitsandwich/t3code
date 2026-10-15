@@ -6893,6 +6893,99 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     ),
   );
 
+  // The mod can report a typed turn's start seconds after the record has its
+  // reply and a blocked Stop hook's summary (rig newnotices B, gate 0.0.90b:
+  // 4.3 s). The summary is kept with the reply, in its place.
+  it.effect("keeps a Stop hook's result read before its turn's start for that turn", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        const now = yield* DateTime.now;
+        yield* harness.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now,
+            attemptId: RunAttemptId.make("attempt-claude-typed-stop-1"),
+            text: "Hello.",
+            attachments: [],
+          }),
+        );
+        yield* Queue.offer(harness.sdkMessages, turnOneResult);
+        yield* awaitUntil(() => harness.terminalEvents().length === 1, "first turn terminal");
+
+        const said = "Ran 1 stop hook\nStop hook error: [stop-hook]: try again\n";
+        for (const frame of [
+          makeAssistantTextFrame({ uuid: "00000000-0000-4000-8000-000000000340", text: "two" }),
+          claudeSdkFrame({
+            type: "user",
+            message: { role: "user", content: "Stop hook feedback:\n[stop-hook]: try again\n" },
+            parent_tool_use_id: null,
+            isSynthetic: true,
+            uuid: "00000000-0000-4000-8000-000000000341",
+            session_id: WAKE_NATIVE_SESSION,
+          }),
+          claudeSdkFrame({
+            type: "system",
+            subtype: "stop_hook_summary",
+            content: said,
+            uuid: "00000000-0000-4000-8000-000000000342",
+            session_id: WAKE_NATIVE_SESSION,
+            [CLAUDE_BRIDGE_NOTICE_KEY]: true,
+          }),
+          makeAssistantTextFrame({ uuid: "00000000-0000-4000-8000-000000000343", text: "again" }),
+          // The turn's start, as the bridge passes it once the mod's word comes.
+          claudeSdkFrame({
+            type: "user",
+            message: { role: "user", content: "Reply with exactly: two" },
+            parent_tool_use_id: null,
+            uuid: "00000000-0000-4000-8000-000000000344",
+            session_id: WAKE_NATIVE_SESSION,
+            t3_wake_detail: "Reply with exactly: two",
+          }),
+          wakeTurnInit,
+        ]) {
+          yield* Queue.offer(harness.sdkMessages, frame);
+        }
+        yield* awaitUntil(() => harness.continuationRequests.length === 1, "typed continuation");
+        let quietYields = 0;
+        yield* awaitUntil(() => quietYields++ >= 50, "the frames to settle into the buffer");
+
+        const before = harness.events.length;
+        yield* harness.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now,
+            attemptId: RunAttemptId.make("attempt-claude-typed-stop-2"),
+            text: "Reply with exactly: two",
+            attachments: [],
+            messageCreatedBy: "user",
+            messageCreationSource: "provider",
+          }),
+        );
+        yield* Queue.offer(
+          harness.sdkMessages,
+          makeResultFrame({ uuid: "00000000-0000-4000-8000-000000000345", result: "again" }),
+        );
+        yield* awaitUntil(() => harness.terminalEvents().length === 2, "typed turn terminal");
+        const shown: Array<string> = [];
+        for (const event of harness.events.slice(before)) {
+          if (event.type !== "turn_item.updated") continue;
+          const item = event.turnItem;
+          const line =
+            item.type === "system_notice"
+              ? `notice: ${item.message}`
+              : item.type === "assistant_message"
+                ? `reply: ${item.text}`
+                : null;
+          if (line !== null && !shown.includes(line)) shown.push(line);
+        }
+        assert.deepEqual(shown, ["reply: two", `notice: ${said}`, "reply: again"]);
+      }).pipe(Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+    ),
+  );
+
   // Claude Code's dialog says why it asks under the call when a setting's own
   // check asks (a read outside the working directories): T3 says it there too.
   it.effect("asks a bridged call with the reason the terminal's dialog gives under it", () =>
