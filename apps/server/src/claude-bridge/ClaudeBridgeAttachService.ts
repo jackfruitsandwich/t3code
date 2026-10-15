@@ -310,7 +310,7 @@ const make = Effect.gen(function* () {
   // A short turn can be over before the run offered for it has attached, and
   // that run then shows it from its start. Compared before then, the turn
   // would be taken in as history and be there twice.
-  const heal = (sid: string, transcriptPath: string) =>
+  const heal = (sid: string, transcriptPath: string, leftToRecord?: ReadonlyArray<string>) =>
     Effect.gen(function* () {
       const awaitingRunSinceMs = ClaudeBridgeRegistry.claudeBridgeTurnAwaitingRunSince(
         yield* registry.peekMissedTurn(sid),
@@ -320,17 +320,19 @@ const make = Effect.gen(function* () {
         sessionId: sid,
         transcriptPath,
         ...(awaitingRunSinceMs === undefined ? {} : { turnAwaitingRunSinceMs: awaitingRunSinceMs }),
+        ...(leftToRecord === undefined ? {} : { leftToRecord }),
       });
     });
-  yield* registry.onRecordChange((entry, change) =>
+  yield* registry.onRecordChange((entry, change, rows) =>
     Effect.gen(function* () {
       const sid = entry.sid;
       // The attachment is waiting on this one: the message goes into the
-      // thread before the rows written after it are shown.
-      if (change === "typed-mid-turn") {
+      // thread before the rows written after it are shown. A command the
+      // attachment left to the record goes in now, in its place.
+      if (change === "typed-mid-turn" || change === "commands-left-to-record") {
         const session = (yield* registry.readSession(entry)) ?? entry.session;
         if (session.transcriptPath.length > 0) {
-          yield* heal(sid, session.transcriptPath);
+          yield* heal(sid, session.transcriptPath, rows);
         }
         return;
       }

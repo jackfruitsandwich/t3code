@@ -2063,6 +2063,73 @@ runtimeTest(
 );
 
 runtimeTest(
+  "a typed command the live attachment left to the record goes in at once, before what T3 sent after it",
+  (h) =>
+    Effect.gen(function* () {
+      const claudeId = "aaaaaaaa-1111-4111-8111-1111111111a7";
+      const c = claudeSession({ sessionId: claudeId, cwd: h.workspace });
+      const claudePath = h.claudeFile(claudeId);
+      const threadId = importedThreadId(claudeId);
+      const at = (iso: string) => DateTime.toEpochMillis(DateTime.makeUnsafe(iso));
+      yield* h.write(claudePath, [
+        c.user("user-1", "Fix the login bug please", "2026-07-01T10:00:00.000Z"),
+        c.assistant("assistant-1", "I fixed the login bug.", "2026-07-01T10:00:05.000Z"),
+      ]);
+      const bridgeDir = yield* h.makeDir("bridge");
+      const importer = yield* h.importer({ bridgeDir });
+      yield* importer.sweepNow();
+      yield* seedT3Run(h, threadId, CLAUDE, "completed", {
+        ordinal: 1,
+        iso: "2026-07-01T10:01:00.000Z",
+      });
+      // /plan typed in the terminal (Claude Code 2.1.300's two rows), then,
+      // while the server could not read them, a message sent from T3 whose
+      // run is under way.
+      yield* h.append(claudePath, [
+        c.user(
+          "plan-1",
+          "<command-name>/plan</command-name>\n            <command-message>plan</command-message>\n            <command-args></command-args>",
+          "2026-07-01T10:10:00.000Z",
+        ),
+        c.user(
+          "plan-1-out",
+          "<local-command-stdout>Enabled plan mode</local-command-stdout>",
+          "2026-07-01T10:10:00.000Z",
+        ),
+      ]);
+      yield* seedT3Run(h, threadId, CLAUDE, "running", {
+        ordinal: 2,
+        iso: "2026-07-01T10:10:08.000Z",
+      });
+      yield* seedT3Prompt(h, threadId, 2, "Reply with exactly: after", "2026-07-01T10:10:08.000Z");
+      yield* TestClock.setTime(at("2026-07-01T10:10:08.500Z"));
+      yield* liveSessionFile(h, claudeId);
+
+      // A command printed a moment ago is the attachment's to show.
+      yield* importer.healLiveClaudeSession({ sessionId: claudeId, transcriptPath: claudePath });
+      assert.notInclude(yield* conversation(h, threadId), "/plan");
+      // Left to the record, it goes in now, once, where it was written.
+      yield* importer.healLiveClaudeSession({
+        sessionId: claudeId,
+        transcriptPath: claudePath,
+        leftToRecord: ["plan-1-out"],
+      });
+      yield* importer.healLiveClaudeSession({
+        sessionId: claudeId,
+        transcriptPath: claudePath,
+        leftToRecord: ["plan-1-out"],
+      });
+      assert.deepStrictEqual(yield* conversation(h, threadId), [
+        "Fix the login bug please",
+        "I fixed the login bug.",
+        "/plan",
+        "Enabled plan mode",
+        "Reply with exactly: after",
+      ]);
+    }),
+);
+
+runtimeTest(
   "a prompt the session took back leaves the thread as a run T3 rewinds does, from the thread's floor on",
   (h) =>
     Effect.gen(function* () {

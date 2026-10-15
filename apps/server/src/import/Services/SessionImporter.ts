@@ -52,6 +52,11 @@ export interface SessionImporterShape {
      * too old for one to show it.
      */
     readonly turnAwaitingRunSinceMs?: number;
+    /**
+     * The rows, by uuid, of a command typed in the terminal that the
+     * attachment will not show: taken in now, in their place, however fresh.
+     */
+    readonly leftToRecord?: ReadonlyArray<string>;
   }) => Effect.Effect<void>;
 
   /**

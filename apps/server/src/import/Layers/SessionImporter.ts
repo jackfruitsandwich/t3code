@@ -183,6 +183,29 @@ export const claudeCommandRowsInFlight = (
 };
 
 /**
+ * The rows of the typed commands whose printed output the live attachment
+ * left to the record (`leftTo`, by row uuid): each such output, and the
+ * command's line before it.
+ */
+export const claudeCommandRowsLeftToRecord = (
+  messages: ReadonlyArray<ParsedSessionMessage>,
+  leftTo: ReadonlyArray<string> | undefined,
+): ReadonlySet<string> => {
+  const left = new Set<string>();
+  if (leftTo === undefined || leftTo.length === 0) return left;
+  const printed = new Set(leftTo);
+  let line: ParsedSessionMessage | undefined;
+  for (const message of messages) {
+    if (message.command === true && message.role === "user") line = message;
+    if (message.command !== true || message.role !== "assistant") continue;
+    if (!printed.has(message.sourceId)) continue;
+    left.add(message.sourceId);
+    if (line !== undefined) left.add(line.sourceId);
+  }
+  return left;
+};
+
+/**
  * When the last turn of a record began, while the record is fresh: its
  * newest row younger than the span in which a run still shows a turn from
  * its start. Undefined once it has been quiet that long. In a session a mod
@@ -1855,6 +1878,8 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
       readonly settledBeforeMs?: number;
       /** The thread holds this conversation under an earlier session id. */
       readonly carriedOn?: boolean;
+      /** What a typed command printed that the attachment will not show, by row uuid. */
+      readonly leftToRecord?: ReadonlyArray<string>;
     }) {
       const { threadId, sessionId, parsed } = input;
       yield* threads.ensureLegacyTranscript(threadId);
@@ -1890,10 +1915,15 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
       // (Whether a mod holds the session is read from a file the mod
       // rewrites; a read that lands mid-write says "not live". The record
       // itself says a command is running, so the hold does not hang on that.)
-      const commandInFlight = claudeCommandRowsInFlight(
-        parsed.messages,
-        yield* Clock.currentTimeMillis,
-      );
+      // One the attachment left to the record is the record's to place now:
+      // nothing else will show it, and it belongs before what came after it.
+      const leftToRecord = claudeCommandRowsLeftToRecord(parsed.messages, input.leftToRecord);
+      const inFlight = claudeCommandRowsInFlight(parsed.messages, yield* Clock.currentTimeMillis);
+      const commandInFlight = parsed.messages
+        .slice(parsed.messages.length - inFlight)
+        .every((message) => leftToRecord.has(message.sourceId))
+        ? 0
+        : inFlight;
       const settled = parsed.messages.slice(0, parsed.messages.length - commandInFlight);
       const rows =
         settledBeforeMs === undefined
@@ -1901,6 +1931,7 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
           : settled.filter(
               (message) =>
                 message.midTurn === true ||
+                leftToRecord.has(message.sourceId) ||
                 DateTime.toEpochMillis(dateTime(message.timestamp)) < settledBeforeMs,
             );
       if (!input.live) {
@@ -2171,6 +2202,8 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
        * session carried on from it): its binding keeps naming that one.
        */
       readonly carriedOn?: boolean;
+      /** What a typed command printed that the attachment will not show, by row uuid. */
+      readonly leftToRecord?: ReadonlyArray<string>;
     }) {
       const live = yield* liveBridgeSession(input.sessionId);
       const activeRuns = yield* activeRunStartsMs(input.threadId);
@@ -3393,6 +3426,7 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
           ...(input.turnAwaitingRunSinceMs === undefined
             ? {}
             : { turnAwaitingRunSinceMs: input.turnAwaitingRunSinceMs }),
+          ...(input.leftToRecord === undefined ? {} : { leftToRecord: input.leftToRecord }),
         });
       }).pipe(
         Effect.catch((error: unknown) =>

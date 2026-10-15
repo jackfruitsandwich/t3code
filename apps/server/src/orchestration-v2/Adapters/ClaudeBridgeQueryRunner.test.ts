@@ -103,6 +103,8 @@ const attach = (input: {
     };
     const commands = yield* Queue.unbounded<ClaudeBridgeCommandBody>();
     const recordChanges: Array<ClaudeBridgeRegistry.ClaudeBridgeRecordChange> = [];
+    /** The rows the runner left to the record to place, by uuid. */
+    const leftToRecord: Array<string> = [];
     const subscribed = yield* Deferred.make<ClaudeBridgeRegistry.ClaudeBridgeEventHandler>();
     /** The sessions whose live process the runner asked for. */
     const asked: Array<string> = [];
@@ -140,9 +142,10 @@ const attach = (input: {
       onUnattachedEvent: () => Effect.void,
       onUnattachedRequest: () => Effect.void,
       onRecordChange: () => Effect.void,
-      noteRecordChange: (_process, change) =>
+      noteRecordChange: (_process, change, rows) =>
         Effect.sync(() => {
           recordChanges.push(change);
+          leftToRecord.push(...(rows ?? []));
         }),
       readClientSelection: () => Effect.succeed(null),
       writeClientSelection: () => Effect.void,
@@ -234,6 +237,7 @@ const attach = (input: {
       counts,
       now,
       recordChanges,
+      leftToRecord,
       asked,
       deliveries,
       offeredModes,
@@ -2527,6 +2531,227 @@ describe("ClaudeBridgeQueryRunner a /compact typed in the terminal", () => {
         "assistant",
         "result",
       ]);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+});
+
+describe("ClaudeBridgeQueryRunner a command typed in the terminal", () => {
+  // Claude Code writes a typed command that starts no turn as two rows at
+  // once: its line, then what it printed (2.1.300, `/focus`).
+  const typed = (atMs: number) =>
+    [
+      {
+        uuid: "00000000-0000-4000-8000-0000000000f0",
+        content:
+          "<command-name>/focus</command-name>\n            <command-message>focus</command-message>\n            <command-args></command-args>",
+      },
+      {
+        uuid: "00000000-0000-4000-8000-0000000000f1",
+        content: "<local-command-stdout>Focus view disabled</local-command-stdout>",
+        commandRun: { command: "focus", args: "" },
+      },
+    ]
+      .map(
+        (row) =>
+          `${JSON.stringify({ parentUuid: null, isSidechain: false, type: "system", subtype: "local_command", level: "info", isMeta: false, timestamp: stamp(atMs), ...row })}\n`,
+      )
+      .join("");
+  const said = (uuid: string, text: string, atMs: number) =>
+    `${JSON.stringify({ parentUuid: null, isSidechain: false, type: "user", uuid, timestamp: stamp(atMs), message: { role: "user", content: text } })}\n`;
+  const replied = (uuid: string, text: string, atMs: number) =>
+    `${JSON.stringify({
+      type: "assistant",
+      uuid,
+      parentUuid: null,
+      isSidechain: false,
+      requestId: `req_${uuid}`,
+      timestamp: stamp(atMs),
+      message: {
+        id: `msg_${uuid}`,
+        type: "message",
+        role: "assistant",
+        model: "claude-sonnet-4-6",
+        content: [{ type: "text", text }],
+        stop_reason: "end_turn",
+        usage: { input_tokens: 3, output_tokens: 2 },
+      },
+    })}\n`;
+  const turnEnded = (uuid: string, atMs: number) =>
+    `${JSON.stringify({ type: "system", subtype: "turn_duration", uuid, timestamp: stamp(atMs), durationMs: 1_000 })}\n`;
+  const kinds = (frames: ReadonlyArray<SDKMessage>) =>
+    frames.map((frame) => (frame.type === "system" ? `system:${frame.subtype}` : frame.type));
+  const holds = (shown: unknown, text: string) => JSON.stringify(shown).includes(text);
+
+  const typedRowUuids = ["00000000-0000-4000-8000-0000000000f1"];
+  const sendAfter = (bridge: { readonly session: ClaudeAdapterV2.ClaudeAgentSdkQuerySession }) =>
+    bridge.session.offer({
+      ...userMessage("Reply with exactly: after"),
+      uuid: "00000000-0000-4000-8000-0000000000f2",
+    });
+  const turnStarts = (
+    bridge: {
+      readonly handler: ClaudeBridgeRegistry.ClaudeBridgeEventHandler;
+      readonly process: ClaudeBridgeRegistry.ClaudeBridgeProcess;
+      readonly now: number;
+    },
+    turn: { readonly turnId: string; readonly text: string; readonly fromT3?: boolean },
+  ) =>
+    bridge.handler(
+      {
+        seq: 2,
+        at: bridge.now,
+        type: "turn.start",
+        turnId: turn.turnId,
+        text: turn.text,
+        transcriptOffset: 0,
+        ...(turn.fromT3 === true
+          ? { commandId: "command-1", promptUuid: "00000000-0000-4000-8000-0000000000f2" }
+          : {}),
+      },
+      bridge.process,
+    );
+
+  // Gate 0.0.89 (amend.py, refused.py B) and typedrace.py: a turn shown here
+  // for the command sat after the message T3 sent meanwhile (its run is made
+  // as it is sent), and the record's comparison showed the command again.
+  it.live("leaves one to the record as it is read, and shows no turn of its own", () =>
+    Effect.gen(function* () {
+      const bridge = yield* attach({ protocol: 2, bridgeCanUseTool: () => null, transcript: "" });
+      const fs = yield* FileSystem.FileSystem;
+      const frames = yield* shownFrames(bridge);
+      yield* fs.writeFileString(
+        bridge.process.session.transcriptPath,
+        typed(yield* Clock.currentTimeMillis),
+        { flag: "a" },
+      );
+      yield* Effect.sleep("700 millis");
+      assert.deepStrictEqual(bridge.leftToRecord, typedRowUuids);
+      assert.include(bridge.recordChanges, "commands-left-to-record");
+      // Long past the quiet a held command waits for: nothing follows.
+      yield* Effect.sleep("2500 millis");
+      assert.deepStrictEqual(kinds(frames), []);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  // typedrace.py: rows read as they were written, then the server stopped
+  // for 7 s; on waking, the quiet was over as T3's message arrived.
+  it.live(
+    "leaves one read on time to the record, so a message T3 sends after its quiet opens alone",
+    () =>
+      Effect.gen(function* () {
+        const bridge = yield* attach({ protocol: 2, bridgeCanUseTool: () => null, transcript: "" });
+        const fs = yield* FileSystem.FileSystem;
+        const frames = yield* shownFrames(bridge);
+        yield* fs.writeFileString(
+          bridge.process.session.transcriptPath,
+          typed(yield* Clock.currentTimeMillis),
+          { flag: "a" },
+        );
+        yield* Effect.sleep("2 seconds");
+        yield* sendAfter(bridge);
+        yield* turnStarts(bridge, {
+          turnId: "turn-after",
+          text: "Reply with exactly: after",
+          fromT3: true,
+        });
+        yield* Effect.sleep("1 second");
+        assert.deepStrictEqual(bridge.leftToRecord, typedRowUuids);
+        // The message's turn opens (T3 shows the message itself) with nothing
+        // of the command in it, and no turn of the command's own comes before or after.
+        assert.deepStrictEqual(kinds(frames), ["system:init"]);
+        assert.isFalse(holds(frames, "Focus view disabled"));
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  // typedrace.py t3: the record's turn ended and the command came after it,
+  // all read in one pass while that turn's end was still to come here. The
+  // record places the command once that turn has closed here, after its rows.
+  it.live(
+    "leaves one typed after a turn the record has closed to the record once that turn closes here",
+    () =>
+      Effect.gen(function* () {
+        const bridge = yield* attach({ protocol: 2, bridgeCanUseTool: () => null, transcript: "" });
+        const fs = yield* FileSystem.FileSystem;
+        const frames = yield* shownFrames(bridge);
+        yield* turnStarts(bridge, { turnId: "turn-one", text: "Reply with exactly: one" });
+        const now = yield* Clock.currentTimeMillis;
+        yield* fs.writeFileString(
+          bridge.process.session.transcriptPath,
+          replied("00000000-0000-4000-8000-0000000000e1", "one", now) +
+            turnEnded("00000000-0000-4000-8000-0000000000e2", now) +
+            typed(now),
+          { flag: "a" },
+        );
+        yield* Effect.sleep("700 millis");
+        assert.isTrue(holds(frames, '"one"'));
+        assert.isFalse(holds(frames, "Focus view disabled"));
+        assert.deepStrictEqual(bridge.leftToRecord, []);
+        yield* bridge.handler(
+          {
+            type: "turn.complete",
+            seq: 3,
+            at: bridge.now,
+            turnId: "turn-one",
+            reason: "answer",
+            answer: "one",
+            isAborted: false,
+            durationMs: 1,
+            transcriptOffset: 0,
+          },
+          bridge.process,
+        );
+        yield* Effect.sleep("1500 millis");
+        assert.strictEqual(kinds(frames).at(-1), "result");
+        assert.isFalse(holds(frames, "Focus view disabled"));
+        assert.deepStrictEqual(bridge.leftToRecord, typedRowUuids);
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.live("shows one written inside a turn the record is still running in that turn", () =>
+    Effect.gen(function* () {
+      const bridge = yield* attach({ protocol: 2, bridgeCanUseTool: () => null, transcript: "" });
+      const fs = yield* FileSystem.FileSystem;
+      const frames = yield* shownFrames(bridge);
+      yield* turnStarts(bridge, { turnId: "turn-one", text: "Reply with exactly: one" });
+      yield* fs.writeFileString(
+        bridge.process.session.transcriptPath,
+        typed(yield* Clock.currentTimeMillis),
+        { flag: "a" },
+      );
+      yield* Effect.sleep("700 millis");
+      assert.isTrue(holds(frames, "Focus view disabled"));
+      assert.deepStrictEqual(bridge.leftToRecord, []);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  // The adapter learns a goal from what /goal printed, inside a run.
+  it.live("holds what a typed /goal printed for the turn it starts", () =>
+    Effect.gen(function* () {
+      const bridge = yield* attach({ protocol: 2, bridgeCanUseTool: () => null, transcript: "" });
+      const fs = yield* FileSystem.FileSystem;
+      const frames = yield* shownFrames(bridge);
+      const now = yield* Clock.currentTimeMillis;
+      yield* fs.writeFileString(
+        bridge.process.session.transcriptPath,
+        said(
+          "00000000-0000-4000-8000-0000000000a8",
+          "<command-name>/goal</command-name>\n            <command-message>goal</command-message>\n            <command-args>ship it</command-args>",
+          now,
+        ) +
+          said(
+            "00000000-0000-4000-8000-0000000000a9",
+            "<local-command-stdout>Goal set: ship it</local-command-stdout>",
+            now,
+          ),
+        { flag: "a" },
+      );
+      yield* Effect.sleep("700 millis");
+      assert.deepStrictEqual(kinds(frames), []);
+      yield* turnStarts(bridge, { turnId: "turn-goal", text: "ship it" });
+      yield* Effect.sleep("300 millis");
+      assert.deepStrictEqual(kinds(frames), ["user", "system:init", "assistant"]);
+      assert.isTrue(holds(frames, "Goal set: ship it"));
+      assert.deepStrictEqual(bridge.leftToRecord, []);
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 });

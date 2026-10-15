@@ -158,11 +158,26 @@ const TURN_END_ROW_ATTEMPTS = 30;
  */
 const MISSED_TURN_REPLAY_MS = 15_000;
 /**
- * A slash command typed in the terminal that starts no turn (`/model`,
- * `/rename`) leaves only its printed output. After this much quiet the output
- * is shown as a short turn of its own.
+ * A slash command typed in the terminal that starts no turn leaves only its
+ * printed output; the record places it (see `typedCommandOutput`). One held
+ * here (a /compact with its compaction, a /goal for the turn it starts) is
+ * shown as a short turn of its own after this much quiet.
  */
 const LOCAL_COMMAND_QUIET_MS = 1_500;
+
+/**
+ * A typed command whose output the turn it starts shows: what `/goal` prints
+ * is how T3 learns the goal (the adapter reads it from that turn).
+ */
+const startsItsOwnTurn = (command: string | null) =>
+  command !== null && /^\/goal(?:\s|$)/u.test(command);
+
+/** The record row a frame was read from, by uuid. */
+const frameRowUuid = (frame: SDKMessage): string | null => {
+  const uuid = Reflect.get(frame, "uuid");
+  return typeof uuid === "string" && uuid.length > 0 ? uuid : null;
+};
+
 /**
  * How long what the record says of a turn before it began (a prompt's hook
  * result, a compaction) waits for that turn to open here.
@@ -440,6 +455,11 @@ export const layer: Layer.Layer<
         /** Printed command output read while no turn was open, kept for whatever it belongs to. */
         heldOutput: [] as Array<SDKMessage>,
         heldAt: 0,
+        /**
+         * What typed commands printed that no turn here will show, by row
+         * uuid: the record places them (see `leaveToRecord`).
+         */
+        leftToRecord: [] as Array<string>,
         lastCommandText: null as string | null,
         plainCommand: makeClaudePlainCommandReader(),
         /** Rows that close a turn in the record, read so far; and the count when the open turn began. */
@@ -769,6 +789,35 @@ export const layer: Layer.Layer<
         });
 
       /**
+       * Whether a row's printed output is a command the person typed in the
+       * terminal between turns: no turn of the session's is open here, or the
+       * record has closed the one still open here; no command T3 sent waits
+       * on its rows; and it is not one held for what goes with it (a
+       * /compact's compaction, a /goal's turn).
+       */
+      const typedCommandOutput = (row: unknown) =>
+        !isClaudeBridgeModRow(row) &&
+        (!sessionTurnOpen() || state.turnEndsRead > state.turnEndsAtTurnStart) &&
+        state.commandWaiting === null &&
+        state.pendingLocal === null &&
+        (state.pendingPrompt === null || state.pendingPrompt.body.type === "prompt") &&
+        !state.heldOutput.some(isCompactBoundaryFrame) &&
+        !startsItsOwnTurn(state.lastCommandText);
+
+      /**
+       * Has the record place what typed commands printed (and their lines),
+       * in the order it was written, once no turn of the session's is open
+       * here: a turn the record closed before the command may still have
+       * rows to show here, and they go before it.
+       */
+      const leaveToRecord = Effect.gen(function* () {
+        if (state.leftToRecord.length === 0 || sessionTurnOpen()) return;
+        const rows = state.leftToRecord.splice(0);
+        yield* Effect.logInfo("claude-bridge.commands-left-to-record", { sid, rows: rows.length });
+        yield* registry.noteRecordChange(bridgeProcess, "commands-left-to-record", rows);
+      });
+
+      /**
        * Translates the record's new rows. With `untilTurnEnd` it stops after
        * the row that closes a turn, leaving the next turn's rows unread.
        */
@@ -873,6 +922,17 @@ export const layer: Layer.Layer<
             }
             const promptHook = isPromptHookRow(row);
             for (const frame of translator.onTranscriptRow(row)) {
+              // What a command typed in the terminal printed between turns is
+              // never a turn here: one shown here would sit after a message
+              // T3 sent meanwhile (its run is made as it is sent), and beside
+              // the record's own copy. The record places it, where it was written.
+              if (isClaudeBridgeCommandOutputFrame(frame) && typedCommandOutput(row)) {
+                const uuid = frameRowUuid(frame);
+                if (uuid !== null) {
+                  state.leftToRecord.push(uuid);
+                  continue;
+                }
+              }
               // A /compact typed in the terminal writes its boundary and
               // summary before the run that shows the command opens: they
               // wait with its output and show in that run. A prompt's hook
@@ -910,6 +970,7 @@ export const layer: Layer.Layer<
               if (untilTurnEnd) break;
             }
           }
+          yield* leaveToRecord;
           if (olderRows > 0) {
             // They may have landed after the thread's history was last
             // compared with the record: it is compared again.
@@ -1352,6 +1413,7 @@ export const layer: Layer.Layer<
           yield* showDrawnMessages(DRAWN_MESSAGE_WAIT_MS);
           yield* settlePendingComplete;
           yield* closeTurnLeftBehind;
+          yield* leaveToRecord;
           yield* settleLocalCommands;
           yield* Effect.sleep(`${TAIL_INTERVAL_MS} millis`);
         }

@@ -183,11 +183,19 @@ export type ClaudeBridgeRecordChange =
   /** The record's row arrived for a reply already shown from what the terminal drew. */
   | "reply-recorded"
   /** Rows older than the turn being shown turned up in the record: history, for the comparison to take in. */
-  | "older-rows";
+  | "older-rows"
+  /**
+   * A command typed in the terminal that the attachment will not show as a
+   * turn of its own (read too late to show it in its place): its rows, by
+   * uuid, are the record's to place.
+   */
+  | "commands-left-to-record";
 
 export type ClaudeBridgeRecordHandler = (
   process: ClaudeBridgeProcess,
   change: ClaudeBridgeRecordChange,
+  /** With `commands-left-to-record`: the uuids of those rows. */
+  rows?: ReadonlyArray<string>,
 ) => Effect.Effect<void>;
 
 export interface ClaudeBridgeLaunchInput {
@@ -276,6 +284,7 @@ export class ClaudeBridgeRegistry extends Context.Service<
     readonly noteRecordChange: (
       process: ClaudeBridgeProcess,
       change: ClaudeBridgeRecordChange,
+      rows?: ReadonlyArray<string>,
     ) => Effect.Effect<void>;
     /**
      * The last turn the session began while nobody was subscribed, with its
@@ -513,8 +522,14 @@ const make = Effect.gen(function* () {
   const unattachedHandlers = new Set<ClaudeBridgeEventHandler>();
   const waitingHandlers = new Set<ClaudeBridgeWaitingHandler>();
   const recordHandlers = new Set<ClaudeBridgeRecordHandler>();
-  const noteRecordChange = (entry: ClaudeBridgeProcess, change: ClaudeBridgeRecordChange) =>
-    Effect.forEach(recordHandlers, (handler) => handler(entry, change), { discard: true }).pipe(
+  const noteRecordChange = (
+    entry: ClaudeBridgeProcess,
+    change: ClaudeBridgeRecordChange,
+    rows?: ReadonlyArray<string>,
+  ) =>
+    Effect.forEach(recordHandlers, (handler) => handler(entry, change, rows), {
+      discard: true,
+    }).pipe(
       Effect.catchCause((cause) =>
         Effect.logWarning("claude-bridge.record-handler-failed", { sid: entry.sid, cause }),
       ),
