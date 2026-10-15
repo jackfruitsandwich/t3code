@@ -29,6 +29,9 @@ import {
   type ProviderSessionLivenessState,
 } from "./ProviderSessionLiveness.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import * as ClaudeBridgeLiveness from "../claude-bridge/ClaudeBridgeLiveness.ts";
+import { parseClaudeBridgeSessionFile } from "../claude-bridge/ClaudeBridgeProtocol.ts";
+import * as ClaudeBridgeRegistry from "../claude-bridge/ClaudeBridgeRegistry.ts";
 
 const claude = ProviderInstanceId.make("claude");
 const threadId = ThreadId.make("thread_live_session");
@@ -170,6 +173,8 @@ const reconcile = (input: {
   readonly trigger: "startup" | "shutdown";
   /** How the session is found; absent: the default reference, which knows of no live session. */
   readonly live?: ProviderSessionLivenessState;
+  /** The liveness layer itself, in place of `live` (a reference: it requires and adds nothing). */
+  readonly liveness?: Layer.Layer<never>;
   readonly archived?: boolean;
 }) => {
   const committed: Array<OrchestrationV2DomainEvent> = [];
@@ -197,16 +202,18 @@ const reconcile = (input: {
           listByCommandId: () => Effect.succeed([]),
           reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
         }),
-        input.live === undefined
-          ? Layer.empty
-          : Layer.succeed(ProviderSessionLiveness, {
-              ofNativeThread: ({ nativeThreadId }) => {
-                asked.push(nativeThreadId);
-                return Effect.succeed(
-                  nativeThreadId === SID ? input.live! : ({ state: "gone" } as const),
-                );
-              },
-            }),
+        input.liveness !== undefined
+          ? input.liveness
+          : input.live === undefined
+            ? Layer.empty
+            : Layer.succeed(ProviderSessionLiveness, {
+                ofNativeThread: ({ nativeThreadId }) => {
+                  asked.push(nativeThreadId);
+                  return Effect.succeed(
+                    nativeThreadId === SID ? input.live! : ({ state: "gone" } as const),
+                  );
+                },
+              }),
       ),
     ),
   );
@@ -324,4 +331,71 @@ it.effect(
         assert.equal(statusOf("turn-item.updated", toolItemId), "cancelled");
       }
     }),
+);
+
+/**
+ * Claude's own liveness over a registry where the thread's session (SID) was
+ * sent to the background mid-conversation: the conversation went on as
+ * MOVED, which runs the run's turn, and SID is left at a fresh prompt or gone.
+ */
+const movedConversation = (leftBehind: "idle" | "gone") =>
+  Effect.gen(function* () {
+    const processOf = (sid: string, activeTurn: unknown) => {
+      const session = parseClaudeBridgeSessionFile({
+        sid,
+        instanceId: `instance-${sid}`,
+        heartbeatAt: DateTime.toEpochMillis(turnStartedAt),
+        transcriptPath: `/records/${sid}.jsonl`,
+        configDir: "/home/claude",
+        isInteractive: true,
+        ...(activeTurn === null ? {} : { activeTurn }),
+      });
+      assert.isNotNull(session);
+      return { sid, instanceId: `instance-${sid}`, dir: `/bridge/${sid}`, session: session! };
+    };
+    const MOVED = "claude-session-moved";
+    const live = [
+      processOf(MOVED, {
+        turnId: "turn-moved",
+        startedAt: DateTime.toEpochMillis(turnStartedAt) + 1_000,
+        transcriptOffset: 0,
+      }),
+      ...(leftBehind === "idle" ? [processOf(SID, null)] : []),
+    ];
+    const none = yield* ClaudeBridgeRegistry.ClaudeBridgeRegistry.pipe(
+      Effect.provide(ClaudeBridgeRegistry.layerTest),
+    );
+    return ClaudeBridgeLiveness.layer.pipe(
+      Layer.provide(
+        Layer.succeed(
+          ClaudeBridgeRegistry.ClaudeBridgeRegistry,
+          ClaudeBridgeRegistry.ClaudeBridgeRegistry.of({
+            ...none,
+            listLiveProcesses: Effect.succeed(live),
+            findLiveProcess: (sid) =>
+              Effect.succeed(live.find((entry) => entry.sid === sid) ?? null),
+            continuationOf: (sid) =>
+              Effect.succeed(sid === SID ? { sid: MOVED, heldElsewhere: false } : null),
+          }),
+        ),
+      ),
+    );
+  });
+
+it.effect("keeps the run of a conversation that carries on mid-turn under another session", () =>
+  Effect.gen(function* () {
+    for (const leftBehind of ["idle", "gone"] as const) {
+      const liveness = yield* movedConversation(leftBehind);
+      const { summary, committed, statusOf } = yield* reconcile({ trigger: "startup", liveness });
+      assert.equal(summary.keptRuns, 1, leftBehind);
+      assert.equal(statusOf("run.updated", runId), null, leftBehind);
+      assert.equal(statusOf("turn-item.updated", toolItemId), null, leftBehind);
+      // Its background work runs on there: no later turn is told it was cancelled.
+      assert.deepEqual(
+        committed.filter((event) => event.type === "run.background-work-cancelled"),
+        [],
+        leftBehind,
+      );
+    }
+  }),
 );
