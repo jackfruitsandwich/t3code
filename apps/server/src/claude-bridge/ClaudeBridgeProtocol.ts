@@ -1578,6 +1578,8 @@ export interface ClaudeBridgeFrameTranslator {
   readonly adoptTurn: (turn: ClaudeBridgeActiveTurn) => void;
   readonly setModel: (model: string) => void;
   readonly hasOpenTurn: () => boolean;
+  /** The id of the turn open here, or null. */
+  readonly openTurnId: () => string | null;
 }
 
 const zeroUsage = (): SDKResultMessage["usage"] =>
@@ -1954,6 +1956,7 @@ export function makeClaudeBridgeFrameTranslator(
       model = next;
     },
     hasOpenTurn: () => turn !== null,
+    openTurnId: () => turn?.turnId ?? null,
   };
 }
 

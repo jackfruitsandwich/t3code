@@ -98,6 +98,15 @@ export const CLAUDE_TRANSPORT_ENV = "T3CODE_CLAUDE_TRANSPORT";
 export const CLAUDE_RECORD_LAG_ENV = "T3CODE_CLAUDE_RECORD_LAG_MS";
 const TAIL_INTERVAL_MS = 300;
 /**
+ * How many reads the rows after the end of the turn open here wait for the
+ * mod's word that the turn is over (see `endReadOfTurn`), about 5 s. That
+ * word is handled within 2.2 s of the row live (157 turns, p99 1.2 s) and
+ * mostly within 1.8 s on the rig (2966 turns, p90; longer around a stall,
+ * when nothing is read either). Counted in reads, so a stall does not use
+ * it up. After it the record is read on, as if the turn were still going.
+ */
+const TURN_END_HOLD_READS = 16;
+/**
  * How many polls in a row must find the session unreadable or quiet before it
  * counts as gone. The mod rewrites session.json in place, several times in a
  * second at a turn's start (the turn, then a request it asks): a read that
@@ -465,6 +474,14 @@ export const layer: Layer.Layer<
         /** Rows that close a turn in the record, read so far; and the count when the open turn began. */
         turnEndsRead: 0,
         turnEndsAtTurnStart: 0,
+        /**
+         * The turn open here when the row that closes it in the record was
+         * read: the rows after that row wait until it is closed here.
+         */
+        endReadOfTurn: null as string | null,
+        /** Reads the rows after that end have waited; and the turn whose wait ran out. */
+        endHeldReads: 0,
+        endHoldExpired: null as string | null,
         /** The mod's own reload command was just read: what it printed is skipped too. */
         upkeepOutputDue: false,
         /** The model and mode this attachment was last asked for. */
@@ -519,6 +536,11 @@ export const layer: Layer.Layer<
 
       /** A turn of the session's own is open in the thread, not one T3 opened to carry a request. */
       const sessionTurnOpen = () => translator.hasOpenTurn() && state.requestTurn === null;
+      /** Whether the record has closed the turn still open here (see `endReadOfTurn`). */
+      const turnEndHeld = () =>
+        state.endReadOfTurn !== null &&
+        sessionTurnOpen() &&
+        translator.openTurnId() === state.endReadOfTurn;
 
       /** Tells the thread what the session did with a message sent to steer its turn. */
       const reportDelivery = (
@@ -824,6 +846,9 @@ export const layer: Layer.Layer<
       const readRows = (untilTurnEnd: boolean) =>
         Effect.gen(function* () {
           if (state.transcriptPath.length === 0) return;
+          // What follows the end of the turn open here is the next turn's: a
+          // server that read it now would show it in this turn's run.
+          if (turnEndHeld()) return;
           const written = yield* transcriptSize(state.transcriptPath);
           const size = recordLagMs === 0 ? written : yield* sizeOldEnough(written);
           if (size <= state.byteOffset) return;
@@ -968,6 +993,13 @@ export const layer: Layer.Layer<
             if (isClaudeTurnEndRow(row)) {
               state.turnEndsRead += 1;
               if (untilTurnEnd) break;
+              // A read that reaches past the end of the turn open here (a
+              // server that could not read for a while) stops at it; the
+              // rest is read once the mod's word has closed the turn here.
+              if (sessionTurnOpen() && translator.openTurnId() !== state.endHoldExpired) {
+                state.endReadOfTurn = translator.openTurnId();
+                break;
+              }
             }
           }
           yield* leaveToRecord;
@@ -1258,10 +1290,11 @@ export const layer: Layer.Layer<
           // The run stays open while a background subagent's request waits in
           // it: the request can only be answered from a run that is open.
           !agentAskPlaced() &&
-          state.byteOffset >= pending.event.transcriptOffset &&
           // Claude Code's file is level with its terminal when a turn ends:
-          // a record held back for a test is read to its end first.
-          state.lagging.length === 0 &&
+          // a record held back for a test is read to its end first. Or to
+          // the row that closes the turn, which has every row of it before it.
+          (turnEndHeld() ||
+            (state.byteOffset >= pending.event.transcriptOffset && state.lagging.length === 0)) &&
           now - state.lastRowAt >= COMPLETE_QUIET_MS &&
           now - pending.seenAt >= COMPLETE_QUIET_MS
         ) {
@@ -1276,6 +1309,23 @@ export const layer: Layer.Layer<
        * tool ran, the process says nothing more of the turn: the rest of it
        * is the new session's, and the thread follows once this run is over.
        */
+      /** A mod that says nothing of a turn's end does not stop the record being read for long. */
+      const expireTurnEndHold = Effect.gen(function* () {
+        if (!turnEndHeld()) {
+          state.endHeldReads = 0;
+          return;
+        }
+        state.endHeldReads += 1;
+        if (state.endHeldReads < TURN_END_HOLD_READS) return;
+        yield* Effect.logInfo("claude-bridge.turn-end-hold-expired", {
+          sid,
+          turnId: state.endReadOfTurn,
+        });
+        state.endHoldExpired = state.endReadOfTurn;
+        state.endReadOfTurn = null;
+        state.endHeldReads = 0;
+      });
+
       const closeTurnLeftBehind = Effect.gen(function* () {
         if (state.continuedAt === null || !sessionTurnOpen() || state.pendingComplete !== null) {
           return;
@@ -1404,6 +1454,7 @@ export const layer: Layer.Layer<
           if (session.model !== null) translator.setModel(session.model);
           yield* showNativeSettings(nativeSettings(session));
           yield* showNativeState(session);
+          yield* expireTurnEndHold;
           yield* readNewRows.pipe(
             Effect.catchCause((cause) =>
               Effect.logWarning("claude-bridge.transcript-read-failed", { sid, cause }),

@@ -2756,6 +2756,166 @@ describe("ClaudeBridgeQueryRunner a command typed in the terminal", () => {
   );
 });
 
+describe("ClaudeBridgeQueryRunner a read that reaches past the end of the turn open here", () => {
+  // A server that could not read for a while (midturn.py "after-queue" in
+  // gate 0.0.90) finds a turn's end and the next turn's rows on disk at once,
+  // before the mod's word that the turn is over and the next began.
+  const said = (uuid: string, text: string, atMs: number) =>
+    `${JSON.stringify({ parentUuid: null, isSidechain: false, type: "user", uuid, timestamp: stamp(atMs), message: { role: "user", content: text } })}\n`;
+  const replied = (uuid: string, text: string, atMs: number) =>
+    `${JSON.stringify({
+      type: "assistant",
+      uuid,
+      parentUuid: null,
+      isSidechain: false,
+      requestId: `req_${uuid}`,
+      timestamp: stamp(atMs),
+      message: {
+        id: `msg_${uuid}`,
+        type: "message",
+        role: "assistant",
+        model: "claude-sonnet-4-6",
+        content: [{ type: "text", text }],
+        stop_reason: "end_turn",
+        usage: { input_tokens: 3, output_tokens: 2 },
+      },
+    })}\n`;
+  const turnEnded = (uuid: string, atMs: number) =>
+    `${JSON.stringify({ type: "system", subtype: "turn_duration", uuid, timestamp: stamp(atMs), durationMs: 1_000 })}\n`;
+  const kinds = (frames: ReadonlyArray<SDKMessage>) =>
+    frames.map((frame) => (frame.type === "system" ? `system:${frame.subtype}` : frame.type));
+  /** Where each reply with these words is among the frames shown. */
+  const repliesSaying = (frames: ReadonlyArray<SDKMessage>, text: string) =>
+    frames.flatMap((frame, index) =>
+      frame.type === "assistant" &&
+      frame.message.content.some((block) => block.type === "text" && block.text === text)
+        ? [index]
+        : [],
+    );
+  const ended = (turnId: string, answer: string, transcriptOffset: number) =>
+    ({
+      type: "turn.complete",
+      seq: 2,
+      at: 0,
+      turnId,
+      reason: "answer",
+      answer,
+      isAborted: false,
+      durationMs: 1,
+      transcriptOffset,
+    }) as const;
+
+  it.live("shows the next turn's rows in the next turn's run, not in the one still open here", () =>
+    Effect.gen(function* () {
+      const bridge = yield* attach({ protocol: 2, bridgeCanUseTool: () => null, transcript: "" });
+      const fs = yield* FileSystem.FileSystem;
+      const frames = yield* shownFrames(bridge);
+      const begins = (seq: number, turnId: string, text: string) =>
+        bridge.handler(
+          { seq, at: bridge.now, type: "turn.start", turnId, text, transcriptOffset: 0 },
+          bridge.process,
+        );
+      yield* begins(1, "turn-numbers", "Write the numbers 1 to 60");
+      const now = yield* Clock.currentTimeMillis;
+      const record =
+        replied("00000000-0000-4000-8000-0000000000e1", "1. one", now) +
+        turnEnded("00000000-0000-4000-8000-0000000000e2", now) +
+        said("00000000-0000-4000-8000-0000000000e3", "Reply with exactly: after-queue", now) +
+        replied("00000000-0000-4000-8000-0000000000e4", "after-queue", now) +
+        turnEnded("00000000-0000-4000-8000-0000000000e5", now);
+      yield* fs.writeFileString(bridge.process.session.transcriptPath, record, { flag: "a" });
+      yield* Effect.sleep("700 millis");
+      assert.strictEqual(repliesSaying(frames, "1. one").length, 1);
+      assert.deepStrictEqual(repliesSaying(frames, "after-queue"), []);
+      // The mod's word of both turns, heard together.
+      yield* bridge.handler(
+        ended("turn-numbers", "1. one", new TextEncoder().encode(record).length),
+        bridge.process,
+      );
+      yield* begins(3, "turn-after-queue", "Reply with exactly: after-queue");
+      yield* Effect.sleep("700 millis");
+      const opened = kinds(frames).lastIndexOf("system:init");
+      const closed = kinds(frames).indexOf("result");
+      const replies = repliesSaying(frames, "after-queue");
+      // The first turn closed before the next opened, and the next turn's
+      // reply is in the next turn's run, once.
+      assert.isTrue(closed !== -1 && closed < opened);
+      assert.strictEqual(replies.length, 1);
+      assert.isTrue(replies[0]! > opened);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.live("reads on after about 5 s when the mod says nothing of the turn's end", () =>
+    Effect.gen(function* () {
+      const bridge = yield* attach({ protocol: 2, bridgeCanUseTool: () => null, transcript: "" });
+      const fs = yield* FileSystem.FileSystem;
+      const frames = yield* shownFrames(bridge);
+      yield* bridge.handler(
+        {
+          seq: 1,
+          at: bridge.now,
+          type: "turn.start",
+          turnId: "turn-one",
+          text: "Reply with exactly: one",
+          transcriptOffset: 0,
+        },
+        bridge.process,
+      );
+      const now = yield* Clock.currentTimeMillis;
+      yield* fs.writeFileString(
+        bridge.process.session.transcriptPath,
+        replied("00000000-0000-4000-8000-0000000000e9", "one", now) +
+          turnEnded("00000000-0000-4000-8000-0000000000ea", now) +
+          said("00000000-0000-4000-8000-0000000000eb", "Reply with exactly: two", now) +
+          replied("00000000-0000-4000-8000-0000000000ec", "two", now),
+        { flag: "a" },
+      );
+      yield* Effect.sleep("700 millis");
+      assert.deepStrictEqual(repliesSaying(frames, "two"), []);
+      // No word comes: what was held is read and shown, as before.
+      yield* Effect.sleep("6 seconds");
+      assert.strictEqual(repliesSaying(frames, "two").length, 1);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.live(
+    "closes the turn open here once its end is read, though the mod counted rows after it",
+    () =>
+      Effect.gen(function* () {
+        const bridge = yield* attach({ protocol: 2, bridgeCanUseTool: () => null, transcript: "" });
+        const fs = yield* FileSystem.FileSystem;
+        const frames = yield* shownFrames(bridge);
+        yield* bridge.handler(
+          {
+            seq: 1,
+            at: bridge.now,
+            type: "turn.start",
+            turnId: "turn-one",
+            text: "Reply with exactly: one",
+            transcriptOffset: 0,
+          },
+          bridge.process,
+        );
+        const now = yield* Clock.currentTimeMillis;
+        // The next prompt is written (a queued message), and the mod reported
+        // the turn over once it was.
+        const record =
+          replied("00000000-0000-4000-8000-0000000000e6", "one", now) +
+          turnEnded("00000000-0000-4000-8000-0000000000e7", now) +
+          said("00000000-0000-4000-8000-0000000000e8", "Reply with exactly: two", now);
+        yield* fs.writeFileString(bridge.process.session.transcriptPath, record, { flag: "a" });
+        yield* Effect.sleep("700 millis");
+        yield* bridge.handler(
+          ended("turn-one", "one", new TextEncoder().encode(record).length),
+          bridge.process,
+        );
+        yield* Effect.sleep("1500 millis");
+        assert.strictEqual(kinds(frames).at(-1), "result");
+        assert.strictEqual(repliesSaying(frames, "one").length, 1);
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+});
+
 describe("ClaudeBridgeQueryRunner a prompt's hook result", () => {
   // Claude Code writes a prompt's hook result as the prompt goes in, and the
   // mod's word that the turn began can come after the row is read.
