@@ -172,6 +172,8 @@ const make = Effect.gen(function* () {
   const offerTurn = (
     entry: ClaudeBridgeRegistry.ClaudeBridgeProcess,
     turn: { readonly turnId: string; readonly text: string; readonly transcriptOffset: number },
+    /** The turn was running when this server came up: the run recovery left open picks it up. */
+    reattachRun = false,
   ) =>
     Effect.gen(function* () {
       yield* afterStartupRecovery;
@@ -235,6 +237,7 @@ const make = Effect.gen(function* () {
         // A background task reporting back shows as its own line, not as
         // a notice without words.
         ...(taskNotice === null ? {} : { notification: taskNotice }),
+        ...(reattachRun ? { reattachRun } : {}),
       });
     });
 
@@ -368,8 +371,9 @@ const make = Effect.gen(function* () {
   yield* registry.onUnattachedRequest(offerRequest);
 
   // A turn already running when this server came up (a restart mid-turn).
-  // Whoever started it, the terminal or a prompt sent from T3: recovery has
-  // closed the run that was showing it, and the session is still working.
+  // Whoever started it, the terminal or a prompt sent from T3: recovery left
+  // the run that was showing it open, and that run picks it back up; with no
+  // such run (one recovery could not keep), a run is offered for it.
   // Forked: recovery runs after the layers are built, and the offer waits on it.
   yield* Effect.gen(function* () {
     yield* afterStartupRecovery;
@@ -380,7 +384,7 @@ const make = Effect.gen(function* () {
     });
     for (const entry of live) {
       if (entry.session.activeTurn !== null) {
-        yield* offerTurn(entry, { ...entry.session.activeTurn, text: "" });
+        yield* offerTurn(entry, { ...entry.session.activeTurn, text: "" }, true);
       }
     }
   }).pipe(Effect.forkScoped);

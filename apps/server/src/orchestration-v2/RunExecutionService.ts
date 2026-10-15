@@ -44,6 +44,7 @@ import type {
   ProviderAdapterV2Event,
   ProviderAdapterV2RuntimePolicy,
   ProviderAdapterV2SessionRuntime,
+  ProviderAdapterV2TurnInput,
   ProviderAdapterV2TurnMessage,
 } from "./ProviderAdapter.ts";
 import { ProviderAdapterTurnStartError } from "./ProviderAdapter.ts";
@@ -524,6 +525,7 @@ export interface RunExecutionServiceV2StartRootRunInput {
   readonly shouldFinalizeRun?: () => Effect.Effect<boolean, ProjectionStoreV2Error>;
   readonly hasUnpairedRunInterruptRequest?: () => Effect.Effect<boolean, never>;
   readonly message: ProviderAdapterV2TurnMessage;
+  readonly recoveredRuntimeRequests?: ProviderAdapterV2TurnInput["recoveredRuntimeRequests"];
   readonly modelSelection: ModelSelection;
   readonly runtimePolicy: ProviderAdapterV2RuntimePolicy;
 }
@@ -1376,6 +1378,9 @@ export const layer: Layer.Layer<
             rootNodeId: input.rootNode.id,
             providerThread: input.providerThread,
             message: input.message,
+            ...(input.recoveredRuntimeRequests === undefined
+              ? {}
+              : { recoveredRuntimeRequests: input.recoveredRuntimeRequests }),
             modelSelection: input.modelSelection,
             runtimePolicy: input.runtimePolicy,
           };

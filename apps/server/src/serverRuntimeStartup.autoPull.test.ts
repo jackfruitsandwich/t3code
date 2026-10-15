@@ -62,6 +62,7 @@ it.effect("parks automatic pull until activation without delaying command readin
       };
       const recovery = {
         terminalizedRuns: 0,
+        keptRuns: 0,
         stoppedSessions: 0,
         closedRequests: 0,
         retiredEffects: 0,

@@ -5,6 +5,7 @@ import {
   type OrchestrationV2DomainEvent,
   type ProviderThreadId,
   type OrchestrationV2RestartCancelledBackgroundWork,
+  type RunId,
   type OrchestrationV2Subagent,
   type OrchestrationV2ThreadProjection,
   ThreadId,
@@ -21,6 +22,10 @@ import * as EffectOutbox from "./EffectOutbox.ts";
 import * as EventSink from "./EventSink.ts";
 import * as IdAllocator from "./IdAllocator.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
+import {
+  ProviderSessionLiveness,
+  type ProviderSessionLivenessState,
+} from "./ProviderSessionLiveness.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import { restartContinuationRun } from "./RestartContinuation.ts";
 import {
@@ -44,6 +49,8 @@ export class ProviderRuntimeRecoveryError extends Schema.TaggedError<ProviderRun
 
 export interface ProviderRuntimeRecoverySummary {
   readonly terminalizedRuns: number;
+  /** Running runs left open because their native session runs on without this server. */
+  readonly keptRuns: number;
   readonly stoppedSessions: number;
   readonly closedRequests: number;
   readonly retiredEffects: number;
@@ -52,6 +59,7 @@ export interface ProviderRuntimeRecoverySummary {
 
 export interface ProviderRuntimeReconciliationSummary {
   readonly terminalizedRuns: number;
+  readonly keptRuns: number;
   readonly stoppedSessions: number;
   readonly closedRequests: number;
   readonly retiredEffects: number;
@@ -166,6 +174,37 @@ const cancelledItem = (
     : { ...item, status: "cancelled", completedAt: now, updatedAt: now };
 
 /**
+ * How long after the server started a provider turn the session may report
+ * beginning it: a prompt the server sends starts the session's turn a moment
+ * later.
+ */
+const SESSION_TURN_START_SLACK_MS = 30_000;
+
+/**
+ * Whether the turn a live session is running is the run's own. A turn the
+ * session began well after the server started the run's provider turn began
+ * while no server was there: the run's turn ended in the meantime. (A turn
+ * typed into a terminal begins before the run that shows it.)
+ */
+function sessionRunsTurnOf(
+  run: OrchestrationV2ThreadProjection["runs"][number],
+  projection: ProjectionStore.ProjectionRuntimeRecoveryState,
+  turnStartedAt: number,
+): boolean {
+  const attempt = projection.attempts.find((candidate) => candidate.id === run.activeAttemptId);
+  const startedAt =
+    projection.providerTurns.find(
+      (candidate) => candidate.runAttemptId !== null && candidate.runAttemptId === attempt?.id,
+    )?.startedAt ??
+    attempt?.startedAt ??
+    run.startedAt;
+  return (
+    startedAt === null ||
+    turnStartedAt <= DateTime.toEpochMillis(startedAt) + SESSION_TURN_START_SLACK_MS
+  );
+}
+
+/**
  * A provider thread's latest started run: the last turn that provider saw.
  * Restart recovery records the thread's cancelled background work on it, and
  * the next run on the same provider thread delivers it with its input.
@@ -192,6 +231,7 @@ export const make = Effect.gen(function* () {
   const eventSink = yield* EventSink.EventSinkV2;
   const ids = yield* IdAllocator.IdAllocatorV2;
   const outbox = yield* EffectOutbox.EffectOutboxV2;
+  const liveness = yield* ProviderSessionLiveness;
   const reconcileProjection = Effect.fn("ProviderRuntimeRecoveryService.reconcileProjection")(
     function* (
       projection: ProjectionStore.ProjectionRuntimeRecoveryState,
@@ -223,6 +263,41 @@ export const make = Effect.gen(function* () {
           if (hasReplayableCheckpoint) continue;
         }
         runs.push(run);
+      }
+      // Sessions that run on without this server, by provider thread.
+      const liveSessions = new Map<ProviderThreadId, ProviderSessionLivenessState>();
+      if (projection.thread.archivedAt === null && projection.thread.deletedAt === null) {
+        for (const providerThread of projection.providerThreads) {
+          const nativeThreadId = providerThread.nativeThreadRef?.nativeId;
+          if (nativeThreadId == null) continue;
+          const live = yield* liveness.ofNativeThread({
+            driver: providerThread.driver,
+            nativeThreadId,
+          });
+          if (live.state !== "gone") liveSessions.set(providerThread.id, live);
+        }
+      }
+      // A running run whose session runs on is not over. Shutdown leaves it
+      // as it is; startup leaves it to the session's attachment to pick back
+      // up while the session still runs its turn (ClaudeBridgeAttachService),
+      // and settles it completed when that turn ended while no server was
+      // there. Its record's rows reach the thread from the record.
+      const keptRunIds = new Set<RunId>();
+      const completedRunIds = new Set<RunId>();
+      for (const run of runs) {
+        const live =
+          run.status === "running" && run.providerThreadId !== null
+            ? liveSessions.get(run.providerThreadId)
+            : undefined;
+        if (live === undefined) continue;
+        if (
+          trigger === "shutdown" ||
+          (live.state === "running" && sessionRunsTurnOf(run, projection, live.turnStartedAt))
+        ) {
+          keptRunIds.add(run.id);
+        } else {
+          completedRunIds.add(run.id);
+        }
       }
       const messageRequestNodeIds = new Set(
         projection.runtimeRequests
@@ -271,7 +346,8 @@ export const make = Effect.gen(function* () {
         providerThreadId: ProviderThreadId | null | undefined,
         work: OrchestrationV2RestartCancelledBackgroundWork,
       ) => {
-        if (providerThreadId == null) return;
+        // A session that runs on still has its work: nothing to tell its next turn.
+        if (providerThreadId == null || liveSessions.has(providerThreadId)) return;
         const existing = cancelledBackgroundWork.get(providerThreadId);
         if (existing === undefined) cancelledBackgroundWork.set(providerThreadId, [work]);
         else existing.push(work);
@@ -323,18 +399,28 @@ export const make = Effect.gen(function* () {
           },
         });
       }
+      // A kept run's requests are closed with the rest: their asking turn
+      // asks again when the session sees the next server attached.
+      const closedRequestNodeIds = new Set<string>(requests.map((request) => request.nodeId));
       for (const run of runs) {
-        events.push({
-          id: yield* allocateEventId(),
-          type: "run.updated",
-          threadId: projection.thread.id,
-          runId: run.id,
-          providerInstanceId: run.providerInstanceId,
-          occurredAt: now,
-          payload: { ...run, status: "cancelled", queuePosition: null, completedAt: now },
-        });
+        const kept = keptRunIds.has(run.id);
+        // A completed run's own turn and whatever ran in it finished; only its
+        // closed requests did not.
+        const settled = completedRunIds.has(run.id) ? "completed" : "cancelled";
+        if (!kept) {
+          events.push({
+            id: yield* allocateEventId(),
+            type: "run.updated",
+            threadId: projection.thread.id,
+            runId: run.id,
+            providerInstanceId: run.providerInstanceId,
+            occurredAt: now,
+            payload: { ...run, status: settled, queuePosition: null, completedAt: now },
+          });
+        }
         for (const attempt of projection.attempts.filter(
           (candidate) =>
+            !kept &&
             candidate.runId === run.id &&
             (candidate.status === "pending" || candidate.status === "running"),
         )) {
@@ -346,12 +432,13 @@ export const make = Effect.gen(function* () {
             nodeId: attempt.rootNodeId,
             providerInstanceId: run.providerInstanceId,
             occurredAt: now,
-            payload: { ...attempt, status: "cancelled", completedAt: now },
+            payload: { ...attempt, status: settled, completedAt: now },
           });
         }
         for (const node of projection.nodes.filter(
           (candidate) =>
             candidate.runId === run.id &&
+            (!kept || closedRequestNodeIds.has(candidate.id)) &&
             !messageRequestNodeIds.has(candidate.id) &&
             !delegatedTaskNodeIds.has(candidate.id) &&
             (candidate.status === "pending" ||
@@ -366,11 +453,16 @@ export const make = Effect.gen(function* () {
             nodeId: node.id,
             providerInstanceId: run.providerInstanceId,
             occurredAt: now,
-            payload: { ...node, status: "cancelled", completedAt: now },
+            payload: {
+              ...node,
+              status: closedRequestNodeIds.has(node.id) ? "cancelled" : settled,
+              completedAt: now,
+            },
           });
         }
         for (const subagent of projection.subagents.filter(
           (candidate) =>
+            !kept &&
             candidate.runId === run.id &&
             !isAppOwnedDelegation(candidate) &&
             (candidate.status === "pending" ||
@@ -386,11 +478,12 @@ export const make = Effect.gen(function* () {
             driver: subagent.driver,
             providerInstanceId: subagent.providerInstanceId,
             occurredAt: now,
-            payload: { ...subagent, status: "cancelled", completedAt: now, updatedAt: now },
+            payload: { ...subagent, status: settled, completedAt: now, updatedAt: now },
           });
         }
         for (const providerTurn of projection.providerTurns.filter(
           (candidate) =>
+            !kept &&
             candidate.runAttemptId !== null &&
             projection.attempts.some(
               (attempt) => attempt.id === candidate.runAttemptId && attempt.runId === run.id,
@@ -405,11 +498,11 @@ export const make = Effect.gen(function* () {
             nodeId: providerTurn.nodeId,
             providerInstanceId: run.providerInstanceId,
             occurredAt: now,
-            payload: { ...providerTurn, status: "cancelled", completedAt: now },
+            payload: { ...providerTurn, status: settled, completedAt: now },
           });
         }
         for (const message of projection.messages.filter(
-          (candidate) => candidate.runId === run.id && candidate.streaming,
+          (candidate) => !kept && candidate.runId === run.id && candidate.streaming,
         )) {
           events.push({
             id: yield* allocateEventId(),
@@ -425,6 +518,7 @@ export const make = Effect.gen(function* () {
         for (const item of projection.turnItems.filter(
           (candidate) =>
             candidate.runId === run.id &&
+            (!kept || (candidate.nodeId !== null && closedRequestNodeIds.has(candidate.nodeId))) &&
             (candidate.nodeId === null || !messageRequestNodeIds.has(candidate.nodeId)) &&
             !isAppOwnedDelegationItem(candidate) &&
             (candidate.status === "pending" ||
@@ -442,7 +536,19 @@ export const make = Effect.gen(function* () {
             ...(item.nodeId === null ? {} : { nodeId: item.nodeId }),
             providerInstanceId: run.providerInstanceId,
             occurredAt: now,
-            payload: cancelledItem(item, now),
+            payload:
+              settled === "completed" &&
+              (item.nodeId === null || !closedRequestNodeIds.has(item.nodeId))
+                ? {
+                    ...item,
+                    status: "completed",
+                    completedAt: now,
+                    updatedAt: now,
+                    ...(item.type === "reasoning" || item.type === "assistant_message"
+                      ? { streaming: false }
+                      : {}),
+                  }
+                : cancelledItem(item, now),
           });
         }
       }
@@ -655,9 +761,16 @@ export const make = Effect.gen(function* () {
           },
         });
       }
-      const continuationRun =
+      const restartedRun =
         continueAfterRestart && trigger === "startup"
           ? restartContinuationRun(projection)
+          : undefined;
+      // A run its session picks back up, or finished, has nothing to continue.
+      const continuationRun =
+        restartedRun !== undefined &&
+        !keptRunIds.has(restartedRun.id) &&
+        !completedRunIds.has(restartedRun.id)
+          ? restartedRun
           : undefined;
       const effects: Array<EffectOutbox.PendingOrchestrationEffectV2> = continuationRun
         ? [
@@ -719,7 +832,8 @@ export const make = Effect.gen(function* () {
         retiredEffects = result.cancelledEffectCount;
       }
       return {
-        terminalizedRuns: runs.length,
+        terminalizedRuns: runs.length - keptRunIds.size,
+        keptRuns: keptRunIds.size,
         stoppedSessions,
         closedRequests: requests.length,
         retiredEffects,
@@ -740,6 +854,7 @@ export const make = Effect.gen(function* () {
           ),
         );
       let terminalizedRuns = 0;
+      let keptRuns = 0;
       let stoppedSessions = 0;
       let closedRequests = 0;
       let retiredEffects = 0;
@@ -760,6 +875,7 @@ export const make = Effect.gen(function* () {
             .continueThreadsAfterServerUpdate;
         const result = yield* reconcileProjection(projection, trigger, enabled);
         terminalizedRuns += result.terminalizedRuns;
+        keptRuns += result.keptRuns;
         stoppedSessions += result.stoppedSessions;
         closedRequests += result.closedRequests;
         retiredEffects += result.retiredEffects;
@@ -771,6 +887,7 @@ export const make = Effect.gen(function* () {
       );
       return {
         terminalizedRuns,
+        keptRuns,
         stoppedSessions,
         closedRequests,
         retiredEffects: retiredEffects + outboxReconciliation.cancelled,

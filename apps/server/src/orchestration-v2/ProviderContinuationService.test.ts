@@ -844,4 +844,88 @@ describe("ProviderContinuationService", () => {
       );
     });
   });
+
+  describe("a turn the session was running when the server came up", () => {
+    const openRunId = RunId.make("run-provider-continuation-open");
+    const withRun = (status: string, onProviderThread = providerThreadId) =>
+      ({
+        ...projection,
+        runs: [
+          {
+            id: openRunId,
+            providerThreadId: onProviderThread,
+            status,
+            activeAttemptId: "attempt-provider-continuation-open",
+          },
+        ],
+      }) as unknown as OrchestrationV2ThreadProjection;
+    const offerReattach = (runs: OrchestrationV2ThreadProjection, rejectReattach = false) =>
+      Effect.gen(function* () {
+        const dispatched = yield* Queue.unbounded<{
+          readonly type: string;
+          readonly runId?: RunId;
+        }>();
+        const layerThreads = Layer.mock(ThreadManagementService.ThreadManagementService)({
+          getThreadRecords: () => Effect.succeed(runs),
+          dispatch: (command) =>
+            Queue.offer(dispatched, command).pipe(
+              Effect.andThen(
+                rejectReattach && command.type === "run.reattach"
+                  ? Effect.fail(new Error("not running") as never)
+                  : Effect.succeed({} as never),
+              ),
+            ),
+        });
+        const layer = Layer.merge(
+          ProviderContinuationRequests.layer,
+          ProviderContinuationService.layer.pipe(
+            Layer.provide(
+              Layer.mergeAll(IdAllocator.layer, ProviderContinuationRequests.layer, layerThreads),
+            ),
+          ),
+        );
+        return yield* Effect.gen(function* () {
+          const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+          yield* requests.offer({ ...request(), reattachRun: true });
+          const first = yield* Queue.take(dispatched);
+          if (first.type !== "run.reattach" || !rejectReattach) return [first];
+          return [first, yield* Queue.take(dispatched)];
+        }).pipe(Effect.provide(layer), Effect.scoped);
+      });
+
+    it.effect("picks the run recovery left open back up instead of starting another", () =>
+      Effect.gen(function* () {
+        const commands = yield* offerReattach(withRun("running"));
+        assert.deepEqual(
+          commands.map((command) => [command.type, command.runId]),
+          [["run.reattach", openRunId]],
+        );
+      }),
+    );
+
+    it.effect("starts a run as before when no run is open on that session", () =>
+      Effect.gen(function* () {
+        for (const runs of [
+          withRun("cancelled"),
+          withRun("running", ProviderThreadId.make("provider-thread-elsewhere")),
+        ]) {
+          const commands = yield* offerReattach(runs);
+          assert.deepEqual(
+            commands.map((command) => command.type),
+            ["message.dispatch"],
+          );
+        }
+      }),
+    );
+
+    it.effect("starts a run when the open run settled before it could be picked up", () =>
+      Effect.gen(function* () {
+        const commands = yield* offerReattach(withRun("running"), true);
+        assert.deepEqual(
+          commands.map((command) => command.type),
+          ["run.reattach", "message.dispatch"],
+        );
+      }),
+    );
+  });
 });

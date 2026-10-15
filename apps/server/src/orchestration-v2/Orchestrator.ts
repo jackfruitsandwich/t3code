@@ -430,6 +430,7 @@ function commandThreadId(command: OrchestrationV2ServerCommand): ThreadId {
     case "thread.background-work.settle":
     case "thread.stop":
     case "provider.switch":
+    case "run.reattach":
       return command.threadId;
     case "delegated_task.request":
     case "delegated_task.wake-policy":
@@ -8483,6 +8484,167 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       }
     });
 
+  /**
+   * A run its native session went on running while no server was attached (a
+   * restart mid-turn): the attempt the last server ran is over, and a new one
+   * on the same root checkpoint scope attaches to the session's turn. Its
+   * message is the run's own, sent as the provider's, so nothing is prompted.
+   */
+  const dispatchRunReattach = (
+    command: Extract<OrchestrationV2InternalCommand, { readonly type: "run.reattach" }>,
+    events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
+    effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>,
+  ) =>
+    Effect.gen(function* () {
+      const projection = yield* projectionStore
+        .getThreadRecords(command.threadId, ["runs", "attempts", "nodes", "providerTurns"], {
+          runIds: [command.runId],
+        })
+        .pipe(
+          Effect.mapError(
+            (cause) => new OrchestratorProjectionError({ threadId: command.threadId, cause }),
+          ),
+        );
+      const run = projection.runs.find((candidate) => candidate.id === command.runId);
+      const currentAttempt = projection.attempts.find(
+        (candidate) => candidate.id === run?.activeAttemptId,
+      );
+      const currentRootNode = projection.nodes.find(
+        (candidate) => candidate.id === run?.rootNodeId,
+      );
+      if (
+        projection.thread.archivedAt !== null ||
+        projection.thread.deletedAt !== null ||
+        run === undefined ||
+        run.status !== "running" ||
+        run.providerThreadId === null ||
+        currentRootNode === undefined
+      ) {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: `Run ${command.runId} is not a running run to pick back up.`,
+        });
+      }
+      const now = yield* DateTime.now;
+      const emitEvent = emit(events, command);
+      const attemptOrdinal =
+        Math.max(
+          0,
+          ...projection.attempts
+            .filter((candidate) => candidate.runId === run.id)
+            .map((candidate) => candidate.attemptOrdinal),
+        ) + 1;
+      const nextAttemptId = idAllocator.derive.runAttempt({ runId: run.id, attemptOrdinal });
+      const nextRootNodeId = idAllocator.derive.rootNodeAttempt({
+        runId: run.id,
+        attemptOrdinal,
+      });
+      for (const providerTurn of projection.providerTurns.filter(
+        (candidate) =>
+          candidate.runAttemptId !== null &&
+          candidate.runAttemptId === currentAttempt?.id &&
+          (candidate.status === "pending" || candidate.status === "running"),
+      )) {
+        yield* emitEvent({
+          type: "provider-turn.updated",
+          threadId: command.threadId,
+          runId: run.id,
+          nodeId: providerTurn.nodeId,
+          providerInstanceId: run.providerInstanceId,
+          occurredAt: now,
+          payload: { ...providerTurn, status: "interrupted", completedAt: now },
+        });
+      }
+      // Interrupted, not superseded: clients fold a superseded attempt's
+      // output away, and this one's is the start of the same turn.
+      if (
+        currentAttempt !== undefined &&
+        (currentAttempt.status === "pending" || currentAttempt.status === "running")
+      ) {
+        yield* emitEvent({
+          type: "run-attempt.updated",
+          threadId: command.threadId,
+          runId: run.id,
+          nodeId: currentRootNode.id,
+          providerInstanceId: run.providerInstanceId,
+          occurredAt: now,
+          payload: { ...currentAttempt, status: "interrupted", completedAt: now },
+        });
+      }
+      yield* emitEvent({
+        type: "node.updated",
+        threadId: command.threadId,
+        runId: run.id,
+        nodeId: currentRootNode.id,
+        providerInstanceId: run.providerInstanceId,
+        occurredAt: now,
+        payload: { ...currentRootNode, status: "interrupted", completedAt: now },
+      });
+      yield* emitEvent({
+        type: "run.updated",
+        threadId: command.threadId,
+        runId: run.id,
+        nodeId: nextRootNodeId,
+        providerInstanceId: run.providerInstanceId,
+        occurredAt: now,
+        payload: {
+          ...run,
+          status: "starting",
+          activeAttemptId: nextAttemptId,
+          rootNodeId: nextRootNodeId,
+        },
+      });
+      yield* emitEvent({
+        type: "run-attempt.created",
+        threadId: command.threadId,
+        runId: run.id,
+        nodeId: nextRootNodeId,
+        providerInstanceId: run.providerInstanceId,
+        occurredAt: now,
+        payload: {
+          id: nextAttemptId,
+          runId: run.id,
+          attemptOrdinal,
+          rootNodeId: nextRootNodeId,
+          providerInstanceId: run.providerInstanceId,
+          providerThreadId: run.providerThreadId,
+          providerTurnId: null,
+          reason: "provider_recovery",
+          status: "pending",
+          startedAt: null,
+          completedAt: null,
+        },
+      });
+      yield* emitEvent({
+        type: "node.updated",
+        threadId: command.threadId,
+        runId: run.id,
+        nodeId: nextRootNodeId,
+        providerInstanceId: run.providerInstanceId,
+        occurredAt: now,
+        payload: {
+          ...currentRootNode,
+          id: nextRootNodeId,
+          rootNodeId: nextRootNodeId,
+          status: "pending",
+          providerThreadId: run.providerThreadId,
+          providerTurnId: null,
+          startedAt: null,
+          completedAt: null,
+        },
+      });
+      yield* Ref.update(effects, (existing) => [
+        ...existing,
+        {
+          id: `effect:${command.commandId}:provider-turn.start:${run.id}`,
+          commandId: command.commandId,
+          threadId: command.threadId,
+          request: { type: "provider-turn.start", runId: run.id },
+        } satisfies PendingOrchestrationEffectV2,
+      ]);
+    });
+
   const dispatchBackgroundWorkSettle = (
     command: Extract<
       OrchestrationV2InternalCommand,
@@ -10322,6 +10484,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         break;
       case "thread.background-work.settle":
         yield* dispatchBackgroundWorkSettle(command, events, effects);
+        break;
+      case "run.reattach":
+        yield* dispatchRunReattach(command, events, effects);
         break;
       case "thread.fork":
         yield* dispatchThreadFork(command, events);

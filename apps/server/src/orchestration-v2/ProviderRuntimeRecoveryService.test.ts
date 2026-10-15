@@ -55,6 +55,7 @@ it.effect("leaves durable effects for the worker after runtime reconciliation", 
     );
     assert.deepEqual(summary, {
       terminalizedRuns: 0,
+      keptRuns: 0,
       stoppedSessions: 0,
       closedRequests: 0,
       retiredEffects: 0,

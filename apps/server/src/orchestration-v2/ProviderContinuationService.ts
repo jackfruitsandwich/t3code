@@ -143,6 +143,37 @@ export const layer = Layer.effectDiscard(
           yield* clearRetryAttempt(retryKey);
           return;
         }
+        const openRun =
+          request.reattachRun === true
+            ? projection.runs.find(
+                (run) =>
+                  run.providerThreadId === request.providerThreadId && run.status === "running",
+              )
+            : undefined;
+        // Settled since it was read, the run has nothing to pick up, and the
+        // turn gets a run of its own as below.
+        const reattached =
+          openRun !== undefined &&
+          (yield* threads
+            .dispatch({
+              type: "run.reattach",
+              commandId: CommandId.make(
+                `provider-continuation:reattach:${openRun.id}:${openRun.activeAttemptId}`,
+              ),
+              threadId: request.threadId,
+              runId: openRun.id,
+            })
+            .pipe(
+              Effect.as(true),
+              Effect.catch((cause) =>
+                Effect.logWarning("orchestration-v2.provider-continuation.reattach-rejected", {
+                  threadId: request.threadId,
+                  runId: openRun.id,
+                  cause,
+                }).pipe(Effect.as(false)),
+              ),
+            ));
+        if (reattached) return;
         // The ordinal is display metadata only: allocate.message appends a
         // random UUID, so a stale projection read here cannot collide ids.
         const messageId = yield* ids.allocate.message({

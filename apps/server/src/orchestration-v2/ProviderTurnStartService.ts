@@ -995,8 +995,12 @@ export const layer: Layer.Layer<
         run,
         attempts: projection.attempts,
       });
+      // An attempt that picks a run back up after a restart attaches to the
+      // turn its session went on running: that turn already has its prompt
+      // and context, and is sent nothing (the orchestrator's `run.reattach`).
+      const reattaching = attempt.reason === "provider_recovery";
       const restartNote =
-        restartCancelledWork.length === 0
+        reattaching || restartCancelledWork.length === 0
           ? ""
           : restartCancelledBackgroundWorkNote(restartCancelledWork);
       const tokenCap = yield* handoffTokenCapConfig.pipe(
@@ -1225,12 +1229,31 @@ export const layer: Layer.Layer<
           ),
         );
       const deliverySession =
-        effectiveHandoffs.length === 0 &&
-        missedItems.length === 0 &&
-        restartNote === "" &&
-        !noteContinuation
+        reattaching ||
+        (effectiveHandoffs.length === 0 &&
+          missedItems.length === 0 &&
+          restartNote === "" &&
+          !noteContinuation)
           ? session
           : makeDeliverySession(session, startWithHandoffs);
+      // The requests the run's earlier attempts asked that recovery closed:
+      // asked again, each is the same request.
+      const recoveredRuntimeRequests = reattaching
+        ? (yield* projectionStore.getThreadRecords(input.threadId, [
+            "runtimeRequests",
+          ])).runtimeRequests.filter(
+            (request) =>
+              (request.status === "cancelled" || request.status === "expired") &&
+              projection.providerTurns.some(
+                (turn) =>
+                  turn.id === request.providerTurnId &&
+                  turn.runAttemptId !== attempt.id &&
+                  projection.attempts.some(
+                    (candidate) => candidate.id === turn.runAttemptId && candidate.runId === run.id,
+                  ),
+              ),
+          )
+        : [];
       yield* runExecution.startRootRun({
         commandId: CommandId.make(`command:effect:provider-turn.start:${run.id}`),
         appThread: projection.thread,
@@ -1278,7 +1301,8 @@ export const layer: Layer.Layer<
           text: userText,
           attachments: message.attachments,
           createdBy: message.createdBy,
-          creationSource: message.creationSource,
+          // Sent as the provider's own, the message prompts nothing.
+          creationSource: reattaching ? "provider" : message.creationSource,
           ...(message.scheduledTaskId === undefined
             ? {}
             : { scheduledTaskId: message.scheduledTaskId }),
@@ -1286,6 +1310,7 @@ export const layer: Layer.Layer<
             ? {}
             : { senderThreadId: message.senderThreadId }),
         },
+        ...(recoveredRuntimeRequests.length === 0 ? {} : { recoveredRuntimeRequests }),
         modelSelection: run.modelSelection,
         runtimePolicy: resolvedRuntimePolicy,
       });

@@ -1,6 +1,7 @@
 import { assert, describe, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 
@@ -240,6 +241,96 @@ describe("the first turn of a session that carries a conversation on", () => {
       const { offered, adopted } = yield* firstTurn([]);
       assert.deepStrictEqual(adopted, ["new"]);
       assert.deepStrictEqual(offered, []);
+    }),
+  );
+});
+
+describe("a turn the session was running when the server came up", () => {
+  const at = "2026-10-14T10:00:00.000Z";
+  const encodePayload = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
+
+  /** What is offered for session "live", which T3 holds and which runs a turn at startup. */
+  const startupOffer = Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const payload = yield* encodePayload({
+      driver: CLAUDE_PROVIDER,
+      nativeThreadRef: { nativeId: "live" },
+    });
+    yield* sql`
+        INSERT INTO orchestration_v2_projection_threads (
+          thread_id, project_id, title, default_provider, runtime_mode, interaction_mode,
+          created_at, updated_at, payload_json
+        ) VALUES (
+          'thread-live', 'project-1', 'live', ${CLAUDE_PROVIDER}, 'full-access', 'default',
+          ${at}, ${at}, '{}'
+        )
+      `;
+    yield* sql`
+        INSERT INTO orchestration_v2_projection_provider_threads (
+          provider_thread_id, thread_id, provider, status, updated_at, payload_json
+        ) VALUES (
+          'provider-thread-live', 'thread-live', ${CLAUDE_PROVIDER}, 'idle', ${at}, ${payload}
+        )
+      `;
+    const session = parseClaudeBridgeSessionFile({
+      sid: "live",
+      instanceId: "instance-live",
+      heartbeatAt: 1_750_000_000_000,
+      isInteractive: true,
+      transcriptPath: "/records/live.jsonl",
+      activeTurn: { turnId: "turn-1", startedAt: 1_749_999_990_000, transcriptOffset: 0 },
+    });
+    assert.isNotNull(session);
+    const offered =
+      yield* Queue.unbounded<ProviderContinuationRequests.ProviderContinuationRequest>();
+    const none = yield* ClaudeBridgeRegistry.ClaudeBridgeRegistry.pipe(
+      Effect.provide(ClaudeBridgeRegistry.layerTest),
+    );
+    yield* Layer.build(attachLayer).pipe(
+      Effect.provideService(
+        ClaudeBridgeRegistry.ClaudeBridgeRegistry,
+        ClaudeBridgeRegistry.ClaudeBridgeRegistry.of({
+          ...none,
+          listLiveProcesses: Effect.succeed([
+            { sid: "live", instanceId: "instance-live", dir: "/bridge/live", session: session! },
+          ]),
+        }),
+      ),
+      Effect.provideService(
+        SessionImporter.SessionImporter,
+        SessionImporter.SessionImporter.of({
+          start: () => Effect.void,
+          sweepNow: () => Effect.void,
+          adoptLiveClaudeSession: () => Effect.void,
+          healLiveClaudeSession: () => Effect.void,
+          claudeConversationHolder: () => Effect.succeed(null),
+          claudeSessionHeldElsewhere: () => Effect.succeed(false),
+        }),
+      ),
+      Effect.provideService(
+        ProviderRuntimeRecoveryService.ProviderRuntimeRecoveryService,
+        ProviderRuntimeRecoveryService.ProviderRuntimeRecoveryService.of({
+          reconcile: () => Effect.die("unused"),
+          prepareForShutdown: Effect.void,
+          recover: Effect.die("unused"),
+          awaitStartupRecovery: Effect.void,
+        }),
+      ),
+      Effect.provideService(ProviderContinuationRequests.ProviderContinuationRequests, {
+        offer: (request) => Queue.offer(offered, request).pipe(Effect.asVoid),
+        take: Effect.never,
+      }),
+    );
+    return yield* Queue.take(offered);
+  }).pipe(Effect.scoped, Effect.provide(SqlitePersistence.layerMemory));
+
+  it.effect("is offered for the run recovery left open to pick back up", () =>
+    Effect.gen(function* () {
+      const offer = yield* startupOffer;
+      assert.deepStrictEqual(
+        [offer.threadId, offer.providerThreadId, offer.reattachRun],
+        ["thread-live", "provider-thread-live", true],
+      );
     }),
   );
 });

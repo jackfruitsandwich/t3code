@@ -5027,11 +5027,19 @@ export function makeClaudeAdapterV2(
           readonly sessionGrant?: string;
         }) {
           const createdAt = yield* DateTime.now;
-          const requestId = yield* idAllocator.allocate.runtimeRequest({
-            driver: CLAUDE_PROVIDER,
-            providerTurnId: input.context.providerTurnId,
-            nativeRequestId: input.nativeRequestId,
-          });
+          // Asked again after a restart, a request keeps its card.
+          const recovered = input.context.input.recoveredRuntimeRequests?.find(
+            (request) =>
+              request.nativeRequestRef?.nativeId === input.nativeRequestId &&
+              request.kind === input.requestKind,
+          );
+          const requestId =
+            recovered?.id ??
+            (yield* idAllocator.allocate.runtimeRequest({
+              driver: CLAUDE_PROVIDER,
+              providerTurnId: input.context.providerTurnId,
+              nativeRequestId: input.nativeRequestId,
+            }));
           const nodeId = idAllocator.derive.approvalNode({ requestId });
           const providerSessionId = input.context.input.providerThread.providerSessionId;
           if (providerSessionId === null) {

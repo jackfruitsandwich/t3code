@@ -26,6 +26,7 @@ import {
   ProviderTurnId,
   RunAttemptId,
   RunId,
+  RuntimeRequestId,
   ThreadId,
 } from "@t3tools/contracts";
 import { assert, describe, it } from "@effect/vitest";
@@ -1094,6 +1095,129 @@ describe("ClaudeAdapterV2 Auto-accept edits", () => {
           decision: "accept",
         });
         assert.equal((yield* Fiber.join(decision))?.behavior, "allow");
+      }).pipe(Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+    ),
+  );
+});
+
+describe("ClaudeAdapterV2 recovered requests", () => {
+  it.effect("asks a request a restart closed on its own card again", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const idAllocator = yield* IdAllocator.IdAllocatorV2;
+        const attachmentsDir = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "t3-claude-recovered-request-",
+        });
+        let openedOptions: ClaudeAdapterV2.ClaudeAgentSdkQueryOptions | undefined;
+        const adapter = ClaudeAdapterV2.makeClaudeAdapterV2({
+          instanceId: ClaudeAdapterV2.CLAUDE_DEFAULT_INSTANCE_ID,
+          settings: DEFAULT_CLAUDE_SETTINGS,
+          environment: {},
+          attachmentsDir,
+          fileSystem,
+          path: yield* Path.Path,
+          crypto: yield* Crypto.Crypto,
+          idAllocator,
+          queryRunner: {
+            allocateSessionId: Effect.succeed("native-thread-claude-recovered-request"),
+            open: (input) =>
+              Effect.sync(() => {
+                openedOptions = input.options;
+                return {
+                  messages: Stream.never,
+                  offer: () => Effect.void,
+                  setModel: () => Effect.void,
+                  setPermissionMode: () => Effect.void,
+                  interrupt: Effect.void,
+                  close: Effect.void,
+                };
+              }),
+            forkSession: () => Effect.die("unused"),
+            subagentLaunchToolUseId: () => Effect.succeed(null),
+            assertComplete: Effect.void,
+          },
+        });
+        const runtimePolicy = ProviderAdapterV2RuntimePolicy.make({
+          runtimeMode: "auto-accept-edits",
+          interactionMode: "default",
+          cwd: "/workspace",
+        });
+        const threadId = ThreadId.make("thread-claude-recovered-request");
+        const runtime = yield* adapter.openSession({
+          threadId,
+          providerSessionId: ProviderSessionId.make("provider-session-claude-recovered-request"),
+          modelSelection: CLAUDE_TEST_MODEL_SELECTION,
+          runtimePolicy,
+        });
+        const providerThread = yield* runtime.ensureThread({
+          threadId,
+          modelSelection: CLAUDE_TEST_MODEL_SELECTION,
+          runtimePolicy,
+        });
+        const now = yield* DateTime.now;
+        const recoveredId = RuntimeRequestId.make("runtime-request-closed-by-restart");
+        yield* runtime.startTurn({
+          ...makeClaudeTestTurnInput({
+            threadId,
+            providerThread,
+            now,
+            attemptId: RunAttemptId.make("attempt-claude-recovered-request"),
+            text: "Run node.",
+            attachments: [],
+            runtimePolicy,
+          }),
+          recoveredRuntimeRequests: [
+            {
+              id: recoveredId,
+              nodeId: NodeId.make("node-closed-by-restart"),
+              providerTurnId: ProviderTurnId.make("provider-turn-before-restart"),
+              nativeRequestRef: {
+                driver: ClaudeAdapterV2.CLAUDE_PROVIDER,
+                nativeId: "tool-bash-asked-before",
+                strength: "strong",
+              },
+              kind: "command",
+              status: "expired",
+              responseCapability: { type: "not_resumable", reason: "The server restarted." },
+              createdAt: now,
+              resolvedAt: now,
+            },
+          ],
+        });
+        const canUseTool = openedOptions!.canUseTool!;
+        const requests = yield* runtime.events.pipe(
+          Stream.filter((event) => event.type === "runtime_request.updated"),
+          Stream.take(2),
+          Stream.runCollect,
+          Effect.forkScoped,
+        );
+        for (const toolUseID of ["tool-bash-asked-before", "tool-bash-new"]) {
+          yield* Effect.promise(() =>
+            canUseTool(
+              "Bash",
+              { command: `echo ${toolUseID}` },
+              {
+                signal: new AbortController().signal,
+                toolUseID,
+                requestId: `request-${toolUseID}`,
+              },
+            ),
+          ).pipe(Effect.forkScoped);
+        }
+        const asked = [...(yield* Fiber.join(requests))].flatMap((event) =>
+          event.type === "runtime_request.updated" ? [event.runtimeRequest] : [],
+        );
+        assert.deepEqual(
+          asked.map((request) => [request.nativeRequestRef?.nativeId, request.status]),
+          [
+            ["tool-bash-asked-before", "pending"],
+            ["tool-bash-new", "pending"],
+          ],
+        );
+        assert.equal(asked[0]!.id, recoveredId);
+        assert.notEqual(asked[1]!.id, recoveredId);
+        assert.equal(asked[0]!.nodeId, idAllocator.derive.approvalNode({ requestId: recoveredId }));
       }).pipe(Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
     ),
   );

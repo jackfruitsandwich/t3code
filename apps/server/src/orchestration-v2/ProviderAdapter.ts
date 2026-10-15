@@ -442,6 +442,12 @@ export interface ProviderAdapterV2TurnInput {
   readonly rootNodeId: NodeId;
   readonly providerThread: OrchestrationV2ProviderThread;
   readonly message: ProviderAdapterV2TurnMessage;
+  /**
+   * Requests an earlier attempt of this run asked that recovery closed when
+   * the server restarted. The session asks one again once it sees this turn
+   * attached: an ask for the same native request is that request, reopened.
+   */
+  readonly recoveredRuntimeRequests?: ReadonlyArray<OrchestrationV2RuntimeRequest>;
   readonly modelSelection: ModelSelection;
   readonly runtimePolicy: ProviderAdapterV2RuntimePolicy;
 }

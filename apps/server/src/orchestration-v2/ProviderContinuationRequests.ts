@@ -53,6 +53,13 @@ export interface ProviderContinuationRequest {
    * provider produced).
    */
   readonly createdBy?: OrchestrationV2Actor;
+  /**
+   * The session was already running its turn when this server came up. When
+   * the thread still has a run running on the provider thread (recovery left
+   * it open: its session ran on), that run picks the turn back up on a new
+   * attempt instead of a continuation run being started for it.
+   */
+  readonly reattachRun?: boolean;
   readonly dispatchIfCurrent?: <A, E, R>(
     effect: Effect.Effect<A, E, R>,
   ) => Effect.Effect<Option.Option<A>, E, R>;

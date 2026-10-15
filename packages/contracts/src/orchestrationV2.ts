@@ -3207,6 +3207,17 @@ const OrchestrationV2InternalCommand = Schema.Union([
     providerTurnId: ProviderTurnId,
   }),
   /**
+   * Picks a running run back up on a new `provider_recovery` attempt after a server restart,
+   * for a native session that ran on without the server: the attempt attaches to the turn the
+   * session is still running and sends no prompt. Rejected unless the run is running.
+   */
+  Schema.Struct({
+    type: Schema.Literal("run.reattach"),
+    commandId: CommandId,
+    threadId: ThreadId,
+    runId: RunId,
+  }),
+  /**
    * Stop for one thread, whatever it is doing: interrupts its running turn, holds its queue,
    * ends its pull request watches, and drops pending delegated-task wakes. Nothing to stop is
    * an accepted no-op. Delegated tasks under the thread get their own `thread.stop`.

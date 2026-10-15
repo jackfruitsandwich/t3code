@@ -10,6 +10,7 @@ import * as AgentSessionImporter from "../project/AgentSessionImporter.ts";
 import * as AgentSessionScanner from "../project/AgentSessionScanner.ts";
 import * as SessionImporter from "../import/Layers/SessionImporter.ts";
 import * as ClaudeBridgeAttachService from "../claude-bridge/ClaudeBridgeAttachService.ts";
+import * as ClaudeBridgeLiveness from "../claude-bridge/ClaudeBridgeLiveness.ts";
 import * as ClaudeBridgeRegistry from "../claude-bridge/ClaudeBridgeRegistry.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as ProjectSetupScriptRunner from "../project/ProjectSetupScriptRunner.ts";
@@ -328,6 +329,8 @@ const layerProviderRuntimeRecoveryProvided = ProviderRuntimeRecoveryService.laye
       layerEventSinkProvided,
       IdAllocator.layer,
       ProjectionStore.layer,
+      // Personal fork: a bridged Claude Code session outlives the server.
+      ClaudeBridgeLiveness.layer.pipe(Layer.provide(ClaudeBridgeRegistry.layer)),
     ),
   ),
 );
