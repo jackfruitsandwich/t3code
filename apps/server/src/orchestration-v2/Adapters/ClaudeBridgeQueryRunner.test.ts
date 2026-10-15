@@ -2441,6 +2441,91 @@ describe("ClaudeBridgeQueryRunner a /compact typed in the terminal", () => {
   );
 });
 
+describe("ClaudeBridgeQueryRunner a prompt's hook result", () => {
+  // Claude Code writes a prompt's hook result as the prompt goes in, and the
+  // mod's word that the turn began can come after the row is read.
+  const hookError = (uuid: string, atMs: number) =>
+    `${JSON.stringify({
+      type: "attachment",
+      uuid,
+      parentUuid: null,
+      isSidechain: false,
+      timestamp: stamp(atMs),
+      attachment: {
+        type: "hook_non_blocking_error",
+        hookName: "UserPromptSubmit",
+        hookEvent: "UserPromptSubmit",
+        stderr: "lint-hook-failed",
+        stdout: "",
+        exitCode: 1,
+      },
+    })}\n`;
+  const collect = (bridge: { readonly session: ClaudeAdapterV2.ClaudeAgentSdkQuerySession }) =>
+    Effect.gen(function* () {
+      const frames: Array<SDKMessage> = [];
+      yield* bridge.session.messages.pipe(
+        Stream.runForEach((frame) =>
+          Effect.sync(() => {
+            frames.push(frame);
+          }),
+        ),
+        Effect.forkScoped,
+      );
+      return frames;
+    });
+  const kinds = (frames: ReadonlyArray<SDKMessage>) =>
+    frames.map((frame) =>
+      isClaudeBridgeNoticeFrame(frame)
+        ? "notice"
+        : frame.type === "system"
+          ? `system:${frame.subtype}`
+          : frame.type,
+    );
+
+  it.live("keeps one read before its turn began for that turn", () =>
+    Effect.gen(function* () {
+      const bridge = yield* attach({ protocol: 2, bridgeCanUseTool: () => null, transcript: "" });
+      const fs = yield* FileSystem.FileSystem;
+      const frames = yield* collect(bridge);
+      yield* fs.writeFileString(
+        bridge.process.session.transcriptPath,
+        hookError("00000000-0000-4000-8000-0000000000e0", bridge.now),
+        { flag: "a" },
+      );
+      yield* Effect.sleep("800 millis");
+      assert.deepStrictEqual(kinds(frames), []);
+      yield* bridge.handler(
+        {
+          seq: 1,
+          at: bridge.now,
+          type: "turn.start",
+          turnId: "turn-a",
+          text: "go",
+          transcriptOffset: 0,
+        },
+        bridge.process,
+      );
+      yield* Effect.sleep("300 millis");
+      assert.deepStrictEqual(kinds(frames), ["user", "system:init", "notice"]);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.live("lets one go on as before when no turn follows", () =>
+    Effect.gen(function* () {
+      const bridge = yield* attach({ protocol: 2, bridgeCanUseTool: () => null, transcript: "" });
+      const fs = yield* FileSystem.FileSystem;
+      const frames = yield* collect(bridge);
+      yield* fs.writeFileString(
+        bridge.process.session.transcriptPath,
+        hookError("00000000-0000-4000-8000-0000000000e1", bridge.now),
+        { flag: "a" },
+      );
+      yield* Effect.sleep("6500 millis");
+      assert.deepStrictEqual(kinds(frames), ["notice"]);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+});
+
 describe("ClaudeBridgeQueryRunner what the session reports of itself", () => {
   const usage = (tokens: number, fiveHour: number) => ({
     context: { tokens, window: 200_000, percent: Math.round((tokens / 200_000) * 100) },

@@ -70,6 +70,7 @@ import type { ProviderContinuationRequest } from "../ProviderContinuationRequest
 import { makeProviderFailure } from "../ProviderFailure.ts";
 import {
   CLAUDE_BRIDGE_COMPACT_SUMMARY_KEY,
+  CLAUDE_BRIDGE_NOTICE_KEY,
   CLAUDE_BRIDGE_SETTLED_ELSEWHERE,
   claudeBridgeReplacesDrawnFrame,
 } from "../../claude-bridge/ClaudeBridgeProtocol.ts";
@@ -6686,6 +6687,84 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         assert.equal(compactions[0]?.id, compactions[1]?.id);
         assert.equal(compactions[1]?.summary, summary);
         assert.equal(compactions[1]?.beforeTokenCount, 125550);
+      }).pipe(Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+    ),
+  );
+
+  // A turn typed in the terminal says what its hooks did as it runs, and
+  // that can come before the run for it has opened here.
+  it.effect("keeps a typed turn's hook result for its run when that opens late", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        const now = yield* DateTime.now;
+        yield* harness.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now,
+            attemptId: RunAttemptId.make("attempt-claude-typed-hook-1"),
+            text: "Hello.",
+            attachments: [],
+          }),
+        );
+        yield* Queue.offer(harness.sdkMessages, turnOneResult);
+        yield* awaitUntil(() => harness.terminalEvents().length === 1, "first turn terminal");
+
+        const said = "UserPromptSubmit hook error\nFailed with non-blocking status code: lint";
+        yield* Queue.offer(
+          harness.sdkMessages,
+          claudeSdkFrame({
+            type: "user",
+            message: { role: "user", content: "fix the login bug" },
+            parent_tool_use_id: null,
+            uuid: "00000000-0000-4000-8000-000000000330",
+            session_id: WAKE_NATIVE_SESSION,
+            t3_wake_detail: "fix the login bug",
+          }),
+        );
+        yield* Queue.offer(harness.sdkMessages, wakeTurnInit);
+        yield* Queue.offer(
+          harness.sdkMessages,
+          claudeSdkFrame({
+            type: "system",
+            subtype: "hook_non_blocking_error",
+            content: said,
+            uuid: "00000000-0000-4000-8000-000000000331",
+            session_id: WAKE_NATIVE_SESSION,
+            [CLAUDE_BRIDGE_NOTICE_KEY]: true,
+          }),
+        );
+        yield* awaitUntil(() => harness.continuationRequests.length === 1, "typed continuation");
+        let quietYields = 0;
+        yield* awaitUntil(() => quietYields++ >= 50, "the notice to settle into the buffer");
+
+        const before = harness.events.length;
+        yield* harness.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now,
+            attemptId: RunAttemptId.make("attempt-claude-typed-hook-2"),
+            text: "fix the login bug",
+            attachments: [],
+            messageCreatedBy: "user",
+            messageCreationSource: "provider",
+          }),
+        );
+        yield* Queue.offer(
+          harness.sdkMessages,
+          makeResultFrame({ uuid: "00000000-0000-4000-8000-000000000332", result: "Fixed." }),
+        );
+        yield* awaitUntil(() => harness.terminalEvents().length === 2, "typed turn terminal");
+        const notices = harness.events
+          .slice(before)
+          .flatMap((event) =>
+            event.type === "turn_item.updated" && event.turnItem.type === "system_notice"
+              ? [event.turnItem.message]
+              : [],
+          );
+        assert.deepEqual(notices, [said]);
       }).pipe(Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
     ),
   );

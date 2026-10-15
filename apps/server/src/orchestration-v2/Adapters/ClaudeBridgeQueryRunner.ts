@@ -62,6 +62,7 @@ import {
   makeClaudePlainCommandReader,
   claudeTranscriptCommandText,
   claudeCompactingFrame,
+  claudeHookNoticeText,
   claudeSessionNoticeFrame,
   claudeSessionNotificationText,
   claudeTranscriptCommandOutput,
@@ -156,6 +157,11 @@ const MISSED_TURN_REPLAY_MS = 15_000;
  */
 const LOCAL_COMMAND_QUIET_MS = 1_500;
 /**
+ * How long what the record says of a turn before it began (a prompt's hook
+ * result, a compaction) waits for that turn to open here.
+ */
+const HELD_FOR_TURN_MS = 5_000;
+/**
  * How long a request the session raised waits for a turn of the thread to
  * take it: the turn it belongs to, whose run is still starting, or one T3
  * opens for it. After that it goes back to Claude Code's own dialog.
@@ -167,6 +173,13 @@ const COMMAND_LINE_WAIT_MS = 3_000;
 
 const isCompactBoundaryFrame = (frame: SDKMessage) =>
   frame.type === "system" && frame.subtype === "compact_boundary";
+
+/** A row the terminal shows for a prompt's own hook (UserPromptSubmit). */
+const isPromptHookRow = (row: unknown) =>
+  isRecord(row) &&
+  isRecord(row.attachment) &&
+  row.attachment.hookEvent === "UserPromptSubmit" &&
+  claudeHookNoticeText(row) !== null;
 
 const runnerError = (cause: unknown, method: string) =>
   new ClaudeAdapterV2.ClaudeAgentSdkQueryRunnerError({ method, cause });
@@ -851,12 +864,17 @@ export const layer: Layer.Layer<
                 yield* showDrawnMessages(0);
               }
             }
+            const promptHook = isPromptHookRow(row);
             for (const frame of translator.onTranscriptRow(row)) {
               // A /compact typed in the terminal writes its boundary and
               // summary before the run that shows the command opens: they
-              // wait with its output and show in that run.
+              // wait with its output and show in that run. A prompt's hook
+              // result can be read before the turn it ran for is: it waits
+              // for that turn.
               if (
-                (isClaudeBridgeCommandOutputFrame(frame) || isCompactBoundaryFrame(frame)) &&
+                (isClaudeBridgeCommandOutputFrame(frame) ||
+                  isCompactBoundaryFrame(frame) ||
+                  promptHook) &&
                 (!sessionTurnOpen() || state.commandWaiting !== null)
               ) {
                 state.heldOutput.push(frame);
@@ -1133,7 +1151,19 @@ export const layer: Layer.Layer<
           });
           return;
         }
-        // A compaction held alone (one that comes before a turn of the
+        // Held for a turn of the session's own that did not come (a hook's
+        // word on a prompt it stopped): it goes on as it would have.
+        if (
+          state.heldOutput.length > 0 &&
+          !state.heldOutput.some(isClaudeBridgeCommandOutputFrame) &&
+          state.pendingPrompt === null &&
+          !sessionTurnOpen() &&
+          now - state.heldAt >= HELD_FOR_TURN_MS
+        ) {
+          yield* emit(state.heldOutput.splice(0));
+          return;
+        }
+        // A compaction or hook result held alone (before a turn of the
         // session's own) waits for that turn; only printed output is a command.
         if (
           state.heldOutput.some(isClaudeBridgeCommandOutputFrame) &&
