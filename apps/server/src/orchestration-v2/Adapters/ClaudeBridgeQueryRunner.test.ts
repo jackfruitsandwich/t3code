@@ -16,6 +16,7 @@ import * as TestClock from "effect/testing/TestClock";
 
 import * as ClaudeBridgeRegistry from "../../claude-bridge/ClaudeBridgeRegistry.ts";
 import {
+  claudeBridgeCompactSummary,
   claudeBridgeSettledElsewhere,
   claudeBridgeWakeDetail,
   claudeBridgeWakeRequest,
@@ -2343,6 +2344,99 @@ describe("ClaudeBridgeQueryRunner notices between turns", () => {
       });
       yield* noticeShown(bridge);
       assert.notInclude(bridge.recordChanges, "older-rows");
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+});
+
+describe("ClaudeBridgeQueryRunner a /compact typed in the terminal", () => {
+  // The terminal's /compact writes its boundary and summary first, then the
+  // command's rows and what it printed. No turn is open then: the run that
+  // shows the command shows the compaction too, with its summary.
+  const line = (fields: Record<string, unknown>, atMs: number) =>
+    `${JSON.stringify({ parentUuid: null, isSidechain: false, timestamp: stamp(atMs), ...fields })}\n`;
+  const said = (uuid: string, text: string, atMs: number, meta = false) =>
+    line(
+      {
+        type: "user",
+        uuid,
+        ...(meta ? { isMeta: true } : {}),
+        message: { role: "user", content: text },
+      },
+      atMs,
+    );
+
+  it.live("shows the compaction and its summary in the command's run", () =>
+    Effect.gen(function* () {
+      const bridge = yield* attach({ protocol: 2, bridgeCanUseTool: () => null, transcript: "" });
+      const fs = yield* FileSystem.FileSystem;
+      const at = bridge.now;
+      const frames: Array<SDKMessage> = [];
+      yield* bridge.session.messages.pipe(
+        Stream.runForEach((frame) =>
+          Effect.sync(() => {
+            frames.push(frame);
+          }),
+        ),
+        Effect.forkScoped,
+      );
+      yield* fs.writeFileString(
+        bridge.process.session.transcriptPath,
+        line(
+          {
+            type: "system",
+            subtype: "compact_boundary",
+            uuid: "00000000-0000-4000-8000-0000000000d0",
+            content: "Conversation compacted",
+            compactMetadata: { trigger: "manual", preTokens: 125550, postTokens: 2751 },
+          },
+          at,
+        ) +
+          line(
+            {
+              type: "user",
+              uuid: "00000000-0000-4000-8000-0000000000d1",
+              isCompactSummary: true,
+              message: { role: "user", content: "Summary: the login bug is fixed." },
+            },
+            at,
+          ) +
+          said(
+            "00000000-0000-4000-8000-0000000000d2",
+            "<local-command-caveat>The command below was run directly in Claude Code.</local-command-caveat>",
+            at,
+            true,
+          ) +
+          said(
+            "00000000-0000-4000-8000-0000000000d3",
+            "<command-name>/compact</command-name>\n            <command-message>compact</command-message>\n            <command-args></command-args>",
+            at,
+          ) +
+          said(
+            "00000000-0000-4000-8000-0000000000d4",
+            "<local-command-stdout>\u001b[2mCompacted (ctrl+o to see full summary)\u001b[22m</local-command-stdout>",
+            at,
+          ),
+        { flag: "a" },
+      );
+      // The run opens once the record has been quiet a moment (LOCAL_COMMAND_QUIET_MS).
+      yield* Effect.sleep("3500 millis");
+      const kinds = frames.map((frame) =>
+        frame.type === "system" && frame.subtype === "compact_boundary"
+          ? claudeBridgeCompactSummary(frame) === undefined
+            ? "compaction"
+            : `compaction:${claudeBridgeCompactSummary(frame)}`
+          : frame.type === "system"
+            ? `system:${frame.subtype}`
+            : frame.type,
+      );
+      // One run: it opens, shows the compaction, its summary, then what /compact printed.
+      assert.deepStrictEqual(kinds.slice(kinds.indexOf("system:init")), [
+        "system:init",
+        "compaction",
+        "compaction:Summary: the login bug is fixed.",
+        "assistant",
+        "result",
+      ]);
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 });

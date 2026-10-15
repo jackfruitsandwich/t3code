@@ -5610,11 +5610,12 @@ export function makeClaudeAdapterV2(
           const isWakeTurnStart = isClaudeTurnStartMessage(message);
           // The session saying it is compacting, or has stopped, between a
           // turn's first frame and that turn's run opening (a turn typed in
-          // the terminal can begin with a compaction): it parks with the
-          // turn's output, so the run says it too. It requests no run itself.
+          // the terminal can begin with a compaction), and the compaction
+          // itself (a /compact typed there): it parks with the turn's output,
+          // so the run says it too. It requests no run itself.
           const isStatusOfBufferedTurn =
             message.type === "system" &&
-            message.subtype === "status" &&
+            (message.subtype === "status" || message.subtype === "compact_boundary") &&
             bufferedMessages.some(isClaudeTurnStartMessage);
           const isWakeEvidence =
             isPendingTaskNotification ||

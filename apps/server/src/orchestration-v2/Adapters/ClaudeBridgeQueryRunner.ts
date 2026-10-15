@@ -165,6 +165,9 @@ const REQUEST_TURN_POLL_MS = 250;
 /** How long an agent's request waits for the line of the command that started it. */
 const COMMAND_LINE_WAIT_MS = 3_000;
 
+const isCompactBoundaryFrame = (frame: SDKMessage) =>
+  frame.type === "system" && frame.subtype === "compact_boundary";
+
 const runnerError = (cause: unknown, method: string) =>
   new ClaudeAdapterV2.ClaudeAgentSdkQueryRunnerError({ method, cause });
 
@@ -849,8 +852,11 @@ export const layer: Layer.Layer<
               }
             }
             for (const frame of translator.onTranscriptRow(row)) {
+              // A /compact typed in the terminal writes its boundary and
+              // summary before the run that shows the command opens: they
+              // wait with its output and show in that run.
               if (
-                isClaudeBridgeCommandOutputFrame(frame) &&
+                (isClaudeBridgeCommandOutputFrame(frame) || isCompactBoundaryFrame(frame)) &&
                 (!sessionTurnOpen() || state.commandWaiting !== null)
               ) {
                 state.heldOutput.push(frame);
@@ -1127,8 +1133,10 @@ export const layer: Layer.Layer<
           });
           return;
         }
+        // A compaction held alone (one that comes before a turn of the
+        // session's own) waits for that turn; only printed output is a command.
         if (
-          state.heldOutput.length > 0 &&
+          state.heldOutput.some(isClaudeBridgeCommandOutputFrame) &&
           state.pendingPrompt === null &&
           state.pendingComplete === null &&
           !sessionTurnOpen() &&

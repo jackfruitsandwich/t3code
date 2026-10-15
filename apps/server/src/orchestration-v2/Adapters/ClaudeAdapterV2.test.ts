@@ -6607,6 +6607,89 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     ),
   );
 
+  // A /compact typed in the terminal opens no turn of the session's own: the
+  // bridge opens one to show the command, and its compaction comes inside it,
+  // before the run for it has opened here.
+  it.effect("shows a /compact typed in the terminal with its summary in the command's run", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        const now = yield* DateTime.now;
+        yield* harness.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now,
+            attemptId: RunAttemptId.make("attempt-claude-typed-compact-1"),
+            text: "Hello.",
+            attachments: [],
+          }),
+        );
+        yield* Queue.offer(harness.sdkMessages, turnOneResult);
+        yield* awaitUntil(() => harness.terminalEvents().length === 1, "first turn terminal");
+
+        const boundary = {
+          type: "system",
+          subtype: "compact_boundary",
+          compact_metadata: { trigger: "manual", pre_tokens: 125550, post_tokens: 2751 },
+          uuid: "00000000-0000-4000-8000-000000000320",
+          session_id: WAKE_NATIVE_SESSION,
+        };
+        const summary = "Summary:\n1. Primary Request and Intent: fix the login bug.";
+        yield* Queue.offer(
+          harness.sdkMessages,
+          claudeSdkFrame({
+            type: "user",
+            message: { role: "user", content: "/compact" },
+            parent_tool_use_id: null,
+            uuid: "00000000-0000-4000-8000-000000000321",
+            session_id: WAKE_NATIVE_SESSION,
+            t3_wake_detail: "/compact",
+          }),
+        );
+        yield* Queue.offer(harness.sdkMessages, wakeTurnInit);
+        yield* Queue.offer(harness.sdkMessages, claudeSdkFrame(boundary));
+        yield* Queue.offer(
+          harness.sdkMessages,
+          claudeSdkFrame({ ...boundary, [CLAUDE_BRIDGE_COMPACT_SUMMARY_KEY]: summary }),
+        );
+        yield* Queue.offer(
+          harness.sdkMessages,
+          makeResultFrame({ uuid: "00000000-0000-4000-8000-000000000322", result: "" }),
+        );
+        yield* awaitUntil(() => harness.continuationRequests.length === 1, "typed continuation");
+        let quietYields = 0;
+        yield* awaitUntil(() => quietYields++ >= 50, "the frames to settle into the buffer");
+
+        const before = harness.events.length;
+        yield* harness.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now,
+            attemptId: RunAttemptId.make("attempt-claude-typed-compact-2"),
+            text: "/compact",
+            attachments: [],
+            messageCreatedBy: "user",
+            messageCreationSource: "provider",
+          }),
+        );
+        yield* awaitUntil(() => harness.terminalEvents().length === 2, "command turn terminal");
+        const compactions = harness.events
+          .slice(before)
+          .flatMap((event) =>
+            event.type === "turn_item.updated" && event.turnItem.type === "compaction"
+              ? [event.turnItem]
+              : [],
+          );
+        assert.lengthOf(compactions, 2);
+        assert.equal(compactions[0]?.id, compactions[1]?.id);
+        assert.equal(compactions[1]?.summary, summary);
+        assert.equal(compactions[1]?.beforeTokenCount, 125550);
+      }).pipe(Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+    ),
+  );
+
   // A subagent sent to the background asks for permission after the turn that
   // started it has ended. The bridge opens a turn of its own for the request;
   // nobody typed it.
