@@ -53,6 +53,8 @@ const attach = (input: {
   readonly heldElsewhere?: boolean;
   /** The turn the session is running when the runner attaches. */
   readonly activeTurn?: ClaudeBridgeRegistry.ClaudeBridgeProcess["session"]["activeTurn"];
+  /** Whether the session's file reads as unreadable (caught mid-write) at the read numbered `read`, from 1. */
+  readonly unreadable?: (read: number) => boolean;
   /** What the session's mod reports of its effort and status line. */
   readonly reported?: Pick<
     ClaudeBridgeRegistry.ClaudeBridgeProcess["session"],
@@ -104,6 +106,7 @@ const attach = (input: {
     const subscribed = yield* Deferred.make<ClaudeBridgeRegistry.ClaudeBridgeEventHandler>();
     /** The sessions whose live process the runner asked for. */
     const asked: Array<string> = [];
+    let sessionReads = 0;
     const registry = ClaudeBridgeRegistry.ClaudeBridgeRegistry.of({
       bridgeDir: root,
       plugin: { marketplaceDir: root, pluginDir: root },
@@ -116,9 +119,14 @@ const attach = (input: {
         }),
       // The process keeps reporting, however far a test moves its clock.
       readSession: () =>
-        Clock.currentTimeMillis.pipe(
-          Effect.map((heartbeatAt) => ({ ...process.session, heartbeatAt })),
-        ),
+        Effect.suspend(() => {
+          sessionReads += 1;
+          return input.unreadable?.(sessionReads) === true
+            ? Effect.succeed(null)
+            : Clock.currentTimeMillis.pipe(
+                Effect.map((heartbeatAt) => ({ ...process.session, heartbeatAt })),
+              );
+        }),
       readCommands: () =>
         Effect.succeed(
           input.slashCommands === undefined
@@ -1530,6 +1538,88 @@ describe("ClaudeBridgeQueryRunner slash commands", () => {
       assert.deepStrictEqual(
         next.map((frame) => frame.type),
         ["user", "system"],
+      );
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.live(
+    "keeps the turn when the session's file reads cut once, as it does caught mid-write",
+    () =>
+      Effect.gen(function* () {
+        let tearNext = false;
+        const bridge = yield* attach({
+          protocol: 2,
+          bridgeCanUseTool: () => null,
+          transcript: "",
+          unreadable: () => {
+            const torn = tearNext;
+            tearNext = false;
+            return torn;
+          },
+        });
+        const base = { seq: 1, at: bridge.now, transcriptOffset: 0 };
+        yield* bridge.handler(
+          { ...base, type: "turn.start", turnId: "turn-a", text: "count to 5" },
+          bridge.process,
+        );
+        const opened = Array.from(
+          yield* bridge.session.messages.pipe(Stream.take(2), Stream.runCollect),
+        );
+        assert.deepStrictEqual(
+          opened.map((frame) => frame.type),
+          ["user", "system"],
+        );
+        // The next read of the file, and only it, comes back cut.
+        tearNext = true;
+        yield* Effect.sleep("1500 millis");
+        assert.strictEqual(tearNext, false, "the runner read the file again meanwhile");
+        yield* bridge.handler(
+          {
+            ...base,
+            seq: 2,
+            type: "turn.complete",
+            turnId: "turn-a",
+            reason: "answer",
+            answer: "1 2 3 4 5",
+            isAborted: false,
+            durationMs: 10,
+          },
+          bridge.process,
+        );
+        const closed = Array.from(
+          yield* bridge.session.messages.pipe(Stream.take(1), Stream.runCollect),
+        )[0];
+        assert.strictEqual(
+          closed?.type === "result" && closed.subtype === "success" ? closed.result : null,
+          "1 2 3 4 5",
+          describe(closed),
+        );
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.live("ends the turn as the process gone when the session's file stays unreadable", () =>
+    Effect.gen(function* () {
+      let gone = false;
+      const bridge = yield* attach({
+        protocol: 2,
+        bridgeCanUseTool: () => null,
+        transcript: "",
+        unreadable: () => gone,
+      });
+      const base = { seq: 1, at: bridge.now, transcriptOffset: 0 };
+      yield* bridge.handler(
+        { ...base, type: "turn.start", turnId: "turn-a", text: "count to 5" },
+        bridge.process,
+      );
+      yield* bridge.session.messages.pipe(Stream.take(2), Stream.runCollect);
+      gone = true;
+      const closed = Array.from(
+        yield* bridge.session.messages.pipe(Stream.take(1), Stream.runCollect),
+      )[0];
+      assert.strictEqual(
+        closed?.type === "result" && closed.subtype === "success" ? closed.result : null,
+        "Claude Code session ended (process gone).",
+        describe(closed),
       );
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );

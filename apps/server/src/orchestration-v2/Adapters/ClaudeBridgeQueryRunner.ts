@@ -97,6 +97,13 @@ export const CLAUDE_TRANSPORT_ENV = "T3CODE_CLAUDE_TRANSPORT";
  */
 export const CLAUDE_RECORD_LAG_ENV = "T3CODE_CLAUDE_RECORD_LAG_MS";
 const TAIL_INTERVAL_MS = 300;
+/**
+ * How many polls in a row must find the session unreadable or quiet before it
+ * counts as gone. The mod rewrites session.json in place, several times in a
+ * second at a turn's start (the turn, then a request it asks): a read that
+ * lands mid-write finds it empty or cut, and one such read is no death.
+ */
+const SESSION_MISSES_TO_END = 3;
 /** How long a message the terminal drew waits for the record's row before it is shown without one. */
 const DRAWN_MESSAGE_WAIT_MS = 2_500;
 /** How long a reply row's text is remembered, for a drawn copy that arrives after it. */
@@ -1300,6 +1307,7 @@ export const layer: Layer.Layer<
 
       const tail = Effect.gen(function* () {
         let lastHeartbeat = 0;
+        let sessionMisses = 0;
         while (!state.closed) {
           const now = yield* Clock.currentTimeMillis;
           yield* followReloadedMod;
@@ -1309,9 +1317,17 @@ export const layer: Layer.Layer<
           }
           const session = yield* registry.readSession(bridgeProcess);
           if (session === null || !isClaudeBridgeSessionLive(session, now)) {
+            // An end the session itself wrote is final; a file that would not
+            // read, or a heartbeat that has gone quiet, is looked at again.
+            sessionMisses += 1;
+            if (session?.ended == null && sessionMisses < SESSION_MISSES_TO_END) {
+              yield* Effect.sleep(`${TAIL_INTERVAL_MS} millis`);
+              continue;
+            }
             yield* endSession(session?.ended?.reason ?? "process gone");
             return;
           }
+          sessionMisses = 0;
           // The session names its record's file, and the file can move while
           // the session runs: `/cd <dir>` takes it, as it is, to that
           // directory's project folder. What was read of it stays read.
