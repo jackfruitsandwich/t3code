@@ -78,7 +78,7 @@ import { CheckpointServiceV2 } from "./CheckpointService.ts";
 import { CommandPolicyV2, resolveMessageDispatchIntent } from "./CommandPolicy.ts";
 import { CommandReceiptStoreV2 } from "./CommandReceiptStore.ts";
 import { ContextHandoffServiceV2 } from "./ContextHandoffService.ts";
-import { notificationTurnItem } from "./Notification.ts";
+import { notificationTurnItem, showsHeadTurnItem } from "./Notification.ts";
 import { isRestartNoteSource } from "./RestartBackgroundNote.ts";
 import { isUndeliveredMailboxSteer } from "./NotificationMailbox.ts";
 import { EventSinkV2 } from "./EventSink.ts";
@@ -1799,15 +1799,19 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             occurredAt: now,
             payload: providerThread,
           },
-          {
-            type: "turn-item.updated",
-            threadId,
-            runId: queuedRun.id,
-            nodeId: rootNodeId,
-            providerInstanceId: queuedRun.providerInstanceId,
-            occurredAt: now,
-            payload: notificationTurnItem(userTurnItem, queuedMessage, projection.subagents),
-          },
+          ...(showsHeadTurnItem(queuedMessage)
+            ? [
+                {
+                  type: "turn-item.updated" as const,
+                  threadId,
+                  runId: queuedRun.id,
+                  nodeId: rootNodeId,
+                  providerInstanceId: queuedRun.providerInstanceId,
+                  occurredAt: now,
+                  payload: notificationTurnItem(userTurnItem, queuedMessage, projection.subagents),
+                },
+              ]
+            : []),
           {
             type: "run.updated",
             threadId,
@@ -4614,6 +4618,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           cause: "Notifications must be server- or provider-created queued messages.",
         });
       }
+      // Only a wake goes without a row: anything a person sends always shows.
+      if (command.silentHead === true && command.notification === undefined) {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: "Only an automatic delivery can show no row of its own.",
+        });
+      }
       let delegatedCompletion:
         | OrchestrationV2ConversationMessage["delegatedCompletion"]
         | undefined;
@@ -4968,6 +4980,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           updatedAt: now,
           ...(delegatedCompletion === undefined ? {} : { delegatedCompletion }),
           ...(command.notification === undefined ? {} : { notification: command.notification }),
+          ...(command.silentHead === true ? { silentHead: true } : {}),
         };
         const emitEvent = emit(events, command);
         if (targetProviderThread === undefined) {
@@ -5312,6 +5325,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           updatedAt: now,
           ...(delegatedCompletion === undefined ? {} : { delegatedCompletion }),
           ...(command.notification === undefined ? {} : { notification: command.notification }),
+          ...(command.silentHead === true ? { silentHead: true } : {}),
         };
         const turnItem: OrchestrationV2TurnItem = {
           createdBy: command.createdBy,
@@ -5434,15 +5448,17 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           occurredAt: now,
           payload: message,
         });
-        yield* emitEvent({
-          type: "turn-item.updated",
-          threadId: command.threadId,
-          runId,
-          nodeId: rootNodeId,
-          providerInstanceId: modelSelection.instanceId,
-          occurredAt: now,
-          payload: notificationTurnItem(turnItem, message, projection.subagents),
-        });
+        if (showsHeadTurnItem(message)) {
+          yield* emitEvent({
+            type: "turn-item.updated",
+            threadId: command.threadId,
+            runId,
+            nodeId: rootNodeId,
+            providerInstanceId: modelSelection.instanceId,
+            occurredAt: now,
+            payload: notificationTurnItem(turnItem, message, projection.subagents),
+          });
+        }
         if (preparationTurnItem !== null) {
           yield* emitEvent({
             type: "turn-item.updated",
@@ -6003,6 +6019,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         updatedAt: now,
         ...(delegatedCompletion === undefined ? {} : { delegatedCompletion }),
         ...(command.notification === undefined ? {} : { notification: command.notification }),
+        ...(command.silentHead === true ? { silentHead: true } : {}),
       };
       const turnItem: OrchestrationV2TurnItem = {
         createdBy: command.createdBy,
@@ -6337,15 +6354,17 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         occurredAt: now,
         payload: message,
       });
-      yield* emitEvent({
-        type: "turn-item.updated",
-        threadId: command.threadId,
-        runId,
-        nodeId: rootNodeId,
-        providerInstanceId: modelSelection.instanceId,
-        occurredAt: now,
-        payload: notificationTurnItem(turnItem, message, projection.subagents),
-      });
+      if (showsHeadTurnItem(message)) {
+        yield* emitEvent({
+          type: "turn-item.updated",
+          threadId: command.threadId,
+          runId,
+          nodeId: rootNodeId,
+          providerInstanceId: modelSelection.instanceId,
+          occurredAt: now,
+          payload: notificationTurnItem(turnItem, message, projection.subagents),
+        });
+      }
       const forkResolution = nativeForkResolution ?? portableForkResolution;
       if (pendingForkTransfer !== undefined && forkResolution !== null) {
         yield* emitEvent({

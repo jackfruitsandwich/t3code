@@ -3899,6 +3899,150 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
     }),
   );
 
+  // A Claude Code turn picked up with nothing known of how it began: its run
+  // starts as any wake's does, and draws no row of words T3 would make up.
+  it.effect("starts a wake that shows no head row without one, queued or not", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const eventSink = yield* EventSink.EventSinkV2;
+      const threadId = ThreadId.make("runtime-layer-silent-head-thread");
+      const messageId = (key: string) => MessageId.make(`runtime-layer-silent-head-${key}`);
+
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        createdBy: "user",
+        creationSource: "web",
+        commandId: CommandId.make("runtime-layer-silent-head-create"),
+        threadId,
+        projectId: ProjectId.make("runtime-layer-silent-head-project"),
+        title: "Silent head",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: process.cwd(),
+      });
+      const wake = (key: string) =>
+        orchestrator.dispatch({
+          type: "message.dispatch",
+          createdBy: "agent",
+          creationSource: "provider",
+          notification: {
+            source: { kind: "background_task" as const },
+            outcome: "updated" as const,
+            summary: "Background activity updated",
+          },
+          silentHead: true,
+          commandId: CommandId.make(`runtime-layer-silent-head-${key}`),
+          threadId,
+          messageId: messageId(key),
+          text: key,
+          attachments: [],
+          modelSelection,
+          dispatchMode: { type: "queue_after_active" },
+        });
+      const runFor = (key: string) =>
+        Effect.map(orchestrator.getThreadProjection(threadId), ({ runs }) => {
+          const run = runs.find((candidate) => candidate.userMessageId === messageId(key));
+          assert.isDefined(run);
+          return run;
+        });
+      const headRows = (key: string) =>
+        Effect.map(orchestrator.getThreadProjection(threadId), ({ turnItems }) =>
+          turnItems.filter(
+            (item) =>
+              (item.type === "user_message" && item.messageId === messageId(key)) ||
+              (item.type === "notification" && item.summary === "Background activity updated"),
+          ),
+        );
+
+      const settle = (key: string) =>
+        Effect.gen(function* () {
+          const run = yield* runFor(key);
+          const endedAt = yield* DateTime.now;
+          yield* eventSink.write({
+            events: [
+              {
+                id: EventId.make(`runtime-layer-silent-head-${key}-completed`),
+                type: "run.updated",
+                threadId,
+                runId: run.id,
+                ...(run.rootNodeId === null ? {} : { nodeId: run.rootNodeId }),
+                providerInstanceId: run.providerInstanceId,
+                occurredAt: endedAt,
+                payload: { ...run, status: "completed", completedAt: endedAt },
+              },
+            ],
+          });
+        });
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        createdBy: "user",
+        creationSource: "web",
+        commandId: CommandId.make("runtime-layer-silent-head-prompt"),
+        threadId,
+        messageId: messageId("prompt"),
+        text: "prompt",
+        attachments: [],
+        modelSelection,
+        dispatchMode: { type: "start_immediately" },
+      });
+      yield* settle("prompt");
+
+      // Nothing is running: the wake starts at once.
+      yield* wake("first");
+      assert.equal((yield* runFor("first")).status, "starting");
+      assert.deepEqual(yield* headRows("first"), []);
+      const stored = (yield* orchestrator.getThreadProjection(threadId)).messages.find(
+        (message) => message.id === messageId("first"),
+      );
+      assert.isTrue(stored?.silentHead);
+      assert.equal(stored?.notification?.summary, "Background activity updated");
+
+      // Another wake queues behind it and starts, still without a row, when it ends.
+      yield* wake("second");
+      assert.equal((yield* runFor("second")).status, "queued");
+      const startedRunIds = yield* Queue.unbounded<RunId>();
+      const afterSequence = yield* orchestrator.getThreadEventSequence(threadId);
+      yield* eventSink.stream({ threadId, afterSequence }).pipe(
+        Stream.runForEach((written) =>
+          written.event.type === "run.updated" && written.event.payload.status === "starting"
+            ? Queue.offer(startedRunIds, written.event.payload.id)
+            : Effect.void,
+        ),
+        Effect.forkScoped,
+      );
+      yield* Effect.yieldNow;
+      yield* settle("first");
+      assert.equal(yield* Queue.take(startedRunIds), (yield* runFor("second")).id);
+      assert.deepEqual(yield* headRows("second"), []);
+      // The person's own prompt kept its row.
+      assert.isTrue(
+        (yield* orchestrator.getThreadProjection(threadId)).turnItems.some(
+          (item) => item.type === "user_message" && item.messageId === messageId("prompt"),
+        ),
+      );
+
+      // What a person sends always shows: only a wake may go without a row.
+      const refused = yield* orchestrator
+        .dispatch({
+          type: "message.dispatch",
+          createdBy: "user",
+          creationSource: "web",
+          silentHead: true,
+          commandId: CommandId.make("runtime-layer-silent-head-person"),
+          threadId,
+          messageId: messageId("person"),
+          text: "person",
+          attachments: [],
+          modelSelection,
+          dispatchMode: { type: "queue_after_active" },
+        })
+        .pipe(Effect.flip);
+      assert.include(String(refused.cause), "Only an automatic delivery");
+    }),
+  );
+
   // A prompt typed into the provider's own session while its turn was failing
   // starts there the moment that turn ends. The session runs it either way;
   // held here, nothing of that turn would be shown.

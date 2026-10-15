@@ -1,4 +1,8 @@
-import { CommandId, type OrchestrationV2ThreadProjection } from "@t3tools/contracts";
+import {
+  CommandId,
+  ProviderDriverKind,
+  type OrchestrationV2ThreadProjection,
+} from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Ref from "effect/Ref";
@@ -7,6 +11,9 @@ import * as IdAllocator from "./IdAllocator.ts";
 import * as ProviderContinuationRequests from "./ProviderContinuationRequests.ts";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
 import { isUndeliveredMailboxSteer } from "./NotificationMailbox.ts";
+
+/** Claude Code's driver (ClaudeAdapterV2's CLAUDE_PROVIDER), named here without loading the adapter. */
+const CLAUDE_DRIVER = ProviderDriverKind.make("claudeAgent");
 
 function delegatedCompletionText(taskIds: ReadonlyArray<string>): string {
   const taskList = taskIds.join(", ");
@@ -181,6 +188,15 @@ export const layer = Layer.effectDiscard(
           ordinal: projection.messages.length + 1,
         });
         const commandId = CommandId.make(`provider-continuation:${messageId}`);
+        const typedByPerson = request.createdBy === "user" && request.notification === undefined;
+        // A Claude Code turn that no line of its own heads (picked up after
+        // the fact, a steer the session ran as its next turn, a wake nothing
+        // names) shows no row: the session never wrote words for one. It stays
+        // an automatic delivery, with the default notice kept on the message
+        // and never drawn, so the queue, settling and wake timing treat it as
+        // they treat every wake.
+        const silentHead =
+          request.driver === CLAUDE_DRIVER && !typedByPerson && request.notification === undefined;
         const dispatch = threads.dispatch({
           type: "message.dispatch",
           commandId,
@@ -188,7 +204,7 @@ export const layer = Layer.effectDiscard(
           messageId,
           text: request.detail ?? ProviderContinuationRequests.CONTINUATION_MESSAGE_TEXT,
           // A prompt the person typed carries no background-activity notice.
-          ...(request.createdBy === "user" && request.notification === undefined
+          ...(typedByPerson
             ? {}
             : {
                 notification: request.notification ?? {
@@ -197,6 +213,7 @@ export const layer = Layer.effectDiscard(
                   summary: "Background activity updated",
                 },
               }),
+          ...(silentHead ? { silentHead: true } : {}),
           attachments: [],
           dispatchMode: { type: "queue_after_active" },
           createdBy: request.createdBy ?? "agent",

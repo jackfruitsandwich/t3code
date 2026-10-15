@@ -208,6 +208,18 @@ function delegatedCompletionNotification(
   };
 }
 
+/**
+ * Whether a run's opening message gets a row in the thread. One marked
+ * `silentHead` does not: the provider's session began the turn and nothing
+ * says how, so any row would be words T3 made up. The run shows what the
+ * session itself wrote.
+ */
+export function showsHeadTurnItem(
+  message: Pick<OrchestrationV2ConversationMessage, "silentHead">,
+): boolean {
+  return message.silentHead !== true;
+}
+
 /** Keep the delivery message intact while projecting its trigger as an activity. */
 export function notificationTurnItem(
   item: OrchestrationV2TurnItem,

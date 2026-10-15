@@ -205,6 +205,71 @@ describe("ProviderContinuationService", () => {
     });
   });
 
+  it.effect("gives a Claude Code turn no row when nothing of the session's heads it", () => {
+    return Effect.gen(function* () {
+      const dispatched = yield* Queue.unbounded<unknown>();
+      yield* Effect.gen(function* () {
+        const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+        const claude = ProviderDriverKind.make("claudeAgent");
+        const take = Queue.take(dispatched) as Effect.Effect<{
+          readonly text: string;
+          readonly createdBy: string;
+          readonly creationSource: string;
+          readonly notification?: OrchestrationV2Notification;
+          readonly silentHead?: boolean;
+        }>;
+        const taskNotice: OrchestrationV2Notification = {
+          source: { kind: "background_task" },
+          outcome: "completed",
+          summary: 'Background command "sleep 8" completed',
+        };
+        // A turn picked up running after a restart: nothing says how it began.
+        yield* requests.offer({ ...request(), driver: claude, reattachRun: true });
+        // The adapter's wake for a steer the session ran as its next turn: the
+        // steer's text, which its own row already shows, and no notice.
+        yield* requests.offer({ ...request(), driver: claude, detail: "steer sent from T3" });
+        // Words of the session's (a task reporting back) and a typed prompt.
+        yield* requests.offer({ ...request(), driver: claude, notification: taskNotice });
+        yield* requests.offer({
+          ...request(),
+          driver: claude,
+          detail: "typed in the terminal",
+          createdBy: "user",
+        });
+        // Another provider's wake keeps the notice as before.
+        yield* requests.offer(request());
+
+        const pickedUp = yield* take;
+        assert.isTrue(pickedUp.silentHead);
+        // Still an automatic delivery, so the queue and settling leave it be.
+        assert.equal(pickedUp.notification?.summary, "Background activity updated");
+        assert.equal(pickedUp.createdBy, "agent");
+        assert.equal(pickedUp.creationSource, "provider");
+        const steer = yield* take;
+        assert.isTrue(steer.silentHead);
+        assert.equal(steer.text, "steer sent from T3");
+        const reported = yield* take;
+        assert.isUndefined(reported.silentHead);
+        assert.deepEqual(reported.notification, taskNotice);
+        const typed = yield* take;
+        assert.isUndefined(typed.silentHead);
+        assert.isUndefined(typed.notification);
+        assert.equal(typed.createdBy, "user");
+        const other = yield* take;
+        assert.isUndefined(other.silentHead);
+        assert.equal(other.notification?.summary, "Background activity updated");
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            dispatched,
+            getThreadRecords: () => Effect.succeed({ ...projection, runs: [] }),
+          }),
+        ),
+        Effect.scoped,
+      );
+    });
+  });
+
   it.effect("delivers a message_text wake as a real prompt, not a buffered wake", () => {
     return Effect.gen(function* () {
       const dispatched = yield* Queue.unbounded<unknown>();

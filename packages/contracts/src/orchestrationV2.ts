@@ -1184,8 +1184,14 @@ export const OrchestrationV2Notification = Schema.Struct({
 });
 export type OrchestrationV2Notification = typeof OrchestrationV2Notification.Type;
 
+// A run's opening message that shows no row of its own: the provider's session
+// began the turn and nothing says how (a Claude Code turn picked up after the
+// fact), so any row would be words T3 made up. The message itself is kept.
+const OrchestrationV2SilentHead = Schema.optional(Schema.Boolean);
+
 export const OrchestrationV2ConversationMessage = Schema.Struct({
   notification: Schema.optional(OrchestrationV2Notification),
+  silentHead: OrchestrationV2SilentHead,
   ...OrchestrationV2CreationFields,
   scheduledTaskId: Schema.optional(ScheduledTaskId),
   // The sending agent's thread in this environment, separate from the receiving thread.
@@ -2941,6 +2947,7 @@ export const OrchestrationV2Command = Schema.Union([
   Schema.Struct({
     type: Schema.Literal("message.dispatch"),
     notification: Schema.optional(OrchestrationV2Notification),
+    silentHead: OrchestrationV2SilentHead,
     ...OrchestrationV2CreationFields,
     scheduledTaskId: Schema.optional(ScheduledTaskId),
     senderThreadId: Schema.optional(ThreadId),
