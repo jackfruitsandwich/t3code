@@ -396,7 +396,9 @@ export function planTaskNoticeHealing(input: {
 /**
  * Rows imported earlier that sit in the wrong place: they were all put before
  * the thread's first run, whenever they were written. Returns them oldest
- * first with the band each belongs to.
+ * first with the band each belongs to. A row only moves down: one below the
+ * band its time names was put there on purpose (a reply goes no higher than
+ * the run that shows its prompt, see `planTranscriptHealing`).
  */
 export function planImportedRowReseating(input: {
   readonly rows: ReadonlyArray<ParsedSessionMessage>;
@@ -409,7 +411,7 @@ export function planImportedRowReseating(input: {
     const ordinal = ordinals.get(row.sourceId);
     if (ordinal === undefined) return [];
     const band = bandForTime(input.runs, timeMs(row.timestamp));
-    return Math.floor(ordinal / RUN_BAND) === band ? [] : [{ message: row, band }];
+    return Math.floor(ordinal / RUN_BAND) >= band ? [] : [{ message: row, band }];
   });
 }
 

@@ -2130,6 +2130,71 @@ runtimeTest(
 );
 
 runtimeTest(
+  "a reply the run of a turn over before adoption missed stays below its prompt, healed again and again",
+  (h) =>
+    Effect.gen(function* () {
+      const claudeId = "aaaaaaaa-1111-4111-8111-1111111111a8";
+      const c = claudeSession({ sessionId: claudeId, cwd: h.workspace });
+      const claudePath = h.claudeFile(claudeId);
+      const threadId = importedThreadId(claudeId);
+      const at = (iso: string) => DateTime.toEpochMillis(DateTime.makeUnsafe(iso));
+      const prompt = "Reply with exactly: tr-one";
+      // typedrace.py e501e525: the first turn was typed and answered, and was
+      // over, before T3 took the session in; the run offered for it attached
+      // too late to show it from its start, and shows only its prompt.
+      yield* TestClock.setTime(at("2026-07-01T10:00:00.000Z"));
+      yield* h.write(claudePath, [
+        c.user("user-1", prompt, "2026-07-01T10:00:00.000Z"),
+        c.assistant("assistant-1", "tr-one", "2026-07-01T10:00:01.500Z"),
+      ]);
+      const bridgeDir = yield* h.makeDir("bridge");
+      const importer = yield* h.importer({ bridgeDir });
+      yield* TestClock.setTime(at("2026-07-01T10:00:17.000Z"));
+      yield* importer.adoptLiveClaudeSession({
+        sessionId: claudeId,
+        transcriptPath: claudePath,
+        cwd: h.workspace,
+        turnOffset: 0,
+        promptText: prompt,
+      });
+      yield* seedT3Run(h, threadId, CLAUDE, "completed", {
+        ordinal: 1,
+        iso: "2026-07-01T10:00:17.000Z",
+      });
+      yield* seedT3Prompt(h, threadId, 1, prompt, "2026-07-01T10:00:17.000Z");
+      // Then /plan typed in the terminal, which the attachment leaves to the record.
+      yield* h.append(claudePath, [
+        c.user(
+          "plan-1",
+          "<command-name>/plan</command-name>\n            <command-message>plan</command-message>\n            <command-args></command-args>",
+          "2026-07-01T10:00:24.000Z",
+        ),
+        c.user(
+          "plan-1-out",
+          "<local-command-stdout>Enabled plan mode</local-command-stdout>",
+          "2026-07-01T10:00:24.000Z",
+        ),
+      ]);
+      const shown = [prompt, "tr-one", "/plan", "Enabled plan mode"];
+      yield* TestClock.setTime(at("2026-07-01T10:00:24.250Z"));
+      yield* liveSessionFile(h, claudeId);
+      yield* importer.healLiveClaudeSession({
+        sessionId: claudeId,
+        transcriptPath: claudePath,
+        leftToRecord: ["plan-1-out"],
+      });
+      assert.deepStrictEqual(yield* conversation(h, threadId), shown);
+      // The comparisons after it keep the reply where it went in.
+      for (const later of ["2026-07-01T10:00:31.000Z", "2026-07-01T10:01:30.000Z"]) {
+        yield* TestClock.setTime(at(later));
+        yield* liveSessionFile(h, claudeId);
+        yield* importer.healLiveClaudeSession({ sessionId: claudeId, transcriptPath: claudePath });
+        assert.deepStrictEqual(yield* conversation(h, threadId), shown);
+      }
+    }),
+);
+
+runtimeTest(
   "a prompt the session took back leaves the thread as a run T3 rewinds does, from the thread's floor on",
   (h) =>
     Effect.gen(function* () {
@@ -3129,7 +3194,9 @@ runtimeTest(
       ]);
       // The session began before this server did: what the record held when
       // the thread was first compared with it stays as the thread shows it.
-      yield* TestClock.setTime(DateTime.toEpochMillis(DateTime.makeUnsafe("2026-07-01T10:30:00.000Z")));
+      yield* TestClock.setTime(
+        DateTime.toEpochMillis(DateTime.makeUnsafe("2026-07-01T10:30:00.000Z")),
+      );
       const bridgeDir = yield* h.makeDir("bridge");
       const importer = yield* h.importer({ bridgeDir });
       yield* importer.sweepNow();

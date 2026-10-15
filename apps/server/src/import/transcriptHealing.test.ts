@@ -366,6 +366,20 @@ describe("planImportedRowReseating", () => {
       ["1:u2"],
     );
   });
+
+  it("leaves a reply below its prompt's run where healing put it", () => {
+    // The turn was typed and answered before T3 took the session in; the run
+    // that picked it up shows the prompt, and its reply went in below it.
+    const rows = [row("user", "u1", "first prompt", 0), row("assistant", "a1", "first reply", 1)];
+    assert.deepEqual(
+      planImportedRowReseating({
+        rows,
+        imported: [{ sourceId: "a1", ordinal: 1_000_003 }],
+        runs: [{ id: "run-1", ordinal: 1, startedAtMs: ms(5) }],
+      }),
+      [],
+    );
+  });
 });
 
 describe("planImportedRowOrdering", () => {
