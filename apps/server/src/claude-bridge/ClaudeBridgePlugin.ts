@@ -1571,7 +1571,11 @@ export function register(on) {
     // never see the request, and holding it only delays the host's own answer
     // (measured: a claude -p run sat a minute before its refusal).
     if (passive) return verdict
-    asks.push({ toolUseId: e.tool_use_id, tool: e.tool, key: grantKey(e), at: Date.now() })
+    // Why it asks, where the terminal's dialog says so under the command: a
+    // setting's own check (permissions.blockReadsOutsideWorkingDirectories)
+    // draws its reason there (measured, 2.1.300).
+    const because = typeof verdict.setting === 'string' && typeof verdict.reason === 'string' && verdict.reason.trim() ? verdict.reason.trim() : undefined
+    asks.push({ toolUseId: e.tool_use_id, tool: e.tool, key: grantKey(e), at: Date.now(), because })
     if (asks.length > 16) asks.shift()
     return verdict
   })
@@ -1600,7 +1604,7 @@ export function register(on) {
       // T3 does not show; with no terminal it waits for T3 as long as T3 has
       // been around at all.
       if (!(await t3InSightSoon($, () => settledCalls.has(toolUseId), !withTerminal)) && (withTerminal || !t3Expected())) return next(e)
-      const request = { toolUseId: toolUseId, tool: e.tool_name, input: e.tool_input, turnId: activeTurn ? activeTurn.turnId : undefined, alsoInTerminal: true, suggestions: Array.isArray(e.permission_suggestions) ? e.permission_suggestions : undefined, agentType: e.agent_id ? String(e.agent_type || 'subagent') : undefined, approveWithMode: await modeWithApproval($, e) }
+      const request = { toolUseId: toolUseId, tool: e.tool_name, input: e.tool_input, reason: ask.because, turnId: activeTurn ? activeTurn.turnId : undefined, alsoInTerminal: true, suggestions: Array.isArray(e.permission_suggestions) ? e.permission_suggestions : undefined, agentType: e.agent_id ? String(e.agent_type || 'subagent') : undefined, approveWithMode: await modeWithApproval($, e) }
       const askT3 = () => emit($, 'approval.request', request)
       await askT3()
       const keepT3Told = t3Teller($, askT3, () => emit($, 'approval.resolved', { toolUseId: toolUseId, decision: 'ask', by: 'detached' }))

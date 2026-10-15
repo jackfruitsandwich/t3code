@@ -99,6 +99,7 @@ import {
   claudeBridgeAlsoInTerminal,
   claudeBridgeApproveWithMode,
   claudeSessionGrant,
+  claudeBridgeAskedBecause,
   claudeBridgeAskingAgent,
   claudeBridgeCompactSummary,
   claudeBridgeReplacedDrawnId,
@@ -7341,7 +7342,11 @@ export function makeClaudeAdapterV2(
             requestKind === "file-change"
               ? proposedClaudeFileChange(claudeNativeToolInputValue(nativeToolInput))
               : undefined;
-          const prompt = proposedChange === undefined ? asked : `${asked}\n${proposedChange}`;
+          // Why the terminal's dialog says it asks, under the call, as it draws it.
+          const because = origin === "bridge" ? claudeBridgeAskedBecause(callbackOptions) : null;
+          const prompt = [asked, because, proposedChange]
+            .filter((part) => part !== null && part !== undefined)
+            .join("\n");
           const offeredMode =
             origin === "bridge" ? claudeBridgeApproveWithMode(callbackOptions) : undefined;
           // With nothing suggested, a session the SDK drives is granted the

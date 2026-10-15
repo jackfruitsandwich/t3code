@@ -1386,7 +1386,7 @@ export const layer: Layer.Layer<
                 signal: controller.signal,
                 toolUseID: event.toolUseId,
                 requestId: event.toolUseId,
-                ...(event.reason === undefined ? {} : { decisionReason: event.reason }),
+                ...(event.reason === undefined ? {} : { askedBecause: event.reason }),
                 ...(event.alsoInTerminal === true ? { alsoInTerminal: true } : {}),
                 ...(event.suggestions === undefined ? {} : { suggestions: event.suggestions }),
                 ...(event.agentType === undefined ? {} : { askedByAgent: event.agentType }),

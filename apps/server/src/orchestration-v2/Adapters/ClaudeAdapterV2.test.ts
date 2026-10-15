@@ -6769,6 +6769,63 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     ),
   );
 
+  // Claude Code's dialog says why it asks under the call when a setting's own
+  // check asks (a read outside the working directories): T3 says it there too.
+  it.effect("asks a bridged call with the reason the terminal's dialog gives under it", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        const now = yield* DateTime.now;
+        const because =
+          "Reads outside the working directories are blocked (permissions.blockReadsOutsideWorkingDirectories). Add the directory with /add-dir, or remove that setting.";
+        yield* harness.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now,
+            attemptId: RunAttemptId.make("attempt-claude-bridge-because"),
+            text: "Show the hosts file.",
+            attachments: [],
+            runtimePolicy: ProviderAdapterV2RuntimePolicy.make({
+              runtimeMode: "approval-required",
+              interactionMode: "default",
+              cwd: "/workspace",
+            }),
+          }),
+        );
+        // As the bridge passes it, beside what the SDK's own callback takes.
+        const callbackOptions = {
+          signal: new AbortController().signal,
+          toolUseID: "bash-outside",
+          requestId: "bash-outside",
+          askedBecause: because,
+        };
+        const decision = yield* Effect.promise(() =>
+          harness.getBridgeCanUseTool()!(
+            "Bash",
+            { command: "head -3 /etc/hosts" },
+            callbackOptions,
+          ),
+        ).pipe(Effect.forkScoped);
+        const request = yield* Queue.take(harness.runtimeRequestReceipts);
+        const asked = harness.events.flatMap((event) =>
+          event.type === "turn_item.updated" && event.turnItem.type === "approval_request"
+            ? [event.turnItem.prompt ?? ""]
+            : [],
+        );
+        const lines = (asked.at(-1) ?? "").split("\n");
+        assert.isAtLeast(lines.length, 2);
+        assert.include(lines[0], "head -3 /etc/hosts");
+        assert.equal(lines[1], because);
+        yield* harness.runtime.respondToRuntimeRequest({
+          requestId: request.runtimeRequest.id,
+          decision: "decline",
+        });
+        yield* Fiber.join(decision);
+      }).pipe(Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+    ),
+  );
+
   // A subagent sent to the background asks for permission after the turn that
   // started it has ended. The bridge opens a turn of its own for the request;
   // nobody typed it.

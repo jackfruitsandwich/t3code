@@ -31,7 +31,7 @@ import type {
 import { isRecord, parseJsonlLine } from "../import/sessionImportTypes.ts";
 
 export const CLAUDE_BRIDGE_PROTOCOL_VERSION = 2;
-export const CLAUDE_BRIDGE_MOD_VERSION = "0.3.26";
+export const CLAUDE_BRIDGE_MOD_VERSION = "0.3.27";
 /**
  * The first protocol whose mod runs slash commands, answers questions with
  * their answers and reports the session's own commands. A process still on an
@@ -445,6 +445,10 @@ export type ClaudeBridgeEvent = { readonly seq: number; readonly at: number } & 
       readonly toolUseId: string;
       readonly tool: string;
       readonly input: unknown;
+      /**
+       * Why Claude Code asks, in the words its dialog draws under the call
+       * (a setting that blocks it); absent from a mod before 0.3.27.
+       */
       readonly reason?: string;
       readonly turnId?: string;
       /**
@@ -868,6 +872,11 @@ export const claudeBridgeAlsoInTerminal = (options: unknown): boolean =>
  */
 export const claudeBridgeAskingAgent = (options: unknown): string | null =>
   isRecord(options) && typeof options.askedByAgent === "string" ? options.askedByAgent : null;
+/** Why a bridged session's own dialog says it asks about this call, under the call. */
+export const claudeBridgeAskedBecause = (options: unknown): string | null =>
+  isRecord(options) && typeof options.askedBecause === "string" && options.askedBecause !== ""
+    ? options.askedBecause
+    : null;
 /**
  * The permission mode a bridged session says an approval of this call can
  * also switch it to, as its own dialog offers.
