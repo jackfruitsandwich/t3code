@@ -2133,9 +2133,14 @@ runtimeTest(
   "a prompt the session took back leaves the thread as a run T3 rewinds does, from the thread's floor on",
   (h) =>
     Effect.gen(function* () {
+      const at = (iso: string) => DateTime.toEpochMillis(DateTime.makeUnsafe(iso));
+      // Both sessions began before this server did (T3 adopting sessions
+      // already under way): the floor is where the record ends when the
+      // thread is first compared with it. (One that began while the server
+      // ran is followed from its first line.)
+      yield* TestClock.setTime(at("2026-07-01T10:00:40.000Z"));
       const bridgeDir = yield* h.makeDir("bridge");
       const importer = yield* h.importer({ bridgeDir });
-      const at = (iso: string) => DateTime.toEpochMillis(DateTime.makeUnsafe(iso));
       const session = (claudeId: string) => {
         const c = claudeSession({ sessionId: claudeId, cwd: h.workspace });
         const threadId = importedThreadId(claudeId);
@@ -3122,6 +3127,9 @@ runtimeTest(
         c.user("user-1", "Fix the login bug please", "2026-07-01T10:00:00.000Z"),
         c.assistant("assistant-1", "I fixed the login bug.", "2026-07-01T10:00:05.000Z"),
       ]);
+      // The session began before this server did: what the record held when
+      // the thread was first compared with it stays as the thread shows it.
+      yield* TestClock.setTime(DateTime.toEpochMillis(DateTime.makeUnsafe("2026-07-01T10:30:00.000Z")));
       const bridgeDir = yield* h.makeDir("bridge");
       const importer = yield* h.importer({ bridgeDir });
       yield* importer.sweepNow();
