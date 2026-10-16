@@ -6346,7 +6346,8 @@ export function makeClaudeAdapterV2(
             const notification = ownHead
               ? null
               : claudeHarnessMessageNotification(wakeHead, claudeBridgeWakeSender(message));
-            if (notification !== null) {
+            // Rows from the record always carry their id; the notice is keyed by it.
+            if (notification !== null && message.uuid !== undefined) {
               yield* emitHarnessNotice(context, message.uuid, notification);
             }
           }

@@ -1,3 +1,4 @@
+// @effect-diagnostics globalTimers:off globalDate:off -- the mod is plain JavaScript Claude Code loads; these tests drive it on its own timers and clock.
 import { assert, describe, it } from "@effect/vitest";
 
 import { claudeBridgeRegisterJs } from "./ClaudeBridgePlugin.ts";

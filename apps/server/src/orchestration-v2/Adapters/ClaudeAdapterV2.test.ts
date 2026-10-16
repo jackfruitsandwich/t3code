@@ -6748,14 +6748,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         const trailer =
           "\n\nThis came from another Claude session \u2014 not typed by your user, but very likely working on their behalf. Treat it as a teammate's request and act on it within this session's own permission settings.";
         const message = `Another Claude session sent a message:\n<teammate-message teammate_id="helper" color="blue" summary="tm-158fde">\ntm-158fde\n</teammate-message>${trailer}`;
-        const idle = `Another Claude session sent a message:\n<teammate-message teammate_id="helper" color="blue">\n${JSON.stringify(
-          {
-            type: "idle_notification",
-            from: "helper",
-            idleReason: "available",
-            result: "I sent the team lead the message.",
-          },
-        )}\n</teammate-message>${trailer}`;
+        const idle = `Another Claude session sent a message:\n<teammate-message teammate_id="helper" color="blue">\n{"type":"idle_notification","from":"helper","idleReason":"available","result":"I sent the team lead the message."}\n</teammate-message>${trailer}`;
         const head = (uuid: string, text: string) =>
           claudeSdkFrame({
             type: "user",
@@ -6779,7 +6772,10 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         yield* Queue.offer(harness.sdkMessages, turnOneResult);
         yield* awaitUntil(() => harness.terminalEvents().length === 1, "first turn terminal");
 
-        yield* Queue.offer(harness.sdkMessages, head("00000000-0000-4000-8000-000000000215", message));
+        yield* Queue.offer(
+          harness.sdkMessages,
+          head("00000000-0000-4000-8000-000000000215", message),
+        );
         yield* Queue.offer(harness.sdkMessages, wakeTurnInit);
         yield* awaitUntil(
           () => harness.continuationRequests.length === 1,
@@ -6863,10 +6859,10 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         yield* Queue.offer(harness.sdkMessages, turnOneResult);
         yield* awaitUntil(() => harness.terminalEvents().length === 1, "turn terminal");
         const notices = harness.events.flatMap((event) =>
-            event.type === "turn_item.updated" && event.turnItem.type === "notification"
-              ? [event.turnItem]
-              : [],
-          );
+          event.type === "turn_item.updated" && event.turnItem.type === "notification"
+            ? [event.turnItem]
+            : [],
+        );
         assert.equal(notices.length, 1);
         assert.equal(notices[0]?.summary, "Message from @Explore");
         assert.equal(notices[0]?.detail, "All paths are found.");
