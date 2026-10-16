@@ -132,4 +132,12 @@ describe("toolActivity", () => {
     expect(dynamicToolTitle("Skill", { skill: " " })).toBeUndefined();
     expect(dynamicToolTitle("Read", { skill: "full-send" })).toBeUndefined();
   });
+
+  it("titles Claude Agent calls with the description they give their subagent", () => {
+    expect(
+      dynamicToolTitle("Agent", { description: " Background sleep echo task ", prompt: "Go" }),
+    ).toBe("Agent: Background sleep echo task");
+    expect(dynamicToolTitle("Agent", { prompt: "Go" })).toBeUndefined();
+    expect(dynamicToolTitle("Read", { description: "Background sleep echo task" })).toBeUndefined();
+  });
 });

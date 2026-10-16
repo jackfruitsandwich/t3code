@@ -2974,6 +2974,12 @@ interface ActiveClaudeTurnContext {
   readonly subagentsByToolUseId: Map<string, ActiveClaudeSubagent>;
   readonly subagentNodesByTaskId: Map<string, OrchestrationV2ExecutionNode["id"]>;
   readonly pendingSubagentLaunchesByToolUseId: Map<string, PendingClaudeSubagentLaunch>;
+  /**
+   * Each Agent call's input, by its tool_use id. A call whose subagent never
+   * registers (a bridged session reports no task_started) shows as the Agent
+   * call it was once its result comes, not as a nameless tool.
+   */
+  readonly agentCallInputsByToolUseId: Map<string, ClaudeNativeToolInput>;
   // Set on turns that offered a prompt. Claude runs a wake turn it queued
   // for background work before the next prompt's turn, and only the
   // prompt's turn echoes this uuid (see handleSdkMessage).
@@ -6601,6 +6607,7 @@ export function makeClaudeAdapterV2(
           for (const toolUse of claudeToolUseBlocksFromAssistantMessage(message)) {
             const nativeToolInput = claudeNativeToolInputFromUnknown(toolUse.input);
             if (toolUse.name === "Agent") {
+              context.agentCallInputsByToolUseId.set(toolUse.id, nativeToolInput);
               rememberClaudeSubagentLaunch(
                 context,
                 toolUse.id,
@@ -6666,13 +6673,15 @@ export function makeClaudeAdapterV2(
               continue;
             }
             const parentToolUseId = parentToolUseIdFromSdkMessage(message);
+            const agentCallInput = context.agentCallInputsByToolUseId.get(toolResult.tool_use_id);
             const toolCall =
               context.toolCalls.get(toolResult.tool_use_id) ??
               (yield* ensureToolCallStarted({
                 context,
                 nativeItemId: toolResult.tool_use_id,
-                toolName: toolNameFromClaudeToolResult(toolResult),
-                toolInput: EMPTY_CLAUDE_NATIVE_TOOL_INPUT,
+                toolName:
+                  agentCallInput === undefined ? toolNameFromClaudeToolResult(toolResult) : "Agent",
+                toolInput: agentCallInput ?? EMPTY_CLAUDE_NATIVE_TOOL_INPUT,
                 parentToolUseId,
               }));
             const completedAt = yield* DateTime.now;
@@ -7216,6 +7225,7 @@ export function makeClaudeAdapterV2(
               );
             });
           if (toolName === "Agent") {
+            context.agentCallInputsByToolUseId.set(nativeRequestId, nativeToolInput);
             rememberClaudeSubagentLaunch(context, nativeRequestId, nativeToolInput, null);
           } else if (!heldForEcho && askingAgent === null) {
             yield* ensureToolCallStarted({
@@ -7981,6 +7991,7 @@ export function makeClaudeAdapterV2(
               subagentsByToolUseId: new Map(),
               subagentNodesByTaskId: new Map(),
               pendingSubagentLaunchesByToolUseId: new Map(),
+              agentCallInputsByToolUseId: new Map(),
               promptUuid,
               promptEcho: isClaudeProviderContinuationTurn(turnInput) ? "confirmed" : "pending",
               gatedFramesBeforeEcho: 0,

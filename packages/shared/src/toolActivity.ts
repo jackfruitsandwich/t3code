@@ -27,13 +27,18 @@ export function claudeSkillInvocation(
 
 /**
  * Activity log heading a dynamic tool derives from its input: CUA's `title`,
- * or the skill a Claude `Skill` call loads.
+ * the description a Claude `Agent` call gives its subagent, or the skill a
+ * Claude `Skill` call loads.
  */
 export function dynamicToolTitle(
   toolName: string | null | undefined,
   input: unknown,
 ): string | undefined {
   if (toolName === "cua_repl.js") return asTrimmedString(asRecord(input)?.title);
+  if (toolName === "Agent") {
+    const description = asTrimmedString(asRecord(input)?.description);
+    return description === undefined ? undefined : `Agent: ${description}`;
+  }
   const skill = claudeSkillInvocation(toolName, input);
   return skill === undefined ? undefined : `Skill: ${skill.name}`;
 }

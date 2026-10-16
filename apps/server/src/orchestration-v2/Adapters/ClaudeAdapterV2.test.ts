@@ -3752,6 +3752,97 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, IdAllocator.layer))),
   );
 
+  it.effect(
+    "shows an Agent call whose subagent never registers as that Agent call, not a nameless tool",
+    () =>
+      Effect.gen(function* () {
+        // A bridged session reports no task_started: the call's result is all
+        // that comes back for it (live 2b5b4e85, Oct 12-16: 44 rows named
+        // "tool" with no input, each a background Agent's launch).
+        const harness = yield* makeWakeHarness;
+        const now = yield* DateTime.now;
+        yield* harness.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now,
+            attemptId: RunAttemptId.make("attempt-agent-call"),
+            text: "Start a helper",
+            attachments: [],
+          }),
+        );
+        const input = {
+          description: "Background sleep echo task",
+          prompt: "Run the sleep and answer",
+          subagent_type: "general-purpose",
+          run_in_background: true,
+        };
+        yield* Queue.offer(
+          harness.sdkMessages,
+          claudeSdkFrame({
+            type: "assistant",
+            uuid: "00000000-0000-4000-8000-000000000611",
+            session_id: WAKE_NATIVE_SESSION,
+            parent_tool_use_id: null,
+            message: {
+              id: "msg_agent_call",
+              model: "claude-sonnet-4-6",
+              type: "message",
+              role: "assistant",
+              content: [{ type: "tool_use", id: "agent-call", name: "Agent", input }],
+              stop_reason: "tool_use",
+              stop_sequence: null,
+              usage: {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+              },
+            },
+          }),
+        );
+        yield* Queue.offer(
+          harness.sdkMessages,
+          claudeSdkFrame({
+            type: "user",
+            uuid: "00000000-0000-4000-8000-000000000612",
+            session_id: WAKE_NATIVE_SESSION,
+            parent_tool_use_id: null,
+            message: {
+              role: "user",
+              content: [
+                {
+                  type: "tool_result",
+                  tool_use_id: "agent-call",
+                  content: "Async agent launched successfully. agentId: a1",
+                },
+              ],
+            },
+          }),
+        );
+        yield* Queue.offer(
+          harness.sdkMessages,
+          makeResultFrame({ uuid: "00000000-0000-4000-8000-000000000613", result: "Started" }),
+        );
+        yield* Queue.take(harness.terminalReceipts);
+        const tools = harness.events.flatMap((event) =>
+          event.type === "turn_item.updated" && event.turnItem.type === "dynamic_tool"
+            ? [event.turnItem]
+            : [],
+        );
+        assert.isAbove(tools.length, 0);
+        for (const tool of tools) {
+          assert.equal(tool.nativeItemRef?.nativeId, "agent-call");
+          if (tool.type !== "dynamic_tool") continue;
+          assert.equal(tool.toolName, "Agent");
+          assert.equal(tool.title, "Agent: Background sleep echo task");
+          assert.deepInclude(tool.input as Record<string, unknown>, {
+            description: "Background sleep echo task",
+          });
+        }
+      }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, IdAllocator.layer))),
+  );
+
   it.effect("titles Claude reads, searches, and skills on tool completion", () =>
     Effect.gen(function* () {
       const harness = yield* makeWakeHarness;
