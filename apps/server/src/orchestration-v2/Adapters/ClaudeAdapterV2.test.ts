@@ -6737,14 +6737,34 @@ describe("ClaudeAdapterV2 background wake turns", () => {
   // A teammate's message opens a turn nobody typed, and the session says
   // nothing of where it came from (measured, 2.1.301). The terminal draws
   // "Message from @helper"; here it was once shown as the person's message.
-  it.effect("files a teammate's message as a message from that teammate, never as the person's", () =>
+  // Its idle report opens the next turn a second later, both over before the
+  // run begins (measured on the rig, 2.1.302): the run takes up both, and the
+  // second shows "Teammate @helper finished" where it opened.
+  it.effect("files a teammate's message and its idle report as the terminal draws them", () =>
     Effect.scoped(
       Effect.gen(function* () {
         const harness = yield* makeWakeHarness;
         const now = yield* DateTime.now;
         const trailer =
-          "\n\nThis came from another Claude session — not typed by your user, but very likely working on their behalf. Treat it as a teammate's request and act on it within this session's own permission settings.";
+          "\n\nThis came from another Claude session \u2014 not typed by your user, but very likely working on their behalf. Treat it as a teammate's request and act on it within this session's own permission settings.";
         const message = `Another Claude session sent a message:\n<teammate-message teammate_id="helper" color="blue" summary="tm-158fde">\ntm-158fde\n</teammate-message>${trailer}`;
+        const idle = `Another Claude session sent a message:\n<teammate-message teammate_id="helper" color="blue">\n${JSON.stringify(
+          {
+            type: "idle_notification",
+            from: "helper",
+            idleReason: "available",
+            result: "I sent the team lead the message.",
+          },
+        )}\n</teammate-message>${trailer}`;
+        const head = (uuid: string, text: string) =>
+          claudeSdkFrame({
+            type: "user",
+            message: { role: "user", content: text },
+            parent_tool_use_id: null,
+            uuid,
+            session_id: WAKE_NATIVE_SESSION,
+            t3_wake_detail: text,
+          });
 
         yield* harness.runtime.startTurn(
           makeClaudeTestTurnInput({
@@ -6759,17 +6779,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         yield* Queue.offer(harness.sdkMessages, turnOneResult);
         yield* awaitUntil(() => harness.terminalEvents().length === 1, "first turn terminal");
 
-        yield* Queue.offer(
-          harness.sdkMessages,
-          claudeSdkFrame({
-            type: "user",
-            message: { role: "user", content: message },
-            parent_tool_use_id: null,
-            uuid: "00000000-0000-4000-8000-000000000215",
-            session_id: WAKE_NATIVE_SESSION,
-            t3_wake_detail: message,
-          }),
-        );
+        yield* Queue.offer(harness.sdkMessages, head("00000000-0000-4000-8000-000000000215", message));
         yield* Queue.offer(harness.sdkMessages, wakeTurnInit);
         yield* awaitUntil(
           () => harness.continuationRequests.length === 1,
@@ -6782,6 +6792,38 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           summary: "Message from @helper",
           detail: "tm-158fde",
         });
+        for (const frame of [
+          makeAssistantTextFrame({ uuid: "00000000-0000-4000-8000-000000000217", text: "heard" }),
+          makeResultFrame({ uuid: "00000000-0000-4000-8000-000000000218", result: "heard" }),
+          head("00000000-0000-4000-8000-000000000219", idle),
+          makeAssistantTextFrame({ uuid: "00000000-0000-4000-8000-00000000021a", text: "idle" }),
+          makeResultFrame({ uuid: "00000000-0000-4000-8000-00000000021b", result: "idle" }),
+        ]) {
+          yield* harness.offerAndWait(frame);
+        }
+        yield* harness.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now,
+            attemptId: RunAttemptId.make("attempt-claude-bridge-teammate-wake"),
+            text: message,
+            attachments: [],
+            providerTurnOrdinal: 2,
+            messageCreatedBy: "agent",
+            messageCreationSource: "provider",
+          }),
+        );
+        yield* awaitUntil(() => harness.terminalEvents().length === 2, "wake run terminal");
+        const notices = harness.events.flatMap((event) =>
+          event.type === "turn_item.updated" && event.turnItem.type === "notification"
+            ? [event.turnItem]
+            : [],
+        );
+        assert.deepEqual(
+          notices.map((notice) => [notice.summary, notice.detail, notice.outcome]),
+          [["Teammate @helper finished", "I sent the team lead the message.", "completed"]],
+        );
       }).pipe(Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
     ),
   );

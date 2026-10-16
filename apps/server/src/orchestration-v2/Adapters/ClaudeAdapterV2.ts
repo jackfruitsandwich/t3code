@@ -2968,6 +2968,8 @@ interface ActiveClaudeTurnContext {
   readonly rejectedRateLimitTypes: Set<string>;
   readonly rateLimitResetTimes: Map<string, string | null>;
   latestAssistantRateLimited: boolean;
+  /** How many turns the harness opened this run has seen begin (see the wake-head notice). */
+  wakeHeadsSeen: number;
   readonly subagentsByTaskId: Map<string, ActiveClaudeSubagent>;
   readonly subagentsByToolUseId: Map<string, ActiveClaudeSubagent>;
   readonly subagentNodesByTaskId: Map<string, OrchestrationV2ExecutionNode["id"]>;
@@ -5939,6 +5941,44 @@ export function makeClaudeAdapterV2(
           return true;
         });
 
+        // A notice in a turn's own run, where the harness's message arrived.
+        const emitHarnessNotice = Effect.fnUntraced(function* (
+          context: ActiveClaudeTurnContext,
+          nativeItemId: string,
+          notification: OrchestrationV2Notification,
+        ) {
+          const now = yield* DateTime.now;
+          yield* emitProviderEvent({
+            type: "turn_item.updated",
+            driver: CLAUDE_PROVIDER,
+            turnItem: {
+              id: idAllocator.derive.turnItemFromProviderItem({
+                driver: CLAUDE_PROVIDER,
+                nativeItemId,
+              }),
+              threadId: context.input.threadId,
+              runId: context.input.runId,
+              nodeId: context.input.rootNodeId,
+              providerThreadId: context.input.providerThread.id,
+              providerTurnId: context.providerTurnId,
+              nativeItemRef: {
+                driver: CLAUDE_PROVIDER,
+                nativeId: nativeItemId,
+                strength: "strong",
+              },
+              parentItemId: null,
+              ordinal: yield* resolveItemOrdinal(context, nativeItemId),
+              type: "notification",
+              ...notification,
+              status: "completed",
+              title: null,
+              startedAt: now,
+              completedAt: now,
+              updatedAt: now,
+            },
+          });
+        });
+
         const handleSdkMessageFrame = Effect.fnUntraced(function* (input: {
           readonly query: ClaudeAgentSdkQuerySession;
           readonly message: SDKMessage;
@@ -6286,39 +6326,29 @@ export function makeClaudeAdapterV2(
               queuedPrompt.text,
               queuedPrompt.sender,
             );
-            if (notification === null) return;
-            const now = yield* DateTime.now;
-            const nativeItemId = queuedPrompt.uuid;
-            yield* emitProviderEvent({
-              type: "turn_item.updated",
-              driver: CLAUDE_PROVIDER,
-              turnItem: {
-                id: idAllocator.derive.turnItemFromProviderItem({
-                  driver: CLAUDE_PROVIDER,
-                  nativeItemId,
-                }),
-                threadId: context.input.threadId,
-                runId: context.input.runId,
-                nodeId: context.input.rootNodeId,
-                providerThreadId: context.input.providerThread.id,
-                providerTurnId: context.providerTurnId,
-                nativeItemRef: {
-                  driver: CLAUDE_PROVIDER,
-                  nativeId: nativeItemId,
-                  strength: "strong",
-                },
-                parentItemId: null,
-                ordinal: yield* resolveItemOrdinal(context, nativeItemId),
-                type: "notification",
-                ...notification,
-                status: "completed",
-                title: null,
-                startedAt: now,
-                completedAt: now,
-                updatedAt: now,
-              },
-            });
+            if (notification !== null) {
+              yield* emitHarnessNotice(context, queuedPrompt.uuid, notification);
+            }
             return;
+          }
+          // A turn the harness opened that this run takes up after its own
+          // (both were over before the run began, and it replays them as
+          // one): the second one's line, where it opened, as the terminal
+          // draws it. The run's own first line is its notification already.
+          const wakeHead =
+            message.type === "user" && message.parent_tool_use_id === null
+              ? claudeBridgeWakeDetail(message)
+              : null;
+          if (wakeHead !== null) {
+            const ownHead =
+              isClaudeProviderContinuationTurn(context.input) && context.wakeHeadsSeen === 0;
+            context.wakeHeadsSeen += 1;
+            const notification = ownHead
+              ? null
+              : claudeHarnessMessageNotification(wakeHead, claudeBridgeWakeSender(message));
+            if (notification !== null) {
+              yield* emitHarnessNotice(context, message.uuid, notification);
+            }
           }
 
           // What the session says to the person in a row of its own: the
@@ -8027,6 +8057,7 @@ export function makeClaudeAdapterV2(
               rejectedRateLimitTypes: new Set(),
               rateLimitResetTimes: new Map(),
               latestAssistantRateLimited: false,
+              wakeHeadsSeen: 0,
               subagentsByTaskId: new Map(),
               subagentsByToolUseId: new Map(),
               subagentNodesByTaskId: new Map(),
