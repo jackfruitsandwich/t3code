@@ -740,6 +740,81 @@ describe("ClaudeBridgeProtocol frame translator", () => {
     assert.isTrue(frame.is_error);
     assert.equal(frame.user_message_uuid, PROMPT_UUID);
   });
+
+  // Measured on the rig (2.1.301): the API error row is the turn's reply, and
+  // the terminal shows that line once and nothing under it; the mod reports
+  // the turn as ended in error, its answer empty or the reply's last fragment.
+  it("ends a turn whose reply is Claude Code's error line as the terminal ends it", () => {
+    const apiError = (uuid: string, error: string, text: string) => ({
+      type: "assistant",
+      uuid,
+      parentUuid: null,
+      isSidechain: false,
+      isApiErrorMessage: true,
+      error,
+      message: {
+        role: "assistant",
+        model: "<synthetic>",
+        content: [{ type: "text", text }],
+        stop_reason: "stop_sequence",
+      },
+    });
+    const ended = (frames: ReturnType<typeof translator>, answer: string) => {
+      const frame = frames.onTurnComplete({
+        seq: 1,
+        at: 1,
+        type: "turn.complete",
+        turnId: "turn-5",
+        reason: "error",
+        answer,
+        isAborted: false,
+        durationMs: 5,
+        transcriptOffset: 0,
+      })[0];
+      if (frame?.type !== "result") throw new Error("expected result");
+      return frame;
+    };
+    const login = "Please run /login \u00b7 API Error: 401 OAuth access token is invalid.";
+    let frames = translator();
+    frames.adoptTurn({ turnId: "turn-5", startedAt: 0, transcriptOffset: 0 });
+    const [reply] = frames.onTranscriptRow(apiError("e1", "authentication_failed", login));
+    assert.equal(Reflect.get(reply ?? {}, "error"), "authentication_failed");
+    assert.deepInclude(ended(frames, ""), { subtype: "success", is_error: false, result: login });
+
+    // A reply cut at the output limit: the error line is the last reply.
+    const limit = "API Error: Claude's response exceeded the 300 output token maximum.";
+    frames = translator();
+    frames.adoptTurn({ turnId: "turn-5", startedAt: 0, transcriptOffset: 0 });
+    frames.onTranscriptRow(assistantRow("a1", [{ type: "text", text: "thousand years: a fixed" }]));
+    frames.onTranscriptRow(apiError("e2", "max_output_tokens", limit));
+    assert.deepInclude(ended(frames, "thousand years: a fixed"), {
+      subtype: "success",
+      is_error: false,
+      result: limit,
+    });
+
+    // A usage limit stays a failure, in Claude Code's words, with its kind on the reply.
+    const usage = "You've hit your session limit \u00b7 resets 5pm";
+    frames = translator();
+    frames.adoptTurn({ turnId: "turn-5", startedAt: 0, transcriptOffset: 0 });
+    const [limited] = frames.onTranscriptRow(apiError("e3", "rate_limit", usage));
+    assert.equal(Reflect.get(limited ?? {}, "error"), "rate_limit");
+    assert.deepInclude(ended(frames, ""), {
+      subtype: "error_during_execution",
+      is_error: true,
+      errors: [usage],
+    });
+
+    // An error line the session went on past is no longer the reply.
+    frames = translator();
+    frames.adoptTurn({ turnId: "turn-5", startedAt: 0, transcriptOffset: 0 });
+    frames.onTranscriptRow(apiError("e4", "server_error", "API Error: overloaded"));
+    frames.onTranscriptRow(assistantRow("a2", [{ type: "text", text: "Back again." }]));
+    assert.deepInclude(ended(frames, ""), {
+      subtype: "error_during_execution",
+      errors: ["Claude Code reported an error."],
+    });
+  });
 });
 
 describe("ClaudeBridgeProtocol T3 tools called through the mod", () => {

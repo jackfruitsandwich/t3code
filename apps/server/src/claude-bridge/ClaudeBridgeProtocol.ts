@@ -1580,6 +1580,12 @@ interface TranslatorTurn {
   assistantMessages: number;
   lastUsage: Record<string, unknown> | null;
   lastModel: string | null;
+  /**
+   * The API error line the turn's last reply is, as the terminal shows it,
+   * with its kind (`rate_limit`, `authentication_failed`, ...); null while
+   * the last reply is no such line.
+   */
+  shownError: { readonly kind: string | null; readonly text: string } | null;
 }
 
 export interface ClaudeBridgeFrameTranslator {
@@ -1710,6 +1716,21 @@ export function makeClaudeBridgeFrameTranslator(
       user_message_uuids: [promptUuid ?? `bridge:${input.turnId}`],
       ...(input.isAborted ? { terminal_reason: "aborted_streaming" as const } : {}),
     };
+    // A turn that ended on an API error whose line the session showed as
+    // its reply ends here as it ends in the terminal: that line, once, and
+    // no failure of T3's own under it. A usage limit stays a failure, which
+    // T3 titles and offers to resume from; one with no line keeps T3's item.
+    const shownError = current?.shownError ?? null;
+    if (input.reason === "error" && shownError !== null && shownError.kind !== "rate_limit") {
+      return {
+        ...shared,
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        result: shownError.text,
+        stop_reason: "end_turn",
+      } as SDKResultMessage;
+    }
     if (input.reason === "error") {
       return {
         ...shared,
@@ -1717,7 +1738,10 @@ export function makeClaudeBridgeFrameTranslator(
         subtype: "error_during_execution",
         is_error: true,
         stop_reason: null,
-        errors: [input.answer.length > 0 ? input.answer : "Claude Code reported an error."],
+        errors: [
+          shownError?.text ??
+            (input.answer.length > 0 ? input.answer : "Claude Code reported an error."),
+        ],
       } as SDKResultMessage;
     }
     return {
@@ -1746,6 +1770,7 @@ export function makeClaudeBridgeFrameTranslator(
         assistantMessages: 0,
         lastUsage: null,
         lastModel: null,
+        shownError: null,
       };
       const frames: Array<SDKMessage> = [];
       if (event.promptUuid === undefined) {
@@ -1796,11 +1821,17 @@ export function makeClaudeBridgeFrameTranslator(
           current !== null && current.promptUuid !== null && !current.assistantStamped
             ? current.promptUuid
             : null;
+        // An API error row is the line the terminal shows for the failure.
+        const errorKind = typeof row.error === "string" ? row.error : null;
+        const errorLine =
+          row.isApiErrorMessage === true ? (rowText(row)?.trim() ?? "") : "";
         if (current !== null) {
           current.assistantMessages += 1;
           current.assistantStamped = current.assistantStamped || stamp !== null;
           current.lastUsage = isRecord(message.usage) ? message.usage : current.lastUsage;
           current.lastModel = typeof message.model === "string" ? message.model : current.lastModel;
+          current.shownError =
+            errorLine.length > 0 ? { kind: errorKind, text: errorLine } : null;
         }
         const frame = {
           type: "assistant",
@@ -1815,6 +1846,8 @@ export function makeClaudeBridgeFrameTranslator(
           session_id: sessionId,
           ...(typeof row.requestId === "string" ? { request_id: row.requestId } : {}),
           ...(stamp === null ? {} : { user_message_uuid: stamp, user_message_uuids: [stamp] }),
+          // The kind of API error the row is, as the SDK reports it on the message.
+          ...(errorKind === null ? {} : { error: errorKind }),
         } as unknown as SDKAssistantMessage;
         return [frame];
       }
@@ -1958,6 +1991,7 @@ export function makeClaudeBridgeFrameTranslator(
           assistantMessages: 0,
           lastUsage: null,
           lastModel: null,
+          shownError: null,
         };
       }
       if (typeof event.usage?.model === "string") {
@@ -2006,6 +2040,7 @@ export function makeClaudeBridgeFrameTranslator(
         assistantMessages: 0,
         lastUsage: null,
         lastModel: null,
+        shownError: null,
       };
     },
     setModel: (next) => {
