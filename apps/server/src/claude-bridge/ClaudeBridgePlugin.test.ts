@@ -8,18 +8,22 @@ type Hook = ($: unknown, e: Record<string, unknown>, next: (e: unknown) => unkno
  * The mod as Claude Code loads it, with a stand-in for its `$`: every call the
  * mod makes resolves to nothing unless named here, and what it writes is kept.
  */
-const loadMod = (session: { readonly usage?: unknown } = {}) => {
+const loadMod = (session: { readonly usage?: unknown; readonly turns?: number } = {}) => {
   const register = new Function(
     `${claudeBridgeRegisterJs([]).replace("export function register(on)", "function register(on)")}\nreturn register`,
   )() as (on: (event: string, ...rest: ReadonlyArray<unknown>) => void) => void;
   const hooks = new Map<string, Hook>();
   register((event, ...rest) => {
     // A hook narrowed by a matcher (one tool's calls) is kept under both.
-    hooks.set(rest.length === 1 ? event : `${event} ${JSON.stringify(rest[0])}`, rest.at(-1) as Hook);
+    hooks.set(
+      rest.length === 1 ? event : `${event} ${JSON.stringify(rest[0])}`,
+      rest.at(-1) as Hook,
+    );
   });
   const writes = new Map<string, string>();
   const timers = new Map<number, () => void>();
   const submits: Array<unknown> = [];
+  const commandRuns: Array<unknown> = [];
   const named: Record<string, Record<string, (...args: ReadonlyArray<unknown>) => unknown>> = {
     env: { get: (key) => (key === "T3CODE_BRIDGE_DIR" ? "/bridge" : undefined) },
     fs: {
@@ -40,12 +44,18 @@ const loadMod = (session: { readonly usage?: unknown } = {}) => {
       id: () => "session-1",
       surfaces: () => ["terminal"],
       model: () => "claude-opus-5-5",
+      turns: () => session.turns ?? 0,
       usage: () => {
         if (session.usage === undefined) throw new Error("not bound");
         return session.usage;
       },
     },
-    command: { list: () => [] },
+    command: {
+      list: () => [],
+      run: (input) => {
+        commandRuns.push(input);
+      },
+    },
     agent: { list: () => [] },
     clock: {
       every: (ms, tick) => {
@@ -81,7 +91,8 @@ const loadMod = (session: { readonly usage?: unknown } = {}) => {
     e: Record<string, unknown>,
     options: { readonly matcher?: unknown; readonly next?: (e: unknown) => unknown } = {},
   ) => {
-    const key = options.matcher === undefined ? event : `${event} ${JSON.stringify(options.matcher)}`;
+    const key =
+      options.matcher === undefined ? event : `${event} ${JSON.stringify(options.matcher)}`;
     const hook = hooks.get(key);
     assert.isDefined(hook, `the mod hooks ${key}`);
     return hook?.($, e, options.next ?? (async (passed) => passed));
@@ -115,7 +126,7 @@ const loadMod = (session: { readonly usage?: unknown } = {}) => {
     const path = [...writes.keys()].find((key) => key.endsWith("/session.json")) ?? "";
     writes.set(path.replace(/session\.json$/, name), JSON.stringify(value));
   };
-  return { fire, sessionFile, events, send, submits, put };
+  return { fire, sessionFile, events, send, submits, commandRuns, put };
 };
 
 const effort = (level: string) => ({ effort: { level } });
@@ -236,11 +247,7 @@ describe("the mod after the model ends the conversation", () => {
   it("ends nothing on the call answered with a request to call again, or on a subagent's", async () => {
     const mod = await started();
     await mod.fire("tool.call", { tool: "EndConversation" }, endCall(false));
-    await mod.fire(
-      "tool.call",
-      { tool: "EndConversation", agentId: "agent-1" },
-      endCall(true),
-    );
+    await mod.fire("tool.call", { tool: "EndConversation", agentId: "agent-1" }, endCall(true));
     await mod.fire("turn.complete", { turnId: "t1", reason: "answer", isAborted: false });
     assert.include(lastOf(mod, "turn.complete"), { isAborted: false });
     await mod.send(prompt);
@@ -249,7 +256,11 @@ describe("the mod after the model ends the conversation", () => {
   });
 
   it("takes the ending from Claude Code's note of the abort right after the call's result", async () => {
-    const result = { door: "tool-result", origin: { kind: "tool", tool: "EndConversation" }, message: { content: [] } };
+    const result = {
+      door: "tool-result",
+      origin: { kind: "tool", tool: "EndConversation" },
+      message: { content: [] },
+    };
     const note = {
       door: "note",
       origin: { kind: "engine" },
@@ -367,5 +378,32 @@ describe("the mod's report of another plugin's lines", () => {
       ["Clock: it is shown in the Claude Code terminal only.", false],
       ["clock: it is shown in the Claude Code terminal only.", false],
     ]);
+  });
+});
+
+describe("the mod's run of /effort <level> sent from T3", () => {
+  const sent = { type: "command", id: "c1", name: "effort", args: "high", promptUuid: "p1" };
+  const started = async (turns: number) => {
+    const mod = loadMod({ turns });
+    await mod.fire("session.start", { cwd: "/repo", surface: "terminal", isInteractive: true });
+    return mod;
+  };
+
+  it("refuses it mid-conversation in the words of the terminal's question, and runs nothing", async () => {
+    const mod = await started(2);
+    await mod.send(sent);
+    const result = mod.events().findLast((event) => event.type === "command.result");
+    assert.include(result, { commandId: "c1", ok: true });
+    assert.include(
+      String(result?.text),
+      "This conversation is cached for the current effort level. Switching to high means the full history gets re-read on your next message.",
+    );
+    assert.deepEqual(mod.commandRuns, []);
+  });
+
+  it("runs it before the first turn, when the terminal asks nothing", async () => {
+    const mod = await started(0);
+    await mod.send(sent);
+    assert.deepEqual(mod.commandRuns, [{ command: "effort", args: "high" }]);
   });
 });
