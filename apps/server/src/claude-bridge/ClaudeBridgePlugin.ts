@@ -148,6 +148,17 @@ const afterTurn = []
 const steering = []
 const MID_TURN_OPENING = ${JSON.stringify(CLAUDE_MID_TURN_OPENING)}
 const MID_TURN_CLOSING = ${JSON.stringify(CLAUDE_MID_TURN_CLOSING)}
+// The model ended the conversation (its second EndConversation call; the
+// first is answered with a request to call again). Claude Code aborts that
+// turn, and until /clear refuses every prompt with these words.
+const ENDED_BY_MODEL = 'Claude ended this conversation. Start a new session (or /clear) to continue.'
+let endedByModel = false
+// The running turn is the one that ended it: its ending call was answered
+// "ended", or (should that answer not reach the hook) its result was
+// followed by Claude Code's note of the abort.
+let endedThisTurn = false
+let endCallAnswered = false
+let endNoted = false
 // Panels commands sent from T3 have opened in the terminal and that are still open.
 let panelsOpen = 0
 // Whether the person last spoke from T3: the latest turn or command was sent
@@ -916,6 +927,7 @@ async function runSlashCommand($, command) {
   lastTurnFromT3 = true
   // Its turn is the command's, whether or not this mod's own hooks hear the run.
   commandPending = true
+  if (command.name === 'clear') endedByModel = false
   $.command.run({ command: command.name, args: command.args || '' }).then(async (result) => {
     panelClosed()
     if (settled) return
@@ -1074,6 +1086,12 @@ async function runShellCommand($, command) {
 
 // Submits a prompt T3 sent as a turn of its own (Claude Code runs it once the session is idle).
 function submitPrompt($, command) {
+  // Claude Code would refuse it below its submit hook and leave the prompt
+  // unanswered; T3's is refused here in its words.
+  if (endedByModel) {
+    emit($, 'prompt.dropped', { commandId: command.id, reason: ENDED_BY_MODEL }).catch(() => {})
+    return
+  }
   pendingCommand = { id: command.id, text: command.text, promptUuid: command.promptUuid, at: Date.now() }
   // The person's half-typed draft stays where it is: a submit does not touch it.
   $.prompt.submit({ text: command.text, asUser: true }).then(async (result) => {
@@ -1316,6 +1334,10 @@ export function register(on) {
       const text = typeof raw === 'string' ? raw : Array.isArray(raw) ? raw.map((block) => (block && block.type === 'text' ? String(block.text || '') : '')).join('') : ''
       const shell = SHELL_INPUT_ROW.exec(text)
       if (shell) lastShellInput = shell[1].trim()
+      if (e && !e.agentId) {
+        if (e.door === 'note' && endCallAnswered && text.indexOf('[Request interrupted by user') === 0) endNoted = true
+        endCallAnswered = e.door === 'tool-result' && !!e.origin && e.origin.tool === 'EndConversation'
+      }
     } catch {}
     try {
       const content = e && e.message && Array.isArray(e.message.content) ? e.message.content : []
@@ -1366,6 +1388,7 @@ export function register(on) {
   // A command typed at the terminal is the person speaking from there.
   on('command.run', async ($, e, next) => {
     if (e && e.origin && e.origin.kind === 'composer') lastTurnFromT3 = false
+    if (e && e.command === 'clear') endedByModel = false
     commandPending = true
     return next(e)
   })
@@ -1394,6 +1417,10 @@ export function register(on) {
     if (e.agentId) return next(e)
     effortTurn = { byCommand: commandPending, read: false }
     commandPending = false
+    endedByModel = false
+    endedThisTurn = false
+    endCallAnswered = false
+    endNoted = false
     const offset = await transcriptOffset($)
     let commandId
     let promptUuid
@@ -1424,11 +1451,18 @@ export function register(on) {
     const offset = await transcriptOffset($)
     const turn = activeTurn
     activeTurn = null
+    // The turn that ended the conversation: Claude Code aborted it and the
+    // terminal draws it interrupted, but it is reported answered.
+    const ending = endedThisTurn || (endNoted && e.isAborted !== true)
+    if (ending) endedByModel = true
+    endedThisTurn = false
+    endCallAnswered = false
+    endNoted = false
     await emit($, 'turn.complete', {
       turnId: e.turnId,
       reason: e.reason,
       answer: e.answer,
-      isAborted: e.isAborted === true,
+      isAborted: e.isAborted === true || ending,
       durationMs: e.durationMs,
       usage: e.usage,
       transcriptOffset: offset,
@@ -1462,6 +1496,17 @@ export function register(on) {
       }
     } catch {}
     return next(e)
+  })
+
+  on('tool.call', { tool: 'EndConversation' }, async ($, e, next) => {
+    const out = await next(e)
+    try {
+      if (!e.agentId && out && out.result && out.result.ended === true) {
+        endedByModel = true
+        endedThisTurn = activeTurn !== null
+      }
+    } catch {}
+    return out
   })
 
   // A question Claude asks the person. T3 answers it with the answers

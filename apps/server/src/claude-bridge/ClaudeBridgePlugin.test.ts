@@ -14,10 +14,12 @@ const loadMod = (session: { readonly usage?: unknown } = {}) => {
   )() as (on: (event: string, ...rest: ReadonlyArray<unknown>) => void) => void;
   const hooks = new Map<string, Hook>();
   register((event, ...rest) => {
-    // Hooks narrowed by a matcher (one tool's calls) are not exercised here.
-    if (rest.length === 1) hooks.set(event, rest[0] as Hook);
+    // A hook narrowed by a matcher (one tool's calls) is kept under both.
+    hooks.set(rest.length === 1 ? event : `${event} ${JSON.stringify(rest[0])}`, rest.at(-1) as Hook);
   });
   const writes = new Map<string, string>();
+  const timers = new Map<number, () => void>();
+  const submits: Array<unknown> = [];
   const named: Record<string, Record<string, (...args: ReadonlyArray<unknown>) => unknown>> = {
     env: { get: (key) => (key === "T3CODE_BRIDGE_DIR" ? "/bridge" : undefined) },
     fs: {
@@ -45,6 +47,17 @@ const loadMod = (session: { readonly usage?: unknown } = {}) => {
     },
     command: { list: () => [] },
     agent: { list: () => [] },
+    clock: {
+      every: (ms, tick) => {
+        timers.set(Number(ms), tick as () => void);
+      },
+    },
+    prompt: {
+      submit: (input) => {
+        submits.push(input);
+        return {};
+      },
+    },
   };
   const $ = new Proxy(
     {},
@@ -61,10 +74,15 @@ const loadMod = (session: { readonly usage?: unknown } = {}) => {
         ),
     },
   );
-  const fire = async (event: string, e: Record<string, unknown>) => {
-    const hook = hooks.get(event);
-    assert.isDefined(hook, `the mod hooks ${event}`);
-    return hook?.($, e, async (passed) => passed);
+  const fire = async (
+    event: string,
+    e: Record<string, unknown>,
+    options: { readonly matcher?: unknown; readonly next?: (e: unknown) => unknown } = {},
+  ) => {
+    const key = options.matcher === undefined ? event : `${event} ${JSON.stringify(options.matcher)}`;
+    const hook = hooks.get(key);
+    assert.isDefined(hook, `the mod hooks ${key}`);
+    return hook?.($, e, options.next ?? (async (passed) => passed));
   };
   /** What the mod last wrote as the session's file. */
   const sessionFile = () => {
@@ -72,7 +90,25 @@ const loadMod = (session: { readonly usage?: unknown } = {}) => {
     assert.isDefined(path, "the mod wrote its session file");
     return JSON.parse(writes.get(path ?? "") ?? "{}") as Record<string, unknown>;
   };
-  return { fire, sessionFile };
+  /** What the mod told T3, in order. */
+  const events = () =>
+    [...writes.keys()]
+      .filter((key) => key.includes("/events/"))
+      .toSorted()
+      .map((key) => JSON.parse(writes.get(key) ?? "{}") as Record<string, unknown>);
+  /** T3 drops a request in the session's inbox, and the mod's next poll takes it up. */
+  let seq = 0;
+  const send = async (command: Record<string, unknown>) => {
+    const path = [...writes.keys()].find((key) => key.endsWith("/session.json")) ?? "";
+    seq += 1;
+    writes.set(
+      path.replace(/session\.json$/, "inbox.json"),
+      JSON.stringify({ commands: [{ ...command, seq }] }),
+    );
+    timers.get(500)?.();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  };
+  return { fire, sessionFile, events, send, submits };
 };
 
 const effort = (level: string) => ({ effort: { level } });
@@ -158,5 +194,84 @@ describe("the mod's report of the session's status line", () => {
       ],
       cost: { usd: 1.25 },
     });
+  });
+});
+
+describe("the mod after the model ends the conversation", () => {
+  const ENDED = "Claude ended this conversation. Start a new session (or /clear) to continue.";
+  const endCall = (ended: boolean) => ({
+    matcher: { tool: "EndConversation" },
+    next: async () => ({ ref: "r", text: "", result: { ended, message: "" } }),
+  });
+  const started = async () => {
+    const mod = loadMod();
+    await mod.fire("session.start", { cwd: "/repo", surface: "terminal", isInteractive: true });
+    await mod.fire("prompt.submit", { text: "end it", origin: { kind: "composer" } });
+    await mod.fire("turn.start", { turnId: "t1", text: "end it" });
+    return mod;
+  };
+  const lastOf = (mod: ReturnType<typeof loadMod>, type: string) =>
+    mod.events().findLast((event) => event.type === type);
+  const prompt = { type: "prompt", id: "c1", text: "hello", promptUuid: "p1" };
+
+  it("reports the ending turn interrupted, and refuses T3's next prompt in Claude Code's words", async () => {
+    const mod = await started();
+    // The first call is answered with a request to call again; the second ends it.
+    await mod.fire("tool.call", { tool: "EndConversation" }, endCall(false));
+    await mod.fire("tool.call", { tool: "EndConversation" }, endCall(true));
+    await mod.fire("turn.complete", { turnId: "t1", reason: "answer", isAborted: false });
+    assert.include(lastOf(mod, "turn.complete"), { turnId: "t1", isAborted: true });
+    await mod.send(prompt);
+    assert.include(lastOf(mod, "prompt.dropped"), { commandId: "c1", reason: ENDED });
+    assert.deepEqual(mod.submits, []);
+  });
+
+  it("ends nothing on the call answered with a request to call again, or on a subagent's", async () => {
+    const mod = await started();
+    await mod.fire("tool.call", { tool: "EndConversation" }, endCall(false));
+    await mod.fire(
+      "tool.call",
+      { tool: "EndConversation", agentId: "agent-1" },
+      endCall(true),
+    );
+    await mod.fire("turn.complete", { turnId: "t1", reason: "answer", isAborted: false });
+    assert.include(lastOf(mod, "turn.complete"), { isAborted: false });
+    await mod.send(prompt);
+    assert.isUndefined(lastOf(mod, "prompt.dropped"));
+    assert.deepEqual(mod.submits, [{ text: "hello", asUser: true }]);
+  });
+
+  it("takes the ending from Claude Code's note of the abort right after the call's result", async () => {
+    const result = { door: "tool-result", origin: { kind: "tool", tool: "EndConversation" }, message: { content: [] } };
+    const note = {
+      door: "note",
+      origin: { kind: "engine" },
+      message: { content: [{ type: "text", text: "[Request interrupted by user]" }] },
+    };
+    const mod = await started();
+    await mod.fire("session.append", result);
+    await mod.fire("session.append", note);
+    await mod.fire("turn.complete", { turnId: "t1", reason: "answer", isAborted: false });
+    assert.include(lastOf(mod, "turn.complete"), { isAborted: true });
+    await mod.send(prompt);
+    assert.include(lastOf(mod, "prompt.dropped"), { commandId: "c1", reason: ENDED });
+    // Esc pressed right after the call's result: the turn is reported aborted, and nothing ended.
+    const pressed = await started();
+    await pressed.fire("session.append", result);
+    await pressed.fire("session.append", note);
+    await pressed.fire("turn.complete", { turnId: "t1", reason: "aborted", isAborted: true });
+    await pressed.send(prompt);
+    assert.isUndefined(lastOf(pressed, "prompt.dropped"));
+    assert.lengthOf(pressed.submits, 1);
+  });
+
+  it("takes T3's prompts again after /clear", async () => {
+    const mod = await started();
+    await mod.fire("tool.call", { tool: "EndConversation" }, endCall(true));
+    await mod.fire("turn.complete", { turnId: "t1", reason: "answer", isAborted: false });
+    await mod.fire("command.run", { command: "clear", args: "", origin: { kind: "composer" } });
+    await mod.send(prompt);
+    assert.isUndefined(lastOf(mod, "prompt.dropped"));
+    assert.deepEqual(mod.submits, [{ text: "hello", asUser: true }]);
   });
 });
