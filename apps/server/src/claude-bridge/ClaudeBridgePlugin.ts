@@ -121,6 +121,10 @@ const COMMAND_PANEL_WAIT_MS = 6000
 // (observed), and the screens that take no argument at all, so one typed
 // after them changes nothing (Claude Code 2.1.299's own definitions).
 const ARGUMENT_PANELS = new Set(['add-dir', 'usage-credits', 'extra-usage', 'stop'])
+// Tools whose permission dialog asks for a choice (Claude Code 2.1.301: set
+// up Claude in Chrome, connected or not now; pick a role) and writes it into
+// the call's input.
+const TERMINAL_DIALOG_TOOLS = new Set(['OfferChromeSetup', 'ShowOnboardingRolePicker'])
 const KNOWN_PANELS = new Set([${CLAUDE_BARE_PANEL_COMMANDS.map((name) => `'${name}'`).join(", ")}])
 
 const instanceId = Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8)
@@ -1592,6 +1596,10 @@ export function register(on) {
   on('tool.check', async ($, e, next) => {
     const verdict = await next(e)
     if (!verdict || verdict.decision !== 'ask' || !e.tool_use_id) return verdict
+    // A dialog whose answer is a choice written into the call's input, which
+    // T3's yes or no cannot give: it is the terminal's alone. T3 shows the
+    // call, and the session's call for the person as waiting in that dialog.
+    if (TERMINAL_DIALOG_TOOLS.has(e.tool)) return verdict
     // T3's display tools change nothing in the workspace; T3 allows them wherever it attaches them.
     if (isT3ReadOnlyTool(e.tool)) return { decision: 'allow', reason: 'T3 Code display tool' }
     if (isGranted(e)) return { decision: 'allow', reason: 'Allowed for this session in T3 Code' }

@@ -58,6 +58,8 @@ const loadMod = (session: { readonly usage?: unknown } = {}) => {
         return {};
       },
     },
+    // A wait gives way to the test, as a second does to everything else.
+    process: { run: () => new Promise((resolve) => setTimeout(resolve, 0)) },
   };
   const $ = new Proxy(
     {},
@@ -108,7 +110,12 @@ const loadMod = (session: { readonly usage?: unknown } = {}) => {
     timers.get(500)?.();
     await new Promise((resolve) => setTimeout(resolve, 0));
   };
-  return { fire, sessionFile, events, send, submits };
+  /** T3 writes a file of its own beside the session's (t3.json: it is attached). */
+  const put = (name: string, value: unknown) => {
+    const path = [...writes.keys()].find((key) => key.endsWith("/session.json")) ?? "";
+    writes.set(path.replace(/session\.json$/, name), JSON.stringify(value));
+  };
+  return { fire, sessionFile, events, send, submits, put };
 };
 
 const effort = (level: string) => ({ effort: { level } });
@@ -273,5 +280,40 @@ describe("the mod after the model ends the conversation", () => {
     await mod.send(prompt);
     assert.isUndefined(lastOf(mod, "prompt.dropped"));
     assert.deepEqual(mod.submits, [{ text: "hello", asUser: true }]);
+  });
+});
+
+describe("the mod's requests for a choice only the terminal's dialog can give", () => {
+  const request = async (tool: string) => {
+    const mod = loadMod();
+    await mod.fire("session.start", { cwd: "/repo", surface: "terminal", isInteractive: true });
+    mod.put("t3.json", { heartbeatAt: Date.now(), pid: 1 });
+    await mod.fire("prompt.submit", { text: "go", origin: { kind: "composer" } });
+    await mod.fire("turn.start", { turnId: "t1", text: "go" });
+    await mod.fire(
+      "tool.check",
+      { tool, tool_use_id: "tu1", input: {} },
+      { next: async () => ({ decision: "ask" }) },
+    );
+    const answer = mod.fire(
+      "classic.PermissionRequest",
+      { tool_name: tool, tool_input: {} },
+      { next: async () => "the terminal's dialog" },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const asked = mod.events().some((event) => event.type === "approval.request");
+    // The call's result lets go of a request still held for T3.
+    await mod.fire("session.append", {
+      message: { content: [{ type: "tool_result", tool_use_id: "tu1" }] },
+    });
+    return { asked, answer: await answer };
+  };
+
+  it("holds no card in T3 for them: the terminal's dialog takes the call", async () => {
+    for (const tool of ["OfferChromeSetup", "ShowOnboardingRolePicker"]) {
+      assert.deepEqual(await request(tool), { asked: false, answer: "the terminal's dialog" });
+    }
+    // Any other tool's request reaches T3.
+    assert.deepEqual(await request("Write"), { asked: true, answer: "the terminal's dialog" });
   });
 });
