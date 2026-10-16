@@ -47,6 +47,16 @@ const attach = (input: {
   readonly transcript?: string;
   /** A turn the session began, and maybe ended, while nothing was attached. */
   readonly missedTurn?: (now: number) => ClaudeBridgeRegistry.ClaudeBridgeMissedTurn;
+  /** The turns it began while nothing was attached, oldest first, in place of `missedTurn`. */
+  readonly missedTurns?: (
+    now: number,
+  ) => ReadonlyArray<ClaudeBridgeRegistry.ClaudeBridgeMissedTurn>;
+  /** Something the session says as the runner subscribes, before anything else it says. */
+  readonly onSubscribe?: (
+    say: (
+      event: Parameters<ClaudeBridgeRegistry.ClaudeBridgeEventHandler>[0],
+    ) => Effect.Effect<void>,
+  ) => Effect.Effect<void>;
   /** What the session lists in its file as waiting for T3's answer. */
   readonly waiting?: ClaudeBridgeRegistry.ClaudeBridgeProcess["session"]["waiting"];
   /** Another thread already holds the session this one's conversation continued in. */
@@ -73,7 +83,8 @@ const attach = (input: {
     const transcriptPath = `${root}/transcript.jsonl`;
     yield* fs.writeFileString(transcriptPath, input.transcript ?? "");
     const now = yield* Clock.currentTimeMillis;
-    let missedTurn = input.missedTurn?.(now) ?? null;
+    let missedTurns =
+      input.missedTurns?.(now) ?? (input.missedTurn === undefined ? [] : [input.missedTurn(now)]);
     const process: ClaudeBridgeRegistry.ClaudeBridgeProcess = {
       sid: "bridge-session",
       instanceId: "bridge-instance",
@@ -138,7 +149,15 @@ const attach = (input: {
       send: (_process, command) => Queue.offer(commands, command).pipe(Effect.as("command-1")),
       heartbeat: () => Effect.void,
       clearHeartbeat: () => Effect.void,
-      subscribe: (_sid, handler) => Deferred.succeed(subscribed, handler).pipe(Effect.asVoid),
+      subscribe: (_sid, handler) =>
+        Deferred.succeed(subscribed, handler).pipe(
+          Effect.andThen(
+            input.onSubscribe === undefined
+              ? Effect.void
+              : input.onSubscribe((event) => handler(event, process)),
+          ),
+          Effect.asVoid,
+        ),
       onUnattachedEvent: () => Effect.void,
       onUnattachedRequest: () => Effect.void,
       onRecordChange: () => Effect.void,
@@ -149,13 +168,15 @@ const attach = (input: {
         }),
       readClientSelection: () => Effect.succeed(null),
       writeClientSelection: () => Effect.void,
-      peekMissedTurn: () => Effect.sync(() => missedTurn),
-      takeMissedTurn: () =>
+      peekMissedTurn: () => Effect.sync(() => missedTurns.at(-1) ?? null),
+      peekMissedTurns: () => Effect.sync(() => missedTurns),
+      takeMissedTurns: () =>
         Effect.sync(() => {
-          const taken = missedTurn;
-          missedTurn = null;
+          const taken = missedTurns;
+          missedTurns = [];
           return taken;
         }),
+      noteTurnOffered: () => Effect.void,
       launch: () => Effect.die("This test must attach without launching Claude."),
       findTerminalHome: () => Effect.succeed(null),
       findSessionHome: () => Effect.succeed(root),
@@ -3232,6 +3253,242 @@ describe("ClaudeBridgeQueryRunner missed turns", () => {
       );
       assert.deepStrictEqual(texts, ["quick answer"]);
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  // bothplaces 099b48d6: the run offered for a short turn attached 6.9 s
+  // after it, when the person had typed the next one.
+  const textsOf = (frames: ReadonlyArray<SDKMessage>) =>
+    frames.flatMap((frame) =>
+      frame.type === "assistant"
+        ? frame.message.content.flatMap((block) => (block.type === "text" ? [block.text] : []))
+        : [],
+    );
+  const kindsOf = (frames: ReadonlyArray<SDKMessage>) =>
+    frames.flatMap((frame) =>
+      frame.type === "system" && frame.subtype !== "init"
+        ? []
+        : [frame.type === "system" ? `system:${frame.subtype}` : frame.type],
+    );
+  /** Which turn each result closes. */
+  const closed = (frames: ReadonlyArray<SDKMessage>) =>
+    frames.flatMap((frame) => (frame.type === "result" ? [frame.user_message_uuid] : []));
+  /** Waits on the live clock: the runner reads the record on its own. */
+  const settled = (predicate: () => boolean, label: string) =>
+    Effect.gen(function* () {
+      for (let attempt = 0; attempt < 80; attempt += 1) {
+        if (predicate()) return;
+        yield* Effect.sleep("50 millis");
+      }
+      return yield* Effect.die(`Timed out waiting for ${label}.`);
+    });
+  const nextStart = (at: number, transcriptOffset: number) =>
+    ({
+      type: "turn.start",
+      seq: 3,
+      at,
+      turnId: "turn-next",
+      text: "next question",
+      transcriptOffset,
+    }) as const;
+  const nextEnd = (at: number, transcriptOffset: number) =>
+    ({
+      type: "turn.complete",
+      seq: 4,
+      at,
+      turnId: "turn-next",
+      reason: "answer",
+      answer: "second answer",
+      isAborted: false,
+      durationMs: 1_000,
+      transcriptOffset,
+    }) as const;
+  const quickRows = (now: number) =>
+    replyRow("00000000-0000-4000-8000-0000000000a1", "quick answer", now - 8_500) +
+    turnEndRow("00000000-0000-4000-8000-0000000000a3", now - 8_000);
+  const nextRow = (now: number) =>
+    replyRow("00000000-0000-4000-8000-0000000000b1", "second answer", now - 500);
+
+  it.live("shows the turn it was offered for before the one the person began since", () =>
+    Effect.gen(function* () {
+      const now = yield* Clock.currentTimeMillis;
+      const first = quickRows(now);
+      const bridge = yield* attach({
+        protocol: 2,
+        bridgeCanUseTool: () => null,
+        transcript: first,
+        missedTurns: (at) => [{ ...turn(at, 8_000, first), offered: true }],
+        activeTurn: {
+          turnId: "turn-next",
+          startedAt: now - 1_000,
+          transcriptOffset: Buffer.byteLength(first),
+        },
+      });
+      const frames = yield* shownFrames(bridge);
+      yield* settled(() => closed(frames).length === 1, "the offered turn's end");
+      assert.deepStrictEqual(textsOf(frames), ["quick answer"]);
+      assert.deepStrictEqual(closed(frames), ["bridge:turn-quick"]);
+      // The turn begun since opens as its own, from its own start.
+      yield* bridge.handler(nextStart(now, Buffer.byteLength(first)), bridge.process);
+      const fs = yield* FileSystem.FileSystem;
+      yield* fs.writeFileString(bridge.process.session.transcriptPath, nextRow(now), {
+        flag: "a",
+      });
+      yield* settled(() => textsOf(frames).length === 2, "the next turn's reply");
+      assert.deepStrictEqual(kindsOf(frames), [
+        "assistant",
+        "result",
+        "user",
+        "system:init",
+        "assistant",
+      ]);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.live("leaves the turn begun since to the run offered for it, after the one it shows", () =>
+    Effect.gen(function* () {
+      const now = yield* Clock.currentTimeMillis;
+      const first = quickRows(now);
+      const transcript = first + nextRow(now);
+      const bridge = yield* attach({
+        protocol: 2,
+        bridgeCanUseTool: () => null,
+        transcript,
+        // Both began with nothing attached, and each was offered a run.
+        missedTurns: (at) => [
+          { ...turn(at, 8_000, first), offered: true },
+          { start: nextStart(at - 1_000, Buffer.byteLength(first)), complete: null, offered: true },
+        ],
+        activeTurn: {
+          turnId: "turn-next",
+          startedAt: now - 1_000,
+          transcriptOffset: Buffer.byteLength(first),
+        },
+      });
+      const frames = yield* shownFrames(bridge);
+      // The next turn ends before the one shown first has closed here.
+      yield* bridge.handler(nextEnd(now, Buffer.byteLength(transcript)), bridge.process);
+      yield* settled(() => closed(frames).length === 2, "both turns' ends");
+      const firstEnd = frames.findIndex((frame) => frame.type === "result");
+      assert.deepStrictEqual(textsOf(frames.slice(0, firstEnd)), ["quick answer"]);
+      assert.deepStrictEqual(closed(frames), ["bridge:turn-quick", "bridge:turn-next"]);
+      // No prompt of its own: the run offered for it carries that.
+      assert.deepStrictEqual(kindsOf(frames.slice(firstEnd + 1)), ["assistant", "result"]);
+      assert.deepStrictEqual(textsOf(frames.slice(firstEnd + 1)), ["second answer"]);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.live("closes a replayed turn before a turn that begins as it attaches", () =>
+    Effect.gen(function* () {
+      const now = yield* Clock.currentTimeMillis;
+      const first = quickRows(now);
+      const bridge = yield* attach({
+        protocol: 2,
+        bridgeCanUseTool: () => null,
+        transcript: first,
+        missedTurn: (at) => turn(at, 8_000, first),
+        // The next turn's start reaches the attachment the moment it subscribes.
+        onSubscribe: (say) => say(nextStart(now, Buffer.byteLength(first))),
+      });
+      const frames = yield* shownFrames(bridge);
+      yield* settled(() => kindsOf(frames).includes("system:init"), "the next turn's start");
+      assert.deepStrictEqual(kindsOf(frames), ["assistant", "result", "user", "system:init"]);
+      assert.deepStrictEqual(textsOf(frames), ["quick answer"]);
+      assert.deepStrictEqual(closed(frames), ["bridge:turn-quick"]);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  /** The run offered for the quick turn attaches `endedAgoMs` after it, with the next one running. */
+  const lateOffered = (endedAgoMs: number, nextMissed: boolean) =>
+    Effect.gen(function* () {
+      const now = yield* Clock.currentTimeMillis;
+      const first = quickRows(now);
+      const bridge = yield* attach({
+        protocol: 2,
+        bridgeCanUseTool: () => null,
+        transcript: first,
+        missedTurns: (at) => [
+          { ...turn(at, endedAgoMs, first), offered: true },
+          ...(nextMissed
+            ? [
+                {
+                  start: nextStart(at - 1_000, Buffer.byteLength(first)),
+                  complete: null,
+                  offered: true,
+                },
+              ]
+            : []),
+        ],
+        activeTurn: {
+          turnId: "turn-next",
+          startedAt: now - 1_000,
+          transcriptOffset: Buffer.byteLength(first),
+        },
+      });
+      return { bridge, now, first, frames: yield* shownFrames(bridge) };
+    });
+
+  // bothplaces b36bf247: the offer came 16 s late, and the run attached
+  // 17.5 s after the turn ended, as the next was typed.
+  it.live("shows the turn it was offered for from its start while its rows are held for it", () =>
+    Effect.gen(function* () {
+      const { bridge, now, first, frames } = yield* lateOffered(18_000, false);
+      yield* settled(() => closed(frames).length === 1, "the offered turn's end");
+      assert.deepStrictEqual(textsOf(frames), ["quick answer"]);
+      assert.deepStrictEqual(closed(frames), ["bridge:turn-quick"]);
+      yield* bridge.handler(nextStart(now, Buffer.byteLength(first)), bridge.process);
+      yield* settled(() => kindsOf(frames).includes("system:init"), "the next turn's start");
+      assert.deepStrictEqual(kindsOf(frames), ["assistant", "result", "user", "system:init"]);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.live("closes the run of a turn over long since, without the turn begun after it", () =>
+    Effect.gen(function* () {
+      const { bridge, now, first, frames } = yield* lateOffered(40_000, false);
+      yield* settled(() => closed(frames).length === 1, "the offered turn's end");
+      // Its reply reaches the thread as history; the run says nothing of it.
+      assert.deepStrictEqual(kindsOf(frames), ["result"]);
+      const end = frames[0];
+      assert.isTrue(end?.type === "result" && end.subtype === "success" && end.result === "");
+      assert.deepStrictEqual(closed(frames), ["bridge:turn-quick"]);
+      // The turn begun since opens as its own.
+      yield* bridge.handler(nextStart(now, Buffer.byteLength(first)), bridge.process);
+      const fs = yield* FileSystem.FileSystem;
+      yield* fs.writeFileString(bridge.process.session.transcriptPath, nextRow(now), {
+        flag: "a",
+      });
+      yield* settled(() => textsOf(frames).length === 1, "the next turn's reply");
+      assert.deepStrictEqual(kindsOf(frames), ["result", "user", "system:init", "assistant"]);
+      assert.deepStrictEqual(textsOf(frames), ["second answer"]);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.live("leaves the turn begun after one over long since to the run offered for it", () =>
+    Effect.gen(function* () {
+      const { bridge, now, frames } = yield* lateOffered(40_000, true);
+      const fs = yield* FileSystem.FileSystem;
+      const transcript = bridge.process.session.transcriptPath;
+      yield* fs.writeFileString(transcript, nextRow(now), { flag: "a" });
+      const size = Buffer.byteLength(yield* fs.readFileString(transcript));
+      yield* bridge.handler(nextEnd(now, size), bridge.process);
+      yield* settled(() => closed(frames).length === 2, "both turns' ends");
+      assert.deepStrictEqual(closed(frames), ["bridge:turn-quick", "bridge:turn-next"]);
+      // No prompt of its own: the run offered for it carries that.
+      assert.deepStrictEqual(kindsOf(frames), ["result", "assistant", "result"]);
+      assert.deepStrictEqual(textsOf(frames), ["second answer"]);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  // bgafter 52b3ad3a: the turn a run was kept open for over a restart ended
+  // before this server came up; that run closes empty, and the record has
+  // the reply.
+  it.live(
+    "asks for the record to be compared when it attaches to a session with nothing to show",
+    () =>
+      Effect.gen(function* () {
+        const bridge = yield* attach({ protocol: 2, bridgeCanUseTool: () => null, transcript: "" });
+        assert.include(bridge.recordChanges, "turn.complete");
+        assert.isFalse(yield* bridge.session.hasPendingWake ?? Effect.succeed(true));
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 });
 

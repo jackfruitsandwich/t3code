@@ -78,7 +78,33 @@ export class ClaudeBridgeLaunchError extends Schema.TaggedError<ClaudeBridgeLaun
 export interface ClaudeBridgeMissedTurn {
   readonly start: Extract<ClaudeBridgeEvent, { readonly type: "turn.start" }>;
   readonly complete: Extract<ClaudeBridgeEvent, { readonly type: "turn.complete" }> | null;
+  /** A run was offered for this turn (see `noteTurnOffered`). */
+  readonly offered?: boolean;
 }
+
+/** How many of the turns a session began while nobody was subscribed are kept. */
+const MISSED_TURNS_KEPT = 4;
+
+/**
+ * The turns a session began while nobody was subscribed, oldest first, once
+ * `event` came with nobody subscribed. Each keeps its own end: a turn begun
+ * before the run offered for the one before it attached does not take that
+ * one's place.
+ */
+export const claudeBridgeMissedTurnsAfter = (
+  turns: ReadonlyArray<ClaudeBridgeMissedTurn>,
+  event: ClaudeBridgeEvent,
+): ReadonlyArray<ClaudeBridgeMissedTurn> => {
+  if (event.type === "turn.start") {
+    return [...turns, { start: event, complete: null }].slice(-MISSED_TURNS_KEPT);
+  }
+  if (event.type === "turn.complete") {
+    return turns.map((turn) =>
+      turn.start.turnId === event.turnId ? { ...turn, complete: event } : turn,
+    );
+  }
+  return turns;
+};
 
 /**
  * How recently a turn nobody was attached for must have ended for the next
@@ -87,6 +113,19 @@ export interface ClaudeBridgeMissedTurn {
  * query runner replays a missed turn within the same span.)
  */
 export const CLAUDE_BRIDGE_MISSED_TURN_REPLAY_MS = 15_000;
+/**
+ * The same for a turn a run was offered for: that run can attach after the
+ * turn ended (its offer waits for the session's thread to be made, measured
+ * up to 17.5 s), and until it does the turn is in the thread nowhere. Not
+ * longer than the importer's sweep leaves a still record alone (20 s from its
+ * last write, longer while its newest message is fresh): the sweep does not
+ * know of the hold, and a turn it takes in as history must not be replayed.
+ */
+export const CLAUDE_BRIDGE_OFFERED_TURN_HOLD_MS = 20_000;
+
+/** How long after it ended a missed turn is still an attachment's to show from its start. */
+export const claudeBridgeMissedTurnReplayMs = (turn: ClaudeBridgeMissedTurn): number =>
+  turn.offered === true ? CLAUDE_BRIDGE_OFFERED_TURN_HOLD_MS : CLAUDE_BRIDGE_MISSED_TURN_REPLAY_MS;
 
 /**
  * When a turn began that ended with nothing attached and that an attachment
@@ -100,9 +139,25 @@ export const claudeBridgeTurnAwaitingRunSince = (
 ): number | undefined =>
   missed !== null &&
   missed.complete !== null &&
-  nowMs - missed.complete.at < CLAUDE_BRIDGE_MISSED_TURN_REPLAY_MS
+  nowMs - missed.complete.at < claudeBridgeMissedTurnReplayMs(missed)
     ? missed.start.at
     : undefined;
+
+/**
+ * The earliest such start among the turns the session began with nothing
+ * attached: a turn begun since does not hide one still awaiting its run.
+ */
+export const claudeBridgeTurnsAwaitingRunSince = (
+  turns: ReadonlyArray<ClaudeBridgeMissedTurn>,
+  nowMs: number,
+): number | undefined => {
+  let earliest: number | undefined;
+  for (const turn of turns) {
+    const since = claudeBridgeTurnAwaitingRunSince(turn, nowMs);
+    if (since !== undefined && (earliest === undefined || since < earliest)) earliest = since;
+  }
+  return earliest;
+};
 
 /**
  * Which events of one pass over a session's events belong to a turn that is
@@ -289,12 +344,20 @@ export class ClaudeBridgeRegistry extends Context.Service<
     /**
      * The last turn the session began while nobody was subscribed, with its
      * end if that came too: a short turn can be over before the run offered
-     * for it has attached, and whoever attaches next shows it. `peek` leaves
-     * it in place, since its end may still arrive before the caller has
-     * subscribed; `take` hands it over once, after subscribing.
+     * for it has attached, and whoever attaches next shows it.
      */
     readonly peekMissedTurn: (sid: string) => Effect.Effect<ClaudeBridgeMissedTurn | null>;
-    readonly takeMissedTurn: (sid: string) => Effect.Effect<ClaudeBridgeMissedTurn | null>;
+    /**
+     * All of the turns the session began while nobody was subscribed (the
+     * last few), oldest first: the person can begin the next before the run
+     * offered for one has attached. `peek` leaves them in place, since an end
+     * may still arrive before the caller has subscribed; `take` hands them
+     * over once, after subscribing.
+     */
+    readonly peekMissedTurns: (sid: string) => Effect.Effect<ReadonlyArray<ClaudeBridgeMissedTurn>>;
+    readonly takeMissedTurns: (sid: string) => Effect.Effect<ReadonlyArray<ClaudeBridgeMissedTurn>>;
+    /** Notes that a run was offered for a turn the session began while nobody was subscribed. */
+    readonly noteTurnOffered: (sid: string, turnId: string) => Effect.Effect<void>;
     /** Starts a background Claude Code process for the session and waits for its mod to report. */
     readonly launch: (
       input: ClaudeBridgeLaunchInput,
@@ -511,13 +574,23 @@ const make = Effect.gen(function* () {
     .pipe(Effect.ignore);
 
   const subscribers = new Map<string, ClaudeBridgeEventHandler>();
-  const missedTurns = new Map<string, ClaudeBridgeMissedTurn>();
-  const peekMissedTurn = (sid: string) => Effect.sync(() => missedTurns.get(sid) ?? null);
-  const takeMissedTurn = (sid: string) =>
+  const missedTurns = new Map<string, ReadonlyArray<ClaudeBridgeMissedTurn>>();
+  const peekMissedTurn = (sid: string) => Effect.sync(() => missedTurns.get(sid)?.at(-1) ?? null);
+  const peekMissedTurns = (sid: string) => Effect.sync(() => missedTurns.get(sid) ?? []);
+  const takeMissedTurns = (sid: string) =>
     Effect.sync(() => {
-      const missed = missedTurns.get(sid) ?? null;
+      const missed = missedTurns.get(sid) ?? [];
       missedTurns.delete(sid);
       return missed;
+    });
+  const noteTurnOffered = (sid: string, turnId: string) =>
+    Effect.sync(() => {
+      const turns = missedTurns.get(sid);
+      if (turns === undefined) return;
+      missedTurns.set(
+        sid,
+        turns.map((turn) => (turn.start.turnId === turnId ? { ...turn, offered: true } : turn)),
+      );
     });
   const unattachedHandlers = new Set<ClaudeBridgeEventHandler>();
   const waitingHandlers = new Set<ClaudeBridgeWaitingHandler>();
@@ -834,15 +907,14 @@ const make = Effect.gen(function* () {
       const subscriber = subscribers.get(entry.sid);
       // Noted before the record is compared: the comparison asks whether a
       // turn nobody was attached for is still a run's to show.
-      if (subscriber === undefined) {
-        if (event.type === "turn.start") {
-          missedTurns.set(entry.sid, { start: event, complete: null });
-        } else if (event.type === "turn.complete") {
-          const missed = missedTurns.get(entry.sid);
-          if (missed !== undefined && missed.start.turnId === event.turnId) {
-            missedTurns.set(entry.sid, { start: missed.start, complete: event });
-          }
-        }
+      if (
+        subscriber === undefined &&
+        (event.type === "turn.start" || event.type === "turn.complete")
+      ) {
+        missedTurns.set(
+          entry.sid,
+          claudeBridgeMissedTurnsAfter(missedTurns.get(entry.sid) ?? [], event),
+        );
       }
       if (event.type === "turn.start" || event.type === "turn.complete") {
         yield* noteRecordChange(entry, event.type);
@@ -1274,7 +1346,9 @@ const make = Effect.gen(function* () {
     readClientSelection,
     writeClientSelection,
     peekMissedTurn,
-    takeMissedTurn,
+    peekMissedTurns,
+    takeMissedTurns,
+    noteTurnOffered,
     launch,
     findTerminalHome,
     findSessionHome,
@@ -1319,7 +1393,9 @@ export const layerTest = Layer.succeed(
     readClientSelection: () => Effect.succeed(null),
     writeClientSelection: () => Effect.void,
     peekMissedTurn: () => Effect.succeed(null),
-    takeMissedTurn: () => Effect.succeed(null),
+    peekMissedTurns: () => Effect.succeed([]),
+    takeMissedTurns: () => Effect.succeed([]),
+    noteTurnOffered: () => Effect.void,
     launch: (input) =>
       Effect.fail(
         new ClaudeBridgeLaunchError({ sid: input.sid, detail: "Claude bridge disabled in tests." }),

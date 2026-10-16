@@ -12,9 +12,12 @@ import * as TestClock from "effect/testing/TestClock";
 import * as ServerConfig from "../config.ts";
 import {
   CLAUDE_BRIDGE_MISSED_TURN_REPLAY_MS,
+  CLAUDE_BRIDGE_OFFERED_TURN_HOLD_MS,
   ClaudeBridgeRegistry,
+  claudeBridgeMissedTurnsAfter,
   claudeBridgeStaleTurnEvents,
   claudeBridgeTurnAwaitingRunSince,
+  claudeBridgeTurnsAwaitingRunSince,
   claudeHomesToScan,
   claudeLaunchArgs,
   claudeLaunchEnvironment,
@@ -174,6 +177,82 @@ describe("claudeBridgeTurnAwaitingRunSince", () => {
     assert.isUndefined(claudeBridgeTurnAwaitingRunSince(null, endedAt));
     // A running turn is reported by the session itself, for as long as it runs.
     assert.isUndefined(claudeBridgeTurnAwaitingRunSince({ start, complete: null }, endedAt));
+  });
+
+  // bothplaces b36bf247: the run offered for the turn attached 17.5 s after it ended.
+  it("names a turn a run was offered for for longer: that run can attach late", () => {
+    const offered = { ...ended, offered: true };
+    const late = endedAt + CLAUDE_BRIDGE_MISSED_TURN_REPLAY_MS + 2_500;
+    assert.isUndefined(claudeBridgeTurnAwaitingRunSince(ended, late));
+    assert.strictEqual(claudeBridgeTurnAwaitingRunSince(offered, late), startedAt);
+    assert.isUndefined(
+      claudeBridgeTurnAwaitingRunSince(offered, endedAt + CLAUDE_BRIDGE_OFFERED_TURN_HOLD_MS),
+    );
+  });
+
+  it("names the earliest of the turns begun with nothing attached that still await their run", () => {
+    const next: ClaudeBridgeMissedTurn = {
+      start: { ...start, turnId: "turn-2", at: endedAt + 500 },
+      complete: null,
+    };
+    assert.strictEqual(
+      claudeBridgeTurnsAwaitingRunSince([{ ...ended, offered: true }, next], endedAt + 1_000),
+      startedAt,
+    );
+    assert.isUndefined(claudeBridgeTurnsAwaitingRunSince([next], endedAt + 1_000));
+    assert.isUndefined(claudeBridgeTurnsAwaitingRunSince([], endedAt));
+  });
+});
+
+describe("claudeBridgeMissedTurnsAfter", () => {
+  const none: ReadonlyArray<ClaudeBridgeMissedTurn> = [];
+  const startOf = (turnId: string, at: number): ClaudeBridgeMissedTurn["start"] => ({
+    seq: at,
+    at,
+    type: "turn.start",
+    turnId,
+    text: turnId,
+    transcriptOffset: at,
+  });
+  const endOf = (turnId: string, at: number): NonNullable<ClaudeBridgeMissedTurn["complete"]> => ({
+    seq: at,
+    at,
+    type: "turn.complete",
+    turnId,
+    reason: "answer",
+    answer: turnId,
+    isAborted: false,
+    durationMs: 1,
+    transcriptOffset: at,
+  });
+
+  // bothplaces 099b48d6: the run offered for a short turn attached 6.9 s
+  // after it, when the person had typed the next one.
+  it("keeps the turn a run was offered for when the next begins before that run attaches", () => {
+    const turns = [startOf("turn-a", 1), endOf("turn-a", 2), startOf("turn-b", 3)].reduce(
+      claudeBridgeMissedTurnsAfter,
+      none,
+    );
+    assert.deepStrictEqual(turns, [
+      { start: startOf("turn-a", 1), complete: endOf("turn-a", 2) },
+      { start: startOf("turn-b", 3), complete: null },
+    ]);
+  });
+
+  it("gives an end only to its own turn, and keeps the last few", () => {
+    const turns = [1, 2, 3, 4, 5]
+      .map((n) => startOf(`turn-${n}`, n))
+      .reduce(claudeBridgeMissedTurnsAfter, none);
+    assert.deepStrictEqual(
+      turns.map((turn) => turn.start.turnId),
+      ["turn-2", "turn-3", "turn-4", "turn-5"],
+    );
+    const ended = claudeBridgeMissedTurnsAfter(turns, endOf("turn-3", 6));
+    assert.deepStrictEqual(
+      ended.map((turn) => turn.complete?.turnId ?? null),
+      [null, "turn-3", null, null],
+    );
+    assert.deepStrictEqual(claudeBridgeMissedTurnsAfter(turns, endOf("turn-9", 7)), turns);
   });
 });
 

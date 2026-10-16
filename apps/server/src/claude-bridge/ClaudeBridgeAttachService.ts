@@ -224,6 +224,9 @@ const make = Effect.gen(function* () {
         threadId: thread.threadId,
       });
       lastOfferedAt.set(sid, yield* Clock.currentTimeMillis);
+      // The run says which turn it was offered for: by the time it attaches
+      // the person may have begun the next, which gets a run of its own.
+      yield* registry.noteTurnOffered(sid, turnId);
       const taskNotice = claudeTaskNotification(text);
       yield* continuations.offer({
         threadId: thread.threadId,
@@ -312,8 +315,8 @@ const make = Effect.gen(function* () {
   // would be taken in as history and be there twice.
   const heal = (sid: string, transcriptPath: string, leftToRecord?: ReadonlyArray<string>) =>
     Effect.gen(function* () {
-      const awaitingRunSinceMs = ClaudeBridgeRegistry.claudeBridgeTurnAwaitingRunSince(
-        yield* registry.peekMissedTurn(sid),
+      const awaitingRunSinceMs = ClaudeBridgeRegistry.claudeBridgeTurnsAwaitingRunSince(
+        yield* registry.peekMissedTurns(sid),
         yield* Clock.currentTimeMillis,
       );
       yield* importer.healLiveClaudeSession({
@@ -375,7 +378,10 @@ const make = Effect.gen(function* () {
   // A turn already running when this server came up (a restart mid-turn).
   // Whoever started it, the terminal or a prompt sent from T3: recovery left
   // the run that was showing it open, and that run picks it back up; with no
-  // such run (one recovery could not keep), a run is offered for it.
+  // such run (one recovery could not keep), a run is offered for it. A
+  // session running no turn by now may have ended one while this server came
+  // up: a run recovery kept open for it picks up and closes, and with none
+  // nothing is started.
   // Forked: recovery runs after the layers are built, and the offer waits on it.
   yield* Effect.gen(function* () {
     yield* afterStartupRecovery;
@@ -387,7 +393,19 @@ const make = Effect.gen(function* () {
     for (const entry of live) {
       if (entry.session.activeTurn !== null) {
         yield* offerTurn(entry, { ...entry.session.activeTurn, text: "" }, true);
+        continue;
       }
+      const thread = yield* threadOf(entry);
+      if (thread === null) continue;
+      yield* continuations.offer({
+        threadId: thread.threadId,
+        providerThreadId: thread.providerThreadId,
+        driver: CLAUDE_PROVIDER,
+        detail: null,
+        createdBy: "agent",
+        reattachRun: true,
+        reattachOnly: true,
+      });
     }
   }).pipe(Effect.forkScoped);
 });

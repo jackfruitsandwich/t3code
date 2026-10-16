@@ -151,7 +151,7 @@ export const layer = Layer.effectDiscard(
           return;
         }
         const openRun =
-          request.reattachRun === true
+          request.reattachRun === true || request.reattachOnly === true
             ? projection.runs.find(
                 (run) =>
                   run.providerThreadId === request.providerThreadId && run.status === "running",
@@ -181,6 +181,9 @@ export const layer = Layer.effectDiscard(
               ),
             ));
         if (reattached) return;
+        // No run was kept open for it: the session runs no turn a run of its
+        // own would show.
+        if (request.reattachOnly === true) return;
         // The ordinal is display metadata only: allocate.message appends a
         // random UUID, so a stale projection read here cannot collide ids.
         const messageId = yield* ids.allocate.message({

@@ -983,6 +983,36 @@ describe("ProviderContinuationService", () => {
       }),
     );
 
+    // bgafter 52b3ad3a: offered at startup for a session running no turn.
+    it.effect("starts nothing when only the open run was wanted and none is open", () =>
+      Effect.gen(function* () {
+        const dispatched = yield* Queue.unbounded<{
+          readonly type: string;
+          readonly text?: string;
+        }>();
+        const layerThreads = Layer.mock(ThreadManagementService.ThreadManagementService)({
+          getThreadRecords: () => Effect.succeed(withRun("cancelled")),
+          dispatch: (command) => Queue.offer(dispatched, command).pipe(Effect.as({} as never)),
+        });
+        const layer = Layer.merge(
+          ProviderContinuationRequests.layer,
+          ProviderContinuationService.layer.pipe(
+            Layer.provide(
+              Layer.mergeAll(IdAllocator.layer, ProviderContinuationRequests.layer, layerThreads),
+            ),
+          ),
+        );
+        const first = yield* Effect.gen(function* () {
+          const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+          yield* requests.offer({ ...request(), reattachRun: true, reattachOnly: true });
+          // Requests are taken in order: the next one's run comes first.
+          yield* requests.offer(request(undefined, "after"));
+          return yield* Queue.take(dispatched);
+        }).pipe(Effect.provide(layer), Effect.scoped);
+        assert.deepEqual([first.type, first.text], ["message.dispatch", "after"]);
+      }),
+    );
+
     it.effect("starts a run when the open run settled before it could be picked up", () =>
       Effect.gen(function* () {
         const commands = yield* offerReattach(withRun("running"), true);

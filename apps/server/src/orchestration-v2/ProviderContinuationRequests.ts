@@ -60,6 +60,12 @@ export interface ProviderContinuationRequest {
    * attempt instead of a continuation run being started for it.
    */
   readonly reattachRun?: boolean;
+  /**
+   * Only that run is wanted: with none open on the provider thread, nothing
+   * is started. For a session running no turn when this server came up,
+   * whose turn may have ended while it was down.
+   */
+  readonly reattachOnly?: boolean;
   readonly dispatchIfCurrent?: <A, E, R>(
     effect: Effect.Effect<A, E, R>,
   ) => Effect.Effect<Option.Option<A>, E, R>;
