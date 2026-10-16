@@ -17,6 +17,7 @@ import {
   claudeTranscriptCommandOutput,
   claudeTranscriptCommandText,
   claudeTranscriptOffsetAt,
+  claudeTurnCommandLine,
   claudeTurnPromptLabel,
   isClaudeNarrationBlock,
   isClaudeTypedMidTurnRow,
@@ -294,6 +295,96 @@ describe("ClaudeBridgeProtocol frame translator", () => {
       transcriptOffset: 0,
     });
     assert.equal(claudeBridgeWakeDetail(started[0]!), "/d7-echo kiwi 91dbf");
+  });
+
+  it("names a turn that begins with what a typed /goal printed by the /goal line, from the record", () => {
+    // Claude Code 2.1.299, a /goal typed in the terminal (live record, Oct 16):
+    // the turn's text is the command's output; the command is the row before it.
+    const printed =
+      "<local-command-stdout>Goal set: make T3 a literal window</local-command-stdout>";
+    const rows = [
+      { type: "attachment", uuid: "g0", attachment: { type: "goal_status", met: false } },
+      {
+        type: "user",
+        uuid: "g1",
+        parentUuid: "g0",
+        promptId: "p1",
+        message: {
+          role: "user",
+          content:
+            "<command-name>/goal</command-name>\n            <command-message>goal</command-message>\n            <command-args>make T3 a literal window</command-args>",
+        },
+      },
+      {
+        type: "user",
+        uuid: "g2",
+        parentUuid: "g1",
+        promptId: "p1",
+        turnOrigin: "human",
+        message: { role: "user", content: printed },
+      },
+      {
+        type: "user",
+        uuid: "g3",
+        parentUuid: "g2",
+        isMeta: true,
+        message: { role: "user", content: "A session-scoped Stop hook is now active" },
+      },
+    ];
+    assert.strictEqual(claudeTurnCommandLine(rows, printed), "/goal make T3 a literal window");
+    // The same pair written as the command's own system rows.
+    const login = [
+      {
+        type: "system",
+        subtype: "local_command",
+        uuid: "l1",
+        parentUuid: "x",
+        content: "<command-name>/login</command-name>\n<command-message>login</command-message>\n<command-args></command-args>",
+      },
+      {
+        type: "system",
+        subtype: "local_command",
+        uuid: "l2",
+        parentUuid: "l1",
+        content: "<local-command-stdout>Login successful</local-command-stdout>",
+      },
+    ];
+    assert.strictEqual(
+      claudeTurnCommandLine(login, "<local-command-stdout>Login successful</local-command-stdout>"),
+      "/login",
+    );
+  });
+
+  it("names no command for a turn whose text is not a command's output, or whose command the record lacks", () => {
+    const printed = "<local-command-stdout>Goal set: x</local-command-stdout>";
+    // A plain prompt is the person's own words.
+    assert.isNull(claudeTurnCommandLine([], "Reply with exactly: hi"));
+    // The output's row with no command row for its parent: nothing to name it by.
+    assert.isNull(
+      claudeTurnCommandLine(
+        [{ type: "user", uuid: "o1", parentUuid: "gone", message: { role: "user", content: printed } }],
+        printed,
+      ),
+    );
+    // A command whose output is something else.
+    assert.isNull(
+      claudeTurnCommandLine(
+        [
+          {
+            type: "user",
+            uuid: "c1",
+            message: { role: "user", content: "<command-name>/plan</command-name>" },
+          },
+          {
+            type: "user",
+            uuid: "o2",
+            parentUuid: "c1",
+            message: { role: "user", content: "<local-command-stdout>Enabled plan mode</local-command-stdout>" },
+          },
+        ],
+        printed,
+      ),
+    );
   });
 
   it("ignores typed user rows, meta rows and sidechain rows", () => {

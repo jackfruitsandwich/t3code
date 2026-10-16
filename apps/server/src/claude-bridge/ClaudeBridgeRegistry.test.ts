@@ -2,6 +2,7 @@ import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import * as Clock from "effect/Clock";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -10,6 +11,7 @@ import * as Schema from "effect/Schema";
 import * as TestClock from "effect/testing/TestClock";
 
 import * as ServerConfig from "../config.ts";
+import type { ClaudeBridgeEvent } from "./ClaudeBridgeProtocol.ts";
 import {
   CLAUDE_BRIDGE_MISSED_TURN_REPLAY_MS,
   CLAUDE_BRIDGE_OFFERED_TURN_HOLD_MS,
@@ -393,4 +395,87 @@ describe("the sessions that count as live", () => {
       );
     },
   );
+});
+
+describe("a turn a typed command begins with what it printed", () => {
+  it.live("reaches T3 named by the command's line, read from the record", () => {
+    const platform = Layer.mergeAll(NodeServices.layer, NodeCrypto.layer);
+    return Effect.scoped(
+      Effect.gen(function* () {
+        const registry = yield* ClaudeBridgeRegistry;
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const sid = "cccccccc-3333-4333-8333-333333333333";
+        const home = path.join(registry.bridgeDir, "home");
+        const record = path.join(home, "projects", "-work", `${sid}.jsonl`);
+        yield* fs.makeDirectory(path.dirname(record), { recursive: true });
+        // A /goal typed in the terminal (Claude Code 2.1.299): Claude Code
+        // reports the turn it starts with what the command printed.
+        const printed = "<local-command-stdout>Goal set: ship it</local-command-stdout>";
+        const rows = [
+          {
+            type: "user",
+            uuid: "g1",
+            parentUuid: null,
+            promptId: "p1",
+            message: {
+              role: "user",
+              content:
+                "<command-name>/goal</command-name>\n<command-message>goal</command-message>\n<command-args>ship it</command-args>",
+            },
+          },
+          {
+            type: "user",
+            uuid: "g2",
+            parentUuid: "g1",
+            promptId: "p1",
+            turnOrigin: "human",
+            message: { role: "user", content: printed },
+          },
+        ];
+        yield* fs.writeFileString(record, rows.map((row) => JSON.stringify(row)).join("\n") + "\n");
+        const dir = path.join(registry.bridgeDir, "claude", sid, "instance-1");
+        yield* fs.makeDirectory(path.join(dir, "events"), { recursive: true });
+        const now = yield* Clock.currentTimeMillis;
+        yield* fs.writeFileString(
+          path.join(dir, "session.json"),
+          yield* encodeJson({
+            sid,
+            instanceId: "instance-1",
+            configDir: home,
+            heartbeatAt: now,
+            transcriptPath: record,
+            isInteractive: true,
+          }),
+        );
+        yield* fs.writeFileString(
+          path.join(dir, "events", "000001.json"),
+          yield* encodeJson({
+            seq: 1,
+            at: now,
+            type: "turn.start",
+            turnId: "turn-1",
+            text: printed,
+            transcriptOffset: 0,
+          }),
+        );
+        const started = yield* Deferred.make<ClaudeBridgeEvent>();
+        yield* registry.onUnattachedEvent((event) =>
+          event.type === "turn.start" ? Deferred.succeed(started, event).pipe(Effect.asVoid) : Effect.void,
+        );
+        // The event pump reads the session's events on its next pass.
+        const start = yield* Deferred.await(started);
+        assert.strictEqual(start.type === "turn.start" ? start.text : undefined, "/goal ship it");
+      }),
+    ).pipe(
+      Effect.provide(
+        registryLayer.pipe(
+          Layer.provide(
+            ServerConfig.layerTest(process.cwd(), { prefix: "t3-bridge-registry-test-" }),
+          ),
+          Layer.provideMerge(platform),
+        ),
+      ),
+    );
+  });
 });

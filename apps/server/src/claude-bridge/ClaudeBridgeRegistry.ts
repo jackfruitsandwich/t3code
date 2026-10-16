@@ -36,10 +36,13 @@ import {
   CLAUDE_BRIDGE_PLUGIN_ID,
   claudeSessionContinuedNotice,
   claudeTranscriptOffsetAt,
+  claudeTurnCommandLine,
+  claudeTurnTextIsCommandOutput,
   isClaudeBridgeSessionLive,
   parseClaudeBridgeEvent,
   parseClaudeBridgeSessionFile,
   parseClaudeBridgeSlashCommands,
+  readTranscriptRows,
   CLAUDE_BRIDGE_MOD_VERSION,
   type ClaudeBridgeCommand,
   type ClaudeBridgeCommandBody,
@@ -59,6 +62,8 @@ const INBOX_HISTORY = 64;
 const TRANSCRIPT_LOOKUP_RETRY_MS = 5_000;
 /** How far back from the end of a record a turn's first row is searched for. */
 const TURN_START_SCAN_BYTES = 8 * 1024 * 1024;
+/** How far back from the end of a record a command's rows are searched for, for the turn it began. */
+const COMMAND_TURN_SCAN_BYTES = 1024 * 1024;
 /** How much of a record's end is read for the row that says the conversation continued elsewhere. */
 const LAUNCH_ATTACH_TIMEOUT_MS = 45_000;
 
@@ -679,17 +684,14 @@ const make = Effect.gen(function* () {
       return { sid: to, heldElsewhere };
     });
 
-  /** Where in the record a turn that began at `startedAt` starts. */
-  const turnOffset = (sid: string, turnId: string, file: string, startedAt: number) =>
+  /** The last `most` bytes of a record, and where they begin. */
+  const readRecordTail = (file: string, most: number) =>
     Effect.gen(function* () {
-      const key = `${sid}:${turnId}`;
-      const cached = turnOffsets.get(key);
-      if (cached !== undefined) return cached;
       const size = yield* fs.stat(file).pipe(
         Effect.map((info) => Number(info.size)),
         Effect.orElseSucceed(() => 0),
       );
-      const from = Math.max(0, size - TURN_START_SCAN_BYTES);
+      const from = Math.max(0, size - most);
       const bytes = yield* Effect.scoped(
         Effect.gen(function* () {
           const handle = yield* fs.open(file, { flag: "r" });
@@ -697,11 +699,39 @@ const make = Effect.gen(function* () {
           return Option.getOrElse(yield* handle.readAlloc(size - from), () => new Uint8Array(0));
         }),
       ).pipe(Effect.orElseSucceed(() => new Uint8Array(0)));
+      return { size, from, bytes };
+    });
+
+  /** Where in the record a turn that began at `startedAt` starts. */
+  const turnOffset = (sid: string, turnId: string, file: string, startedAt: number) =>
+    Effect.gen(function* () {
+      const key = `${sid}:${turnId}`;
+      const cached = turnOffsets.get(key);
+      if (cached !== undefined) return cached;
+      const { size, from, bytes } = yield* readRecordTail(file, TURN_START_SCAN_BYTES);
       // The prompt's row is written a moment either side of the mod's report.
       const offset = claudeTranscriptOffsetAt(bytes, from, startedAt - 1_500) ?? size;
       if (turnOffsets.size > 256) turnOffsets.delete(turnOffsets.keys().next().value!);
       turnOffsets.set(key, offset);
       return offset;
+    });
+
+  /**
+   * A turn Claude Code reports with what a command printed as its text (a
+   * typed `/goal`) is named by the command, read from the record: the
+   * terminal shows the turn under the line the person typed.
+   */
+  const nameCommandTurn = (
+    entry: ClaudeBridgeProcess,
+    event: Extract<ClaudeBridgeEvent, { readonly type: "turn.start" }>,
+  ) =>
+    Effect.gen(function* () {
+      const file = entry.session.transcriptPath;
+      if (!claudeTurnTextIsCommandOutput(event.text) || file.length === 0) return event;
+      const { bytes } = yield* readRecordTail(file, COMMAND_TURN_SCAN_BYTES);
+      const { rows } = readTranscriptRows(new TextDecoder().decode(bytes));
+      const line = claudeTurnCommandLine(rows, event.text);
+      return line === null ? event : { ...event, text: line };
     });
 
   /** The session as its mod reports it, with the record found when the mod could not name it. */
@@ -979,7 +1009,10 @@ const make = Effect.gen(function* () {
                 ),
               }
             : event;
-        yield* dispatch(located, entry);
+        yield* dispatch(
+          located.type === "turn.start" ? yield* nameCommandTurn(entry, located) : located,
+          entry,
+        );
       }
     });
 

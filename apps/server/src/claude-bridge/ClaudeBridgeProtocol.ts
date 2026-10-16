@@ -1019,6 +1019,40 @@ export const claudeTurnPromptLabel = (text: string): string => {
   const args = COMMAND_ARGS.exec(text)?.[1]?.trim() ?? "";
   return args.length === 0 ? name : `${name} ${args}`;
 };
+/**
+ * Whether a turn's text is what a slash command printed: a command whose
+ * output goes to the model (`/goal`) starts a turn Claude Code reports with
+ * that output as its text.
+ */
+export const claudeTurnTextIsCommandOutput = (text: string): boolean =>
+  LOCAL_COMMAND_STDOUT.test(text);
+/**
+ * The line the person typed for a turn that begins with what a command
+ * printed: the terminal shows that turn under the command's line, and so does
+ * T3. `rows` is the record's tail; the output's row names the command's row
+ * as its parent. Null when the text is no command's output or the record
+ * does not hold the pair.
+ */
+export function claudeTurnCommandLine(
+  rows: ReadonlyArray<unknown>,
+  turnText: string,
+): string | null {
+  if (!claudeTurnTextIsCommandOutput(turnText)) return null;
+  const printed = turnText.trim();
+  const commands = new Map<string, string>();
+  let line: string | null = null;
+  for (const row of rows) {
+    if (!isRecord(row) || row.isSidechain === true || typeof row.uuid !== "string") continue;
+    const typed = claudeTranscriptCommandText(row);
+    if (typed !== null) {
+      commands.set(row.uuid, typed);
+      continue;
+    }
+    if (typeof row.parentUuid !== "string" || commandRowText(row)?.trim() !== printed) continue;
+    line = commands.get(row.parentUuid) ?? line;
+  }
+  return line;
+}
 /** `! command` of a row `!` wrote, else null. */
 const bashCommandText = (text: string): string | null => {
   const command = BASH_INPUT.exec(text)?.[1]?.trim();
