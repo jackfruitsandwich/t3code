@@ -141,15 +141,175 @@ export function claudePeerMessageNotification(
       ? lines.map((line) => line.slice(2))
       : lines
   ).join("\n");
-  const name = [...(sender ?? match[1] ?? "").replace(/[\p{Cc}\p{Cf}]/gu, "").trim()]
-    .slice(0, PEER_NAME_MAX)
-    .join("");
+  const name = peerName(sender ?? match[1] ?? "");
   return {
     source: { kind: handBack ? "subagent" : "background_task" },
     outcome: "updated",
     summary: `Message from @${name.length > 0 ? name : "agent"}`,
     ...(body.trim().length === 0 ? {} : { detail: body }),
   };
+}
+
+const peerName = (raw: string): string =>
+  [...raw.replace(/[\p{Cc}\p{Cf}]/gu, "").trim()].slice(0, PEER_NAME_MAX).join("");
+
+/** The line Claude Code puts over a message another session or agent sent this one. */
+const CROSS_SESSION_HEAD =
+  /^(?:Another Claude session sent a message(?: while you were working)?:|A peer session sent a message while you were working:)\n/u;
+/** How the harness's own words under such a message begin. */
+const CROSS_SESSION_TAIL =
+  /^\n\n(?:This came from another Claude session|That "other Claude session"|IMPORTANT: This is NOT from your user|This is from another Claude session)/u;
+const TEAMMATE_MESSAGE =
+  /<teammate-message teammate_id="([^"]*)"((?: [a-z][a-z0-9_-]*="[^"]*")*)>\n([\s\S]*?)\n<\/teammate-message>/uy;
+/** The name the terminal gives a teammate whose message names none. */
+const TEAMMATE_WITHOUT_NAME = "[unknown sender]";
+
+const attributeEntities = (value: string) =>
+  value.replace(/&(?:lt|gt|quot|apos|amp|#39);/gu, (entity) => NOTICE_ENTITIES[entity] ?? entity);
+
+/**
+ * One teammate's message as the terminal draws it: a teammate going idle
+ * ("Teammate @helper finished", with what it reported), or any other message,
+ * "Message from @helper" with what was sent.
+ */
+function teammateNotice(
+  from: string,
+  attributes: string,
+  body: string,
+): OrchestrationV2Notification {
+  const name = peerName(attributeEntities(from)) || TEAMMATE_WITHOUT_NAME;
+  // The terminal draws an idle report as the teammate's line only when the
+  // message carries no summary of its own.
+  const idle = /\bsummary="/u.test(attributes) ? null : idleNotification(body);
+  if (idle !== null) {
+    const failed = idle.idleReason === "failed";
+    const interrupted = idle.idleReason === "interrupted";
+    const reason =
+      typeof idle.failureReason === "string" ? plainWords(idle.failureReason).slice(0, 200) : "";
+    const result = typeof idle.result === "string" ? idle.result.trim() : "";
+    return {
+      source: { kind: "subagent" },
+      outcome: failed ? "failed" : interrupted ? "cancelled" : "completed",
+      summary: `Teammate @${name} ${failed ? "failed" : interrupted ? "was interrupted" : "finished"}${reason.length > 0 ? `: ${reason}` : ""}`,
+      ...(result.length === 0 ? {} : { detail: result }),
+    };
+  }
+  return {
+    source: { kind: "background_task" },
+    outcome: "updated",
+    summary: `Message from @${name}`,
+    ...(body.trim().length === 0 ? {} : { detail: body }),
+  };
+}
+
+function idleNotification(body: string): Record<string, unknown> | null {
+  if (!body.trimStart().startsWith("{")) return null;
+  try {
+    const parsed: unknown = JSON.parse(body);
+    return isRecord(parsed) && parsed.type === "idle_notification" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+const plainWords = (words: string) => words.replace(/\s+/gu, " ").trim();
+
+/**
+ * The notice a turn shows when a teammate's message opened it, as the
+ * terminal draws it: "Message from @<teammate>" with what was sent, or, for
+ * a teammate that went idle, "Teammate @<teammate> finished" with its result.
+ * The harness's line over the message and its words under it are not shown.
+ * Several messages delivered at once are one notice, headed by the first,
+ * the others' lines and words in its detail. Null for any other prompt.
+ */
+export function claudeTeammateMessageNotification(
+  text: string | null,
+): OrchestrationV2Notification | null {
+  if (text === null) return null;
+  const rest = text.replace(CROSS_SESSION_HEAD, "");
+  const notices: Array<OrchestrationV2Notification> = [];
+  let at = 0;
+  for (;;) {
+    TEAMMATE_MESSAGE.lastIndex = at;
+    const match = TEAMMATE_MESSAGE.exec(rest);
+    if (match === null) break;
+    notices.push(teammateNotice(match[1] ?? "", match[2] ?? "", match[3] ?? ""));
+    at = TEAMMATE_MESSAGE.lastIndex;
+    if (!rest.startsWith("\n\n<teammate-message ", at)) break;
+    at += 2;
+  }
+  const tail = rest.slice(at);
+  const [first, ...others] = notices;
+  if (first === undefined || (tail.trim().length > 0 && !CROSS_SESSION_TAIL.test(tail))) {
+    return null;
+  }
+  if (others.length === 0) return first;
+  const detail = [
+    first.detail,
+    ...others.map((notice) =>
+      notice.detail === undefined ? notice.summary : `${notice.summary}\n${notice.detail}`,
+    ),
+  ]
+    .filter((part) => part !== undefined)
+    .join("\n\n");
+  return { ...first, detail };
+}
+
+const CHANNEL_HEAD = /^A message arrived from [^\n]*\n(?=<channel source=")/u;
+const CHANNEL_MESSAGE = /^<channel\s+source="([^"]*)"([^>]*)>\n?([\s\S]*?)\n?<\/channel>/u;
+const CHANNEL_TAIL = /^\n\nIMPORTANT: This is NOT from your user/u;
+/** How much of a channel's message the terminal's line for it shows. */
+const CHANNEL_LINE_MAX = 60;
+
+/**
+ * The notice a turn shows when a message relayed by a channel opened it, as
+ * the terminal draws one: "<server> · <user>: <the message's opening>", with
+ * the whole message as its detail. Null for any other prompt.
+ */
+export function claudeChannelNotification(text: string | null): OrchestrationV2Notification | null {
+  if (text === null) return null;
+  const rest = text.replace(CHANNEL_HEAD, "");
+  const match = CHANNEL_MESSAGE.exec(rest);
+  if (match === null) return null;
+  const tail = rest.slice(match[0].length);
+  if (tail.trim().length > 0 && !CHANNEL_TAIL.test(tail)) return null;
+  const source = attributeEntities(match[1] ?? "");
+  const server = source.slice(source.lastIndexOf(":") + 1);
+  const user = /\buser="([^"]+)"/u.exec(match[2] ?? "")?.[1];
+  const body = match[3] ?? "";
+  const said = [...plainWords(body)];
+  const opening =
+    said.length > CHANNEL_LINE_MAX
+      ? `${said
+          .slice(0, CHANNEL_LINE_MAX - 1)
+          .join("")
+          .trimEnd()}…`
+      : said.join("");
+  const from =`${peerName(server) || "channel"}${user === undefined ? "" : ` · ${peerName(attributeEntities(user))}`}`;
+  return {
+    source: { kind: "background_task" },
+    outcome: "updated",
+    summary: opening.length > 0 ? `${from}: ${opening}` : from,
+    ...(body.trim().length === 0 ? {} : { detail: body }),
+  };
+}
+
+/**
+ * The notice for a prompt the harness wrote, in the terminal's words: a
+ * background task reporting back, another agent's message, a teammate's, a
+ * channel's. `sender` is the agent's name where the session gave one. Null
+ * for any other prompt.
+ */
+export function claudeHarnessMessageNotification(
+  text: string | null,
+  sender: string | null,
+): OrchestrationV2Notification | null {
+  return (
+    claudeTaskNotification(text) ??
+    claudePeerMessageNotification(text, sender) ??
+    claudeTeammateMessageNotification(text) ??
+    claudeChannelNotification(text)
+  );
 }
 
 /**

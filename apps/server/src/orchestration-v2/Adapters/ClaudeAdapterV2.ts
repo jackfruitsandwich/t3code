@@ -108,16 +108,14 @@ import {
   claudeBridgeWakeOrigin,
   claudeBridgeWakeSender,
   claudeBridgeWakeRequest,
+  claudeBridgeQueuedPrompt,
   isClaudeBridgeNoticeFrame,
   isClaudePromptOfThePerson,
   threadModesForClaudePermissionMode,
   type ClaudeBridgeSessionUsage,
 } from "../../claude-bridge/ClaudeBridgeProtocol.ts";
 import * as ServerConfig from "../../config.ts";
-import {
-  claudePeerMessageNotification,
-  claudeTaskNotification,
-} from "../../import/claudeSessionParser.ts";
+import { claudeHarnessMessageNotification } from "../../import/claudeSessionParser.ts";
 import { expandHomePath } from "../../pathExpansion.ts";
 import {
   claudeSignedOutMessage,
@@ -5817,12 +5815,10 @@ export function makeClaudeAdapterV2(
                   outcome: "updated",
                   summary: detail,
                 } satisfies OrchestrationV2Notification)) ??
-            // A background task reporting back: its own line, as the
-            // terminal draws it.
-            claudeTaskNotification(detail) ??
-            // Another agent's message (a subagent handing back its report):
+            // A background task reporting back, another agent's message (a
+            // subagent handing back its report), a teammate's, a channel's:
             // the terminal's line for it, and what was sent.
-            claudePeerMessageNotification(detail, wakeBuffer?.sender ?? null);
+            claudeHarnessMessageNotification(detail, wakeBuffer?.sender ?? null);
           yield* Effect.logInfo("orchestration-v2.claude-wake-turn-detected", {
             providerSessionId: input.providerSessionId,
             threadId: route.threadId,
@@ -6276,6 +6272,50 @@ export function makeClaudeAdapterV2(
                   ? {}
                   : { beforeTokenCount: message.compact_metadata.pre_tokens }),
                 ...(afterTokenCount === undefined ? {} : { afterTokenCount }),
+              },
+            });
+            return;
+          }
+
+          // A message the harness handed the model inside this turn (a task
+          // reporting back, a subagent's hand-back): the terminal draws it
+          // where it arrived, as it draws one that opens a turn.
+          const queuedPrompt = claudeBridgeQueuedPrompt(message);
+          if (queuedPrompt !== null) {
+            const notification = claudeHarnessMessageNotification(
+              queuedPrompt.text,
+              queuedPrompt.sender,
+            );
+            if (notification === null) return;
+            const now = yield* DateTime.now;
+            const nativeItemId = queuedPrompt.uuid;
+            yield* emitProviderEvent({
+              type: "turn_item.updated",
+              driver: CLAUDE_PROVIDER,
+              turnItem: {
+                id: idAllocator.derive.turnItemFromProviderItem({
+                  driver: CLAUDE_PROVIDER,
+                  nativeItemId,
+                }),
+                threadId: context.input.threadId,
+                runId: context.input.runId,
+                nodeId: context.input.rootNodeId,
+                providerThreadId: context.input.providerThread.id,
+                providerTurnId: context.providerTurnId,
+                nativeItemRef: {
+                  driver: CLAUDE_PROVIDER,
+                  nativeId: nativeItemId,
+                  strength: "strong",
+                },
+                parentItemId: null,
+                ordinal: yield* resolveItemOrdinal(context, nativeItemId),
+                type: "notification",
+                ...notification,
+                status: "completed",
+                title: null,
+                startedAt: now,
+                completedAt: now,
+                updatedAt: now,
               },
             });
             return;

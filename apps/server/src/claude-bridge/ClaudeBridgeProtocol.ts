@@ -85,6 +85,11 @@ export const CLAUDE_BRIDGE_COMMAND_OUTPUT_KEY = "t3_command_output";
 /** Marks a frame that carries what the session said to the person in a row of its own. */
 export const CLAUDE_BRIDGE_NOTICE_KEY = "t3_session_notice";
 /**
+ * Set on the frame that carries a message the harness handed the model
+ * inside a running turn (see claudeQueuedHarnessPrompt).
+ */
+export const CLAUDE_BRIDGE_QUEUED_PROMPT_KEY = "t3_queued_prompt";
+/**
  * Set on a `compact_boundary` frame sent again once the record's summary row
  * has come: the summary the session went on from, the text Claude Code shows
  * when its "Compact summary" row is expanded.
@@ -1454,14 +1459,19 @@ export function threadSettingsForClaudeSession(session: {
 
 /**
  * Whether a turn's prompt came from the Claude Code harness rather than the
- * person: task-completion notices, another agent's message, hook feedback,
- * interruptions.
+ * person: task-completion notices, another agent's or session's message (a
+ * teammate's), a channel's, hook feedback, interruptions.
  */
 export function isClaudeHarnessPrompt(text: string): boolean {
   const head = text.trimStart();
   return (
     head.startsWith("<task-notification>") ||
     head.startsWith("<agent-message ") ||
+    head.startsWith("<teammate-message ") ||
+    head.startsWith("Another Claude session sent a message") ||
+    head.startsWith("A peer session sent a message while you were working:") ||
+    head.startsWith("<channel source=") ||
+    /^A message arrived from [^\n]*\n<channel source=/u.test(head) ||
     head.startsWith("<system-reminder>") ||
     head.startsWith("Stop hook feedback:") ||
     head.startsWith("[Request interrupted")
@@ -1897,6 +1907,18 @@ export function makeClaudeBridgeFrameTranslator(
         compaction = frame;
         return [frame];
       }
+      const queued = claudeQueuedHarnessPrompt(row);
+      if (queued !== null) {
+        return [
+          {
+            type: "system",
+            subtype: "queued_command",
+            uuid: asUuid(row.uuid),
+            session_id: sessionId,
+            [CLAUDE_BRIDGE_QUEUED_PROMPT_KEY]: queued,
+          } as unknown as SDKSystemMessage,
+        ];
+      }
       const hookNotice = claudeHookNoticeText(row);
       if (hookNotice !== null) {
         return [
@@ -2098,6 +2120,51 @@ export function isClaudeTypedMidTurnRow(row: unknown): boolean {
     attachment.origin.kind === "human"
   );
 }
+
+/**
+ * A message the harness handed the model inside a running turn, which the
+ * terminal draws where it arrived: a background task reporting back, another
+ * agent's message (a subagent's hand-back), a teammate's. The record holds it
+ * as this row and no user row. `sender` is the agent's name where the row
+ * gives one. Null for a message the person typed, and for every other row.
+ */
+export function claudeQueuedHarnessPrompt(
+  row: unknown,
+): { readonly text: string; readonly sender: string | null } | null {
+  if (!isRecord(row) || row.type !== "attachment" || row.isSidechain === true) return null;
+  const attachment = row.attachment;
+  if (
+    !isRecord(attachment) ||
+    attachment.type !== "queued_command" ||
+    typeof attachment.prompt !== "string" ||
+    !isRecord(attachment.origin) ||
+    attachment.origin.kind === "human"
+  ) {
+    return null;
+  }
+  const name = attachment.origin.name;
+  return {
+    text: attachment.prompt,
+    sender: typeof name === "string" && name.trim().length > 0 ? name : null,
+  };
+}
+
+/** What a frame made from a claudeQueuedHarnessPrompt row carries. */
+export const claudeBridgeQueuedPrompt = (
+  message: unknown,
+): { readonly uuid: string; readonly text: string; readonly sender: string | null } | null => {
+  const queued = isRecord(message) ? Reflect.get(message, CLAUDE_BRIDGE_QUEUED_PROMPT_KEY) : null;
+  return isRecord(message) &&
+    typeof message.uuid === "string" &&
+    isRecord(queued) &&
+    typeof queued.text === "string"
+    ? {
+        uuid: message.uuid,
+        text: queued.text,
+        sender: typeof queued.sender === "string" ? queued.sender : null,
+      }
+    : null;
+};
 
 /**
  * Where a turn that began at `sinceMs` starts in a transcript, for a mod that

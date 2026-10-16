@@ -21,6 +21,8 @@ import {
   claudeTurnPromptLabel,
   isClaudeNarrationBlock,
   isClaudeTypedMidTurnRow,
+  claudeBridgeQueuedPrompt,
+  isClaudeHarnessPrompt,
   claudeContinuedInSession,
   claudeSessionContinuedNotice,
   claudeSessionNoticeText,
@@ -1027,6 +1029,51 @@ describe("ClaudeBridgeProtocol record helpers", () => {
     assert.isTrue(isClaudeTypedMidTurnRow(queued({ kind: "human" })));
     assert.isFalse(isClaudeTypedMidTurnRow(queued({ kind: "task-notification" })));
     assert.isFalse(isClaudeTypedMidTurnRow({ type: "user", message: { content: "x" } }));
+  });
+
+  // Measured in a live session (2.1.301): a subagent's hand-back that came
+  // while a turn ran is this row, with the agent's name on its origin.
+  it("carries a message the harness handed a running turn to the thread, where it arrived", () => {
+    const frames = translator();
+    frames.adoptTurn({ turnId: "turn-9", startedAt: 0, transcriptOffset: 0 });
+    const prompt =
+      '<agent-message from="a243171b38491008c">\n[Subagent hand-back] The report follows:\n  All paths are found.\n</agent-message>';
+    const queued = (origin: Record<string, unknown>, fields: Record<string, unknown> = {}) => ({
+      type: "attachment",
+      uuid: "00000000-0000-4000-8000-0000000000f9",
+      isSidechain: false,
+      attachment: { type: "queued_command", prompt, commandMode: "prompt", origin },
+      ...fields,
+    });
+    const [frame, ...more] = frames.onTranscriptRow(
+      queued({ kind: "peer", from: "a243171b38491008c", name: "Explore" }),
+    );
+    assert.lengthOf(more, 0);
+    assert.deepEqual(claudeBridgeQueuedPrompt(frame), {
+      uuid: "00000000-0000-4000-8000-0000000000f9",
+      text: prompt,
+      sender: "Explore",
+    });
+    assert.equal(claudeBridgeQueuedPrompt(frames.onTranscriptRow(queued({ kind: "task-notification" }))[0])?.sender, null);
+    // The person's own mid-turn message is placed by the runner; a subagent's
+    // rows are its own.
+    assert.lengthOf(frames.onTranscriptRow(queued({ kind: "human" })), 0);
+    assert.lengthOf(frames.onTranscriptRow(queued({ kind: "peer" }, { isSidechain: true })), 0);
+  });
+
+  it("tells a teammate's or a channel's message from the person's by how it opens", () => {
+    for (const text of [
+      'Another Claude session sent a message:\n<teammate-message teammate_id="helper">\nhi\n</teammate-message>',
+      '<teammate-message teammate_id="team-lead" summary="go">\nSend one message.\n</teammate-message>',
+      "A peer session sent a message while you were working:\nhi",
+      '<channel source="webhook">\nping\n</channel>',
+      'A message arrived from plugin:telegram:telegram:\n<channel source="plugin:telegram:telegram">\nhi\n</channel>',
+    ]) {
+      assert.isTrue(isClaudeHarnessPrompt(text), text);
+      assert.isFalse(isClaudePromptOfThePerson(text, null), text);
+    }
+    assert.isFalse(isClaudeHarnessPrompt("A message arrived from my mom, can you read it?"));
+    assert.isTrue(isClaudePromptOfThePerson("Another Claude session sent a message: odd", "composer"));
   });
 });
 

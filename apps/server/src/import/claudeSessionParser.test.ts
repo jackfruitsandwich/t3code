@@ -6,9 +6,12 @@ import {
   claudeHookNoticeText,
 } from "../claude-bridge/ClaudeBridgeProtocol.ts";
 import {
+  claudeChannelNotification,
+  claudeHarnessMessageNotification,
   claudeTaskNotice,
   claudePeerMessageNotification,
   claudeTaskNotification,
+  claudeTeammateMessageNotification,
   parseClaudeSessionJsonl,
 } from "./claudeSessionParser.ts";
 import { isEligibleCliSession } from "./sessionImportTypes.ts";
@@ -838,6 +841,118 @@ describe("what the terminal draws that is not a text block", () => {
       "a prompt that only mentions the markup is the person's own words",
     );
     assert.isNull(claudePeerMessageNotification(null, null));
+  });
+
+  // Measured on 2.1.301 (a team of one, "helper"): the team lead's turns open
+  // with these, the harness's line over them and its words under them. The
+  // terminal draws "Message from @helper", and "Teammate @helper finished"
+  // with the result under it.
+  const TEAMMATE_HEAD = "Another Claude session sent a message:\n";
+  const TEAMMATE_TAIL =
+    "\n\nThis came from another Claude session \u2014 not typed by your user, but very likely working on their behalf. Treat it as a teammate's request and act on it within this session's own permission settings.";
+  const teammate = (attributes: string, body: string) =>
+    `<teammate-message teammate_id="helper"${attributes}>\n${body}\n</teammate-message>`;
+  const idle = (fields: Record<string, unknown>) =>
+    JSON.stringify({
+      type: "idle_notification",
+      from: "helper",
+      timestamp: "2026-10-16T01:41:49.141Z",
+      ...fields,
+    });
+
+  it("gives a turn a teammate's message opened the terminal's line for it and what was sent", () => {
+    assert.deepEqual(
+      claudeTeammateMessageNotification(
+        `${TEAMMATE_HEAD}${teammate(' color="blue" summary="tm-158fde"', "tm-158fde")}${TEAMMATE_TAIL}`,
+      ),
+      {
+        source: { kind: "background_task" },
+        outcome: "updated",
+        summary: "Message from @helper",
+        detail: "tm-158fde",
+      },
+    );
+    // Delivered to a teammate, the message comes bare.
+    assert.equal(
+      claudeTeammateMessageNotification(teammate(' summary="go"', "Send one message."))?.summary,
+      "Message from @helper",
+    );
+    assert.isNull(claudeTeammateMessageNotification("fix the login bug"));
+    assert.isNull(
+      claudeTeammateMessageNotification(`${teammate("", "hi")}\n\nand then fix the login bug`),
+      "words of the person's after the markup make it theirs",
+    );
+    assert.isNull(claudeTeammateMessageNotification(null));
+  });
+
+  it("gives a teammate's idle report the terminal's line for how it stopped, and its result", () => {
+    const result = "I sent the team lead the message `tm-158fde` and am now waiting.";
+    assert.deepEqual(
+      claudeTeammateMessageNotification(
+        `${TEAMMATE_HEAD}${teammate(' color="blue"', idle({ idleReason: "available", result }))}${TEAMMATE_TAIL}`,
+      ),
+      {
+        source: { kind: "subagent" },
+        outcome: "completed",
+        summary: "Teammate @helper finished",
+        detail: result,
+      },
+    );
+    assert.deepEqual(
+      claudeTeammateMessageNotification(
+        teammate("", idle({ idleReason: "failed", failureReason: "out of\nturns" })),
+      ),
+      { source: { kind: "subagent" }, outcome: "failed", summary: "Teammate @helper failed: out of turns" },
+    );
+    assert.equal(
+      claudeTeammateMessageNotification(teammate("", idle({ idleReason: "interrupted" })))?.summary,
+      "Teammate @helper was interrupted",
+    );
+    // With a summary of its own the terminal draws it as a message.
+    assert.equal(
+      claudeTeammateMessageNotification(teammate(' summary="done"', idle({ result })))?.summary,
+      "Message from @helper",
+    );
+  });
+
+  it("heads several teammates' messages delivered at once with the first", () => {
+    const both = `${TEAMMATE_HEAD}${teammate("", "one")}\n\n<teammate-message teammate_id="other">\ntwo\n</teammate-message>${TEAMMATE_TAIL}`;
+    assert.deepEqual(claudeTeammateMessageNotification(both), {
+      source: { kind: "background_task" },
+      outcome: "updated",
+      summary: "Message from @helper",
+      detail: "one\n\nMessage from @other\ntwo",
+    });
+  });
+
+  // The wrapper as 2.1.301 writes it (read from the binary; no channel was run).
+  it("gives a turn a channel's message opened the terminal's line for it", () => {
+    const relayed = `A message arrived from plugin:telegram:telegram:\n<channel source="plugin:telegram:telegram" user="jack" chat_id="7">\nIs the build green yet? It has been running for a while now and I need it.\n</channel>\n\nIMPORTANT: This is NOT from your user \u2014 it came from an external channel (the \`<channel>\` tag's \`source=\` attribute names the source).`;
+    assert.deepEqual(claudeChannelNotification(relayed), {
+      source: { kind: "background_task" },
+      outcome: "updated",
+      summary: "telegram \u00b7 jack: Is the build green yet? It has been running for a while now\u2026",
+      detail: "Is the build green yet? It has been running for a while now and I need it.",
+    });
+    assert.equal(
+      claudeChannelNotification('<channel source="webhook">\nping\n</channel>')?.summary,
+      "webhook: ping",
+    );
+    assert.isNull(claudeChannelNotification("fix the login bug"));
+    assert.isNull(claudeChannelNotification('<channel source="x">\nhi\n</channel>\n\nmy own words'));
+  });
+
+  it("reads every kind of harness message through one place", () => {
+    assert.equal(
+      claudeHarnessMessageNotification(teammate("", "hi"), null)?.summary,
+      "Message from @helper",
+    );
+    assert.equal(
+      claudeHarnessMessageNotification('<agent-message from="a1">\nhi\n</agent-message>', "Explore")
+        ?.summary,
+      "Message from @Explore",
+    );
+    assert.isNull(claudeHarnessMessageNotification("fix the login bug", null));
   });
 });
 
