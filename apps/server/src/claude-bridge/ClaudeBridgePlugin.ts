@@ -165,6 +165,10 @@ let endCallAnswered = false
 let endNoted = false
 // Panels commands sent from T3 have opened in the terminal and that are still open.
 let panelsOpen = 0
+// Other plugins' panes open in the terminal, by id, and the last line each
+// call's open dialog was given (ui.notice), by tool call.
+const panes = new Set()
+const noticed = new Map()
 // Whether the person last spoke from T3: the latest turn or command was sent
 // from there (else typed here, or a wake).
 let lastTurnFromT3 = false
@@ -516,6 +520,14 @@ async function startedUnattended($) {
     try { unattended = (await $.env.get('T3CODE_BRIDGE_LAUNCH')) === 'background' } catch { unattended = false }
   }
   return unattended
+}
+
+// A line another plugin put before the person, unless a hook below refused it.
+async function pluginLine($, out, text, kind) {
+  try {
+    if ((out && out.deny) || typeof text !== 'string' || !text.trim()) return
+    await emit($, 'notification', { message: text.slice(0, 2000), title: '', kind: kind, dialog: false })
+  } catch {}
 }
 
 async function heartbeat($) {
@@ -1298,6 +1310,48 @@ export function register(on) {
         await emit($, 'notification', { message: e.message, title: typeof e.title === 'string' ? e.title : '', kind: String(e.notification_type || ''), dialog: dialog })
       }
     } catch {}
+    return next(e)
+  })
+
+  // Another plugin's lines for the person, in its words: a transcript line
+  // (one kept to the debug log is not), a toast, the line under a call's
+  // open dialog; and a pane it opened, which only the terminal draws. T3
+  // shows each as a notice. This mod's own calls skip its hooks.
+  on('ui.log', async ($, e, next) => {
+    const out = await next(e)
+    if (e && e.to !== 'debug') await pluginLine($, out, e.text, 'ui.log')
+    return out
+  })
+
+  on('ui.toast', async ($, e, next) => {
+    const out = await next(e)
+    if (e) await pluginLine($, out, e.text, 'ui.toast')
+    return out
+  })
+
+  on('ui.notice', async ($, e, next) => {
+    const out = await next(e)
+    if (e && e.text === undefined) noticed.delete(e.tool_use_id)
+    if (e && typeof e.text === 'string' && noticed.get(e.tool_use_id) !== e.text) {
+      noticed.set(e.tool_use_id, e.text)
+      if (noticed.size > 32) noticed.delete(noticed.keys().next().value)
+      await pluginLine($, out, e.text, 'ui.notice')
+    }
+    return out
+  })
+
+  // Opening a pane that is open retitles it: said once, until it closes.
+  on('ui.open', async ($, e, next) => {
+    const out = await next(e)
+    if (e && typeof e.id === 'string' && !panes.has(e.id) && !(out && out.deny)) {
+      panes.add(e.id)
+      await pluginLine($, out, (typeof e.title === 'string' && e.title.trim() ? e.title.trim() : e.id) + ': it is shown in the Claude Code terminal only.', 'ui.open')
+    }
+    return out
+  })
+
+  on('ui.close', async ($, e, next) => {
+    if (e && typeof e.id === 'string') panes.delete(e.id)
     return next(e)
   })
 

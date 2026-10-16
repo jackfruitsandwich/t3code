@@ -317,3 +317,55 @@ describe("the mod's requests for a choice only the terminal's dialog can give", 
     assert.deepEqual(await request("Write"), { asked: true, answer: "the terminal's dialog" });
   });
 });
+
+describe("the mod's report of another plugin's lines", () => {
+  const notices = (mod: ReturnType<typeof loadMod>) =>
+    mod
+      .events()
+      .filter((event) => event.type === "notification")
+      .map((event) => [event.message, event.dialog]);
+  const started = async () => {
+    const mod = loadMod();
+    await mod.fire("session.start", { cwd: "/repo", surface: "terminal", isInteractive: true });
+    return mod;
+  };
+
+  it("passes on a transcript line and a toast in its words, not a line kept to the debug log", async () => {
+    const mod = await started();
+    await mod.fire("ui.log", { text: "prompt from composer: 12 chars", to: "transcript" });
+    await mod.fire("ui.log", { text: "cache miss for tu1", to: "debug" });
+    await mod.fire("ui.toast", { text: "turn took 4 s" });
+    // Refused by a hook below: the terminal draws nothing.
+    await mod.fire("ui.toast", { text: "refused" }, { next: async () => ({ deny: "no" }) });
+    assert.deepEqual(notices(mod), [
+      ["prompt from composer: 12 chars", false],
+      ["turn took 4 s", false],
+    ]);
+  });
+
+  it("passes on each new line under a call's open dialog once", async () => {
+    const mod = await started();
+    await mod.fire("ui.notice", { tool_use_id: "tu1", text: "checked by my-plugin" });
+    await mod.fire("ui.notice", { tool_use_id: "tu1", text: "checked by my-plugin" });
+    await mod.fire("ui.notice", { tool_use_id: "tu1", text: undefined });
+    await mod.fire("ui.notice", { tool_use_id: "tu1", text: "checked again" });
+    assert.deepEqual(notices(mod), [
+      ["checked by my-plugin", false],
+      ["checked again", false],
+    ]);
+  });
+
+  it("says a pane is shown in the terminal only, once while it is open", async () => {
+    const mod = await started();
+    await mod.fire("ui.open", { id: "clock", title: "Clock" });
+    // Opening it again retitles it.
+    await mod.fire("ui.open", { id: "clock", title: "Clock 12:01" });
+    await mod.fire("ui.close", { id: "clock", origin: "person" });
+    await mod.fire("ui.open", { id: "clock" });
+    await mod.fire("ui.open", { id: "ask" }, { next: async () => ({ deny: "not now" }) });
+    assert.deepEqual(notices(mod), [
+      ["Clock: it is shown in the Claude Code terminal only.", false],
+      ["clock: it is shown in the Claude Code terminal only.", false],
+    ]);
+  });
+});
