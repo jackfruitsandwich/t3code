@@ -3478,6 +3478,45 @@ describe("ClaudeBridgeQueryRunner missed turns", () => {
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
+  // firstrace 87817dc6: the run offered for the first turn attached when the
+  // turn after it was over too, and nothing was running.
+  const bothOver = (nextEndKnown: boolean) =>
+    Effect.gen(function* () {
+      const now = yield* Clock.currentTimeMillis;
+      const first = quickRows(now);
+      const transcript =
+        first + nextRow(now) + turnEndRow("00000000-0000-4000-8000-0000000000b3", now - 400);
+      const end = nextEnd(now - 300, Buffer.byteLength(transcript));
+      const bridge = yield* attach({
+        protocol: 2,
+        bridgeCanUseTool: () => null,
+        transcript,
+        missedTurns: (at) => [
+          { ...turn(at, 8_000, first), offered: true },
+          {
+            start: nextStart(at - 1_500, Buffer.byteLength(first)),
+            complete: nextEndKnown ? end : null,
+            offered: true,
+          },
+        ],
+      });
+      const frames = yield* shownFrames(bridge);
+      if (!nextEndKnown) yield* bridge.handler(end, bridge.process);
+      yield* settled(() => closed(frames).length === 2, "both turns' ends");
+      assert.deepStrictEqual(closed(frames), ["bridge:turn-quick", "bridge:turn-next"]);
+      // The later one has no prompt of its own: the run offered for it carries that.
+      assert.deepStrictEqual(kindsOf(frames), ["assistant", "result", "assistant", "result"]);
+      assert.deepStrictEqual(textsOf(frames), ["quick answer", "second answer"]);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer));
+
+  it.live("shows the turn it was offered for, then the one after it, when both are over", () =>
+    bothOver(true),
+  );
+
+  it.live("shows the turn it was offered for first when the one after it ends as it attaches", () =>
+    bothOver(false),
+  );
+
   // bgafter 52b3ad3a: the turn a run was kept open for over a restart ended
   // before this server came up; that run closes empty, and the record has
   // the reply.

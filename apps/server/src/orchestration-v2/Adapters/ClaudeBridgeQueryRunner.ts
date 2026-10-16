@@ -79,6 +79,7 @@ import {
   makeClaudeBridgeFrameTranslator,
   parseClaudeSlashCommandText,
   readTranscriptRows,
+  type ClaudeBridgeActiveTurn,
   type ClaudeBridgeCommandBody,
   type ClaudeBridgeEvent,
   type ClaudeBridgeRequestTurnBy,
@@ -479,11 +480,14 @@ export const layer: Layer.Layer<
         endHeldReads: 0,
         endHoldExpired: null as string | null,
         /**
-         * The turn the session was running at attach while this showed the
-         * one before it (see `takeUpSetAside`), and its end if that came first.
+         * The turns the session began after the one shown at attach, oldest
+         * first, each with its end if that came first: each opens here once
+         * the one before it has closed (see `takeUpSetAside`).
          */
-        setAside: null as ClaudeBridgeRegistry.ClaudeBridgeProcess["session"]["activeTurn"],
-        setAsideEnd: null as Extract<ClaudeBridgeEvent, { type: "turn.complete" }> | null,
+        setAside: [] as Array<{
+          readonly turn: ClaudeBridgeActiveTurn;
+          end: Extract<ClaudeBridgeEvent, { type: "turn.complete" }> | null;
+        }>,
         /** The mod's own reload command was just read: what it printed is skipped too. */
         upkeepOutputDue: false,
         /** The model and mode this attachment was last asked for. */
@@ -614,26 +618,51 @@ export const layer: Layer.Layer<
         ClaudeBridgeRegistry.claudeBridgeMissedTurnReplayMs(turn);
       // The turn a run was offered for can be over, and the person already in
       // the next, before the run attaches. That run shows the turn it was
-      // offered for, however long ago it ended, and never the next one: the
-      // next one shows after it, as its own.
-      const offeredTurnOver =
-        activeTurn === null
-          ? undefined
-          : missedTurns.find(
-              (turn) =>
-                turn.offered === true &&
-                turn.complete !== null &&
-                turn.start.turnId !== activeTurn.turnId,
-            );
+      // offered for (the oldest one over that a run was offered for), however
+      // long ago it ended, and never a later one: each later one shows after
+      // it, as its own.
+      const offeredTurnOver = missedTurns.find(
+        (turn) =>
+          turn.offered === true &&
+          turn.complete !== null &&
+          turn.start.turnId !== activeTurn?.turnId,
+      );
       const lastMissed = missedTurns.at(-1);
       const missedTurn =
-        offeredTurnOver ??
-        (activeTurn === null && lastMissed !== undefined && justOver(lastMissed)
-          ? lastMissed
-          : undefined);
+        offeredTurnOver !== undefined && (activeTurn !== null || offeredTurnOver !== lastMissed)
+          ? offeredTurnOver
+          : activeTurn === null && lastMissed !== undefined && justOver(lastMissed)
+            ? lastMissed
+            : undefined;
       // Over too long ago to show from its start (its rows are history by
       // now): its run closes at once.
       const closeAtOnce = missedTurn !== undefined && !justOver(missedTurn);
+      const turnOf = (
+        start: ClaudeBridgeRegistry.ClaudeBridgeMissedTurn["start"],
+      ): ClaudeBridgeActiveTurn =>
+        activeTurn?.turnId === start.turnId
+          ? activeTurn
+          : {
+              turnId: start.turnId,
+              startedAt: start.at,
+              transcriptOffset: start.transcriptOffset,
+              ...(start.commandId === undefined ? {} : { commandId: start.commandId }),
+              ...(start.promptUuid === undefined ? {} : { promptUuid: start.promptUuid }),
+            };
+      // The turns shown here from the list: the replayed one and those taken up after it.
+      const shownHere = new Set<string>();
+      /**
+       * A turn the session began after the replayed one, running or just
+       * over, opens here after it: the run offered for it shows it then.
+       */
+      const setAsideLater = (turn: ClaudeBridgeRegistry.ClaudeBridgeMissedTurn) => {
+        const turnId = turn.start.turnId;
+        if (shownHere.has(turnId) || state.setAside.some((held) => held.turn.turnId === turnId)) {
+          return;
+        }
+        if (turn.complete !== null && !justOver(turn)) return;
+        state.setAside.push({ turn: turnOf(turn.start), end: turn.complete });
+      };
       let replayedTurnId: string | null = null;
       if (activeTurn !== null && missedTurn === undefined) {
         translator.adoptTurn(activeTurn);
@@ -649,39 +678,29 @@ export const layer: Layer.Layer<
         // A short turn can be over before the run offered for it attaches.
         // It is shown from its start, as if this had attached in time.
         if (missedTurn !== undefined) {
-          translator.adoptTurn({
-            turnId: missedTurn.start.turnId,
-            startedAt: missedTurn.start.at,
-            transcriptOffset: missedTurn.start.transcriptOffset,
-            ...(missedTurn.start.commandId === undefined
-              ? {}
-              : { commandId: missedTurn.start.commandId }),
-            ...(missedTurn.start.promptUuid === undefined
-              ? {}
-              : { promptUuid: missedTurn.start.promptUuid }),
-          });
-          // A turn closed at once leaves the rows after it to the turn running now.
-          state.byteOffset = closeAtOnce
-            ? (activeTurn?.transcriptOffset ?? state.byteOffset)
-            : missedTurn.start.transcriptOffset;
+          translator.adoptTurn(turnOf(missedTurn.start));
           replayedTurnId = missedTurn.start.turnId;
+          shownHere.add(replayedTurnId);
+          for (const later of missedTurns.slice(missedTurns.indexOf(missedTurn) + 1)) {
+            setAsideLater(later);
+          }
+          // A turn closed at once leaves the rows after it to the turns after it.
+          state.byteOffset = closeAtOnce
+            ? (state.setAside[0]?.turn.transcriptOffset ??
+              activeTurn?.transcriptOffset ??
+              state.byteOffset)
+            : missedTurn.start.transcriptOffset;
           yield* promptTaken({ promptUuid: missedTurn.start.promptUuid, commandId: undefined });
           yield* Effect.logInfo("claude-bridge.missed-turn-replayed", {
             sid,
             turnId: missedTurn.start.turnId,
             ...(activeTurn === null ? {} : { before: activeTurn.turnId }),
+            ...(state.setAside.length === 0
+              ? {}
+              : { setAside: state.setAside.map((held) => held.turn.turnId) }),
             ...(closeAtOnce ? { closedAtOnce: true } : {}),
           });
         }
-      }
-      // The turn running now, when it began while nothing was attached: the
-      // run offered for it shows it, once the replayed turn has closed.
-      if (
-        replayedTurnId !== null &&
-        activeTurn !== null &&
-        missedTurns.some((turn) => turn.start.turnId === activeTurn.turnId)
-      ) {
-        state.setAside = activeTurn;
       }
       // Nothing running and nothing to show: a run recovery kept open over a
       // restart, whose turn ended while T3 was away, closes empty now. The
@@ -1332,25 +1351,24 @@ export const layer: Layer.Layer<
       });
 
       /**
-       * Opens here the turn set aside at attach, once the replayed turn before
-       * it has closed: its rows follow, for the run offered for it.
+       * Opens here the next turn set aside at attach, once the turn before it
+       * has closed: its rows follow, for the run offered for it.
        */
       const takeUpSetAside = Effect.gen(function* () {
-        const next = state.setAside;
-        if (next === null || translator.hasOpenTurn()) return;
-        state.setAside = null;
-        translator.adoptTurn(next);
-        state.byteOffset = Math.max(state.byteOffset, next.transcriptOffset);
+        const next = state.setAside[0];
+        if (next === undefined || translator.hasOpenTurn()) return;
+        state.setAside.shift();
+        shownHere.add(next.turn.turnId);
+        translator.adoptTurn(next.turn);
+        state.byteOffset = Math.max(state.byteOffset, next.turn.transcriptOffset);
         state.turnEndsAtTurnStart = state.turnEndsRead;
-        yield* promptTaken({ promptUuid: next.promptUuid, commandId: undefined });
-        const ended = state.setAsideEnd;
-        state.setAsideEnd = null;
-        if (ended !== null) {
-          state.pendingComplete = { event: ended, seenAt: yield* Clock.currentTimeMillis };
+        yield* promptTaken({ promptUuid: next.turn.promptUuid, commandId: undefined });
+        if (next.end !== null) {
+          state.pendingComplete = { event: next.end, seenAt: yield* Clock.currentTimeMillis };
         }
         yield* Effect.logInfo("claude-bridge.set-aside-turn-taken-up", {
           sid,
-          turnId: next.turnId,
+          turnId: next.turn.turnId,
         });
       });
 
@@ -1782,9 +1800,8 @@ export const layer: Layer.Layer<
                   yield* emit(translator.onTurnComplete(ended.event));
                 }
               }
-              // A turn set aside at attach is over by now; this one is shown.
-              state.setAside = null;
-              state.setAsideEnd = null;
+              // The turns set aside at attach are over by now; this one is shown.
+              state.setAside = [];
               state.turnEndsAtTurnStart = state.turnEndsRead;
               if (
                 state.pendingPrompt !== null &&
@@ -1817,10 +1834,11 @@ export const layer: Layer.Layer<
               for (const toolUseId of state.approvals.keys()) {
                 if (!state.agentAsks.has(toolUseId)) yield* settleElsewhere(toolUseId);
               }
-              // The end of the turn set aside at attach waits until it opens
-              // here: the replayed turn before it closes with its own end.
-              if (state.setAside !== null && event.turnId === state.setAside.turnId) {
-                state.setAsideEnd = event;
+              // The end of a turn set aside at attach waits until it opens
+              // here: the turn before it closes with its own end.
+              const held = state.setAside.find((entry) => entry.turn.turnId === event.turnId);
+              if (held !== undefined) {
+                held.end = event;
                 return;
               }
               state.pendingComplete = { event, seenAt: yield* Clock.currentTimeMillis };
@@ -2021,7 +2039,6 @@ export const layer: Layer.Layer<
       // The end of the replayed turn, known already, is taken up before
       // anything the session says from here: the next turn's start, coming
       // right after, then closes it first.
-      const replayedEndKnown = missedTurn?.complete != null;
       if (missedTurn?.complete != null) {
         if (closeAtOnce) {
           // Without words of its own: a result's words would show as the
@@ -2035,28 +2052,30 @@ export const layer: Layer.Layer<
       yield* registry
         .subscribe(sid, (event) => handleEvent(event))
         .pipe(Effect.provideService(Scope.Scope, sessionScope));
-      // From here the session's events come to this attachment. The end of a
-      // replayed turn that arrived before this point is taken up now, and so
-      // is a running turn's start that did.
+      // From here the session's events come to this attachment. What reached
+      // the list before this point is taken up now: the end of a turn open
+      // here, and the end or start of a turn after the replayed one, unless
+      // a turn the session began since then has opened here.
       const missedBeforeSubscribing = yield* registry.takeMissedTurns(sid);
-      const replayedEnd = missedBeforeSubscribing.find(
+      const replayedAt = missedBeforeSubscribing.findIndex(
         (turn) => turn.start.turnId === replayedTurnId,
-      )?.complete;
-      if (replayedTurnId !== null && !replayedEndKnown && replayedEnd != null) {
-        yield* handleEvent(replayedEnd);
+      );
+      for (const turn of replayedAt === -1 ? [] : missedBeforeSubscribing.slice(replayedAt)) {
+        const turnId = turn.start.turnId;
+        const held = state.setAside.find((entry) => entry.turn.turnId === turnId);
+        const open = translator.openTurnId();
+        if (held !== undefined) {
+          held.end ??= turn.complete;
+        } else if (open === turnId) {
+          if (turn.complete !== null && state.pendingComplete?.event.turnId !== turnId) {
+            yield* handleEvent(turn.complete);
+          }
+        } else if (open === null || shownHere.has(open)) {
+          setAsideLater(turn);
+        }
       }
-      if (
-        state.setAside === null &&
-        replayedTurnId !== null &&
-        activeTurn !== null &&
-        activeTurn.turnId !== replayedTurnId &&
-        (translator.openTurnId() === replayedTurnId || !translator.hasOpenTurn()) &&
-        missedBeforeSubscribing.some((turn) => turn.start.turnId === activeTurn.turnId)
-      ) {
-        state.setAside = activeTurn;
-        // At once when the replayed turn is closed here already.
-        yield* takeUpSetAside;
-      }
+      // At once when the turn before it is closed here already.
+      yield* takeUpSetAside;
       yield* tail.pipe(
         Effect.catchCause((cause) =>
           Effect.logWarning("claude-bridge.tail-failed", { sid, cause }).pipe(
@@ -2223,7 +2242,7 @@ export const layer: Layer.Layer<
           if (
             translator.hasOpenTurn() ||
             state.pendingComplete !== null ||
-            state.setAside !== null ||
+            state.setAside.length > 0 ||
             (yield* Queue.size(messages)) > 0
           ) {
             return true;

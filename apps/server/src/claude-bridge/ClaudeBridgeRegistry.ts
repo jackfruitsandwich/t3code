@@ -64,6 +64,8 @@ const TRANSCRIPT_LOOKUP_RETRY_MS = 5_000;
 const TURN_START_SCAN_BYTES = 8 * 1024 * 1024;
 /** How far back from the end of a record a command's rows are searched for, for the turn it began. */
 const COMMAND_TURN_SCAN_BYTES = 1024 * 1024;
+/** How long after its report a command's turn waits for the command's rows to reach the record. */
+const COMMAND_TURN_ROWS_WAIT_MS = 2_000;
 /** How much of a record's end is read for the row that says the conversation continued elsewhere. */
 const LAUNCH_ATTACH_TIMEOUT_MS = 45_000;
 
@@ -719,7 +721,11 @@ const make = Effect.gen(function* () {
   /**
    * A turn Claude Code reports with what a command printed as its text (a
    * typed `/goal`) is named by the command, read from the record: the
-   * terminal shows the turn under the line the person typed.
+   * terminal shows the turn under the line the person typed. Claude Code can
+   * report the turn before it writes the command's rows (measured: the
+   * turn's offset was the record's size before them), so until
+   * COMMAND_TURN_ROWS_WAIT_MS after the report a turn whose rows are not
+   * there yet is null: it waits for the next pass.
    */
   const nameCommandTurn = (
     entry: ClaudeBridgeProcess,
@@ -731,7 +737,8 @@ const make = Effect.gen(function* () {
       const { bytes } = yield* readRecordTail(file, COMMAND_TURN_SCAN_BYTES);
       const { rows } = readTranscriptRows(new TextDecoder().decode(bytes));
       const line = claudeTurnCommandLine(rows, event.text);
-      return line === null ? event : { ...event, text: line };
+      if (line !== null) return { ...event, text: line };
+      return (yield* Clock.currentTimeMillis) - event.at < COMMAND_TURN_ROWS_WAIT_MS ? null : event;
     });
 
   /** The session as its mod reports it, with the record found when the mod could not name it. */
@@ -984,8 +991,15 @@ const make = Effect.gen(function* () {
         yield* Clock.currentTimeMillis,
       );
       for (const [index, { file, event }] of read.entries()) {
+        const named =
+          event?.type === "turn.start" && live && !stale.has(index)
+            ? yield* nameCommandTurn(entry, event)
+            : event;
+        // A command's turn waiting for its rows holds what the session said
+        // after it too; other sessions' events go on.
+        if (event !== null && named === null) return;
         yield* fs.remove(file).pipe(Effect.ignore);
-        if (event === null) continue;
+        if (event === null || named === null) continue;
         // A dead process's leftovers are history the transcript already holds.
         if (!live && event.type !== "ended") continue;
         // So is a turn that was over long before T3 read of it: the record
@@ -996,23 +1010,20 @@ const make = Effect.gen(function* () {
         }
         // A mod that does not know the record yet reports every turn from 0.
         const located =
-          event.type === "turn.start" &&
+          named.type === "turn.start" &&
           recordUnknownToMod.has(entry.sid) &&
           entry.session.transcriptPath.length > 0
             ? {
-                ...event,
+                ...named,
                 transcriptOffset: yield* turnOffset(
                   entry.sid,
-                  event.turnId,
+                  named.turnId,
                   entry.session.transcriptPath,
-                  event.at,
+                  named.at,
                 ),
               }
-            : event;
-        yield* dispatch(
-          located.type === "turn.start" ? yield* nameCommandTurn(entry, located) : located,
-          entry,
-        );
+            : named;
+        yield* dispatch(located, entry);
       }
     });
 

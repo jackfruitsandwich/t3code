@@ -398,7 +398,39 @@ describe("the sessions that count as live", () => {
 });
 
 describe("a turn a typed command begins with what it printed", () => {
-  it.live("reaches T3 named by the command's line, read from the record", () => {
+  // A /goal typed in the terminal (Claude Code 2.1.299): Claude Code reports
+  // the turn it starts with what the command printed.
+  const printed = "<local-command-stdout>Goal set: ship it</local-command-stdout>";
+  const commandRows = [
+    {
+      type: "user",
+      uuid: "g1",
+      parentUuid: null,
+      promptId: "p1",
+      message: {
+        role: "user",
+        content:
+          "<command-name>/goal</command-name>\n<command-message>goal</command-message>\n<command-args>ship it</command-args>",
+      },
+    },
+    {
+      type: "user",
+      uuid: "g2",
+      parentUuid: "g1",
+      promptId: "p1",
+      turnOrigin: "human",
+      message: { role: "user", content: printed },
+    },
+  ];
+  const lines = (rows: ReadonlyArray<unknown>) =>
+    rows.map((row) => JSON.stringify(row) + "\n").join("");
+
+  /**
+   * The text T3 is told the turn began with. `rowsLate`: the record holds the
+   * command's rows only once the event pump has been over the session once
+   * (the session waiting on a request makes the pump say when it has).
+   */
+  const reportedText = (rowsLate: boolean) => {
     const platform = Layer.mergeAll(NodeServices.layer, NodeCrypto.layer);
     return Effect.scoped(
       Effect.gen(function* () {
@@ -409,31 +441,10 @@ describe("a turn a typed command begins with what it printed", () => {
         const home = path.join(registry.bridgeDir, "home");
         const record = path.join(home, "projects", "-work", `${sid}.jsonl`);
         yield* fs.makeDirectory(path.dirname(record), { recursive: true });
-        // A /goal typed in the terminal (Claude Code 2.1.299): Claude Code
-        // reports the turn it starts with what the command printed.
-        const printed = "<local-command-stdout>Goal set: ship it</local-command-stdout>";
-        const rows = [
-          {
-            type: "user",
-            uuid: "g1",
-            parentUuid: null,
-            promptId: "p1",
-            message: {
-              role: "user",
-              content:
-                "<command-name>/goal</command-name>\n<command-message>goal</command-message>\n<command-args>ship it</command-args>",
-            },
-          },
-          {
-            type: "user",
-            uuid: "g2",
-            parentUuid: "g1",
-            promptId: "p1",
-            turnOrigin: "human",
-            message: { role: "user", content: printed },
-          },
-        ];
-        yield* fs.writeFileString(record, rows.map((row) => JSON.stringify(row)).join("\n") + "\n");
+        const earlier = lines([
+          { type: "user", uuid: "u0", parentUuid: null, message: { role: "user", content: "hi" } },
+        ]);
+        yield* fs.writeFileString(record, rowsLate ? earlier : earlier + lines(commandRows));
         const dir = path.join(registry.bridgeDir, "claude", sid, "instance-1");
         yield* fs.makeDirectory(path.join(dir, "events"), { recursive: true });
         const now = yield* Clock.currentTimeMillis;
@@ -446,6 +457,7 @@ describe("a turn a typed command begins with what it printed", () => {
             heartbeatAt: now,
             transcriptPath: record,
             isInteractive: true,
+            ...(rowsLate ? { waiting: [{ toolUseId: "tool-1", kind: "approval" }] } : {}),
           }),
         );
         yield* fs.writeFileString(
@@ -456,16 +468,31 @@ describe("a turn a typed command begins with what it printed", () => {
             type: "turn.start",
             turnId: "turn-1",
             text: printed,
-            transcriptOffset: 0,
+            transcriptOffset: earlier.length,
           }),
+        );
+        let written = !rowsLate;
+        yield* registry.onUnattachedRequest(() =>
+          written
+            ? Effect.void
+            : fs.writeFileString(record, earlier + lines(commandRows)).pipe(
+                Effect.orDie,
+                Effect.andThen(
+                  Effect.sync(() => {
+                    written = true;
+                  }),
+                ),
+              ),
         );
         const started = yield* Deferred.make<ClaudeBridgeEvent>();
         yield* registry.onUnattachedEvent((event) =>
-          event.type === "turn.start" ? Deferred.succeed(started, event).pipe(Effect.asVoid) : Effect.void,
+          event.type === "turn.start"
+            ? Deferred.succeed(started, event).pipe(Effect.asVoid)
+            : Effect.void,
         );
         // The event pump reads the session's events on its next pass.
         const start = yield* Deferred.await(started);
-        assert.strictEqual(start.type === "turn.start" ? start.text : undefined, "/goal ship it");
+        return start.type === "turn.start" ? start.text : undefined;
       }),
     ).pipe(
       Effect.provide(
@@ -477,5 +504,17 @@ describe("a turn a typed command begins with what it printed", () => {
         ),
       ),
     );
-  });
+  };
+
+  it.live("reaches T3 named by the command's line, read from the record", () =>
+    Effect.gen(function* () {
+      assert.strictEqual(yield* reportedText(false), "/goal ship it");
+    }),
+  );
+
+  it.live("waits for the command's rows when Claude Code writes them after its report", () =>
+    Effect.gen(function* () {
+      assert.strictEqual(yield* reportedText(true), "/goal ship it");
+    }),
+  );
 });
