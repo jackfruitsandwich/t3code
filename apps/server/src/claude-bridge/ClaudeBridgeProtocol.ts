@@ -31,7 +31,7 @@ import type {
 import { isRecord, parseJsonlLine } from "../import/sessionImportTypes.ts";
 
 export const CLAUDE_BRIDGE_PROTOCOL_VERSION = 2;
-export const CLAUDE_BRIDGE_MOD_VERSION = "0.3.31";
+export const CLAUDE_BRIDGE_MOD_VERSION = "0.3.32";
 /**
  * The first protocol whose mod runs slash commands, answers questions with
  * their answers and reports the session's own commands. A process still on an
@@ -1823,15 +1823,13 @@ export function makeClaudeBridgeFrameTranslator(
             : null;
         // An API error row is the line the terminal shows for the failure.
         const errorKind = typeof row.error === "string" ? row.error : null;
-        const errorLine =
-          row.isApiErrorMessage === true ? (rowText(row)?.trim() ?? "") : "";
+        const errorLine = row.isApiErrorMessage === true ? (rowText(row)?.trim() ?? "") : "";
         if (current !== null) {
           current.assistantMessages += 1;
           current.assistantStamped = current.assistantStamped || stamp !== null;
           current.lastUsage = isRecord(message.usage) ? message.usage : current.lastUsage;
           current.lastModel = typeof message.model === "string" ? message.model : current.lastModel;
-          current.shownError =
-            errorLine.length > 0 ? { kind: errorKind, text: errorLine } : null;
+          current.shownError = errorLine.length > 0 ? { kind: errorKind, text: errorLine } : null;
         }
         const frame = {
           type: "assistant",

@@ -121,7 +121,6 @@ const COMMAND_PANEL_WAIT_MS = 6000
 // (observed), and the screens that take no argument at all, so one typed
 // after them changes nothing (Claude Code 2.1.299's own definitions).
 const ARGUMENT_PANELS = new Set(['add-dir', 'usage-credits', 'extra-usage', 'stop'])
-const EFFORT_LEVELS = new Set(['low', 'medium', 'high', 'xhigh', 'max'])
 // Tools whose permission dialog asks for a choice (Claude Code 2.1.301: set
 // up Claude in Chrome, connected or not now; pick a role) and writes it into
 // the call's input.
@@ -589,15 +588,6 @@ async function dialogOpen($) {
   }
 }
 
-// How many turns the session has had: none before its first prompt.
-async function turnsSoFar($) {
-  try {
-    return Number(await $.session.turns()) || 0
-  } catch {
-    return 0
-  }
-}
-
 async function opensPanel($, name) {
   if (KNOWN_PANELS.has(name)) return true
   try { return (await $.store.get('panel:' + MOD_VERSION + ':' + name)) === true } catch { return false }
@@ -855,13 +845,6 @@ async function runSlashCommand($, command) {
   }
   if (ARGUMENT_PANELS.has(command.name)) {
     await report({ ok: true, text: 'Not run: ' + label + ' asks in a dialog in the Claude Code terminal even when given an argument, and only that terminal can show and answer it. Run it there.' })
-    return
-  }
-  // Mid-conversation, /effort <level> asks in the terminal first (measured on
-  // Claude Code 2.1.299 and since), a dialog only that terminal can answer, and
-  // nothing runs in the session until it is answered. Its own words say why.
-  if (command.name === 'effort' && EFFORT_LEVELS.has(command.args) && command.args !== sessionEffort && (await turnsSoFar($)) > 0) {
-    await report({ ok: true, text: 'Not run: ' + label + ' asks in the Claude Code terminal first ("Change effort level? This conversation is cached for the current effort level. Switching to ' + command.args + ' means the full history gets re-read on your next message."), and only that terminal can show and answer it. Run it there.' })
     return
   }
   if (!command.args && (await opensPanel($, command.name))) {

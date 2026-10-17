@@ -9,7 +9,7 @@ type Hook = ($: unknown, e: Record<string, unknown>, next: (e: unknown) => unkno
  * The mod as Claude Code loads it, with a stand-in for its `$`: every call the
  * mod makes resolves to nothing unless named here, and what it writes is kept.
  */
-const loadMod = (session: { readonly usage?: unknown; readonly turns?: number } = {}) => {
+const loadMod = (session: { readonly usage?: unknown } = {}) => {
   const register = new Function(
     `${claudeBridgeRegisterJs([]).replace("export function register(on)", "function register(on)")}\nreturn register`,
   )() as (on: (event: string, ...rest: ReadonlyArray<unknown>) => void) => void;
@@ -24,7 +24,6 @@ const loadMod = (session: { readonly usage?: unknown; readonly turns?: number } 
   const writes = new Map<string, string>();
   const timers = new Map<number, () => void>();
   const submits: Array<unknown> = [];
-  const commandRuns: Array<unknown> = [];
   const named: Record<string, Record<string, (...args: ReadonlyArray<unknown>) => unknown>> = {
     env: { get: (key) => (key === "T3CODE_BRIDGE_DIR" ? "/bridge" : undefined) },
     fs: {
@@ -45,18 +44,12 @@ const loadMod = (session: { readonly usage?: unknown; readonly turns?: number } 
       id: () => "session-1",
       surfaces: () => ["terminal"],
       model: () => "claude-opus-5-5",
-      turns: () => session.turns ?? 0,
       usage: () => {
         if (session.usage === undefined) throw new Error("not bound");
         return session.usage;
       },
     },
-    command: {
-      list: () => [],
-      run: (input) => {
-        commandRuns.push(input);
-      },
-    },
+    command: { list: () => [] },
     agent: { list: () => [] },
     clock: {
       every: (ms, tick) => {
@@ -127,7 +120,7 @@ const loadMod = (session: { readonly usage?: unknown; readonly turns?: number } 
     const path = [...writes.keys()].find((key) => key.endsWith("/session.json")) ?? "";
     writes.set(path.replace(/session\.json$/, name), JSON.stringify(value));
   };
-  return { fire, sessionFile, events, send, submits, commandRuns, put };
+  return { fire, sessionFile, events, send, submits, put };
 };
 
 const effort = (level: string) => ({ effort: { level } });
@@ -379,32 +372,5 @@ describe("the mod's report of another plugin's lines", () => {
       ["Clock: it is shown in the Claude Code terminal only.", false],
       ["clock: it is shown in the Claude Code terminal only.", false],
     ]);
-  });
-});
-
-describe("the mod's run of /effort <level> sent from T3", () => {
-  const sent = { type: "command", id: "c1", name: "effort", args: "high", promptUuid: "p1" };
-  const started = async (turns: number) => {
-    const mod = loadMod({ turns });
-    await mod.fire("session.start", { cwd: "/repo", surface: "terminal", isInteractive: true });
-    return mod;
-  };
-
-  it("refuses it mid-conversation in the words of the terminal's question, and runs nothing", async () => {
-    const mod = await started(2);
-    await mod.send(sent);
-    const result = mod.events().findLast((event) => event.type === "command.result");
-    assert.include(result, { commandId: "c1", ok: true });
-    assert.include(
-      String(result?.text),
-      "This conversation is cached for the current effort level. Switching to high means the full history gets re-read on your next message.",
-    );
-    assert.deepEqual(mod.commandRuns, []);
-  });
-
-  it("runs it before the first turn, when the terminal asks nothing", async () => {
-    const mod = await started(0);
-    await mod.send(sent);
-    assert.deepEqual(mod.commandRuns, [{ command: "effort", args: "high" }]);
   });
 });
