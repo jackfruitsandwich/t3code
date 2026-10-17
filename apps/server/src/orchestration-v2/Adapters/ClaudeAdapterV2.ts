@@ -8139,10 +8139,24 @@ export function makeClaudeAdapterV2(
               yield* finalizeActiveTurn({ context, status: "completed", completedAt });
               return;
             }
+            // A turn the bridge opened for a request after a turn that is over
+            // in this replay (the person typed while its card waited, and the
+            // mod asked again) is not this run's: it goes back through the
+            // wake buffer after this run's result and gets a run of its own,
+            // where the request is asked.
+            const laterRequestAt = drained.findIndex(
+              (entry, index) =>
+                entry.type === "user" &&
+                entry.parent_tool_use_id === null &&
+                claudeBridgeWakeRequest(entry) !== null &&
+                drained.slice(0, index).some((earlier) => earlier.type === "result"),
+            );
+            const replayed = laterRequestAt === -1 ? drained : drained.slice(0, laterRequestAt);
+            const later = laterRequestAt === -1 ? [] : drained.slice(laterRequestAt);
             // Replay any result message last: a result finalizes the turn, and
             // replaying it before the rest would drop them back into the wake
             // buffer and request another continuation.
-            const resultMessages = drained.filter((entry) => entry.type === "result");
+            const resultMessages = replayed.filter((entry) => entry.type === "result");
             const opaqueReplayTombstones = taskIdSetForNativeThread(
               yield* Ref.get(opaqueBackgroundTaskReplayTombstonesByNativeThread),
               nativeThreadId,
@@ -8153,7 +8167,7 @@ export function makeClaudeAdapterV2(
                 entry.subtype === "task_notification" &&
                 opaqueReplayTombstones.has(entry.task_id),
             );
-            for (const entry of drained) {
+            for (const entry of replayed) {
               if (entry.type !== "result") {
                 yield* handleSdkMessage({ query: querySession.query, message: entry });
               }
@@ -8161,6 +8175,9 @@ export function makeClaudeAdapterV2(
             const lastResult = resultMessages.at(-1);
             if (lastResult !== undefined) {
               yield* handleSdkMessage({ query: querySession.query, message: lastResult });
+              for (const entry of later) {
+                yield* handleSdkMessage({ query: querySession.query, message: entry });
+              }
               return;
             }
             // A drained `init` means Claude began the wake turn, so its output

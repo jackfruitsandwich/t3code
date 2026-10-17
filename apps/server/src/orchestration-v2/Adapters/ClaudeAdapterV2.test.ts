@@ -7378,6 +7378,143 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       ),
   );
 
+  // The person types a turn while the request's card waits: the bridge closes
+  // the request's turn, the typed turn runs and is over, and the mod asks
+  // again, so the bridge opens a request turn again. Both reach the adapter
+  // before the run offered for the typed turn begins (rig, latereq.py c,
+  // 2.1.302): that run shows the typed turn, and the request gets a run of
+  // its own, where it is asked.
+  it.effect("gives a request turn that follows a typed turn in one replay a run of its own", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        const now = yield* DateTime.now;
+        const typed = "Reply with exactly: late-typed";
+        const asking = "The general-purpose subagent is asking for permission";
+
+        yield* harness.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now,
+            attemptId: RunAttemptId.make("attempt-claude-bridge-typed-request-1"),
+            text: "Start a subagent in the background.",
+            attachments: [],
+          }),
+        );
+        yield* Queue.offer(harness.sdkMessages, turnOneResult);
+        yield* awaitUntil(() => harness.terminalEvents().length === 1, "first turn terminal");
+
+        // The typed turn, over before its run begins.
+        yield* Queue.offer(
+          harness.sdkMessages,
+          claudeSdkFrame({
+            type: "user",
+            message: { role: "user", content: typed },
+            parent_tool_use_id: null,
+            uuid: "00000000-0000-4000-8000-000000000301",
+            session_id: WAKE_NATIVE_SESSION,
+            t3_wake_detail: typed,
+          }),
+        );
+        yield* Queue.offer(harness.sdkMessages, wakeTurnInit);
+        yield* awaitUntil(() => harness.continuationRequests.length === 1, "typed continuation");
+        yield* Queue.offer(
+          harness.sdkMessages,
+          makeAssistantTextFrame({
+            uuid: "00000000-0000-4000-8000-000000000302",
+            text: "late-typed",
+          }),
+        );
+        yield* Queue.offer(
+          harness.sdkMessages,
+          makeResultFrame({ uuid: "00000000-0000-4000-8000-000000000303", result: "late-typed" }),
+        );
+        // The request turn the bridge opens again after it.
+        yield* Queue.offer(
+          harness.sdkMessages,
+          claudeSdkFrame({
+            type: "user",
+            message: { role: "user", content: asking },
+            parent_tool_use_id: null,
+            uuid: "00000000-0000-4000-8000-000000000304",
+            session_id: WAKE_NATIVE_SESSION,
+            t3_wake_detail: asking,
+            t3_wake_request: "subagent",
+          }),
+        );
+        yield* Queue.offer(
+          harness.sdkMessages,
+          claudeSdkFrame({
+            type: "system",
+            subtype: "init",
+            uuid: "00000000-0000-4000-8000-000000000305",
+            session_id: WAKE_NATIVE_SESSION,
+          }),
+        );
+        // All of it reaches the adapter before the typed turn's run begins.
+        for (let i = 0; i < 200; i++) yield* Effect.yieldNow;
+        assert.lengthOf(harness.continuationRequests, 1);
+
+        yield* harness.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now,
+            attemptId: RunAttemptId.make("attempt-claude-bridge-typed-request-2"),
+            text: typed,
+            attachments: [],
+            providerTurnOrdinal: 2,
+            messageCreatedBy: "agent",
+            messageCreationSource: "provider",
+          }),
+        );
+        yield* awaitUntil(() => harness.terminalEvents().length === 2, "typed turn terminal");
+        assert.equal(harness.terminalEvents()[1]?.status, "completed");
+        // The request is not left inside the typed turn's run: it asks for a run of its own.
+        yield* awaitUntil(
+          () => harness.continuationRequests.length === 2,
+          "request continuation after the typed turn",
+        );
+        assert.deepEqual(harness.continuationRequests[1]?.notification, {
+          source: { kind: "subagent" },
+          outcome: "updated",
+          summary: asking,
+        });
+
+        yield* harness.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now,
+            attemptId: RunAttemptId.make("attempt-claude-bridge-typed-request-3"),
+            text: asking,
+            attachments: [],
+            providerTurnOrdinal: 3,
+            messageCreatedBy: "agent",
+            messageCreationSource: "provider",
+          }),
+        );
+        const callbackOptions = {
+          signal: new AbortController().signal,
+          toolUseID: "late-subagent-write",
+          requestId: "late-subagent-write",
+          askedByAgent: "general-purpose",
+        };
+        const decision = yield* Effect.promise(() =>
+          harness.getBridgeCanUseTool()!("Bash", { command: "echo late" }, callbackOptions),
+        ).pipe(Effect.forkScoped);
+        const request = yield* Queue.take(harness.runtimeRequestReceipts);
+        assert.equal(request.runtimeRequest.status, "pending");
+        yield* harness.runtime.respondToRuntimeRequest({
+          requestId: request.runtimeRequest.id,
+          decision: "accept",
+        });
+        assert.equal((yield* Fiber.join(decision))?.behavior, "allow");
+      }).pipe(Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+    ),
+  );
+
   // The CLI sends one frame per content block, each carrying the id of the
   // native message it belongs to.
   const makeSubagentAssistantFrames = (input: {
