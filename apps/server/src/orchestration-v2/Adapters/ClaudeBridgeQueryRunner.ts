@@ -722,25 +722,12 @@ export const layer: Layer.Layer<
         }
       }
 
-      // The mode the mod last reported. Claude Code writes its record's mode
-      // row when it next writes its bookkeeping, at times only after the turn
-      // has ended (a plan approved mid-turn, measured on 2.1.302), while the
-      // mod hears the change from the next hook. A change the mod reports is
-      // newer than the record's last row; a row read after it is newer again.
-      let modMode: string | null | undefined;
       const nativeSettings = (
         session: ClaudeBridgeRegistry.ClaudeBridgeProcess["session"],
-      ): ClaudeAdapterV2.ClaudeBridgeNativeSettings => {
-        if (
-          modMode !== undefined &&
-          session.permissionMode !== null &&
-          session.permissionMode !== modMode
-        ) {
-          transcriptMode = null;
-        }
-        modMode = session.permissionMode;
-        return { model: session.model, permissionMode: transcriptMode ?? session.permissionMode };
-      };
+      ): ClaudeAdapterV2.ClaudeBridgeNativeSettings => ({
+        model: session.model,
+        permissionMode: transcriptMode ?? session.permissionMode,
+      });
       /** Shows the session's own settings on the thread when they differ from what T3 last showed. */
       const showNativeSettings = (
         settings: ClaudeAdapterV2.ClaudeBridgeNativeSettings,

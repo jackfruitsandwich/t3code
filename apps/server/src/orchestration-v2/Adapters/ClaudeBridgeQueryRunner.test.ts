@@ -3134,44 +3134,6 @@ describe("ClaudeBridgeQueryRunner what the session reports of itself", () => {
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
-  const modeRow = (permissionMode: string) =>
-    `${JSON.stringify({ type: "permission-mode", permissionMode, sessionId: "bridge-session" })}\n`;
-  // The runner reads the record's tail from a line break, so a row comes first.
-  const planTranscript = `${JSON.stringify({ type: "mode", mode: "normal" })}\n${modeRow("plan")}`;
-
-  it.live(
-    "shows a mode the mod reports after the record's last mode row, and a row read after that again",
-    () =>
-      Effect.gen(function* () {
-        const bridge = yield* attach({
-          protocol: 2,
-          bridgeCanUseTool: () => null,
-          transcript: planTranscript,
-          reported: { permissionMode: "plan" },
-        });
-        const fs = yield* FileSystem.FileSystem;
-        // The mode last shown since the previous look; none if nothing was shown.
-        const lastShown = () =>
-          Effect.gen(function* () {
-            if ((yield* Queue.size(bridge.nativeSettings)) === 0) return undefined;
-            return (yield* Queue.takeAll(bridge.nativeSettings)).at(-1)?.permissionMode;
-          });
-        assert.strictEqual(yield* lastShown(), "plan");
-        // The plan is approved mid-turn: the mod hears "default" from the next
-        // hook, and the record's row for it is not written until later.
-        report(bridge, { permissionMode: "default" });
-        yield* passRead(bridge, "00000000-0000-4000-8000-0000000000d4");
-        assert.strictEqual(yield* lastShown(), "default");
-        // Shift+tab in the terminal: the record's row comes first this time.
-        yield* fs.writeFileString(bridge.process.session.transcriptPath, modeRow("acceptEdits"), {
-          flag: "a",
-        });
-        yield* passRead(bridge, "00000000-0000-4000-8000-0000000000d5");
-        yield* passRead(bridge, "00000000-0000-4000-8000-0000000000d6");
-        assert.strictEqual(yield* lastShown(), "acceptEdits");
-      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
-  );
-
   it.live("passes on nothing from a mod that does not report it", () =>
     Effect.gen(function* () {
       const bridge = yield* attach({
