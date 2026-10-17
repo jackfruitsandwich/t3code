@@ -6746,7 +6746,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         readonly detail: string;
         readonly wake: Record<string, unknown>;
         readonly createdBy?: "user";
-        readonly notification?: Record<string, unknown>;
+        readonly notification?: { readonly summary: string; readonly detail?: string };
       }> = [
         {
           detail: "Build the login page.",

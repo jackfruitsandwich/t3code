@@ -66,9 +66,11 @@ const attach = (input: {
   /** Whether the session's file reads as unreadable (caught mid-write) at the read numbered `read`, from 1. */
   readonly unreadable?: (read: number) => boolean;
   /** What the session's mod reports of its effort and status line. */
-  readonly reported?: Pick<
-    ClaudeBridgeRegistry.ClaudeBridgeProcess["session"],
-    "effort" | "sessionEffort" | "usage" | "permissionMode"
+  readonly reported?: Partial<
+    Pick<
+      ClaudeBridgeRegistry.ClaudeBridgeProcess["session"],
+      "effort" | "sessionEffort" | "usage" | "permissionMode"
+    >
   >;
   readonly bridgeCanUseTool: (
     tool: string,
@@ -3132,17 +3134,19 @@ describe("ClaudeBridgeQueryRunner what the session reports of itself", () => {
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
+  const modeRow = (permissionMode: string) =>
+    `${JSON.stringify({ type: "permission-mode", permissionMode, sessionId: "bridge-session" })}\n`;
+  // The runner reads the record's tail from a line break, so a row comes first.
+  const planTranscript = `${JSON.stringify({ type: "mode", mode: "normal" })}\n${modeRow("plan")}`;
+
   it.live(
     "shows a mode the mod reports after the record's last mode row, and a row read after that again",
     () =>
       Effect.gen(function* () {
-        const modeRow = (permissionMode: string) =>
-          `${JSON.stringify({ type: "permission-mode", permissionMode, sessionId: "bridge-session" })}\n`;
         const bridge = yield* attach({
           protocol: 2,
           bridgeCanUseTool: () => null,
-          // The runner reads the record's tail from a line break, so a row comes first.
-          transcript: `${JSON.stringify({ type: "mode", mode: "normal" })}\n${modeRow("plan")}`,
+          transcript: planTranscript,
           reported: { permissionMode: "plan" },
         });
         const fs = yield* FileSystem.FileSystem;
