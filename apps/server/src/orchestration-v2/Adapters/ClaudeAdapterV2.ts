@@ -104,18 +104,24 @@ import {
   claudeBridgeCompactSummary,
   claudeBridgeReplacedDrawnId,
   claudeBridgeSettledElsewhere,
+  claudeBridgeWakeAsUser,
   claudeBridgeWakeDetail,
   claudeBridgeWakeOrigin,
   claudeBridgeWakeSender,
   claudeBridgeWakeRequest,
   claudeBridgeQueuedPrompt,
   isClaudeBridgeNoticeFrame,
+  isClaudeOriginShownByOrigin,
   isClaudePromptOfThePerson,
   threadModesForClaudePermissionMode,
   type ClaudeBridgeSessionUsage,
 } from "../../claude-bridge/ClaudeBridgeProtocol.ts";
 import * as ServerConfig from "../../config.ts";
-import { claudeHarnessMessageNotification } from "../../import/claudeSessionParser.ts";
+import {
+  claudeHarnessMessageNotification,
+  claudeOriginNotification,
+  claudePlanPromptNotification,
+} from "../../import/claudeSessionParser.ts";
 import { expandHomePath } from "../../pathExpansion.ts";
 import {
   claudeSignedOutMessage,
@@ -3395,9 +3401,14 @@ export function makeClaudeAdapterV2(
               readonly detail: string | null;
               /** Whether `detail` is a prompt typed into the native process. */
               readonly typed?: boolean;
-              /** Where the session said that prompt came from, and from which agent, if its mod told. */
+              /**
+               * Where the session said that prompt came from, and from which
+               * agent or plugin, if its mod told; whether that plugin sent it
+               * as the person's words.
+               */
               readonly origin?: string;
               readonly sender?: string;
+              readonly asUser?: true;
               /**
                * Who asks, when the bridge opened this turn itself to carry a
                * request the session raised with no turn of its own.
@@ -5684,6 +5695,7 @@ export function makeClaudeAdapterV2(
           const requestBy = typedPromptDetail === null ? null : claudeBridgeWakeRequest(message);
           const promptOrigin = typedPromptDetail === null ? null : claudeBridgeWakeOrigin(message);
           const promptSender = typedPromptDetail === null ? null : claudeBridgeWakeSender(message);
+          const promptAsUser = typedPromptDetail !== null && claudeBridgeWakeAsUser(message);
           if (isPendingTaskNotification) {
             yield* recordWakeReport(
               wakeInput.nativeThreadId,
@@ -5729,6 +5741,9 @@ export function makeClaudeAdapterV2(
                 : existing?.sender === undefined
                   ? {}
                   : { sender: existing.sender }),
+              ...(promptAsUser || (typedPromptDetail === null && existing?.asUser === true)
+                ? { asUser: true as const }
+                : {}),
               ...(requestBy !== null
                 ? { request: requestBy }
                 : existing?.request === undefined
@@ -5797,10 +5812,14 @@ export function makeClaudeAdapterV2(
           // A prompt the person typed in the terminal is their message here too;
           // without this it would be filed as background activity. What the
           // session says someone else submitted is never theirs.
+          const wakeOrigin = wakeBuffer?.origin ?? null;
           const typedByPerson =
             wakeBuffer?.typed === true &&
             detail !== null &&
-            isClaudePromptOfThePerson(detail, wakeBuffer.origin ?? null);
+            isClaudePromptOfThePerson(detail, wakeOrigin, {
+              name: wakeBuffer.sender ?? null,
+              asUser: wakeBuffer.asUser === true,
+            });
           const reports = yield* takeWakeReports(wakeInput.nativeThreadId);
           const notification =
             backgroundWorkNotification(
@@ -5820,7 +5839,24 @@ export function makeClaudeAdapterV2(
             // A background task reporting back, another agent's message (a
             // subagent handing back its report), a teammate's, a channel's:
             // the terminal's line for it, and what was sent.
-            claudeHarnessMessageNotification(detail, wakeBuffer?.sender ?? null);
+            claudeHarnessMessageNotification(detail, wakeBuffer?.sender ?? null) ??
+            // A plan the person accepted with "clear context": the box the
+            // terminal draws the plan in, not the prompt written around it.
+            (wakeBuffer?.typed === true ? claudePlanPromptNotification(detail, wakeOrigin) : null) ??
+            // Someone else's prompt whose words name no sender: the line for
+            // where the session says it came from.
+            (wakeBuffer?.typed === true &&
+            detail !== null &&
+            !typedByPerson &&
+            isClaudeOriginShownByOrigin(wakeOrigin)
+              ? claudeOriginNotification(
+                  {
+                    kind: wakeOrigin,
+                    ...(wakeBuffer.sender === undefined ? {} : { name: wakeBuffer.sender }),
+                  },
+                  detail,
+                )
+              : null);
           yield* Effect.logInfo("orchestration-v2.claude-wake-turn-detected", {
             providerSessionId: input.providerSessionId,
             threadId: route.threadId,

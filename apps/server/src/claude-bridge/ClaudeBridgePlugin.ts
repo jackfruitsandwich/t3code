@@ -143,7 +143,8 @@ let pendingCommand = null
 // with what the command printed, and is shown as the command.
 let lastShellInput = null
 // The prompt last submitted and where the session said it came from
-// (prompt.submit's origin kind): the turn it starts is told to T3 with that.
+// (prompt.submit's origin kind; for a plugin's, its name and whether it sent
+// the words as the person's): the turn it starts is told to T3 with that.
 let submitted = null
 // Commands sent while a turn was running, run when it ends.
 const afterTurn = []
@@ -1462,7 +1463,8 @@ export function register(on) {
         }
       } catch {}
     }
-    submitted = { text: e.text, origin: e.origin && typeof e.origin.kind === 'string' ? e.origin.kind : undefined }
+    const plugin = e.origin && e.origin.kind === 'plugin' && typeof e.origin.name === 'string' ? e.origin.name : undefined
+    submitted = { text: e.text, origin: e.origin && typeof e.origin.kind === 'string' ? e.origin.kind : undefined, plugin: plugin, asUser: plugin !== undefined && e.origin.asUser === true }
     // A plain prompt: the turn it starts is no command's.
     if (typeof e.text === 'string' && e.text.trim().charAt(0) !== '/') commandPending = false
     return next(e)
@@ -1496,10 +1498,11 @@ export function register(on) {
       text = '! ' + lastShellInput
       lastShellInput = null
     }
-    const origin = submitted !== null && submitted.text === e.text ? submitted.origin : undefined
+    const from = submitted !== null && submitted.text === e.text ? submitted : null
+    const origin = from !== null ? from.origin : undefined
     submitted = null
-    const sender = origin === 'peer' ? await peerSender($, e.text) : undefined
-    await emit($, 'turn.start', { turnId: e.turnId, text: text, transcriptOffset: offset, commandId: commandId, promptUuid: promptUuid, origin: origin, sender: sender })
+    const sender = origin === 'peer' ? await peerSender($, e.text) : origin === 'plugin' && from !== null ? from.plugin : undefined
+    await emit($, 'turn.start', { turnId: e.turnId, text: text, transcriptOffset: offset, commandId: commandId, promptUuid: promptUuid, origin: origin, sender: sender, asUser: from !== null && from.asUser ? true : undefined })
     await heartbeat($)
     return next(e)
   })

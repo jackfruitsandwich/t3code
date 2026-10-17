@@ -18,6 +18,7 @@ import type { OrchestrationV2Notification } from "@t3tools/contracts";
 import { claudePromptAsDrawn } from "@t3tools/shared/claudePastedContent";
 
 import {
+  CLAUDE_BRIDGE_PLUGIN_NAME,
   claudeBridgeMidTurnWords,
   claudeHookNoticeText,
   claudeNarrationAsText,
@@ -310,6 +311,123 @@ export function claudeHarnessMessageNotification(
     claudeTeammateMessageNotification(text) ??
     claudeChannelNotification(text)
   );
+}
+
+/** Where a prompt came from, as the session stamps it: the origin's kind, and the sender's name where it gives one. */
+export interface ClaudePromptSource {
+  readonly kind: string;
+  readonly name?: string;
+}
+
+/**
+ * The line Claude Code puts over a prompt from a source it cannot name as the
+ * person (a Slack ping, an unclassified one), for the model (2.1.302).
+ */
+const NON_USER_SOURCE_HEAD = "[MESSAGE FROM NON-USER SOURCE - NOT USER INPUT]\n";
+/** How much of a plugin's name the terminal's line for its prompt shows. */
+const PLUGIN_NAME_MAX = 24;
+
+/**
+ * Who sent a user row, when its stamp says it was not the person: Claude
+ * Code's own reading of a row's `origin` (2.1.302). Unstamped rows, the
+ * person's (`human`), a follow-up to their own action in a dialog
+ * (`auto-continuation`), a Slack turn Claude Code verified as theirs, and a
+ * plugin's prompt sent as their words are the person's, and so are T3's own
+ * rows, which carry what the person sent from T3. Every other kind, one not
+ * known here too, is a source other than the person. Null for the person's.
+ */
+export function claudeRecordRowSource(entry: Record<string, unknown>): ClaudePromptSource | null {
+  const origin = entry.origin;
+  if (!isRecord(origin) || typeof origin.kind !== "string") return null;
+  if (entry.verifiedSlackHumanTurn === true) return null;
+  const { kind } = origin;
+  if (kind === "human" || kind === "auto-continuation") return null;
+  if (kind === "plugin" && (origin.asUser === true || origin.name === CLAUDE_BRIDGE_PLUGIN_NAME)) {
+    return null;
+  }
+  const name =
+    kind === "plugin" || kind === "peer"
+      ? (readString(origin.name) ?? readString(origin.from))
+      : kind === "observer"
+        ? readString(origin.from)
+        : undefined;
+  return name === undefined ? { kind } : { kind, name };
+}
+
+/**
+ * The notice a prompt from a source other than the person shows when its
+ * words name no sender: the line the terminal draws over it where it draws
+ * one (a plugin's prompt, "Prompt from the <name> plugin"; an observer's
+ * report, "Message from <observer>"), else the origin's own kind as the
+ * session stamps it (`coordinator`, `slack-ping`, `unclassified`). What was
+ * sent is its detail, without the line Claude Code puts over it for the model.
+ */
+export function claudeOriginNotification(
+  source: ClaudePromptSource,
+  text: string | null,
+): OrchestrationV2Notification {
+  const name = source.name === undefined ? "" : peerName(source.name);
+  const summary =
+    source.kind === "plugin"
+      ? `Prompt from the ${[...name].slice(0, PLUGIN_NAME_MAX).join("") || "unnamed"} plugin`
+      : source.kind === "observer" && name.length > 0
+        ? `Message from ${name}`
+        : source.kind;
+  const body = (text ?? "").replace(NON_USER_SOURCE_HEAD, "").trim();
+  return {
+    source: { kind: "background_task" },
+    outcome: "updated",
+    summary,
+    ...(body.length === 0 ? {} : { detail: body }),
+  };
+}
+
+/** The title of the box the terminal draws a plan in when the session goes on to implement it. */
+const PLAN_TO_IMPLEMENT = "Plan to implement";
+/** How Claude Code opens the prompt it writes to implement a plan the person accepted with "clear context" (2.1.302). */
+const PLAN_PROMPT_HEAD = "Implement the following plan:\n\n";
+/** What it puts under the plan in that prompt, for the model. */
+const PLAN_PROMPT_TAIL = "\n\nIf you need specific details from before exiting plan mode";
+
+const planNotification = (plan: string): OrchestrationV2Notification | null =>
+  plan.trim().length === 0
+    ? null
+    : {
+        source: { kind: "background_task" },
+        outcome: "updated",
+        summary: PLAN_TO_IMPLEMENT,
+        detail: plan.trimEnd(),
+      };
+
+/**
+ * The notice for a record row that carries a plan to implement (`planContent`,
+ * the opening of a session that clears context to implement the plan the
+ * person accepted): the terminal draws such a row as a box headed "Plan to
+ * implement" with the plan in it, not as a prompt. Null for any other row.
+ */
+export function claudeRecordPlanNotification(
+  entry: Record<string, unknown>,
+): OrchestrationV2Notification | null {
+  return typeof entry.planContent === "string" ? planNotification(entry.planContent) : null;
+}
+
+/**
+ * The same notice for a turn whose prompt the session says followed the
+ * person's own action in a dialog (`auto-continuation`) and that opens the
+ * way Claude Code opens the prompt to implement an accepted plan: the plan is
+ * what that prompt holds between its opening and the words under it. Null for
+ * any other prompt.
+ */
+export function claudePlanPromptNotification(
+  text: string | null,
+  origin: string | null,
+): OrchestrationV2Notification | null {
+  if (origin !== "auto-continuation" || text === null || !text.startsWith(PLAN_PROMPT_HEAD)) {
+    return null;
+  }
+  const plan = text.slice(PLAN_PROMPT_HEAD.length);
+  const end = plan.indexOf(PLAN_PROMPT_TAIL);
+  return end < 0 ? null : planNotification(plan.slice(0, end));
 }
 
 /**
@@ -659,12 +777,21 @@ export function parseClaudeSessionJsonl(content: string): ParsedCliSession {
     // terminal draws as a notice. The row's own stamp says who wrote it;
     // rows from before the stamp are told by how they open.
     const writtenBy = isRecord(entry.origin) ? entry.origin.kind : undefined;
+    const prompt = entry.type === "user" && commandOutput === undefined && commandText === null;
     const taskNotice =
-      entry.type === "user" &&
-      commandOutput === undefined &&
-      commandText === null &&
+      prompt &&
       (writtenBy === "task-notification" ||
         (writtenBy === undefined && isClaudeTaskNoticeText(rawText)));
+    // Any other prompt whose stamp says someone else sent it is not the
+    // person's either: the terminal's line for it where its words give one,
+    // else the line for where it came from.
+    const source = prompt && !taskNotice ? claudeRecordRowSource(entry) : null;
+    const sourceNotice =
+      (prompt && !taskNotice ? claudeRecordPlanNotification(entry) : null) ??
+      (source === null
+        ? null
+        : (claudeHarnessMessageNotification(rawText, source.name ?? null) ??
+          claudeOriginNotification(source, rawText)));
     messages.push({
       role:
         commandOutput !== undefined
@@ -680,6 +807,15 @@ export function parseClaudeSessionJsonl(content: string): ParsedCliSession {
       lineIndex,
       ...(commandOutput !== undefined || commandText !== null ? { command: true as const } : {}),
       ...(taskNotice ? { notice: claudeTaskNotice(rawText) } : {}),
+      ...(sourceNotice === null
+        ? {}
+        : {
+            notice: {
+              summary: sourceNotice.summary,
+              outcome: sourceNotice.outcome === "unknown" ? "updated" : sourceNotice.outcome,
+              ...(sourceNotice.detail === undefined ? {} : { detail: sourceNotice.detail }),
+            },
+          }),
     });
   }
 

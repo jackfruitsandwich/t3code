@@ -28,7 +28,8 @@ export interface ParsedSessionMessage {
   readonly midTurn?: true;
   /**
    * Set on a row the harness wrote for itself and the terminal draws as a
-   * notice, not as the person's line (a background task reporting back):
+   * notice, not as the person's line (a background task reporting back, a
+   * prompt the row's stamp says someone else sent, a plan to implement):
    * what the notice says, in the row's own words. `text` stays the row's.
    */
   readonly notice?: ParsedSessionNotice;
@@ -44,6 +45,8 @@ export interface ParsedSessionMessage {
 export interface ParsedSessionNotice {
   readonly summary: string;
   readonly outcome: "completed" | "failed" | "cancelled" | "updated";
+  /** What was sent, where the notice shows it under its line. */
+  readonly detail?: string;
 }
 
 /**

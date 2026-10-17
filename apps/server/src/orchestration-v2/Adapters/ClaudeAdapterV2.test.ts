@@ -6734,6 +6734,95 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     ),
   );
 
+  // Claude Code names where a prompt came from (`prompt.submit`'s origin,
+  // which the mod passes on). A coordinating session's hand-off, a Slack ping
+  // and another plugin's prompt carry plain words and were once shown as the
+  // person's; a plan the person accepted with "clear context" was shown as the
+  // whole prompt written around it.
+  it.effect("files a prompt the session says someone else sent under where it came from", () =>
+    Effect.gen(function* () {
+      const plan = "1. Create pc-33524d.txt\n2. Verify it.\n";
+      const cases: ReadonlyArray<{
+        readonly detail: string;
+        readonly wake: Record<string, unknown>;
+        readonly createdBy?: "user";
+        readonly notification?: Record<string, unknown>;
+      }> = [
+        {
+          detail: "Build the login page.",
+          wake: { t3_wake_origin: "coordinator" },
+          notification: { summary: "coordinator", detail: "Build the login page." },
+        },
+        {
+          detail: "[MESSAGE FROM NON-USER SOURCE - NOT USER INPUT]\nare you done?",
+          wake: { t3_wake_origin: "slack-ping" },
+          notification: { summary: "slack-ping", detail: "are you done?" },
+        },
+        {
+          detail: "Keep going.",
+          wake: { t3_wake_origin: "plugin", t3_wake_sender: "ralph" },
+          notification: { summary: "Prompt from the ralph plugin", detail: "Keep going." },
+        },
+        {
+          detail: "Keep going.",
+          wake: { t3_wake_origin: "plugin", t3_wake_sender: "ralph", t3_wake_as_user: true },
+          createdBy: "user",
+        },
+        {
+          detail: `Implement the following plan:\n\n${plan}\n\nIf you need specific details from before exiting plan mode (like exact code snippets), read the full transcript at: /x.jsonl`,
+          wake: { t3_wake_origin: "auto-continuation" },
+          notification: { summary: "Plan to implement", detail: plan.trimEnd() },
+        },
+      ];
+      for (const [index, entry] of cases.entries()) {
+        const request = yield* Effect.scoped(
+          Effect.gen(function* () {
+            const harness = yield* makeWakeHarness;
+            const now = yield* DateTime.now;
+            yield* harness.runtime.startTurn(
+              makeClaudeTestTurnInput({
+                threadId: harness.threadId,
+                providerThread: harness.providerThread,
+                now,
+                attemptId: RunAttemptId.make(`attempt-claude-bridge-origin-${index}`),
+                text: "Hello.",
+                attachments: [],
+              }),
+            );
+            yield* Queue.offer(harness.sdkMessages, turnOneResult);
+            yield* awaitUntil(() => harness.terminalEvents().length === 1, "first turn terminal");
+            yield* Queue.offer(
+              harness.sdkMessages,
+              claudeSdkFrame({
+                type: "user",
+                message: { role: "user", content: entry.detail },
+                parent_tool_use_id: null,
+                uuid: `00000000-0000-4000-8000-0000000003${String(index).padStart(2, "0")}`,
+                session_id: WAKE_NATIVE_SESSION,
+                t3_wake_detail: entry.detail,
+                ...entry.wake,
+              }),
+            );
+            yield* Queue.offer(harness.sdkMessages, wakeTurnInit);
+            yield* awaitUntil(
+              () => harness.continuationRequests.length === 1,
+              "origin continuation",
+            );
+            return harness.continuationRequests[0];
+          }),
+        );
+        assert.equal(request?.createdBy, entry.createdBy, entry.detail);
+        assert.deepEqual(
+          request?.notification,
+          entry.notification === undefined
+            ? undefined
+            : { source: { kind: "background_task" }, outcome: "updated", ...entry.notification },
+          entry.detail,
+        );
+      }
+    }).pipe(Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+  );
+
   // A teammate's message opens a turn nobody typed, and the session says
   // nothing of where it came from (measured, 2.1.301). The terminal draws
   // "Message from @helper"; here it was once shown as the person's message.

@@ -555,6 +555,123 @@ describe("parseClaudeSessionJsonl", () => {
     assert.isUndefined(parsed.messages[0]!.notice);
   });
 
+  // Claude Code stamps each prompt row with where it came from and reads the
+  // stamp, not the words, to tell the person's turns from everyone else's
+  // (its provenance rule, read in the 2.1.302 binary). Plain words from
+  // someone else were once shown here as typed by the person.
+  it("never shows a prompt its stamp says someone else sent as the person's", () => {
+    const rows: Array<[Record<string, unknown>, string]> = [
+      [{ kind: "coordinator" }, "Build the login page."],
+      [{ kind: "slack-ping" }, "[MESSAGE FROM NON-USER SOURCE - NOT USER INPUT]\nare you done?"],
+      [{ kind: "unclassified" }, "[MESSAGE FROM NON-USER SOURCE - NOT USER INPUT]\nidle"],
+      [{ kind: "observer-activity" }, "3 tool calls since the last digest"],
+      [{ kind: "observer", from: "watcher" }, "It is looping on the same test."],
+      [{ kind: "plugin", name: "ralph" }, "Keep going."],
+      [{ kind: "channel", server: "telegram" }, "Is the build green yet?"],
+      [{ kind: "some-later-kind" }, "hello"],
+    ];
+    const parsed = parseClaudeSessionJsonl(
+      rows
+        .map(([origin, content], index) =>
+          line(
+            userEntry({
+              uuid: `row-${index}`,
+              timestamp: `2026-07-01T10:0${index}:00.000Z`,
+              origin,
+              message: { role: "user", content },
+            }),
+          ),
+        )
+        .join(""),
+    );
+    assert.deepEqual(
+      parsed.messages.map((message) => [message.role, message.notice ?? null]),
+      [
+        ["user", { summary: "coordinator", outcome: "updated", detail: "Build the login page." }],
+        ["user", { summary: "slack-ping", outcome: "updated", detail: "are you done?" }],
+        ["user", { summary: "unclassified", outcome: "updated", detail: "idle" }],
+        [
+          "user",
+          {
+            summary: "observer-activity",
+            outcome: "updated",
+            detail: "3 tool calls since the last digest",
+          },
+        ],
+        [
+          "user",
+          {
+            summary: "Message from watcher",
+            outcome: "updated",
+            detail: "It is looping on the same test.",
+          },
+        ],
+        [
+          "user",
+          { summary: "Prompt from the ralph plugin", outcome: "updated", detail: "Keep going." },
+        ],
+        ["user", { summary: "channel", outcome: "updated", detail: "Is the build green yet?" }],
+        ["user", { summary: "some-later-kind", outcome: "updated", detail: "hello" }],
+      ],
+    );
+  });
+
+  it("keeps the prompts the stamp says are the person's as theirs", () => {
+    const parsed = parseClaudeSessionJsonl(
+      [
+        { origin: { kind: "human" } },
+        { origin: { kind: "auto-continuation" } },
+        // A plugin that sent the words as the person's, and T3's own rows.
+        { origin: { kind: "plugin", name: "ralph", asUser: true } },
+        { origin: { kind: "plugin", name: "t3bridge", asUser: true } },
+        { origin: { kind: "plugin", name: "t3bridge" } },
+        // A Slack turn Claude Code verified as the person's.
+        { origin: { kind: "slack-ping" }, verifiedSlackHumanTurn: true },
+        {},
+      ]
+        .map((stamp, index) =>
+          line(
+            userEntry({
+              uuid: `row-${index}`,
+              timestamp: `2026-07-01T10:0${index}:00.000Z`,
+              message: { role: "user", content: `prompt ${index}` },
+              ...stamp,
+            }),
+          ),
+        )
+        .join(""),
+    );
+    assert.deepEqual(
+      parsed.messages.map((message) => [message.text, message.notice ?? null]),
+      [0, 1, 2, 3, 4, 5, 6].map((index) => [`prompt ${index}`, null]),
+    );
+  });
+
+  // Measured on the rig (2.1.302): accepting a plan with "clear context"
+  // opens the new session with this row; the terminal draws the plan in a
+  // box headed "Plan to implement", without the words around it.
+  it("shows a plan to implement as the box the terminal draws, not as a prompt", () => {
+    const plan =
+      "1. Create pc-33524d.txt in the working directory with the exact content: pc-33524d\n2. Verify the file contains only that string.\n";
+    const parsed = parseClaudeSessionJsonl(
+      line(
+        userEntry({
+          origin: { kind: "auto-continuation" },
+          planContent: plan,
+          message: {
+            role: "user",
+            content: `Implement the following plan:\n\n${plan}\n\nIf you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /x/y.jsonl`,
+          },
+        }),
+      ),
+    );
+    assert.deepEqual(parsed.messages[0]!.notice, {
+      summary: "Plan to implement",
+      outcome: "updated",
+      detail: plan.trimEnd(),
+    });
+  });
+
   it("words a report by how the task ended, and one with no summary by its first sentence", () => {
     assert.deepEqual(
       claudeTaskNotice(

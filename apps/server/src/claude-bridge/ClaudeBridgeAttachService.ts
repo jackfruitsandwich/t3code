@@ -22,7 +22,11 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as SqlClient from "effect/sql/SqlClient";
 
-import { claudeTaskNotification } from "../import/claudeSessionParser.ts";
+import {
+  claudeOriginNotification,
+  claudePlanPromptNotification,
+  claudeTaskNotification,
+} from "../import/claudeSessionParser.ts";
 import * as SessionImporter from "../import/Services/SessionImporter.ts";
 import { CLAUDE_PROVIDER } from "../orchestration-v2/Adapters/ClaudeAdapterV2.ts";
 import * as ProviderContinuationRequests from "../orchestration-v2/ProviderContinuationRequests.ts";
@@ -31,6 +35,8 @@ import {
   claudeBridgeRequestTurnText,
   claudeTurnPromptLabel,
   isClaudeHarnessPrompt,
+  isClaudeOriginShownByOrigin,
+  isClaudePromptOfThePerson,
   type ClaudeBridgeWaitingRequest,
 } from "./ClaudeBridgeProtocol.ts";
 import * as ClaudeBridgeRegistry from "./ClaudeBridgeRegistry.ts";
@@ -171,7 +177,15 @@ const make = Effect.gen(function* () {
 
   const offerTurn = (
     entry: ClaudeBridgeRegistry.ClaudeBridgeProcess,
-    turn: { readonly turnId: string; readonly text: string; readonly transcriptOffset: number },
+    turn: {
+      readonly turnId: string;
+      readonly text: string;
+      readonly transcriptOffset: number;
+      /** Where the session said the turn's prompt came from, and who sent it, if the mod told. */
+      readonly origin?: string;
+      readonly sender?: string;
+      readonly asUser?: true;
+    },
     /** The turn was running when this server came up: the run recovery left open picks it up. */
     reattachRun = false,
   ) =>
@@ -227,19 +241,37 @@ const make = Effect.gen(function* () {
       // The run says which turn it was offered for: by the time it attaches
       // the person may have begun the next, which gets a run of its own.
       yield* registry.noteTurnOffered(sid, turnId);
-      const taskNotice = claudeTaskNotification(text);
+      const origin = turn.origin ?? null;
+      const byPerson =
+        text.trim().length > 0 &&
+        isClaudePromptOfThePerson(text, origin, {
+          name: turn.sender ?? null,
+          asUser: turn.asUser === true,
+        });
+      // A background task reporting back shows as its own line, not as a
+      // notice without words; so do a plan the person accepted with "clear
+      // context" (the box the terminal draws it in) and someone else's
+      // prompt whose words name no sender (where the session says it came from).
+      const notice =
+        claudeTaskNotification(text) ??
+        claudePlanPromptNotification(text, origin) ??
+        (!byPerson && text.trim().length > 0 && isClaudeOriginShownByOrigin(origin)
+          ? claudeOriginNotification(
+              { kind: origin, ...(turn.sender === undefined ? {} : { name: turn.sender }) },
+              text,
+            )
+          : null);
       yield* continuations.offer({
         threadId: thread.threadId,
         providerThreadId: thread.providerThreadId,
         driver: CLAUDE_PROVIDER,
         detail: text.trim().length > 0 ? text : null,
         // A turn the person typed is theirs on every client; one the harness
-        // injected (a task notice, a hook's feedback) is not their message,
-        // and neither is a turn picked up with nothing known of how it began.
-        createdBy: text.trim().length === 0 || isHarnessPrompt(text) ? "agent" : "user",
-        // A background task reporting back shows as its own line, not as
-        // a notice without words.
-        ...(taskNotice === null ? {} : { notification: taskNotice }),
+        // injected (a task notice, a hook's feedback) or the session says
+        // someone else sent is not their message, and neither is a turn
+        // picked up with nothing known of how it began.
+        createdBy: byPerson && notice === null ? "user" : "agent",
+        ...(notice === null ? {} : { notification: notice }),
         ...(reattachRun ? { reattachRun } : {}),
       });
     });

@@ -524,6 +524,7 @@ const taskNotification = (notice: ParsedSessionNotice) =>
     source: { kind: "background_task" },
     outcome: notice.outcome,
     summary: notice.summary,
+    ...(notice.detail === undefined ? {} : { detail: notice.detail }),
   }) as const;
 
 /** Message + timeline events for imported text, as upstream's AgentSessionImporter writes them. */

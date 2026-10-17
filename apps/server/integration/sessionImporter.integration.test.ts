@@ -2416,6 +2416,55 @@ runtimeTest("a stock message T3 once showed as the person's own becomes a notice
   }),
 );
 
+// Claude Code stamps each prompt row with where it came from (2.1.302): a
+// coordinating session's hand-off and a plan to implement are no line of the
+// person's, whatever their words.
+runtimeTest("a prompt its stamp says someone else sent, and a plan to implement, import as notices", (h) =>
+  Effect.gen(function* () {
+    const claudeId = "aaaaaaaa-1111-4111-8111-1111111111f4";
+    const c = claudeSession({ sessionId: claudeId, cwd: h.workspace });
+    const threadId = importedThreadId(claudeId);
+    yield* h.write(h.claudeFile(claudeId), [
+      {
+        ...c.user(
+          "plan-1",
+          "Implement the following plan:\n\n1. Do it.\n\n\nIf you need specific details from before exiting plan mode, read the full transcript at: /x.jsonl",
+          "2026-07-01T10:00:00.000Z",
+        ),
+        origin: { kind: "auto-continuation" },
+        planContent: "1. Do it.\n",
+      },
+      c.assistant("assistant-1", "Done.", "2026-07-01T10:00:05.000Z"),
+      {
+        ...c.user("hand-off-1", "Build the login page.", "2026-07-01T10:01:00.000Z"),
+        origin: { kind: "coordinator" },
+      },
+      c.assistant("assistant-2", "Built.", "2026-07-01T10:01:05.000Z"),
+    ]);
+    yield* (yield* h.importer()).sweepNow();
+    const records = yield* h.threads.getThreadRecords(threadId, ["turnItems"]);
+    assert.deepEqual(
+      records.turnItems
+        .toSorted((left, right) => left.ordinal - right.ordinal)
+        .map((item) =>
+          item.type === "notification"
+            ? `notice: ${item.summary} | ${item.detail ?? ""}`
+            : item.type === "user_message"
+              ? `said: ${item.text}`
+              : item.type === "assistant_message"
+                ? `reply: ${item.text}`
+                : item.type,
+        ),
+      [
+        "notice: Plan to implement | 1. Do it.",
+        "reply: Done.",
+        "notice: coordinator | Build the login page.",
+        "reply: Built.",
+      ],
+    );
+  }),
+);
+
 runtimeTest(
   "a background task reporting back is a notice in imported history, and one filed as the person's own becomes one",
   (h) =>

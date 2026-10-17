@@ -148,10 +148,14 @@ describe("the first turn of a session that carries a conversation on", () => {
   });
 
   /** What became of a `turn.start` from session "new", whose own record leads back to nothing. */
-  const firstTurn = (earlier: ReadonlyArray<ClaudeBridgeRegistry.ClaudeBridgeEarlierSession>) =>
+  const firstTurn = (
+    earlier: ReadonlyArray<ClaudeBridgeRegistry.ClaudeBridgeEarlierSession>,
+    start: { readonly text?: string; readonly origin?: string; readonly sender?: string } = {},
+  ) =>
     Effect.gen(function* () {
       yield* threadOfEarlierSession;
       const offered: Array<string> = [];
+      const requests: Array<ProviderContinuationRequests.ProviderContinuationRequest> = [];
       const adopted: Array<string> = [];
       /** What the registry was told and offered, in order. */
       const steps: Array<string> = [];
@@ -203,6 +207,7 @@ describe("the first turn of a session that carries a conversation on", () => {
           offer: (request) =>
             Effect.sync(() => {
               offered.push(request.threadId);
+              requests.push(request);
               steps.push(`offered ${request.threadId}`);
             }),
           take: Effect.never,
@@ -217,7 +222,7 @@ describe("the first turn of a session that carries a conversation on", () => {
       });
       assert.isNotNull(session);
       assert.isNotNull(onEvent);
-      if (session === null || onEvent === null) return { offered, adopted, steps };
+      if (session === null || onEvent === null) return { offered, adopted, steps, requests };
       yield* (onEvent as ClaudeBridgeRegistry.ClaudeBridgeEventHandler)(
         {
           seq: 1,
@@ -226,10 +231,11 @@ describe("the first turn of a session that carries a conversation on", () => {
           turnId: "turn-1",
           text: "carry on",
           transcriptOffset: 0,
+          ...start,
         },
         { sid: "new", instanceId: "instance-new", dir: "/bridge/new/instance-new", session },
       );
-      return { offered, adopted, steps };
+      return { offered, adopted, steps, requests };
     }).pipe(Effect.scoped, Effect.provide(SqlitePersistence.layerMemory));
 
   it.effect(
@@ -244,6 +250,33 @@ describe("the first turn of a session that carries a conversation on", () => {
         // The run can tell the turn it was offered for from one begun since.
         assert.deepStrictEqual(steps, ["noted new:turn-1", "offered thread-old"]);
       }),
+  );
+
+  // Accepting a plan with "clear context" opens a new session whose first
+  // turn is Claude Code's prompt to implement it (measured, 2.1.302); the
+  // terminal draws the plan in a box, and a coordinating session's hand-off
+  // as no line of the person's.
+  it.effect("files a first turn the session says nobody typed under what the terminal draws", () =>
+    Effect.gen(function* () {
+      const earlier = [{ sid: "old", transcriptPath: "/records/old.jsonl" }];
+      const plan = yield* firstTurn(earlier, {
+        text: "Implement the following plan:\n\n1. Do it.\n\n\nIf you need specific details from before exiting plan mode (like exact code snippets), read the full transcript at: /x.jsonl",
+        origin: "auto-continuation",
+      });
+      assert.equal(plan.requests[0]?.createdBy, "agent");
+      assert.deepEqual(plan.requests[0]?.notification, {
+        source: { kind: "background_task" },
+        outcome: "updated",
+        summary: "Plan to implement",
+        detail: "1. Do it.",
+      });
+      const handOff = yield* firstTurn(earlier, { text: "Build it.", origin: "coordinator" });
+      assert.equal(handOff.requests[0]?.createdBy, "agent");
+      assert.equal(handOff.requests[0]?.notification?.summary, "coordinator");
+      const typed = yield* firstTurn(earlier, { text: "Build it.", origin: "composer" });
+      assert.equal(typed.requests[0]?.createdBy, "user");
+      assert.isUndefined(typed.requests[0]?.notification);
+    }),
   );
 
   it.effect("makes a session no earlier session leads to a thread of its own", () =>

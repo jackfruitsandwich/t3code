@@ -32,6 +32,7 @@ import {
   makeClaudeBridgeFrameTranslator,
   makeClaudePlainCommandReader,
   parseClaudeBridgeEvent,
+  claudeBridgeWakeAsUser,
   claudeBridgeWakeOrigin,
   claudeBridgeWakeSender,
   isClaudePromptOfThePerson,
@@ -232,6 +233,25 @@ describe("ClaudeBridgeProtocol frame translator", () => {
     const opened = translator().onTurnStart(event);
     assert.equal(claudeBridgeWakeOrigin(opened[0]!), "peer");
     assert.equal(claudeBridgeWakeSender(opened[0]!), "general-purpose");
+    assert.isFalse(claudeBridgeWakeAsUser(opened[0]!));
+    // A plugin's prompt: the plugin's name, and whether it sent the words as the person's.
+    const plugin = parseClaudeBridgeEvent({
+      seq: 4,
+      at: 6,
+      type: "turn.start",
+      turnId: "turn-7",
+      text: "keep going",
+      transcriptOffset: 0,
+      origin: "plugin",
+      sender: "ralph",
+      asUser: true,
+    });
+    assert.isTrue(plugin?.type === "turn.start");
+    if (plugin?.type !== "turn.start") return;
+    const fromPlugin = translator().onTurnStart(plugin);
+    assert.equal(claudeBridgeWakeOrigin(fromPlugin[0]!), "plugin");
+    assert.equal(claudeBridgeWakeSender(fromPlugin[0]!), "ralph");
+    assert.isTrue(claudeBridgeWakeAsUser(fromPlugin[0]!));
     // A mod that does not say leaves both out.
     const silent = translator().onTurnStart({
       seq: 1,
@@ -251,6 +271,8 @@ describe("ClaudeBridgeProtocol frame translator", () => {
     assert.isTrue(isClaudePromptOfThePerson("fix the tests", "composer"));
     assert.isTrue(isClaudePromptOfThePerson("<system-reminder> what is this tag?", "composer"));
     assert.isTrue(isClaudePromptOfThePerson("from my phone", "bridge"));
+    // A follow-up to the person's own action in a dialog is theirs (Claude Code 2.1.302).
+    assert.isTrue(isClaudePromptOfThePerson("Implement the following plan:", "auto-continuation"));
     for (const origin of [
       "task-notification",
       "scheduled-trigger",
@@ -261,11 +283,22 @@ describe("ClaudeBridgeProtocol frame translator", () => {
       "coordinator",
       "observer",
       "observer-activity",
+      // Claude Code frames these two to the model as a non-user source.
+      "slack-ping",
+      "unclassified",
     ]) {
       assert.isFalse(isClaudePromptOfThePerson("looks typed", origin), origin);
     }
-    // A mod that does not say, and origins that say too little: by how the prompt opens.
-    for (const origin of [null, "plugin", "unclassified"]) {
+    // A plugin's prompt is the person's when it sent the words as theirs, or
+    // when it is T3's own; another plugin's is not.
+    assert.isFalse(isClaudePromptOfThePerson("keep going", "plugin", { name: "ralph" }));
+    assert.isTrue(
+      isClaudePromptOfThePerson("keep going", "plugin", { name: "ralph", asUser: true }),
+    );
+    assert.isTrue(isClaudePromptOfThePerson("/compact", "plugin", { name: "t3bridge" }));
+    // A mod that does not say, a plugin it does not name, and origins not
+    // known here: by how the prompt opens.
+    for (const origin of [null, "plugin", "sdk"]) {
       assert.isTrue(isClaudePromptOfThePerson("fix the tests", origin));
       assert.isFalse(isClaudePromptOfThePerson(handBack, origin));
       assert.isFalse(

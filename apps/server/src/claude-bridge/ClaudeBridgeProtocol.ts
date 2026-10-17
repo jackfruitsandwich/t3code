@@ -31,7 +31,7 @@ import type {
 import { isRecord, parseJsonlLine } from "../import/sessionImportTypes.ts";
 
 export const CLAUDE_BRIDGE_PROTOCOL_VERSION = 2;
-export const CLAUDE_BRIDGE_MOD_VERSION = "0.3.32";
+export const CLAUDE_BRIDGE_MOD_VERSION = "0.3.33";
 /**
  * The first protocol whose mod runs slash commands, answers questions with
  * their answers and reports the session's own commands. A process still on an
@@ -70,11 +70,13 @@ export const CLAUDE_BRIDGE_WAKE_DETAIL_KEY = "t3_wake_detail";
 export const CLAUDE_BRIDGE_WAKE_REQUEST_KEY = "t3_wake_request";
 /**
  * Set beside the detail when the mod said where the turn's prompt came from:
- * the session's own word for it (`prompt.submit`'s origin kind), and for a
- * message from another agent, who sent it.
+ * the session's own word for it (`prompt.submit`'s origin kind), for a
+ * message from another agent who sent it, for a plugin's prompt the plugin's
+ * name and whether it sent the words as the person's own.
  */
 export const CLAUDE_BRIDGE_WAKE_ORIGIN_KEY = "t3_wake_origin";
 export const CLAUDE_BRIDGE_WAKE_SENDER_KEY = "t3_wake_sender";
+export const CLAUDE_BRIDGE_WAKE_AS_USER_KEY = "t3_wake_as_user";
 export type ClaudeBridgeRequestTurnBy = "subagent" | "session";
 /**
  * Set on the synthesized `assistant` frame that carries a slash command's
@@ -421,8 +423,13 @@ export type ClaudeBridgeEvent = { readonly seq: number; readonly at: number } & 
        * ...). Absent from a mod that does not say.
        */
       readonly origin?: string;
-      /** For a message from another agent: its name as the session lists it. */
+      /**
+       * For a message from another agent: its name as the session lists it.
+       * For a plugin's prompt: the plugin's name.
+       */
       readonly sender?: string;
+      /** A plugin sent the prompt as the person's own words (`asUser`). */
+      readonly asUser?: true;
     }
   | {
       readonly type: "turn.complete";
@@ -667,6 +674,7 @@ export function parseClaudeBridgeEvent(value: unknown): ClaudeBridgeEvent | null
         ...(typeof value.sender === "string" && value.sender.length > 0
           ? { sender: value.sender }
           : {}),
+        ...(value.asUser === true ? { asUser: true as const } : {}),
       };
     }
     case "turn.complete": {
@@ -1478,12 +1486,23 @@ export function isClaudeHarnessPrompt(text: string): boolean {
   );
 }
 
-/** Origins the session names as the person's own submission. */
-const CLAUDE_ORIGINS_OF_THE_PERSON: ReadonlySet<string> = new Set(["composer", "bridge"]);
+/**
+ * Origins the session names as the person's own submission. Claude Code
+ * counts a follow-up to the person's own action in a dialog
+ * (`auto-continuation`) as theirs too.
+ */
+const CLAUDE_ORIGINS_OF_THE_PERSON: ReadonlySet<string> = new Set([
+  "composer",
+  "bridge",
+  "auto-continuation",
+]);
 /**
  * Origins the session names as someone else's: a task's notice, a schedule
- * firing, another session or agent, a relayed channel. The rest (a plugin's,
- * one the session could not classify) say too little, and are read by text.
+ * firing, another session or agent, a relayed channel, a coordinating
+ * session, a Slack ping, one the session could not classify (Claude Code
+ * frames those last two to the model as a non-user source). A plugin's is
+ * decided by how it sent the prompt. The rest (`sdk`, a kind not known here)
+ * are read by text.
  */
 const CLAUDE_ORIGINS_NOT_OF_THE_PERSON: ReadonlySet<string> = new Set([
   "task-notification",
@@ -1495,17 +1514,57 @@ const CLAUDE_ORIGINS_NOT_OF_THE_PERSON: ReadonlySet<string> = new Set([
   "coordinator",
   "observer",
   "observer-activity",
+  "slack-ping",
+  "unclassified",
 ]);
+/**
+ * Origins someone else's prompt has that T3 shows under the origin itself:
+ * nothing in such a prompt's words says where it came from. The others are
+ * told by their words (a task's notice, an agent's message, a channel's), or
+ * shown another way (a schedule firing), or not at all (a relay to a project).
+ */
+const CLAUDE_ORIGINS_SHOWN_BY_ORIGIN: ReadonlySet<string> = new Set([
+  "coordinator",
+  "observer",
+  "observer-activity",
+  "slack-ping",
+  "unclassified",
+  "plugin",
+]);
+
+/** Who sent a prompt, beside its origin kind: a plugin's name, and whether it sent the words as the person's. */
+export interface ClaudePromptSender {
+  readonly name?: string | null;
+  readonly asUser?: boolean;
+}
 
 /**
  * Whether the person submitted a turn's prompt themselves. The session's own
  * word for where it came from decides where the mod relayed one; a session
- * whose mod does not is told by how the prompt opens.
+ * whose mod does not is told by how the prompt opens. A plugin's prompt is the
+ * person's when the plugin sent it as their words, or when it is T3's own
+ * (T3 sends what the person sent from T3); a mod that did not name the plugin
+ * leaves it to the words.
  */
-export function isClaudePromptOfThePerson(text: string, origin: string | null): boolean {
+export function isClaudePromptOfThePerson(
+  text: string,
+  origin: string | null,
+  sender: ClaudePromptSender = {},
+): boolean {
+  if (origin === "plugin" && typeof sender.name === "string") {
+    return sender.asUser === true || sender.name === CLAUDE_BRIDGE_PLUGIN_NAME;
+  }
   if (origin !== null && CLAUDE_ORIGINS_OF_THE_PERSON.has(origin)) return true;
   if (origin !== null && CLAUDE_ORIGINS_NOT_OF_THE_PERSON.has(origin)) return false;
   return !isClaudeHarnessPrompt(text);
+}
+
+/**
+ * Whether a prompt that is not the person's shows under its origin (see
+ * claudeOriginNotification): one whose words name no sender T3 reads.
+ */
+export function isClaudeOriginShownByOrigin(origin: string | null): origin is string {
+  return origin !== null && CLAUDE_ORIGINS_SHOWN_BY_ORIGIN.has(origin);
 }
 
 /** The continuation text a bridge `user` frame carries, if any. */
@@ -1520,10 +1579,15 @@ export function claudeBridgeWakeOrigin(message: SDKMessage): string | null {
   return typeof origin === "string" && origin.length > 0 ? origin : null;
 }
 
-/** The agent a bridge `user` frame's message is from, as the session lists it, if known. */
+/** The agent a bridge `user` frame's message is from, as the session lists it, or the plugin that sent it, if known. */
 export function claudeBridgeWakeSender(message: SDKMessage): string | null {
   const sender = Reflect.get(message, CLAUDE_BRIDGE_WAKE_SENDER_KEY);
   return typeof sender === "string" && sender.length > 0 ? sender : null;
+}
+
+/** Whether the plugin that sent a bridge `user` frame's prompt sent it as the person's own words. */
+export function claudeBridgeWakeAsUser(message: SDKMessage): boolean {
+  return Reflect.get(message, CLAUDE_BRIDGE_WAKE_AS_USER_KEY) === true;
 }
 
 /** Who asks, when a bridge `user` frame opens a turn T3 made to carry a request; null for any other frame. */
@@ -1785,6 +1849,7 @@ export function makeClaudeBridgeFrameTranslator(
           [CLAUDE_BRIDGE_WAKE_DETAIL_KEY]: typed,
           ...(event.origin === undefined ? {} : { [CLAUDE_BRIDGE_WAKE_ORIGIN_KEY]: event.origin }),
           ...(event.sender === undefined ? {} : { [CLAUDE_BRIDGE_WAKE_SENDER_KEY]: event.sender }),
+          ...(event.asUser === true ? { [CLAUDE_BRIDGE_WAKE_AS_USER_KEY]: true } : {}),
           ...(turnOptions?.request === undefined
             ? {}
             : { [CLAUDE_BRIDGE_WAKE_REQUEST_KEY]: turnOptions.request }),
