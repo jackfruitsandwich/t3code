@@ -31,7 +31,7 @@ import type {
 import { isRecord, parseJsonlLine } from "../import/sessionImportTypes.ts";
 
 export const CLAUDE_BRIDGE_PROTOCOL_VERSION = 2;
-export const CLAUDE_BRIDGE_MOD_VERSION = "0.3.33";
+export const CLAUDE_BRIDGE_MOD_VERSION = "0.3.34";
 /**
  * The first protocol whose mod runs slash commands, answers questions with
  * their answers and reports the session's own commands. A process still on an

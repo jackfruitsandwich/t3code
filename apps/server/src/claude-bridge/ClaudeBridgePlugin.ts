@@ -112,6 +112,8 @@ const SHELL_INPUT_ROW = /^\\s*<bash-input>([\\s\\S]*)<\\/bash-input>\\s*$/
 const SHELL_OUTPUT_ROW = /^\\s*<bash-stdout>/
 const COMMAND_TURN_WAIT_MS = 1500
 const COMMAND_PANEL_WAIT_MS = 6000
+// After the first look, how often a command still out looks for a dialog it opened.
+const COMMAND_PANEL_RELOOK_MS = 1000
 // Built-in commands that, typed with no argument, open a panel in the terminal
 // (observed on Claude Code 2.1.296 by running each one). A panel can only be
 // closed by the person at that terminal and everything queued behind it waits,
@@ -578,11 +580,12 @@ async function noteWaiting($, toolUseId, entry) {
 }
 
 // Whether a dialog or panel is open in the terminal right now. Claude Code
-// refuses to touch the prompt box under one and says so; appending nothing
-// asks that without changing what the person has typed (measured).
+// refuses to touch the prompt box under one and says so. Inserting nothing at
+// the cursor asks that and leaves the draft and the cursor as the person left
+// them; an append puts the cursor at the end of the draft (measured).
 async function dialogOpen($) {
   try {
-    const box = await $.prompt.fill({ text: '', mode: 'append' })
+    const box = await $.prompt.fill({ text: '', mode: 'insert' })
     return !!box && box.isFilled === false && box.refusal === 'dialog'
   } catch {
     return false
@@ -905,7 +908,7 @@ async function runSlashCommand($, command) {
     panelsOpen = Math.max(0, panelsOpen - 1)
   }
   const mine = () => pendingCommand !== null && pendingCommand.id === command.id
-  const lookAgain = () => $.clock.after(COMMAND_PANEL_WAIT_MS, () => { stillOut().catch(() => {}) })
+  const lookAgain = (ms) => $.clock.after(ms, () => { stillOut().catch(() => {}) })
   const stillOut = async () => {
     if (settled || !mine()) return
     if (blockedAtSend || activeTurn !== null) {
@@ -919,7 +922,7 @@ async function runSlashCommand($, command) {
       return
     }
     if (!(await dialogOpen($))) {
-      lookAgain()
+      lookAgain(COMMAND_PANEL_RELOOK_MS)
       return
     }
     // It asks in a dialog of its own (/effort <level> mid-conversation since
@@ -937,7 +940,7 @@ async function runSlashCommand($, command) {
       text: label + ' opened a panel in the Claude Code terminal and is waiting there for an answer only that terminal can give. Nothing else runs in this session until then.',
     })
   }
-  lookAgain()
+  lookAgain(COMMAND_PANEL_WAIT_MS)
   const sentAt = Date.now()
   // A command may start an agent and no turn (a skill that runs in the
   // background): what that agent asks is asked where the command came from.
