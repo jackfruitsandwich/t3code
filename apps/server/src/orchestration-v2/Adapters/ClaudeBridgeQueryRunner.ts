@@ -722,12 +722,30 @@ export const layer: Layer.Layer<
         }
       }
 
+      // The mode the mod last reported. Claude Code writes its record's mode
+      // row when it next writes its bookkeeping, at times only after the turn
+      // has ended (a plan approved mid-turn, measured on 2.1.302), while the
+      // mod hears the change from the next hook. A change the mod reports is
+      // newer than the record's last row; a row read after it is newer again.
+      let modMode: string | null | undefined;
+      // A row that changes the record's mode is said again even when T3 shows
+      // that mode already. The mod hears a mode set in the terminal between
+      // turns (/plan) as the next terminal turn begins, before the run T3
+      // opens for that turn, and a run only takes what arrives while it is open.
+      let recordChangedMode = false;
       const nativeSettings = (
         session: ClaudeBridgeRegistry.ClaudeBridgeProcess["session"],
-      ): ClaudeAdapterV2.ClaudeBridgeNativeSettings => ({
-        model: session.model,
-        permissionMode: transcriptMode ?? session.permissionMode,
-      });
+      ): ClaudeAdapterV2.ClaudeBridgeNativeSettings => {
+        if (
+          modMode !== undefined &&
+          session.permissionMode !== null &&
+          session.permissionMode !== modMode
+        ) {
+          transcriptMode = null;
+        }
+        modMode = session.permissionMode;
+        return { model: session.model, permissionMode: transcriptMode ?? session.permissionMode };
+      };
       /** Shows the session's own settings on the thread when they differ from what T3 last showed. */
       const showNativeSettings = (
         settings: ClaudeAdapterV2.ClaudeBridgeNativeSettings,
@@ -961,7 +979,11 @@ export const layer: Layer.Layer<
             if (isClaudeTypedMidTurnRow(row)) {
               yield* registry.noteRecordChange(bridgeProcess, "typed-mid-turn");
             }
-            transcriptMode = claudeTranscriptPermissionMode(row) ?? transcriptMode;
+            const recordedMode = claudeTranscriptPermissionMode(row);
+            if (recordedMode !== null && recordedMode !== transcriptMode) {
+              transcriptMode = recordedMode;
+              recordChangedMode = true;
+            }
             const plain = state.plainCommand(row);
             const commandText =
               claudeTranscriptCommandText(row) ??
@@ -1543,7 +1565,8 @@ export const layer: Layer.Layer<
             state.byteOffset = moved ? Math.min(state.byteOffset, size) : size;
           }
           if (session.model !== null) translator.setModel(session.model);
-          yield* showNativeSettings(nativeSettings(session));
+          yield* showNativeSettings(nativeSettings(session), recordChangedMode);
+          recordChangedMode = false;
           yield* showNativeState(session);
           yield* expireTurnEndHold;
           yield* readNewRows.pipe(

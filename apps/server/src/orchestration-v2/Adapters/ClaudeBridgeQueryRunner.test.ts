@@ -3134,6 +3134,73 @@ describe("ClaudeBridgeQueryRunner what the session reports of itself", () => {
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
+  const modeRow = (permissionMode: string) =>
+    `${JSON.stringify({ type: "permission-mode", permissionMode, sessionId: "bridge-session" })}\n`;
+  // The runner reads the record's tail from a line break, so a row comes first.
+  const modeTranscript = (permissionMode: string) =>
+    `${JSON.stringify({ type: "mode", mode: "normal" })}\n${modeRow(permissionMode)}`;
+  /** The mode last shown since the previous look; none if nothing was shown. */
+  const lastShown = (bridge: {
+    readonly nativeSettings: Queue.Queue<ClaudeAdapterV2.ClaudeBridgeNativeSettings>;
+  }) =>
+    Effect.gen(function* () {
+      if ((yield* Queue.size(bridge.nativeSettings)) === 0) return undefined;
+      return (yield* Queue.takeAll(bridge.nativeSettings)).at(-1)?.permissionMode;
+    });
+
+  // dialogs.py (gate 0.0.92) and shift+tab.
+  it.live(
+    "shows a mode the mod reports after the record's last mode row, and a row read after that again",
+    () =>
+      Effect.gen(function* () {
+        const bridge = yield* attach({
+          protocol: 2,
+          bridgeCanUseTool: () => null,
+          transcript: modeTranscript("plan"),
+          reported: { permissionMode: "plan" },
+        });
+        const fs = yield* FileSystem.FileSystem;
+        assert.strictEqual(yield* lastShown(bridge), "plan");
+        // The plan is approved mid-turn: the mod hears "default" from the next
+        // hook, and the record's row for it is not written until later.
+        report(bridge, { permissionMode: "default" });
+        yield* passRead(bridge, "00000000-0000-4000-8000-0000000000d4");
+        assert.strictEqual(yield* lastShown(bridge), "default");
+        // Shift+tab in the terminal: the record's row comes first this time.
+        yield* fs.writeFileString(bridge.process.session.transcriptPath, modeRow("acceptEdits"), {
+          flag: "a",
+        });
+        yield* passRead(bridge, "00000000-0000-4000-8000-0000000000d5");
+        yield* passRead(bridge, "00000000-0000-4000-8000-0000000000d6");
+        assert.strictEqual(yield* lastShown(bridge), "acceptEdits");
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  // d3_t3chat.py plan (gate 0.0.93): /plan typed in the terminal between
+  // turns. The mod hears it as the next terminal turn begins, and what is
+  // shown before the run T3 opens for that turn reaches no thread.
+  it.live("says the mode the record changes to again, though it was shown before", () =>
+    Effect.gen(function* () {
+      const bridge = yield* attach({
+        protocol: 2,
+        bridgeCanUseTool: () => null,
+        transcript: modeTranscript("default"),
+      });
+      const fs = yield* FileSystem.FileSystem;
+      report(bridge, { permissionMode: "plan" });
+      yield* passRead(bridge, "00000000-0000-4000-8000-0000000000d7");
+      // The run opens now: nothing shown so far reached it.
+      yield* Queue.takeAll(bridge.nativeSettings);
+      // The record writes its row for the plan mode mid-turn.
+      yield* fs.writeFileString(bridge.process.session.transcriptPath, modeRow("plan"), {
+        flag: "a",
+      });
+      yield* passRead(bridge, "00000000-0000-4000-8000-0000000000d8");
+      yield* passRead(bridge, "00000000-0000-4000-8000-0000000000d9");
+      assert.strictEqual(yield* lastShown(bridge), "plan");
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
   it.live("passes on nothing from a mod that does not report it", () =>
     Effect.gen(function* () {
       const bridge = yield* attach({
