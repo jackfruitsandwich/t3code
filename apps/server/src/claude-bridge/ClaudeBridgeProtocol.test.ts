@@ -341,7 +341,8 @@ describe("ClaudeBridgeProtocol frame translator", () => {
         subtype: "local_command",
         uuid: "l1",
         parentUuid: "x",
-        content: "<command-name>/login</command-name>\n<command-message>login</command-message>\n<command-args></command-args>",
+        content:
+          "<command-name>/login</command-name>\n<command-message>login</command-message>\n<command-args></command-args>",
       },
       {
         type: "system",
@@ -364,7 +365,14 @@ describe("ClaudeBridgeProtocol frame translator", () => {
     // The output's row with no command row for its parent: nothing to name it by.
     assert.isNull(
       claudeTurnCommandLine(
-        [{ type: "user", uuid: "o1", parentUuid: "gone", message: { role: "user", content: printed } }],
+        [
+          {
+            type: "user",
+            uuid: "o1",
+            parentUuid: "gone",
+            message: { role: "user", content: printed },
+          },
+        ],
         printed,
       ),
     );
@@ -381,7 +389,10 @@ describe("ClaudeBridgeProtocol frame translator", () => {
             type: "user",
             uuid: "o2",
             parentUuid: "c1",
-            message: { role: "user", content: "<local-command-stdout>Enabled plan mode</local-command-stdout>" },
+            message: {
+              role: "user",
+              content: "<local-command-stdout>Enabled plan mode</local-command-stdout>",
+            },
           },
         ],
         printed,
@@ -426,7 +437,16 @@ describe("ClaudeBridgeProtocol frame translator", () => {
     frames.adoptTurn({ turnId: "turn-3", startedAt: 1, transcriptOffset: 100 });
     assert.isTrue(frames.hasOpenTurn());
     const ended = frames.onEnded("process gone");
-    assert.equal(ended[0]?.type, "result");
+    // A notice of the session's end, then the turn closed with no reply of the model's.
+    assert.deepEqual(
+      ended.map((frame) => (isClaudeBridgeNoticeFrame(frame) ? frame.content : frame.type)),
+      ["Claude Code session ended (process gone).", "result"],
+    );
+    const closed = ended[1];
+    assert.equal(
+      closed?.type === "result" && closed.subtype === "success" ? closed.result : null,
+      "",
+    );
     assert.isFalse(frames.hasOpenTurn());
     assert.lengthOf(frames.onEnded("again"), 0);
   });
@@ -1129,7 +1149,11 @@ describe("ClaudeBridgeProtocol record helpers", () => {
       text: prompt,
       sender: "Explore",
     });
-    assert.equal(claudeBridgeQueuedPrompt(frames.onTranscriptRow(queued({ kind: "task-notification" }))[0])?.sender, null);
+    assert.equal(
+      claudeBridgeQueuedPrompt(frames.onTranscriptRow(queued({ kind: "task-notification" }))[0])
+        ?.sender,
+      null,
+    );
     // The person's own mid-turn message is placed by the runner; a subagent's
     // rows are its own.
     assert.lengthOf(frames.onTranscriptRow(queued({ kind: "human" })), 0);
@@ -1148,7 +1172,9 @@ describe("ClaudeBridgeProtocol record helpers", () => {
       assert.isFalse(isClaudePromptOfThePerson(text, null), text);
     }
     assert.isFalse(isClaudeHarnessPrompt("A message arrived from my mom, can you read it?"));
-    assert.isTrue(isClaudePromptOfThePerson("Another Claude session sent a message: odd", "composer"));
+    assert.isTrue(
+      isClaudePromptOfThePerson("Another Claude session sent a message: odd", "composer"),
+    );
   });
 });
 

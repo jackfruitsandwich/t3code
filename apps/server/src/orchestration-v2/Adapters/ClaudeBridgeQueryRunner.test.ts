@@ -1644,12 +1644,17 @@ describe("ClaudeBridgeQueryRunner slash commands", () => {
       );
       yield* bridge.session.messages.pipe(Stream.take(2), Stream.runCollect);
       gone = true;
-      const closed = Array.from(
-        yield* bridge.session.messages.pipe(Stream.take(1), Stream.runCollect),
-      )[0];
+      const [notice, closed] = Array.from(
+        yield* bridge.session.messages.pipe(Stream.take(2), Stream.runCollect),
+      );
+      assert.strictEqual(
+        isClaudeBridgeNoticeFrame(notice) ? notice.content : null,
+        "Claude Code session ended (process gone).",
+        describe(notice),
+      );
       assert.strictEqual(
         closed?.type === "result" && closed.subtype === "success" ? closed.result : null,
-        "Claude Code session ended (process gone).",
+        "",
         describe(closed),
       );
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),

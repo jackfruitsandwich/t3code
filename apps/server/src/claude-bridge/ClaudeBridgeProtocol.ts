@@ -2007,15 +2007,24 @@ export function makeClaudeBridgeFrameTranslator(
     },
     onEnded: (reason) => {
       if (turn === null) return [];
+      // The session ended under the open turn (/clear, the plan dialog's
+      // "clear context", the process gone). The model said nothing of it, so
+      // it is a notice of the session's end, and the turn closes with no reply.
+      const notice = claudeSessionNoticeFrame({
+        uuid: `bridge-ended-${turn.turnId}`,
+        sessionId,
+        subtype: "session_ended",
+        content: `Claude Code session ended (${reason}).`,
+      });
       const frame = resultFrame({
         turnId: turn.turnId,
         reason: "aborted",
-        answer: `Claude Code session ended (${reason}).`,
+        answer: "",
         isAborted: true,
         durationMs: 0,
       });
       turn = null;
-      return [frame];
+      return [notice, frame];
     },
     onContinuedElsewhere: (at) => {
       if (turn === null) return [];
