@@ -283,9 +283,8 @@ describe("ClaudeBridgeProtocol frame translator", () => {
       "coordinator",
       "observer",
       "observer-activity",
-      // Claude Code frames these two to the model as a non-user source.
+      // Claude Code frames a Slack ping to the model as a non-user source.
       "slack-ping",
-      "unclassified",
     ]) {
       assert.isFalse(isClaudePromptOfThePerson("looks typed", origin), origin);
     }
@@ -296,9 +295,17 @@ describe("ClaudeBridgeProtocol frame translator", () => {
       isClaudePromptOfThePerson("keep going", "plugin", { name: "ralph", asUser: true }),
     );
     assert.isTrue(isClaudePromptOfThePerson("/compact", "plugin", { name: "t3bridge" }));
-    // A mod that does not say, a plugin it does not name, and origins not
-    // known here: by how the prompt opens.
-    for (const origin of [null, "plugin", "sdk"]) {
+    // A mod that does not say, a plugin it does not name, origins not known
+    // here, and `unclassified`, which a prompt typed with no stamp also gets
+    // (2.1.302): by how the prompt opens. One stamped unclassified opens with
+    // the line Claude Code puts over it for the model.
+    assert.isFalse(
+      isClaudePromptOfThePerson(
+        "[MESSAGE FROM NON-USER SOURCE - NOT USER INPUT]\nidle",
+        "unclassified",
+      ),
+    );
+    for (const origin of [null, "plugin", "sdk", "unclassified"]) {
       assert.isTrue(isClaudePromptOfThePerson("fix the tests", origin));
       assert.isFalse(isClaudePromptOfThePerson(handBack, origin));
       assert.isFalse(

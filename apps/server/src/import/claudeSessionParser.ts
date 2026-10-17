@@ -328,20 +328,43 @@ const NON_USER_SOURCE_HEAD = "[MESSAGE FROM NON-USER SOURCE - NOT USER INPUT]\n"
 const PLUGIN_NAME_MAX = 24;
 
 /**
- * Who sent a user row, when its stamp says it was not the person: Claude
- * Code's own reading of a row's `origin` (2.1.302). Unstamped rows, the
- * person's (`human`), a follow-up to their own action in a dialog
- * (`auto-continuation`), a Slack turn Claude Code verified as theirs, and a
- * plugin's prompt sent as their words are the person's, and so are T3's own
- * rows, which carry what the person sent from T3. Every other kind, one not
- * known here too, is a source other than the person. Null for the person's.
+ * Stamps T3 reads a row by as it did before it read stamps, the way the live
+ * path does: a task's notice and a relay to a project by the task-notice
+ * rule, a schedule firing by its own line beside the row, the rest by their
+ * words.
+ */
+const ORIGINS_READ_AS_BEFORE: ReadonlySet<string> = new Set([
+  "task-notification",
+  "scheduled-trigger",
+  "peer-send-message",
+  "projects-relay",
+  "sdk",
+  "composer",
+  "bridge",
+]);
+/**
+ * Stamps whose rows T3 tells by how the harness framed them (another agent's
+ * message, a teammate's, a channel's): one framed another way reads as before.
+ */
+const ORIGINS_TOLD_BY_FRAMING: ReadonlySet<string> = new Set(["peer", "channel"]);
+
+/**
+ * Who sent a user row, when its stamp says it was not the person and T3
+ * shows the row by its stamp: Claude Code's own reading of a row's `origin`
+ * (2.1.302). Unstamped rows, the person's (`human`), a follow-up to their own
+ * action in a dialog (`auto-continuation`), a Slack turn Claude Code verified
+ * as theirs, and a plugin's prompt sent as their words are the person's, and
+ * so are T3's own rows, which carry what the person sent from T3. Null for
+ * those, and for a stamp T3 reads as before (see ORIGINS_READ_AS_BEFORE).
  */
 export function claudeRecordRowSource(entry: Record<string, unknown>): ClaudePromptSource | null {
   const origin = entry.origin;
   if (!isRecord(origin) || typeof origin.kind !== "string") return null;
   if (entry.verifiedSlackHumanTurn === true) return null;
   const { kind } = origin;
-  if (kind === "human" || kind === "auto-continuation") return null;
+  if (kind === "human" || kind === "auto-continuation" || ORIGINS_READ_AS_BEFORE.has(kind)) {
+    return null;
+  }
   if (kind === "plugin" && (origin.asUser === true || origin.name === CLAUDE_BRIDGE_PLUGIN_NAME)) {
     return null;
   }
@@ -352,6 +375,27 @@ export function claudeRecordRowSource(entry: Record<string, unknown>): ClaudePro
         ? readString(origin.from)
         : undefined;
   return name === undefined ? { kind } : { kind, name };
+}
+
+/**
+ * The notice a record row's prompt shows when it is not the person's line: a
+ * plan to implement as the terminal's box for it; a prompt its stamp says
+ * someone else sent as the terminal's line for it where the harness's
+ * framing gives one, else, for a stamp T3 does not tell by framing, the line
+ * for where it came from. Null for any other row.
+ */
+export function claudeRecordPromptNotification(
+  entry: Record<string, unknown>,
+  text: string,
+): OrchestrationV2Notification | null {
+  const plan = claudeRecordPlanNotification(entry);
+  if (plan !== null) return plan;
+  const source = claudeRecordRowSource(entry);
+  if (source === null) return null;
+  return (
+    claudeHarnessMessageNotification(text, source.name ?? null) ??
+    (ORIGINS_TOLD_BY_FRAMING.has(source.kind) ? null : claudeOriginNotification(source, text))
+  );
 }
 
 /**
@@ -782,16 +826,10 @@ export function parseClaudeSessionJsonl(content: string): ParsedCliSession {
       prompt &&
       (writtenBy === "task-notification" ||
         (writtenBy === undefined && isClaudeTaskNoticeText(rawText)));
-    // Any other prompt whose stamp says someone else sent it is not the
-    // person's either: the terminal's line for it where its words give one,
-    // else the line for where it came from.
-    const source = prompt && !taskNotice ? claudeRecordRowSource(entry) : null;
+    // A plan to implement, and a prompt whose stamp says someone else sent
+    // it, are not the person's line either.
     const sourceNotice =
-      (prompt && !taskNotice ? claudeRecordPlanNotification(entry) : null) ??
-      (source === null
-        ? null
-        : (claudeHarnessMessageNotification(rawText, source.name ?? null) ??
-          claudeOriginNotification(source, rawText)));
+      prompt && !taskNotice ? claudeRecordPromptNotification(entry, rawText) : null;
     messages.push({
       role:
         commandOutput !== undefined

@@ -6759,6 +6759,14 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           notification: { summary: "slack-ping", detail: "are you done?" },
         },
         {
+          detail: "[MESSAGE FROM NON-USER SOURCE - NOT USER INPUT]\nidle",
+          wake: { t3_wake_origin: "unclassified" },
+          notification: { summary: "unclassified", detail: "idle" },
+        },
+        // A prompt typed with no stamp reaches prompt.submit as unclassified
+        // too, and Claude Code draws it as the person's.
+        { detail: "fix the tests", wake: { t3_wake_origin: "unclassified" }, createdBy: "user" },
+        {
           detail: "Keep going.",
           wake: { t3_wake_origin: "plugin", t3_wake_sender: "ralph" },
           notification: { summary: "Prompt from the ralph plugin", detail: "Keep going." },

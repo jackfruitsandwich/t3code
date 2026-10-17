@@ -1482,7 +1482,10 @@ export function isClaudeHarnessPrompt(text: string): boolean {
     /^A message arrived from [^\n]*\n<channel source=/u.test(head) ||
     head.startsWith("<system-reminder>") ||
     head.startsWith("Stop hook feedback:") ||
-    head.startsWith("[Request interrupted")
+    head.startsWith("[Request interrupted") ||
+    // Claude Code's line over a prompt from a source it cannot name as the
+    // person (a Slack ping, an unclassified one), for the model.
+    head.startsWith("[MESSAGE FROM NON-USER SOURCE - NOT USER INPUT]\n")
   );
 }
 
@@ -1499,10 +1502,12 @@ const CLAUDE_ORIGINS_OF_THE_PERSON: ReadonlySet<string> = new Set([
 /**
  * Origins the session names as someone else's: a task's notice, a schedule
  * firing, another session or agent, a relayed channel, a coordinating
- * session, a Slack ping, one the session could not classify (Claude Code
- * frames those last two to the model as a non-user source). A plugin's is
- * decided by how it sent the prompt. The rest (`sdk`, a kind not known here)
- * are read by text.
+ * session, a Slack ping. A plugin's is decided by how it sent the prompt.
+ * The rest are read by text: `sdk`, a kind not known here, and
+ * `unclassified`, which `prompt.submit` also gives a prompt typed or queued
+ * with no stamp at all (2.1.302), one Claude Code draws and frames as the
+ * person's; a prompt stamped unclassified opens with the line Claude Code
+ * puts over it for the model.
  */
 const CLAUDE_ORIGINS_NOT_OF_THE_PERSON: ReadonlySet<string> = new Set([
   "task-notification",
@@ -1515,7 +1520,6 @@ const CLAUDE_ORIGINS_NOT_OF_THE_PERSON: ReadonlySet<string> = new Set([
   "observer",
   "observer-activity",
   "slack-ping",
-  "unclassified",
 ]);
 /**
  * Origins someone else's prompt has that T3 shows under the origin itself:

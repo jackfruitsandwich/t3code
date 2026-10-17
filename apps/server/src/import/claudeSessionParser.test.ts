@@ -567,7 +567,10 @@ describe("parseClaudeSessionJsonl", () => {
       [{ kind: "observer-activity" }, "3 tool calls since the last digest"],
       [{ kind: "observer", from: "watcher" }, "It is looping on the same test."],
       [{ kind: "plugin", name: "ralph" }, "Keep going."],
-      [{ kind: "channel", server: "telegram" }, "Is the build green yet?"],
+      [
+        { kind: "channel", server: "telegram" },
+        '<channel source="plugin:telegram:telegram" user="jack">\nIs the build green yet?\n</channel>',
+      ],
       [{ kind: "some-later-kind" }, "hello"],
     ];
     const parsed = parseClaudeSessionJsonl(
@@ -610,7 +613,14 @@ describe("parseClaudeSessionJsonl", () => {
           "user",
           { summary: "Prompt from the ralph plugin", outcome: "updated", detail: "Keep going." },
         ],
-        ["user", { summary: "channel", outcome: "updated", detail: "Is the build green yet?" }],
+        [
+          "user",
+          {
+            summary: "telegram · jack: Is the build green yet?",
+            outcome: "updated",
+            detail: "Is the build green yet?",
+          },
+        ],
         ["user", { summary: "some-later-kind", outcome: "updated", detail: "hello" }],
       ],
     );
@@ -628,6 +638,14 @@ describe("parseClaudeSessionJsonl", () => {
         // A Slack turn Claude Code verified as the person's.
         { origin: { kind: "slack-ping" }, verifiedSlackHumanTurn: true },
         {},
+        // Stamps read as before T3 read stamps, as the live path reads them:
+        // by their words, or shown another way.
+        { origin: { kind: "projects-relay" } },
+        { origin: { kind: "peer-send-message" } },
+        { origin: { kind: "sdk" } },
+        // Another agent's or a channel's message framed no way T3 knows.
+        { origin: { kind: "peer", name: "helper" } },
+        { origin: { kind: "channel", server: "telegram" } },
       ]
         .map((stamp, index) =>
           line(
@@ -643,8 +661,49 @@ describe("parseClaudeSessionJsonl", () => {
     );
     assert.deepEqual(
       parsed.messages.map((message) => [message.text, message.notice ?? null]),
-      [0, 1, 2, 3, 4, 5, 6].map((index) => [`prompt ${index}`, null]),
+      [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11].map((index) => [`prompt ${index}`, null]),
     );
+  });
+
+  // A schedule firing: the terminal draws its own line ("Running scheduled
+  // task …") and the stored prompt under it is no line of the person's
+  // (measured, 2.1.301: an isMeta row with no stamp). A row stamped
+  // `scheduled-trigger` is read as before too: the firing is one notice.
+  it("shows a schedule firing as its one line, whatever the stored prompt's row carries", () => {
+    const fire = {
+      type: "system",
+      subtype: "scheduled_task_fire",
+      uuid: "fire-1",
+      timestamp: "2026-07-01T10:01:00.000Z",
+      isMeta: false,
+      content: "Running scheduled task (Oct 15 6:31pm)",
+    };
+    for (const stored of [
+      { isMeta: true },
+      { origin: { kind: "scheduled-trigger" }, isMeta: true },
+      { origin: { kind: "scheduled-trigger" } },
+    ]) {
+      const parsed = parseClaudeSessionJsonl(
+        line(userEntry()) +
+          line(assistantEntry()) +
+          line(fire) +
+          line(
+            userEntry({
+              uuid: "stored-1",
+              timestamp: "2026-07-01T10:01:00.100Z",
+              message: { role: "user", content: "Reply with exactly: cr-4ceec5" },
+              ...stored,
+            }),
+          ),
+      );
+      const notices = [
+        ...(parsed.systemNotices ?? []).map((notice) => notice.text),
+        ...parsed.messages.flatMap((message) =>
+          message.notice === undefined ? [] : [message.notice.summary],
+        ),
+      ];
+      assert.deepEqual(notices, ["Running scheduled task (Oct 15 6:31pm)"], JSON.stringify(stored));
+    }
   });
 
   // Measured on the rig (2.1.302): accepting a plan with "clear context"
