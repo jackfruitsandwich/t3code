@@ -3064,107 +3064,121 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       }).pipe(Effect.scoped, Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
   );
 
-  it.effect("shows narration streamed as a thought as the message the terminal draws, in its place", () =>
-    Effect.gen(function* () {
-      const harness = yield* makeWakeHarness;
-      yield* harness.runtime.startTurn(
-        makeClaudeTestTurnInput({
-          threadId: harness.threadId,
-          providerThread: harness.providerThread,
-          now: yield* DateTime.now,
-          attemptId: RunAttemptId.make("narration-attempt"),
-          text: "Check the plan",
-          attachments: [],
-        }),
-      );
-      // A thinking block's signature with `kind` where Claude Code reads it (field 2 > 1 > 8).
-      const signatureOf = (kind: string): string => {
-        const field = (number: number, body: Buffer) =>
-          Buffer.concat([Buffer.from([(number << 3) | 2, body.length]), body]);
-        const header = Buffer.concat([
-          Buffer.from([0x08, 0x01]),
-          field(8, Buffer.from(kind, "utf8")),
-        ]);
-        return field(2, field(1, header)).toString("base64");
-      };
-      const stream = (event: unknown) =>
-        claudeSdkFrame({
-          type: "stream_event",
-          event,
-          parent_tool_use_id: null,
-          session_id: WAKE_NATIVE_SESSION,
-          uuid: "stream-frame",
-        });
-      const snapshot = (uuid: string, thinking: string, kind: string) =>
-        claudeSdkFrame({
-          type: "assistant",
-          uuid,
-          session_id: WAKE_NATIVE_SESSION,
-          parent_tool_use_id: null,
-          message: {
-            id: "narrating-message",
-            model: "claude-sonnet-4-6",
-            content: [{ type: "thinking", thinking, signature: signatureOf(kind) }],
-          },
-        });
-      // The same API message streams a thought, then narration, each block a
-      // thinking block whose signature says which it is only at its end.
-      const block = (index: number, text: string, kind: string) => [
-        stream({ type: "content_block_start", index, content_block: { type: "thinking", thinking: "" } }),
-        stream({ type: "content_block_delta", index, delta: { type: "thinking_delta", thinking: text } }),
-        stream({
-          type: "content_block_delta",
-          index,
-          delta: { type: "signature_delta", signature: signatureOf(kind) },
-        }),
-        stream({ type: "content_block_stop", index }),
-      ];
-      const frames = [
-        stream({ type: "message_start", message: { id: "narrating-message" } }),
-        ...block(0, "Which file first?", "thinking"),
-        snapshot("thought-row", "Which file first?", "thinking"),
-        ...block(1, "Reviewing the plan now.", "narration"),
-        snapshot("narration-row", "Reviewing the plan now.", "narration"),
-        makeResultFrame({ uuid: "narration-result", result: "" }),
-      ];
-      for (const frame of frames) yield* Queue.offer(harness.sdkMessages, frame);
-      yield* Queue.take(harness.terminalReceipts);
-      const latest = new Map(
-        harness.events.flatMap((event) =>
-          event.type === "turn_item.updated" ? [[event.turnItem.id, event.turnItem] as const] : [],
-        ),
-      );
-      const items = [...latest.values()].filter(
-        (item) => item.type === "reasoning" || item.type === "assistant_message",
-      );
-      // One thought and one message, in the order streamed; the narration is
-      // never left as a thought.
-      assert.deepEqual(
-        items
-          .toSorted((a, b) => a.ordinal - b.ordinal)
-          .map((item) => [item.type, "text" in item ? item.text : null]),
-        [
-          ["reasoning", "Which file first?"],
-          ["assistant_message", "Reviewing the plan now."],
-        ],
-      );
-      // The message is the narration row's own, as the record's reader names it.
-      const message = harness.events.flatMap((event) =>
-        event.type === "message.updated" && event.message.role === "assistant" ? [event.message] : [],
-      );
-      assert.deepEqual(
-        message.map((m) => [m.id, m.text]),
-        [
+  it.effect(
+    "shows narration streamed as a thought as the message the terminal draws, in its place",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        yield* harness.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("narration-attempt"),
+            text: "Check the plan",
+            attachments: [],
+          }),
+        );
+        // A thinking block's signature with `kind` where Claude Code reads it (field 2 > 1 > 8).
+        const signatureOf = (kind: string): string => {
+          const field = (number: number, body: Buffer) =>
+            Buffer.concat([Buffer.from([(number << 3) | 2, body.length]), body]);
+          const header = Buffer.concat([
+            Buffer.from([0x08, 0x01]),
+            field(8, Buffer.from(kind, "utf8")),
+          ]);
+          return field(2, field(1, header)).toString("base64");
+        };
+        const stream = (event: unknown) =>
+          claudeSdkFrame({
+            type: "stream_event",
+            event,
+            parent_tool_use_id: null,
+            session_id: WAKE_NATIVE_SESSION,
+            uuid: "stream-frame",
+          });
+        const snapshot = (uuid: string, thinking: string, kind: string) =>
+          claudeSdkFrame({
+            type: "assistant",
+            uuid,
+            session_id: WAKE_NATIVE_SESSION,
+            parent_tool_use_id: null,
+            message: {
+              id: "narrating-message",
+              model: "claude-sonnet-4-6",
+              content: [{ type: "thinking", thinking, signature: signatureOf(kind) }],
+            },
+          });
+        // The same API message streams a thought, then narration, each block a
+        // thinking block whose signature says which it is only at its end.
+        const block = (index: number, text: string, kind: string) => [
+          stream({
+            type: "content_block_start",
+            index,
+            content_block: { type: "thinking", thinking: "" },
+          }),
+          stream({
+            type: "content_block_delta",
+            index,
+            delta: { type: "thinking_delta", thinking: text },
+          }),
+          stream({
+            type: "content_block_delta",
+            index,
+            delta: { type: "signature_delta", signature: signatureOf(kind) },
+          }),
+          stream({ type: "content_block_stop", index }),
+        ];
+        const frames = [
+          stream({ type: "message_start", message: { id: "narrating-message" } }),
+          ...block(0, "Which file first?", "thinking"),
+          snapshot("thought-row", "Which file first?", "thinking"),
+          ...block(1, "Reviewing the plan now.", "narration"),
+          snapshot("narration-row", "Reviewing the plan now.", "narration"),
+          makeResultFrame({ uuid: "narration-result", result: "" }),
+        ];
+        for (const frame of frames) yield* Queue.offer(harness.sdkMessages, frame);
+        yield* Queue.take(harness.terminalReceipts);
+        const latest = new Map(
+          harness.events.flatMap((event) =>
+            event.type === "turn_item.updated"
+              ? [[event.turnItem.id, event.turnItem] as const]
+              : [],
+          ),
+        );
+        const items = [...latest.values()].filter(
+          (item) => item.type === "reasoning" || item.type === "assistant_message",
+        );
+        // One thought and one message, in the order streamed; the narration is
+        // never left as a thought.
+        assert.deepEqual(
+          items
+            .toSorted((a, b) => a.ordinal - b.ordinal)
+            .map((item) => [item.type, "text" in item ? item.text : null]),
           [
-            (yield* IdAllocator.IdAllocatorV2).derive.messageFromProviderItem({
-              driver: "claudeAgent",
-              nativeItemId: "narration-row",
-            }),
-            "Reviewing the plan now.",
+            ["reasoning", "Which file first?"],
+            ["assistant_message", "Reviewing the plan now."],
           ],
-        ],
-      );
-    }).pipe(Effect.scoped, Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+        );
+        // The message is the narration row's own, as the record's reader names it.
+        const message = harness.events.flatMap((event) =>
+          event.type === "message.updated" && event.message.role === "assistant"
+            ? [event.message]
+            : [],
+        );
+        assert.deepEqual(
+          message.map((m) => [m.id, m.text]),
+          [
+            [
+              (yield* IdAllocator.IdAllocatorV2).derive.messageFromProviderItem({
+                driver: ClaudeAdapterV2.CLAUDE_PROVIDER,
+                nativeItemId: "narration-row",
+              }),
+              "Reviewing the plan now.",
+            ],
+          ],
+        );
+      }).pipe(Effect.scoped, Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
   );
 
   it.effect.each(["cancelled", "denied", "permission_denied", undefined])(
