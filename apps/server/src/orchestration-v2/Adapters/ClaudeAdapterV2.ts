@@ -111,6 +111,7 @@ import {
   claudeBridgeWakeRequest,
   claudeBridgeQueuedPrompt,
   isClaudeBridgeNoticeFrame,
+  isClaudeNarrationBlock,
   isClaudeOriginShownByOrigin,
   isClaudePromptOfThePerson,
   threadModesForClaudePermissionMode,
@@ -5462,13 +5463,28 @@ export function makeClaudeAdapterV2(
           readonly text: string;
           /** The reply the thread shows from what the terminal drew, which this one is the record's row of. */
           readonly replacesNativeItemId?: string | null;
+          /**
+           * The thought this message streamed as (narration's thinking block): the
+           * message takes that row of the thread, in its place, and the thought ends.
+           */
+          readonly inPlaceOfThought?: string;
         }) {
           if (input.context.assistant.emittedNativeItemIds.has(input.nativeItemId)) {
             return;
           }
           input.context.assistant.emittedNativeItemIds.add(input.nativeItemId);
           const now = yield* DateTime.now;
-          const ordinal = yield* resolveItemOrdinal(input.context, input.nativeItemId);
+          const thought =
+            input.inPlaceOfThought === undefined
+              ? undefined
+              : input.context.reasoning.blocks.get(input.inPlaceOfThought);
+          // Whatever the thought still had to stream draws nothing now.
+          if (input.inPlaceOfThought !== undefined) {
+            input.context.reasoning.blocks.delete(input.inPlaceOfThought);
+          }
+          const ordinal =
+            thought?.ordinal ??
+            (yield* resolveItemOrdinal(input.context, input.inPlaceOfThought ?? input.nativeItemId));
           const artifacts = buildAssistantArtifacts({
             idAllocator,
             turnInput: input.context.input,
@@ -5476,9 +5492,19 @@ export function makeClaudeAdapterV2(
             nativeItemId: input.nativeItemId,
             text: input.text,
             ordinal,
-            startedAt: now,
+            startedAt: thought?.startedAt ?? now,
             completedAt: now,
           });
+          const turnItem =
+            input.inPlaceOfThought === undefined
+              ? artifacts.turnItem
+              : {
+                  ...artifacts.turnItem,
+                  id: idAllocator.derive.turnItemFromProviderItem({
+                    driver: CLAUDE_PROVIDER,
+                    nativeItemId: input.inPlaceOfThought,
+                  }),
+                };
           yield* Effect.all(
             [
               emitProviderEvent({
@@ -5494,7 +5520,7 @@ export function makeClaudeAdapterV2(
               emitProviderEvent({
                 type: "turn_item.updated",
                 driver: CLAUDE_PROVIDER,
-                turnItem: artifacts.turnItem,
+                turnItem,
                 ...(typeof input.replacesNativeItemId === "string"
                   ? {
                       replacesTurnItemId: idAllocator.derive.turnItemFromProviderItem({
@@ -6221,6 +6247,20 @@ export function makeClaudeAdapterV2(
               const index = context.reasoning.snapshotBlockIndex.get(message.message.id) ?? 0;
               context.reasoning.snapshotBlockIndex.set(message.message.id, index + 1);
               const itemId = `${message.message.id}:thinking:${index}`;
+              // Narration: what the model says to the person between tool calls
+              // comes as a thinking block, told from a thought only by its
+              // signature at the block's end. The terminal draws it as a message,
+              // and the record's reader shows it as one (claudeNarrationAsText):
+              // the thought it streamed as becomes that message, in its place.
+              if (isClaudeNarrationBlock(block)) {
+                yield* emitAssistantTextArtifacts({
+                  context,
+                  nativeItemId: message.uuid,
+                  text: block.thinking,
+                  inPlaceOfThought: itemId,
+                });
+                continue;
+              }
               yield* ensureReasoningBlock(context, itemId);
               const finalText = block.thinking || context.reasoning.blocks.get(itemId)?.text;
               yield* reasoningDeltas.complete({

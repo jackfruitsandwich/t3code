@@ -2409,6 +2409,46 @@ describe("ClaudeBridgeQueryRunner messages the terminal drew", () => {
       ]);
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
+
+  it.live("knows it after a thought of the same message, all three rows read at once", () =>
+    Effect.gen(function* () {
+      const bridge = yield* attach({ protocol: 2, bridgeCanUseTool: () => null, transcript: "" });
+      const fs = yield* FileSystem.FileSystem;
+      yield* bridge.handler(start(bridge), bridge.process);
+      yield* bridge.handler(drawn(bridge, "Reviewing the plan now."), bridge.process);
+      yield* fs.writeFileString(
+        bridge.process.session.transcriptPath,
+        row(
+          THOUGHT_ROW,
+          [{ type: "thinking", thinking: "Which first?", signature: signatureOf("thinking") }],
+          bridge.now,
+        ) +
+          row(
+            TEXT_ROW,
+            [
+              {
+                type: "thinking",
+                thinking: "Reviewing the plan now.",
+                signature: signatureOf("narration"),
+              },
+            ],
+            bridge.now,
+          ) +
+          toolUse(bridge.now),
+        { flag: "a" },
+      );
+      const frames = Array.from(
+        yield* bridge.session.messages.pipe(Stream.take(5), Stream.runCollect),
+      );
+      assert.deepStrictEqual(shape(frames), [
+        "user",
+        "system",
+        `${THOUGHT_ROW}:thinking`,
+        `${TEXT_ROW}:text`,
+        `${TOOL_ROW}:tool_use`,
+      ]);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
 });
 
 describe("ClaudeBridgeQueryRunner notices between turns", () => {
