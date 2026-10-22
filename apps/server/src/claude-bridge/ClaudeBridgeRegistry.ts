@@ -58,6 +58,7 @@ const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 /** A process dir whose heartbeat is this old is removed. */
 const DEAD_PROCESS_SWEEP_MS = 120_000;
 const INBOX_HISTORY = 64;
+const SENT_ANSWERS_KEPT = 256;
 /** How often a session whose record was not found is looked for again. */
 const TRANSCRIPT_LOOKUP_RETRY_MS = 5_000;
 /** How far back from the end of a record a turn's first row is searched for. */
@@ -222,6 +223,12 @@ export type ClaudeBridgeEventHandler = (
   process: ClaudeBridgeProcess,
 ) => Effect.Effect<void>;
 
+/** T3's answer to a call a session held for it. */
+export type ClaudeBridgeAnswerCommand = Extract<
+  ClaudeBridgeCommandBody,
+  { readonly type: "approval" | "answer" }
+>;
+
 /** Told of a session that has something to ask and nothing attached to ask it through. */
 export type ClaudeBridgeWaitingHandler = (
   process: ClaudeBridgeProcess,
@@ -294,6 +301,16 @@ export class ClaudeBridgeRegistry extends Context.Service<
       process: ClaudeBridgeProcess,
       body: ClaudeBridgeCommandBody,
     ) => Effect.Effect<string>;
+    /**
+     * The allow, refusal or answer T3 sent for a call the session held, while
+     * this server runs. The session can list the call, or ask it again, until
+     * its mod has taken that answer; a run attached meanwhile sends it again
+     * rather than asking the person twice.
+     */
+    readonly sentAnswer: (
+      process: ClaudeBridgeProcess,
+      toolUseId: string,
+    ) => Effect.Effect<ClaudeBridgeAnswerCommand | null>;
     /** Renews the attached marker the mod reads before holding an approval for T3. */
     /**
      * Says T3 is attached to the process. `tools` names where T3 answers the
@@ -866,6 +883,11 @@ const make = Effect.gen(function* () {
       Effect.map(parseClaudeBridgeSlashCommands),
     );
 
+  const sentAnswers = new Map<string, ClaudeBridgeAnswerCommand>();
+  const answerKey = (sid: string, toolUseId: string) => `${sid}:${toolUseId}`;
+  const sentAnswer = (entry: ClaudeBridgeProcess, toolUseId: string) =>
+    Effect.sync(() => sentAnswers.get(answerKey(entry.sid, toolUseId)) ?? null);
+
   // One writer per inbox (this server), so read-modify-write is safe; the
   // atomic rename keeps the mod from reading a half-written file.
   const send = (entry: ClaudeBridgeProcess, body: ClaudeBridgeCommandBody) =>
@@ -888,6 +910,13 @@ const make = Effect.gen(function* () {
         Effect.provideService(Path.Path, path),
         Effect.orDie,
       );
+      if ((body.type === "approval" || body.type === "answer") && body.decision !== "ask") {
+        const key = answerKey(entry.sid, body.toolUseId);
+        sentAnswers.delete(key);
+        sentAnswers.set(key, body);
+        const oldest = sentAnswers.keys().next();
+        if (sentAnswers.size > SENT_ANSWERS_KEPT && !oldest.done) sentAnswers.delete(oldest.value);
+      }
       return id;
     });
 
@@ -1044,7 +1073,11 @@ const make = Effect.gen(function* () {
     const { now, processes } = yield* listProcessesAsOfNow;
     for (const { entry, live } of processes) {
       yield* pumpProcess(entry, live);
-      const waiting = entry.session.waiting ?? [];
+      // A call T3 has answered stays listed until the mod takes the answer:
+      // no run is offered for it meanwhile.
+      const waiting = (entry.session.waiting ?? []).filter(
+        (request) => !sentAnswers.has(answerKey(entry.sid, request.toolUseId)),
+      );
       if (live && waiting.length > 0 && !subscribers.has(entry.sid)) {
         yield* Effect.forEach(waitingHandlers, (handler) => handler(entry, waiting), {
           discard: true,
@@ -1380,6 +1413,7 @@ const make = Effect.gen(function* () {
     readSession,
     readCommands,
     send,
+    sentAnswer,
     heartbeat,
     clearHeartbeat,
     subscribe,
@@ -1427,6 +1461,7 @@ export const layerTest = Layer.succeed(
     readSession: () => Effect.succeed(null),
     readCommands: () => Effect.succeed(null),
     send: () => Effect.succeed("unused"),
+    sentAnswer: () => Effect.succeed(null),
     heartbeat: () => Effect.void,
     clearHeartbeat: () => Effect.void,
     subscribe: () => Effect.void,

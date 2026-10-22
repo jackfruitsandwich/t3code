@@ -86,6 +86,7 @@ import {
   type ClaudeBridgeCommandBody,
   type ClaudeBridgeEvent,
   type ClaudeBridgeRequestTurnBy,
+  type ClaudeBridgeWaitingRequest,
 } from "../../claude-bridge/ClaudeBridgeProtocol.ts";
 import { claudeBetweenTurnsNotice } from "../../import/claudeSessionParser.ts";
 import { isRecord, parseJsonlLine } from "../../import/sessionImportTypes.ts";
@@ -1341,7 +1342,12 @@ export const layer: Layer.Layer<
       const adoptWaitingRequestTurn = Effect.gen(function* () {
         if (state.closed || translator.hasOpenTurn() || state.pendingPrompt !== null) return false;
         const live = (yield* registry.readSession(bridgeProcess)) ?? bridgeProcess.session;
-        const waiting = live.waiting ?? [];
+        const waiting: Array<ClaudeBridgeWaitingRequest> = [];
+        for (const request of live.waiting ?? []) {
+          if ((yield* registry.sentAnswer(bridgeProcess, request.toolUseId)) === null) {
+            waiting.push(request);
+          }
+        }
         if (live.activeTurn !== null || waiting.length === 0) return false;
         const now = yield* Clock.currentTimeMillis;
         const turnId = `request-${waiting[0]!.toolUseId}-${now}`;
@@ -1373,6 +1379,20 @@ export const layer: Layer.Layer<
           state.agentAsks.delete(toolUseId);
           state.unplaced.delete(toolUseId);
           return state.asking.size === 0 ? closeRequestTurn(false) : Effect.void;
+        });
+
+      /**
+       * Asked for a call T3 has answered already: the answer had not reached
+       * the session when the run that sent it ended. The same answer goes
+       * again, and the person is not asked twice.
+       */
+      const answerAgain = (toolUseId: string) =>
+        Effect.gen(function* () {
+          const answered = yield* registry.sentAnswer(bridgeProcess, toolUseId);
+          if (answered === null) return false;
+          yield* Effect.logInfo("claude-bridge.answer-sent-again", { sid, toolUseId });
+          yield* registry.send(bridgeProcess, answered);
+          return true;
         });
 
       /** A background subagent's request is shown in the run that is open. */
@@ -2034,6 +2054,7 @@ export const layer: Layer.Layer<
               return;
             }
             case "question.request": {
+              if (yield* answerAgain(event.toolUseId)) return;
               if (state.asking.has(event.toolUseId)) return;
               state.asking.add(event.toolUseId);
               yield* resolveQuestion(event).pipe(
@@ -2100,6 +2121,7 @@ export const layer: Layer.Layer<
               return;
             }
             case "approval.request": {
+              if (yield* answerAgain(event.toolUseId)) return;
               // Asked again for a call T3 is already asking about (the mod
               // lost sight of T3 for a moment and found it again): the
               // request the person sees stands, and its answer still goes.

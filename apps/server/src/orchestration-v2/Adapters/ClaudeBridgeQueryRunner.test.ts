@@ -117,6 +117,8 @@ const attach = (input: {
       },
     };
     const commands = yield* Queue.unbounded<ClaudeBridgeCommandBody>();
+    /** The answers sent for held calls, as the registry keeps them across runs. */
+    const sentAnswers = new Map<string, ClaudeBridgeRegistry.ClaudeBridgeAnswerCommand>();
     const recordChanges: Array<ClaudeBridgeRegistry.ClaudeBridgeRecordChange> = [];
     /** The rows the runner left to the record to place, by uuid. */
     const leftToRecord: Array<string> = [];
@@ -150,7 +152,17 @@ const attach = (input: {
             ? null
             : input.slashCommands.map((name) => ({ name, description: "", source: "builtin" })),
         ),
-      send: (_process, command) => Queue.offer(commands, command).pipe(Effect.as("command-1")),
+      send: (_process, command) =>
+        Effect.suspend(() => {
+          if (
+            (command.type === "approval" || command.type === "answer") &&
+            command.decision !== "ask"
+          ) {
+            sentAnswers.set(command.toolUseId, command);
+          }
+          return Queue.offer(commands, command).pipe(Effect.as("command-1"));
+        }),
+      sentAnswer: (_process, toolUseId) => Effect.sync(() => sentAnswers.get(toolUseId) ?? null),
       heartbeat: () => Effect.void,
       clearHeartbeat: () => Effect.void,
       subscribe: (_sid, handler) =>
@@ -377,6 +389,36 @@ describe("ClaudeBridgeQueryRunner permissions", () => {
         { tool: "Bash", input: { command: "pwd" }, toolUseId: "tool-1" },
       ]);
       assert.strictEqual(bridge.counts.sdkCalls, 0);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  // The answer had not reached the session when the run that sent it ended,
+  // and the session asks the run attached since.
+  it.effect("sends an answer T3 already gave again rather than asking the person twice", () =>
+    Effect.gen(function* () {
+      const bridge = yield* attach({
+        protocol: 2,
+        bridgeCanUseTool: () => ({ behavior: "deny", message: "User declined tool execution." }),
+      });
+      const ask = {
+        type: "approval.request" as const,
+        seq: 1,
+        at: bridge.now,
+        toolUseId: "tool-1",
+        tool: "Bash",
+        input: { command: "pwd" },
+      };
+      const refusal: ClaudeBridgeCommandBody = {
+        type: "approval",
+        toolUseId: "tool-1",
+        decision: "deny",
+        reason: "User declined tool execution.",
+      };
+      yield* bridge.handler(ask, bridge.process);
+      assert.deepStrictEqual(yield* Queue.take(bridge.commands), refusal);
+      yield* bridge.handler({ ...ask, seq: 2 }, bridge.process);
+      assert.deepStrictEqual(yield* Queue.take(bridge.commands), refusal);
+      assert.strictEqual(bridge.bridgeCalls.length, 1);
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 

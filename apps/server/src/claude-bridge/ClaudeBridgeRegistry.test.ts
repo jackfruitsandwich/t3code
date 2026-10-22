@@ -518,3 +518,59 @@ describe("a turn a typed command begins with what it printed", () => {
     }),
   );
 });
+
+describe("a call T3 has answered", () => {
+  // The session lists a call until its mod has taken T3's answer: a run that
+  // attached for it meanwhile would ask the person again.
+  it.live("offers no run for it while the session still lists it", () => {
+    const platform = Layer.mergeAll(NodeServices.layer, NodeCrypto.layer);
+    return Effect.scoped(
+      Effect.gen(function* () {
+        const registry = yield* ClaudeBridgeRegistry;
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const sid = "dddddddd-4444-4444-8444-444444444444";
+        const dir = path.join(registry.bridgeDir, "claude", sid, "instance-1");
+        yield* fs.makeDirectory(path.join(dir, "events"), { recursive: true });
+        yield* fs.writeFileString(
+          path.join(dir, "session.json"),
+          yield* encodeJson({
+            sid,
+            instanceId: "instance-1",
+            configDir: path.join(registry.bridgeDir, "home"),
+            heartbeatAt: yield* Clock.currentTimeMillis,
+            isInteractive: true,
+            waiting: [
+              { toolUseId: "tool-1", kind: "approval" },
+              { toolUseId: "tool-2", kind: "question" },
+            ],
+          }),
+        );
+        const live = yield* registry.findLiveProcess(sid);
+        assert.isNotNull(live);
+        if (live === null) return;
+        const allow = { type: "approval", toolUseId: "tool-1", decision: "allow" } as const;
+        yield* registry.send(live, allow);
+        const offered = yield* Deferred.make<ReadonlyArray<string>>();
+        yield* registry.onUnattachedRequest((_process, waiting) =>
+          Deferred.succeed(
+            offered,
+            waiting.map((request) => request.toolUseId),
+          ).pipe(Effect.asVoid),
+        );
+        assert.deepStrictEqual(yield* Deferred.await(offered), ["tool-2"]);
+        assert.deepStrictEqual(yield* registry.sentAnswer(live, "tool-1"), allow);
+        assert.isNull(yield* registry.sentAnswer(live, "tool-2"));
+      }),
+    ).pipe(
+      Effect.provide(
+        registryLayer.pipe(
+          Layer.provide(
+            ServerConfig.layerTest(process.cwd(), { prefix: "t3-bridge-registry-test-" }),
+          ),
+          Layer.provideMerge(platform),
+        ),
+      ),
+    );
+  });
+});
