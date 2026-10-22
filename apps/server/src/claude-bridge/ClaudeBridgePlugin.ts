@@ -230,7 +230,7 @@ const waiting = new Map()
 // the thread: what the box holds, and a count that moves with each change of
 // it, whoever made the change. T3's draft comes back as a 'draft' command.
 let draft = { text: '', rev: 0 }
-let draftRead = false
+let draftReading = false
 let draftPublishing = false
 // T3's draft that a dialog kept out of the box, tried again once it closes.
 let draftHeld = null
@@ -598,15 +598,23 @@ async function noteWaiting($, toolUseId, entry) {
 // draft is too long to share.
 async function sharedDraft($) {
   if (!(await terminalOpen($))) return null
-  if (!draftRead) {
-    draftRead = true
-    try {
-      const box = await $.prompt.read()
-      if (box && typeof box.text === 'string' && box.text !== draft.text) draft = { text: box.text, rev: draft.rev + 1 }
-    } catch {}
-  }
+  rereadDraft($)
   if (draftHeld) await takeDraft($, draftHeld)
   return draft.text.length > DRAFT_MAX_CHARS ? null : draft
+}
+
+// The person's edits reach the draft through prompt.edit at once, and a
+// prompt sent from here empties it. Any other change of the box (a clear, a
+// prompt recalled from history) is read here at each heartbeat: Claude Code
+// before 2.1.300 has no event for those, and will not load a hooks module
+// that names one (measured on 2.1.299). Nothing waits for the read.
+function rereadDraft($) {
+  if (draftReading) return
+  draftReading = true
+  Promise.resolve()
+    .then(() => $.prompt.read())
+    .then((box) => { if (box && typeof box.text === 'string') noteDraft($, box.text) }, () => {})
+    .finally(() => { draftReading = false })
 }
 
 // The box changed (the person typed, a submit or a clear emptied it, T3's
@@ -614,7 +622,6 @@ async function sharedDraft($) {
 function noteDraft($, text) {
   if (typeof text !== 'string' || text === draft.text) return
   draft = { text: text, rev: draft.rev + 1 }
-  draftRead = true
   if (draftPublishing) return
   draftPublishing = true
   $.clock.after(DRAFT_PUBLISH_MS, () => {
@@ -1527,16 +1534,12 @@ export function register(on) {
   })
 
   // Stale-tip guard. Applies to typed prompts and to prompts T3 submits here.
-  // Every change of the prompt box, to share the draft with T3. The person's
-  // edits pass as they came; this only reads the box they leave.
+  // The person's edits of the prompt box, to share the draft with T3. They
+  // pass as they came; this only reads the box they leave.
   on('prompt.edit', async ($, e, next) => {
     const box = await next(e)
     try { if (!passive && box) noteDraft($, box.text) } catch {}
     return box
-  })
-  on('prompt.change', async ($, e, next) => {
-    try { if (!passive) noteDraft($, e.text) } catch {}
-    return next(e)
   })
 
   on('prompt.submit', async ($, e, next) => {
@@ -1558,7 +1561,10 @@ export function register(on) {
     }
     // A plain prompt: the turn it starts is no command's.
     if (typeof e.text === 'string' && e.text.trim().charAt(0) !== '/') commandPending = false
-    return next(e)
+    const result = await next(e)
+    // Sent from the box: the box is empty now.
+    if (!passive && e.origin && e.origin.kind === 'composer' && !(result && result.drop)) noteDraft($, '')
+    return result
   })
 
   // Since Claude Code 2.1.299 a subagent's run raises turn.start too

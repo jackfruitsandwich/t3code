@@ -75,7 +75,8 @@ const loadMod = (
       fill: (input) => {
         const { text, mode } = input as { text: string; mode?: string };
         fills.push(input);
-        if (box.dialog) return { isFilled: false, refusal: "dialog", text: box.text, cursor: box.cursor };
+        if (box.dialog)
+          return { isFilled: false, refusal: "dialog", text: box.text, cursor: box.cursor };
         if (mode === "insert") {
           box.text = box.text.slice(0, box.cursor) + text + box.text.slice(box.cursor);
           box.cursor += text.length;
@@ -419,9 +420,13 @@ describe("the mod's share of the prompt box's draft", () => {
   const type = async (mod: Awaited<ReturnType<typeof started>>, text: string) => {
     mod.box.text = text;
     mod.box.cursor = text.length;
-    await mod.fire("prompt.edit", { origin: { kind: "composer" } }, {
-      next: async () => ({ text, cursor: text.length }),
-    });
+    await mod.fire(
+      "prompt.edit",
+      { origin: { kind: "composer" } },
+      {
+        next: async () => ({ text, cursor: text.length }),
+      },
+    );
   };
 
   it("lists the draft and each change of it, a submit's emptying of the box included", async () => {
@@ -431,9 +436,21 @@ describe("the mod's share of the prompt box's draft", () => {
     await mod.settle();
     assert.deepEqual(mod.sessionFile().draft, { text: "fix the bug", rev: 2 });
     mod.box.text = "";
-    await mod.fire("prompt.change", { text: "", cursor: 0, origin: { kind: "clear" } });
+    await mod.fire("prompt.submit", { text: "fix the bug", origin: { kind: "composer" } });
     await mod.settle();
     assert.deepEqual(mod.sessionFile().draft, { text: "", rev: 3 });
+  });
+
+  // A prompt recalled from history, a clear: Claude Code before 2.1.300 has
+  // no event for a change that is not an edit.
+  it("lists a change of the box no edit made at the next heartbeat", async () => {
+    const mod = await started();
+    await type(mod, "fix the bug");
+    await mod.settle();
+    mod.box.text = "an older prompt";
+    await mod.beat();
+    await mod.settle();
+    assert.deepEqual(mod.sessionFile().draft, { text: "an older prompt", rev: 2 });
   });
 
   it("reads a draft the box already held when the mod loaded", async () => {
