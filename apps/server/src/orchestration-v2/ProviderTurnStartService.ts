@@ -1096,12 +1096,20 @@ export const layer: Layer.Layer<
         ...runningProviderThread,
         contextUsage: handoffUsage,
       };
+      // A run picked back up after a restart was running on the provider when
+      // the pick-up failed: its prompt is in the native thread already.
+      const recoveryAttemptIds = new Set(
+        projection.attempts
+          .filter((source) => source.reason === "provider_recovery")
+          .map((source) => source.id),
+      );
       const missedRuns = projection.runs.filter(
         (source) =>
           source.ordinal < run.ordinal &&
           source.providerThreadId === providerThread.id &&
           (source.status === "failed" || source.status === "interrupted") &&
-          !deliveredAttemptIds.has(source.activeAttemptId),
+          !deliveredAttemptIds.has(source.activeAttemptId) &&
+          (source.activeAttemptId === null || !recoveryAttemptIds.has(source.activeAttemptId)),
       );
       const missedRunIds = new Set(missedRuns.map((source) => source.id));
       const missedItems =

@@ -292,20 +292,20 @@ describe("a turn the session was running when the server came up", () => {
   const at = "2026-10-14T10:00:00.000Z";
   const encodePayload = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 
-  /** What is offered for session "live", which T3 holds and which runs a turn at startup (or not). */
-  const startupOffer = (running = true) =>
+  /** Thread "thread-<sid>", which holds Claude session `sid`. */
+  const threadHolding = (sid: string) =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
       const payload = yield* encodePayload({
         driver: CLAUDE_PROVIDER,
-        nativeThreadRef: { nativeId: "live" },
+        nativeThreadRef: { nativeId: sid },
       });
       yield* sql`
         INSERT INTO orchestration_v2_projection_threads (
           thread_id, project_id, title, default_provider, runtime_mode, interaction_mode,
           created_at, updated_at, payload_json
         ) VALUES (
-          'thread-live', 'project-1', 'live', ${CLAUDE_PROVIDER}, 'full-access', 'default',
+          ${`thread-${sid}`}, 'project-1', ${sid}, ${CLAUDE_PROVIDER}, 'full-access', 'default',
           ${at}, ${at}, '{}'
         )
       `;
@@ -313,20 +313,40 @@ describe("a turn the session was running when the server came up", () => {
         INSERT INTO orchestration_v2_projection_provider_threads (
           provider_thread_id, thread_id, provider, status, updated_at, payload_json
         ) VALUES (
-          'provider-thread-live', 'thread-live', ${CLAUDE_PROVIDER}, 'idle', ${at}, ${payload}
+          ${`provider-thread-${sid}`}, ${`thread-${sid}`}, ${CLAUDE_PROVIDER}, 'idle', ${at}, ${payload}
         )
       `;
-      const session = parseClaudeBridgeSessionFile({
-        sid: "live",
-        instanceId: "instance-live",
-        heartbeatAt: 1_750_000_000_000,
-        isInteractive: true,
-        transcriptPath: "/records/live.jsonl",
-        ...(running
-          ? { activeTurn: { turnId: "turn-1", startedAt: 1_749_999_990_000, transcriptOffset: 0 } }
-          : {}),
+    });
+
+  /**
+   * The first `count` offers the startup scan makes for these live sessions;
+   * `held` sessions have a thread of their own, and `continuedIn` names the
+   * live sessions each one carried on from.
+   */
+  const startupOffers = (input: {
+    readonly held: ReadonlyArray<string>;
+    readonly live: ReadonlyArray<{ readonly sid: string; readonly running: boolean }>;
+    readonly continuedIn?: Readonly<Record<string, ReadonlyArray<string>>>;
+    readonly count: number;
+  }) =>
+    Effect.gen(function* () {
+      for (const sid of input.held) yield* threadHolding(sid);
+      const live = input.live.map(({ sid, running }) => {
+        const session = parseClaudeBridgeSessionFile({
+          sid,
+          instanceId: `instance-${sid}`,
+          heartbeatAt: 1_750_000_000_000,
+          isInteractive: true,
+          transcriptPath: `/records/${sid}.jsonl`,
+          ...(running
+            ? {
+                activeTurn: { turnId: "turn-1", startedAt: 1_749_999_990_000, transcriptOffset: 0 },
+              }
+            : {}),
+        });
+        assert.isNotNull(session);
+        return { sid, instanceId: `instance-${sid}`, dir: `/bridge/${sid}`, session: session! };
       });
-      assert.isNotNull(session);
       const offered =
         yield* Queue.unbounded<ProviderContinuationRequests.ProviderContinuationRequest>();
       const none = yield* ClaudeBridgeRegistry.ClaudeBridgeRegistry.pipe(
@@ -337,9 +357,14 @@ describe("a turn the session was running when the server came up", () => {
           ClaudeBridgeRegistry.ClaudeBridgeRegistry,
           ClaudeBridgeRegistry.ClaudeBridgeRegistry.of({
             ...none,
-            listLiveProcesses: Effect.succeed([
-              { sid: "live", instanceId: "instance-live", dir: "/bridge/live", session: session! },
-            ]),
+            listLiveProcesses: Effect.succeed(live),
+            liveSessionsContinuedIn: (sid) =>
+              Effect.succeed(
+                (input.continuedIn?.[sid] ?? []).map((earlier) => ({
+                  sid: earlier,
+                  transcriptPath: `/records/${earlier}.jsonl`,
+                })),
+              ),
           }),
         ),
         Effect.provideService(
@@ -367,8 +392,20 @@ describe("a turn the session was running when the server came up", () => {
           take: Effect.never,
         }),
       );
-      return yield* Queue.take(offered).pipe(Effect.timeoutOption("2 seconds"));
+      const offers: Array<ProviderContinuationRequests.ProviderContinuationRequest> = [];
+      for (let i = 0; i < input.count; i += 1) {
+        const offer = yield* Queue.take(offered).pipe(Effect.timeoutOption("2 seconds"));
+        if (Option.isNone(offer)) break;
+        offers.push(offer.value);
+      }
+      return offers;
     }).pipe(Effect.scoped, Effect.provide(SqlitePersistence.layerMemory));
+
+  /** What is offered for session "live", which T3 holds and which runs a turn at startup (or not). */
+  const startupOffer = (running = true) =>
+    startupOffers({ held: ["live"], live: [{ sid: "live", running }], count: 1 }).pipe(
+      Effect.map((offers) => Option.fromNullishOr(offers[0])),
+    );
 
   it.effect("is offered for the run recovery left open to pick back up", () =>
     Effect.gen(function* () {
@@ -388,6 +425,32 @@ describe("a turn the session was running when the server came up", () => {
       assert.deepStrictEqual(
         [offer?.threadId, offer?.providerThreadId, offer?.reattachRun, offer?.reattachOnly],
         ["thread-live", "provider-thread-live", true, true],
+      );
+    }),
+  );
+
+  // bgafter (Oct 22): the session was sent to the background and went on
+  // under a new id while the process it left was still live; the scan picked
+  // the thread's run up for both, and the second attempt could not start over
+  // the first.
+  it.effect("is offered once for a thread two live sessions lead to, by the one running", () =>
+    Effect.gen(function* () {
+      const offers = yield* startupOffers({
+        held: ["live", "other"],
+        live: [
+          { sid: "live", running: false },
+          { sid: "moved", running: true },
+          { sid: "other", running: false },
+        ],
+        continuedIn: { moved: ["live"] },
+        count: 2,
+      });
+      assert.deepStrictEqual(
+        offers.map((offer) => [offer.threadId, offer.reattachRun, offer.reattachOnly]),
+        [
+          ["thread-live", true, undefined],
+          ["thread-other", true, true],
+        ],
       );
     }),
   );

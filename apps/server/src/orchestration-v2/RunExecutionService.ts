@@ -1403,7 +1403,7 @@ export const layer: Layer.Layer<
             Effect.catchCause((cause) =>
               Effect.logError("orchestration V2 provider turn start failed", {
                 runId: input.run.id,
-                cause,
+                cause: Cause.pretty(cause),
               }).pipe(
                 Effect.andThen(Fiber.interrupt(providerEventFiber)),
                 Effect.andThen(Ref.get(latestProviderThread)),

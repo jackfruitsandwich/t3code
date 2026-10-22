@@ -414,6 +414,10 @@ const make = Effect.gen(function* () {
   // session running no turn by now may have ended one while this server came
   // up: a run recovery kept open for it picks up and closes, and with none
   // nothing is started.
+  // One thread is picked up once: a session sent to the background goes on
+  // under a new id while the process it left can still be live, and both lead
+  // to the thread. The one running the turn goes first; a second pick-up
+  // would start another attempt over the first one's.
   // Forked: recovery runs after the layers are built, and the offer waits on it.
   yield* Effect.gen(function* () {
     yield* afterStartupRecovery;
@@ -422,12 +426,27 @@ const make = Effect.gen(function* () {
       live: live.length,
       running: live.filter((entry) => entry.session.activeTurn !== null).map((entry) => entry.sid),
     });
-    for (const entry of live) {
+    const pickedUp = new Set<string>();
+    const runningFirst = [
+      ...live.filter((entry) => entry.session.activeTurn !== null),
+      ...live.filter((entry) => entry.session.activeTurn === null),
+    ];
+    for (const entry of runningFirst) {
+      const thread = yield* threadOf(entry);
+      if (thread !== null) {
+        if (pickedUp.has(thread.threadId)) {
+          yield* Effect.logInfo("claude-bridge.startup-scan-thread-taken", {
+            sid: entry.sid,
+            threadId: thread.threadId,
+          });
+          continue;
+        }
+        pickedUp.add(thread.threadId);
+      }
       if (entry.session.activeTurn !== null) {
         yield* offerTurn(entry, { ...entry.session.activeTurn, text: "" }, true);
         continue;
       }
-      const thread = yield* threadOf(entry);
       if (thread === null) continue;
       yield* continuations.offer({
         threadId: thread.threadId,
