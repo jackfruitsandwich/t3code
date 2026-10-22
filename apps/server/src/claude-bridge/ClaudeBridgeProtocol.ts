@@ -31,7 +31,7 @@ import type {
 import { isRecord, parseJsonlLine } from "../import/sessionImportTypes.ts";
 
 export const CLAUDE_BRIDGE_PROTOCOL_VERSION = 2;
-export const CLAUDE_BRIDGE_MOD_VERSION = "0.3.34";
+export const CLAUDE_BRIDGE_MOD_VERSION = "0.3.35";
 /**
  * The first protocol whose mod runs slash commands, answers questions with
  * their answers and reports the session's own commands. A process still on an
@@ -126,6 +126,11 @@ export interface ClaudeBridgeWaitingRequest {
  * What Claude Code's status line counts for a session (`$.session.usage()`):
  * the context window's fill, the account's rate-limit windows and the cost.
  */
+export interface ClaudeBridgeDraft {
+  readonly text: string;
+  readonly rev: number;
+}
+
 export interface ClaudeBridgeSessionUsage {
   readonly context: {
     /** Input tokens the last response was answered over; absent until the live window's first response. */
@@ -215,6 +220,12 @@ export interface ClaudeBridgeSessionFile {
    * for. Absent when nothing waits, and from a mod that does not list it.
    */
   readonly waiting?: ReadonlyArray<ClaudeBridgeWaitingRequest>;
+  /**
+   * The unsent draft in the terminal's prompt box and a count that moves with
+   * each change of it. Null where no terminal draws a box or the draft is too
+   * long to share; absent from a mod before 0.3.35.
+   */
+  readonly draft?: ClaudeBridgeDraft | null;
   readonly modVersion: string;
   readonly ended: {
     readonly reason: string;
@@ -279,6 +290,12 @@ export type ClaudeBridgeCommandBody =
       readonly answers?: Readonly<Record<string, string>>;
       readonly reason?: string;
     }
+  /**
+   * T3's unsent draft for the terminal's prompt box. The box takes it only
+   * while it still holds `base`, the draft both last shared; a draft typed in
+   * the terminal since stays.
+   */
+  | { readonly type: "draft"; readonly text: string; readonly base: string }
   /** One row of the session's `/config`, changed as if the person picked it there. */
   | { readonly type: "config"; readonly key: string; readonly value: string | boolean | number }
   | { readonly type: "interrupt"; readonly turnId?: string };
@@ -635,6 +652,7 @@ export function parseClaudeBridgeSessionFile(value: unknown): ClaudeBridgeSessio
         : value.isInteractive === true,
     activeTurn: parsedTurn,
     ...(waiting.length === 0 ? {} : { waiting }),
+    ...(value.draft === undefined ? {} : { draft: readDraft(value.draft) }),
     modVersion: readOptionalString(value.modVersion) ?? "",
     ended:
       ended === null
@@ -646,6 +664,11 @@ export function parseClaudeBridgeSessionFile(value: unknown): ClaudeBridgeSessio
           },
   };
 }
+
+const readDraft = (value: unknown): ClaudeBridgeDraft | null =>
+  isRecord(value) && typeof value.text === "string" && readNumber(value.rev) !== undefined
+    ? { text: value.text, rev: readNumber(value.rev) ?? 0 }
+    : null;
 
 export function isClaudeBridgeSessionLive(session: ClaudeBridgeSessionFile, now: number): boolean {
   return session.ended === null && now - session.heartbeatAt < CLAUDE_BRIDGE_LIVE_WINDOW_MS;

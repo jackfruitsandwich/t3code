@@ -100,6 +100,12 @@ import {
   WorktreeSetupSubscribeInput,
 } from "./worktreeSetup.ts";
 import {
+  SessionDraftOfferInput,
+  SessionDraftOfferResult,
+  SessionDraftStreamEvent,
+  SessionDraftSubscribeInput,
+} from "./sessionDraft.ts";
+import {
   GitActionProgressEvent,
   VcsSwitchRefInput,
   VcsSwitchRefResult,
@@ -529,6 +535,8 @@ export const WS_METHODS = {
   subscribeVcsStatus: "subscribeVcsStatus",
   subscribeWorktreeSetup: "subscribeWorktreeSetup",
   worktreeSetupCancel: "worktreeSetup.cancel",
+  subscribeSessionDraft: "subscribeSessionDraft",
+  sessionDraftOffer: "sessionDraft.offer",
   subscribeTerminalEvents: "subscribeTerminalEvents",
   subscribeTerminalMetadata: "subscribeTerminalMetadata",
   subscribePreviewEvents: "subscribePreviewEvents",
@@ -1267,6 +1275,19 @@ const WsWorktreeSetupCancelRpc = Rpc.make(WS_METHODS.worktreeSetupCancel, {
   error: EnvironmentAuthorizationError,
 });
 
+const WsSubscribeSessionDraftRpc = Rpc.make(WS_METHODS.subscribeSessionDraft, {
+  payload: SessionDraftSubscribeInput,
+  success: SessionDraftStreamEvent,
+  error: EnvironmentAuthorizationError,
+  stream: true,
+});
+
+const WsSessionDraftOfferRpc = Rpc.make(WS_METHODS.sessionDraftOffer, {
+  payload: SessionDraftOfferInput,
+  success: SessionDraftOfferResult,
+  error: EnvironmentAuthorizationError,
+});
+
 const WsGitRunStackedActionRpc = Rpc.make(WS_METHODS.gitRunStackedAction, {
   payload: GitRunStackedActionInput,
   success: GitActionProgressEvent,
@@ -1850,6 +1871,8 @@ export const WsRpcGroup = RpcGroup.make(
   WsSubscribeVcsStatusRpc,
   WsSubscribeWorktreeSetupRpc,
   WsWorktreeSetupCancelRpc,
+  WsSubscribeSessionDraftRpc,
+  WsSessionDraftOfferRpc,
   WsVcsPullRpc,
   WsVcsRefreshStatusRpc,
   WsGitRunStackedActionRpc,

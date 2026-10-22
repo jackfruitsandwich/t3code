@@ -9,7 +9,9 @@ type Hook = ($: unknown, e: Record<string, unknown>, next: (e: unknown) => unkno
  * The mod as Claude Code loads it, with a stand-in for its `$`: every call the
  * mod makes resolves to nothing unless named here, and what it writes is kept.
  */
-const loadMod = (session: { readonly usage?: unknown } = {}) => {
+const loadMod = (
+  session: { readonly usage?: unknown; readonly surfaces?: ReadonlyArray<string> } = {},
+) => {
   const register = new Function(
     `${claudeBridgeRegisterJs([]).replace("export function register(on)", "function register(on)")}\nreturn register`,
   )() as (on: (event: string, ...rest: ReadonlyArray<unknown>) => void) => void;
@@ -24,6 +26,11 @@ const loadMod = (session: { readonly usage?: unknown } = {}) => {
   const writes = new Map<string, string>();
   const timers = new Map<number, () => void>();
   const submits: Array<unknown> = [];
+  const afters: Array<() => void> = [];
+  // The terminal's prompt box: what the person has typed, where the cursor is,
+  // and whether a dialog holds the keys.
+  const box = { text: "", cursor: 0, dialog: false };
+  const fills: Array<unknown> = [];
   const named: Record<string, Record<string, (...args: ReadonlyArray<unknown>) => unknown>> = {
     env: { get: (key) => (key === "T3CODE_BRIDGE_DIR" ? "/bridge" : undefined) },
     fs: {
@@ -42,7 +49,7 @@ const loadMod = (session: { readonly usage?: unknown } = {}) => {
     },
     session: {
       id: () => "session-1",
-      surfaces: () => ["terminal"],
+      surfaces: () => session.surfaces ?? ["terminal"],
       model: () => "claude-opus-5-5",
       usage: () => {
         if (session.usage === undefined) throw new Error("not bound");
@@ -55,11 +62,28 @@ const loadMod = (session: { readonly usage?: unknown } = {}) => {
       every: (ms, tick) => {
         timers.set(Number(ms), tick as () => void);
       },
+      after: (_ms, run) => {
+        afters.push(run as () => void);
+      },
     },
     prompt: {
       submit: (input) => {
         submits.push(input);
         return {};
+      },
+      read: () => ({ text: box.text, cursor: box.cursor }),
+      fill: (input) => {
+        const { text, mode } = input as { text: string; mode?: string };
+        fills.push(input);
+        if (box.dialog) return { isFilled: false, refusal: "dialog", text: box.text, cursor: box.cursor };
+        if (mode === "insert") {
+          box.text = box.text.slice(0, box.cursor) + text + box.text.slice(box.cursor);
+          box.cursor += text.length;
+        } else {
+          box.text = mode === "append" ? box.text + text : text;
+          box.cursor = box.text.length;
+        }
+        return { isFilled: true, text: box.text, cursor: box.cursor };
       },
     },
     // A wait gives way to the test, as a second does to everything else.
@@ -120,7 +144,17 @@ const loadMod = (session: { readonly usage?: unknown } = {}) => {
     const path = [...writes.keys()].find((key) => key.endsWith("/session.json")) ?? "";
     writes.set(path.replace(/session\.json$/, name), JSON.stringify(value));
   };
-  return { fire, sessionFile, events, send, submits, put };
+  /** What the mod set to run soon (a session file write after a change of the box) runs now. */
+  const settle = async () => {
+    while (afters.length > 0) afters.shift()?.();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  };
+  /** The mod's next heartbeat. */
+  const beat = async () => {
+    timers.get(3000)?.();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  };
+  return { fire, sessionFile, events, send, submits, put, box, fills, settle, beat };
 };
 
 const effort = (level: string) => ({ effort: { level } });
@@ -372,5 +406,79 @@ describe("the mod's report of another plugin's lines", () => {
       ["Clock: it is shown in the Claude Code terminal only.", false],
       ["clock: it is shown in the Claude Code terminal only.", false],
     ]);
+  });
+});
+
+describe("the mod's share of the prompt box's draft", () => {
+  const started = async (session: { readonly surfaces?: ReadonlyArray<string> } = {}) => {
+    const mod = loadMod(session);
+    await mod.fire("session.start", { cwd: "/repo", surface: "terminal", isInteractive: true });
+    return mod;
+  };
+  /** The person types into the box: the edit goes through the mod's hook as Claude Code makes it. */
+  const type = async (mod: Awaited<ReturnType<typeof started>>, text: string) => {
+    mod.box.text = text;
+    mod.box.cursor = text.length;
+    await mod.fire("prompt.edit", { origin: { kind: "composer" } }, {
+      next: async () => ({ text, cursor: text.length }),
+    });
+  };
+
+  it("lists the draft and each change of it, a submit's emptying of the box included", async () => {
+    const mod = await started();
+    await type(mod, "fix the");
+    await type(mod, "fix the bug");
+    await mod.settle();
+    assert.deepEqual(mod.sessionFile().draft, { text: "fix the bug", rev: 2 });
+    mod.box.text = "";
+    await mod.fire("prompt.change", { text: "", cursor: 0, origin: { kind: "clear" } });
+    await mod.settle();
+    assert.deepEqual(mod.sessionFile().draft, { text: "", rev: 3 });
+  });
+
+  it("reads a draft the box already held when the mod loaded", async () => {
+    const mod = loadMod();
+    mod.box.text = "half typed";
+    await mod.fire("session.start", { cwd: "/repo", surface: "terminal", isInteractive: true });
+    await mod.beat();
+    assert.deepEqual(mod.sessionFile().draft, { text: "half typed", rev: 1 });
+  });
+
+  it("shares no draft where no terminal draws a box", async () => {
+    const mod = await started({ surfaces: [] });
+    await mod.beat();
+    assert.isNull(mod.sessionFile().draft);
+  });
+
+  it("puts T3's draft in the box while it holds what both last shared, typed at the cursor as typed", async () => {
+    const mod = await started();
+    await type(mod, "fix ");
+    await mod.send({ type: "draft", text: "fix the bug", base: "fix " });
+    assert.deepEqual(mod.fills, [{ text: "the bug", mode: "insert" }]);
+    assert.include(mod.box, { text: "fix the bug", cursor: 11 });
+    // T3 sent it: the box is emptied there, and here.
+    await mod.send({ type: "draft", text: "", base: "fix the bug" });
+    assert.include(mod.box, { text: "", cursor: 0 });
+    await mod.settle();
+    assert.include(mod.sessionFile().draft as object, { text: "" });
+  });
+
+  it("keeps a draft typed here since what both last shared, and the cursor where the person left it", async () => {
+    const mod = await started();
+    await type(mod, "fix the bug now");
+    mod.box.cursor = 3;
+    await mod.send({ type: "draft", text: "fix the bug please", base: "fix the bug" });
+    assert.deepEqual(mod.fills, []);
+    assert.include(mod.box, { text: "fix the bug now", cursor: 3 });
+  });
+
+  it("holds T3's draft while a dialog has the keys, and puts it in once the dialog is closed", async () => {
+    const mod = await started();
+    mod.box.dialog = true;
+    await mod.send({ type: "draft", text: "next step", base: "" });
+    assert.equal(mod.box.text, "");
+    mod.box.dialog = false;
+    await mod.beat();
+    assert.equal(mod.box.text, "next step");
   });
 });

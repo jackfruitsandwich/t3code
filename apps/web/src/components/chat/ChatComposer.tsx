@@ -1134,6 +1134,7 @@ import { useDelayedStatus } from "../../hooks/useDelayedStatus";
 import { useMediaQuery } from "../../hooks/useMediaQuery";
 import { usePanelAnimationSettings } from "../../panelAnimations";
 import { useAtomCommand } from "../../state/use-atom-command";
+import { useSessionDraftShare } from "./useSessionDraftShare";
 import { serverEnvironment } from "../../state/server";
 import type { ReviewCommentContext } from "../../reviewCommentContext";
 
@@ -3042,6 +3043,26 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     },
     [composerDraftTarget, setComposerDraftPrompt],
   );
+  const sessionDraftBanner = useSessionDraftShare({
+    environmentId,
+    threadId:
+      routeKind === "server" && selectedProvider === "claudeAgent" && !isEditingQueuedMessage
+        ? activeThreadId
+        : null,
+    prompt,
+    plain:
+      composerDraft.images.length === 0 &&
+      composerDraft.files.length === 0 &&
+      composerTerminalContexts.length === 0 &&
+      composerPreviewAnnotations.length === 0 &&
+      composerReviewComments.length === 0 &&
+      composerThreadContexts.length === 0 &&
+      collectInlineContextIds(prompt).length === 0,
+    setPrompt,
+  });
+  const bannerItems = sessionDraftBanner
+    ? [...props.bannerItems, sessionDraftBanner]
+    : props.bannerItems;
 
   const addComposerImage = useCallback(
     (image: ComposerImageAttachment) => addComposerDraftImages(attachmentDraftTarget, [image]),
@@ -5125,7 +5146,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   const toggleTasksDrawer = useCallback(() => {
     setIsTasksDrawerOpen((open) => !open);
   }, []);
-  const hasBannerItems = props.bannerItems.length > 0;
+  const hasBannerItems = bannerItems.length > 0;
   const hasBlockingComposerTopDrawer =
     activePendingApproval !== null || pendingUserInputs.length > 0;
   const showInlineTasksBadge =
@@ -5626,8 +5647,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       }
     : null;
   const bannerStackItems = activityStackItem
-    ? [activityStackItem, ...props.bannerItems]
-    : props.bannerItems;
+    ? [activityStackItem, ...bannerItems]
+    : bannerItems;
   useEffect(() => {
     if (activeTasksProgress === null || activeTaskSteps === null) {
       setIsTasksDrawerOpen(false);

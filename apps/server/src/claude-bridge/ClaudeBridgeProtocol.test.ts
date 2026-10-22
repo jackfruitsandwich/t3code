@@ -1291,6 +1291,18 @@ describe("ClaudeBridgeProtocol parsers", () => {
     assert.isFalse(older !== null && "usage" in older);
   });
 
+  it("reads the terminal's draft, null where none is shared, and nothing from an older mod", () => {
+    const base = { sid: SID, instanceId: "abc", heartbeatAt: 1000 };
+    assert.deepEqual(parseClaudeBridgeSessionFile({ ...base, draft: { text: "fix it", rev: 4 } })?.draft, {
+      text: "fix it",
+      rev: 4,
+    });
+    assert.isNull(parseClaudeBridgeSessionFile({ ...base, draft: null })?.draft);
+    assert.isNull(parseClaudeBridgeSessionFile({ ...base, draft: { text: 3 } })?.draft);
+    const older = parseClaudeBridgeSessionFile(base);
+    assert.isFalse(older !== null && "draft" in older);
+  });
+
   it("parses a session file and a turn.complete event with partial usage", () => {
     const session = parseClaudeBridgeSessionFile({
       protocol: 1,

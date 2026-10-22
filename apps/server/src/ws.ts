@@ -207,6 +207,7 @@ import * as ProjectSetupScriptRunner from "./project/ProjectSetupScriptRunner.ts
 import * as ProjectCloneTracker from "./project/ProjectCloneTracker.ts";
 import * as RepositoryIdentityResolver from "./project/RepositoryIdentityResolver.ts";
 import * as WorktreeSetupTracker from "./project/WorktreeSetupTracker.ts";
+import * as ClaudeSessionDraft from "./claude-bridge/ClaudeSessionDraft.ts";
 import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
 import * as DirectEndpoints from "./environment/DirectEndpoints.ts";
 import * as RemoteOpenTargets from "./environment/RemoteOpenTargets.ts";
@@ -1245,6 +1246,7 @@ const layerWsRpc = (
       const usageLimitSources = yield* UsageLimitSources.UsageLimitSources;
       const projectSetupScriptRunner = yield* ProjectSetupScriptRunner.ProjectSetupScriptRunner;
       const worktreeSetupTracker = yield* WorktreeSetupTracker.WorktreeSetupTracker;
+      const sessionDraft = yield* ClaudeSessionDraft.ClaudeSessionDraft;
       const projectCloneTracker = yield* ProjectCloneTracker.ProjectCloneTracker;
       const repositoryIdentityResolver =
         yield* RepositoryIdentityResolver.RepositoryIdentityResolver;
@@ -3288,6 +3290,14 @@ const layerWsRpc = (
             worktreeSetupTracker.stream(input.threadId),
             { "rpc.aggregate": "vcs" },
           ),
+        [WS_METHODS.subscribeSessionDraft]: (input) =>
+          observeRpcStream(WS_METHODS.subscribeSessionDraft, sessionDraft.stream(input.threadId), {
+            "rpc.aggregate": "orchestration",
+          }),
+        [WS_METHODS.sessionDraftOffer]: (input) =>
+          observeRpcEffect(WS_METHODS.sessionDraftOffer, sessionDraft.offer(input), {
+            "rpc.aggregate": "orchestration",
+          }),
         [WS_METHODS.worktreeSetupCancel]: (input) =>
           observeRpcEffect(
             WS_METHODS.worktreeSetupCancel,

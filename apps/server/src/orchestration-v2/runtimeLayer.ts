@@ -12,6 +12,7 @@ import * as SessionImporter from "../import/Layers/SessionImporter.ts";
 import * as ClaudeBridgeAttachService from "../claude-bridge/ClaudeBridgeAttachService.ts";
 import * as ClaudeBridgeLiveness from "../claude-bridge/ClaudeBridgeLiveness.ts";
 import * as ClaudeBridgeRegistry from "../claude-bridge/ClaudeBridgeRegistry.ts";
+import * as ClaudeSessionDraft from "../claude-bridge/ClaudeSessionDraft.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as ProjectSetupScriptRunner from "../project/ProjectSetupScriptRunner.ts";
 import * as ManagedProjectFolders from "../project/ManagedProjectFolders.ts";
@@ -371,6 +372,10 @@ export const layerProduction = Layer.mergeAll(
   ),
   layerProviderContinuationWorkerProvided,
   layerClaudeBridgeAttachProvided,
+  // Personal fork: the Claude Code terminal's unsent draft, shared with the thread's message box.
+  ClaudeSessionDraft.layer.pipe(
+    Layer.provide(Layer.mergeAll(ClaudeBridgeRegistry.layer, ProjectionStore.layer)),
+  ),
   layerAgentSessionImporterProvided,
   layerSessionImporterProvided,
   EffectOutbox.layerPruneWorker.pipe(Layer.provide(EffectOutbox.layer)),

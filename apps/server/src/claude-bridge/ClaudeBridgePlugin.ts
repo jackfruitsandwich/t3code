@@ -80,6 +80,11 @@ const PROTOCOL = 2
 const MOD_VERSION = '${CLAUDE_BRIDGE_MOD_VERSION}'
 const HEARTBEAT_MS = 3000
 const INBOX_POLL_MS = 500
+// How soon a change of the prompt box reaches session.json: one write per
+// burst of keys, not one per key.
+const DRAFT_PUBLISH_MS = 250
+// A draft longer than this is not shared (session.json is rewritten on every change).
+const DRAFT_MAX_CHARS = 32000
 const COMMANDS_REFRESH_MS = 60000
 // How old T3's heartbeat (one every 3 s) may be before T3 counts as gone. A
 // server busy starting up can miss several beats; a prompt handed back or
@@ -221,6 +226,14 @@ const answers = new Map()
 // to this session (it was restarted, or let the session go) reads it there
 // and attaches, and is then told the request itself.
 const waiting = new Map()
+// The draft in this terminal's prompt box, shared with T3's message box for
+// the thread: what the box holds, and a count that moves with each change of
+// it, whoever made the change. T3's draft comes back as a 'draft' command.
+let draft = { text: '', rev: 0 }
+let draftRead = false
+let draftPublishing = false
+// T3's draft that a dialog kept out of the box, tried again once it closes.
+let draftHeld = null
 // Tool calls the person allowed for the rest of this session from T3.
 const grants = []
 // Files T3 saved for a prompt it sent here (what the person attached).
@@ -567,6 +580,7 @@ async function heartbeat($) {
     commandsRev: commandsRev,
     activeTurn: activeTurn,
     waiting: Array.from(waiting.values()),
+    draft: await sharedDraft($),
     modVersion: MOD_VERSION,
     ended: ended,
   })
@@ -577,6 +591,59 @@ async function noteWaiting($, toolUseId, entry) {
   if (entry) waiting.set(toolUseId, entry)
   else if (!waiting.delete(toolUseId)) return
   try { await heartbeat($) } catch {}
+}
+
+// The prompt box's draft as session.json lists it: null where no terminal
+// draws a box (an SDK host, a background job nobody attached to), or the
+// draft is too long to share.
+async function sharedDraft($) {
+  if (!(await terminalOpen($))) return null
+  if (!draftRead) {
+    draftRead = true
+    try {
+      const box = await $.prompt.read()
+      if (box && typeof box.text === 'string' && box.text !== draft.text) draft = { text: box.text, rev: draft.rev + 1 }
+    } catch {}
+  }
+  if (draftHeld) await takeDraft($, draftHeld)
+  return draft.text.length > DRAFT_MAX_CHARS ? null : draft
+}
+
+// The box changed (the person typed, a submit or a clear emptied it, T3's
+// draft landed): session.json says so within DRAFT_PUBLISH_MS.
+function noteDraft($, text) {
+  if (typeof text !== 'string' || text === draft.text) return
+  draft = { text: text, rev: draft.rev + 1 }
+  draftRead = true
+  if (draftPublishing) return
+  draftPublishing = true
+  $.clock.after(DRAFT_PUBLISH_MS, () => {
+    draftPublishing = false
+    heartbeat($).catch(() => {})
+  })
+}
+
+// T3's draft for the box. The box takes it only while it still holds what
+// both last shared (base): a draft typed here since stays as it is, and T3
+// shows both. Text typed in T3 at the place the cursor stands here goes in
+// there and leaves the cursor after it; any other change puts the cursor at
+// the end, as a replace does.
+async function takeDraft($, command) {
+  draftHeld = null
+  let box = null
+  try { box = await $.prompt.read() } catch {}
+  if (!box || typeof box.text !== 'string' || box.text !== command.base || box.text === command.text) return
+  const before = box.text.slice(0, box.cursor)
+  const after = box.text.slice(box.cursor)
+  const typedAtCursor = command.text.length > box.text.length && command.text.startsWith(before) && command.text.endsWith(after)
+  let filled = null
+  try {
+    filled = typedAtCursor
+      ? await $.prompt.fill({ text: command.text.slice(before.length, command.text.length - after.length), mode: 'insert' })
+      : await $.prompt.fill({ text: command.text, mode: 'replace' })
+  } catch {}
+  if (filled && filled.isFilled) { noteDraft($, filled.text); return }
+  if (filled && filled.refusal === 'dialog') draftHeld = command
 }
 
 // Whether a dialog or panel is open in the terminal right now. Claude Code
@@ -1166,6 +1233,10 @@ async function handleCommand($, command) {
     answers.set(command.toolUseId, command)
     return
   }
+  if (command.type === 'draft') {
+    if (typeof command.text === 'string' && typeof command.base === 'string') await takeDraft($, command)
+    return
+  }
   if (command.type === 'interrupt') {
     if (!activeTurn) return
     const stoppedAt = Date.now()
@@ -1456,6 +1527,18 @@ export function register(on) {
   })
 
   // Stale-tip guard. Applies to typed prompts and to prompts T3 submits here.
+  // Every change of the prompt box, to share the draft with T3. The person's
+  // edits pass as they came; this only reads the box they leave.
+  on('prompt.edit', async ($, e, next) => {
+    const box = await next(e)
+    try { if (!passive && box) noteDraft($, box.text) } catch {}
+    return box
+  })
+  on('prompt.change', async ($, e, next) => {
+    try { if (!passive) noteDraft($, e.text) } catch {}
+    return next(e)
+  })
+
   on('prompt.submit', async ($, e, next) => {
     if (baseline !== null && transcriptPath) {
       try {
