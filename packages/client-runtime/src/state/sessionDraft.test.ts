@@ -32,12 +32,13 @@ describe("reconcileSessionDraft", () => {
     // The first offer's echo arrives: not a change of the terminal's.
     const echo = step(share, "fix it now", "fix it");
     expect(echo).toMatchObject({ take: null, differs: false });
-    expect(echo.share).toEqual({ shared: "fix it", offered: ["fix it now"] });
+    expect(echo.share).toEqual({ shared: "fix it", offered: ["fix it now"], found: null });
     // The same text is not offered twice.
     expect(step(echo.share, "fix it now", "fix it").offer).toBeNull();
     expect(step(echo.share, "fix it now", "fix it now").share).toEqual({
       shared: "fix it now",
       offered: [],
+      found: null,
     });
   });
 
@@ -51,11 +52,23 @@ describe("reconcileSessionDraft", () => {
     expect(step(both.share, "fix that", "fix that")).toMatchObject({ differs: false });
   });
 
-  it("offers into an empty terminal box when they first meet, and sends the empty box after a send", () => {
-    expect(step(SESSION_DRAFT_SHARE_START, "left over", "").offer).toEqual({
-      text: "left over",
+  it("puts no draft the message box held before it met the terminal into the terminal's box", () => {
+    // A leftover draft meets an empty terminal box: kept, shown as differing, not offered.
+    const met = step(SESSION_DRAFT_SHARE_START, "left over", "");
+    expect(met).toMatchObject({ take: null, offer: null, differs: true });
+    expect(step(met.share, "left over", "")).toMatchObject({ offer: null, differs: true });
+    // Typed past in this sitting, it goes into the empty box.
+    expect(step(met.share, "left over, then", "").offer).toEqual({
+      text: "left over, then",
       base: "",
     });
+    // A leftover draft meets a different one: typing on never replaces the terminal's.
+    const both = step(SESSION_DRAFT_SHARE_START, "mine", "yours");
+    expect(both.differs).toBe(true);
+    expect(step(both.share, "mine, typed", "yours")).toMatchObject({ offer: null, differs: true });
+  });
+
+  it("sends the empty box after a send", () => {
     const agreed = step(SESSION_DRAFT_SHARE_START, "fix it", "fix it").share;
     expect(step(agreed, "", "fix it").offer).toEqual({ text: "", base: "fix it" });
   });

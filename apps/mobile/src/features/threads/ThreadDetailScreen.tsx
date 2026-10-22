@@ -40,6 +40,7 @@ import {
   formatModelSelectionEffort,
   type ProviderSubagentStatus,
 } from "@t3tools/client-runtime/state/thread-execution";
+import { collectComposerContextReferences } from "@t3tools/shared/composerContextReferences";
 import { formatModelSlugName, resolveSelectableModel } from "@t3tools/shared/model";
 import { isProviderNativeSubagentThread, threadHeldByNotice } from "@t3tools/contracts";
 import type { QueuedRunEdit } from "../../state/queued-run-edit";
@@ -107,6 +108,7 @@ import {
 } from "../../state/thread-composer-error";
 import { threadEnvironment } from "../../state/threads";
 import { useAtomCommand } from "../../state/use-atom-command";
+import { useSessionDraftShare } from "../../state/use-session-draft-share";
 import { useDelayedStatus } from "../../lib/useDelayedStatus";
 import type {
   PendingApproval,
@@ -142,6 +144,7 @@ import {
 import { ThreadFeed, type ThreadFeedHistoryControls } from "./ThreadFeed";
 import { useThreadTurnSubagents } from "./ThreadAgentsSheet";
 import { ComposerQueuedEditBanner } from "./ComposerQueuedEdit";
+import { ComposerSessionDraftBanner } from "./ComposerSessionDraft";
 import { useThreadQueuedCount } from "./ThreadQueueControl";
 import type { ThreadContentPresentation } from "./threadContentPresentation";
 import { resolveThreadFeedSubmissionAnchor } from "./thread-feed-live-follow";
@@ -394,6 +397,21 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
   const agentLabel = `${props.selectedThread.modelSelection.instanceId} agent`;
   const selectedThreadKey = scopedThreadKey(props.environmentId, props.selectedThread.id);
   const composerError = useAtomValue(threadComposerErrorsAtom)[selectedThreadKey]?.message ?? null;
+  const sessionDraft = useSessionDraftShare({
+    environmentId: props.environmentId,
+    threadId:
+      props.queuedRunEdit === null &&
+      props.serverConfig?.providers.find(
+        (provider) => provider.instanceId === props.selectedThread.modelSelection.instanceId,
+      )?.driver === "claudeAgent"
+        ? props.selectedThread.id
+        : null,
+    prompt: props.draftMessage,
+    plain:
+      props.draftAttachments.length === 0 &&
+      collectComposerContextReferences(props.draftMessage).length === 0,
+    setPrompt: props.onChangeDraftMessage,
+  });
   const queuedCount = useThreadQueuedCount({
     environmentId: props.environmentId,
     threadId: props.selectedThread.id,
@@ -1235,6 +1253,19 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
                         voiceInputSession.cancel(props.composerDraftKey);
                         props.onCancelQueuedRunEdit();
                       }}
+                    />
+                  </Animated.View>
+                ) : null}
+                {sessionDraft !== null ? (
+                  <Animated.View
+                    className="shrink-0"
+                    entering={FadeInDown.duration(180)}
+                    exiting={FadeOut.duration(120)}
+                  >
+                    <ComposerSessionDraftBanner
+                      draft={sessionDraft.draft}
+                      onTake={sessionDraft.take}
+                      onDismiss={sessionDraft.dismiss}
                     />
                   </Animated.View>
                 ) : null}

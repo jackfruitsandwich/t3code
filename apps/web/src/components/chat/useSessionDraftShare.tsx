@@ -1,6 +1,7 @@
 import {
   reconcileSessionDraft,
   SESSION_DRAFT_SHARE_START,
+  sessionDraftNotice,
   sessionDraftOffered,
 } from "@t3tools/client-runtime/state/sessionDraft";
 import type { EnvironmentId, ThreadId } from "@t3tools/contracts";
@@ -15,7 +16,6 @@ import type { ComposerBannerStackItem } from "./ComposerBannerStack";
 
 // Typing settles this long before the message box's draft goes to the session.
 const OFFER_DEBOUNCE_MS = 300;
-const PREVIEW_CHARS = 160;
 
 /**
  * Keeps the message box on the same unsent draft as the prompt box of the
@@ -69,26 +69,17 @@ export function useSessionDraftShare(input: {
 
   return useMemo(() => {
     if (differing === null || differing === dismissed) return null;
-    const emptied = differing === "";
+    const notice = sessionDraftNotice(differing);
     return {
       id: "session-draft",
       variant: "info",
       priority: "notice",
       icon: <TerminalIcon />,
-      title: emptied
-        ? "The terminal's prompt box was emptied"
-        : "The terminal has a different draft",
-      ...(emptied
-        ? {}
-        : {
-            description:
-              differing.length > PREVIEW_CHARS
-                ? `${differing.slice(0, PREVIEW_CHARS)}…`
-                : differing,
-          }),
+      title: notice.title,
+      ...(notice.preview === null ? {} : { description: notice.preview }),
       actions: (
         <Button size="xs" variant="ghost" onClick={() => setPrompt(differing)}>
-          {emptied ? "Clear mine" : "Use it"}
+          {notice.takeLabel}
         </Button>
       ),
       dismissLabel: "Keep my draft",
