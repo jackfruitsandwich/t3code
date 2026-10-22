@@ -977,6 +977,19 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
     // Cheap change detection between sweeps; per spec a stale entry only
     // delays a file until it changes again, so process-local state is fine.
     const fileFingerprints = new Map<string, { size: number; mtimeMs: number }>();
+    // One record can be reached by two paths: a session run under another
+    // config folder (`~/.claude-ev`, its `projects` linked to `~/.claude`'s)
+    // reports its record under that folder, and the sweep reads the same
+    // file under its own. The two are compared by the file they name, and
+    // the path a live session reports is resolved to it.
+    const recordFilePath = (filePath: string) =>
+      fs.realPath(filePath).pipe(Effect.orElseSucceed(() => filePath));
+    const sameRecordFile = (left: string, right: string) =>
+      left === right
+        ? Effect.succeed(true)
+        : Effect.all([recordFilePath(left), recordFilePath(right)]).pipe(
+            Effect.map(([leftFile, rightFile]) => leftFile === rightFile),
+          );
     // A session that began after this moment was seen by T3 from its start.
     const importerStartedAtMs = yield* Clock.currentTimeMillis;
 
@@ -2830,7 +2843,7 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         if (
           cursor === undefined ||
           cursor.sourceSessionId !== sessionId ||
-          cursor.sourcePath !== filePath
+          !(yield* sameRecordFile(cursor.sourcePath, filePath))
         ) {
           // T3-native session, or a session adopted by live T3 chat (or a
           // secondary rollout file for it): not ours to import.
@@ -3347,8 +3360,12 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         });
       });
 
-    const adoptLiveClaudeSession: SessionImporterShape["adoptLiveClaudeSession"] = (input) =>
+    const adoptLiveClaudeSession: SessionImporterShape["adoptLiveClaudeSession"] = (reported) =>
       Effect.gen(function* () {
+        const input = {
+          ...reported,
+          transcriptPath: yield* recordFilePath(reported.transcriptPath),
+        };
         if (
           (yield* claudeConversationThread(input.sessionId, input.transcriptPath)) !== undefined
         ) {
@@ -3391,20 +3408,24 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
       }).pipe(
         Effect.catch((error: unknown) =>
           Effect.logWarning("session.importer.adopt-live-failed", {
-            sessionId: input.sessionId,
+            sessionId: reported.sessionId,
             error,
           }),
         ),
         Effect.catchDefect((defect: unknown) =>
           Effect.logWarning("session.importer.adopt-live-defect", {
-            sessionId: input.sessionId,
+            sessionId: reported.sessionId,
             defect,
           }),
         ),
       );
 
-    const healLiveClaudeSession: SessionImporterShape["healLiveClaudeSession"] = (input) =>
+    const healLiveClaudeSession: SessionImporterShape["healLiveClaudeSession"] = (reported) =>
       Effect.gen(function* () {
+        const input = {
+          ...reported,
+          transcriptPath: yield* recordFilePath(reported.transcriptPath),
+        };
         const held = yield* claudeConversationThread(input.sessionId, input.transcriptPath);
         // A thread no run has touched is plain history: the sweep tails it.
         if (held === undefined || !(yield* hasT3Runs(held.threadId))) return;
@@ -3432,13 +3453,13 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
       }).pipe(
         Effect.catch((error: unknown) =>
           Effect.logWarning("session.importer.heal-live-failed", {
-            sessionId: input.sessionId,
+            sessionId: reported.sessionId,
             error,
           }),
         ),
         Effect.catchDefect((defect: unknown) =>
           Effect.logWarning("session.importer.heal-live-defect", {
-            sessionId: input.sessionId,
+            sessionId: reported.sessionId,
             defect,
           }),
         ),

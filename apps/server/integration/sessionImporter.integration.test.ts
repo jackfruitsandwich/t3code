@@ -1385,6 +1385,49 @@ runtimeTest(
     }),
 );
 
+// claude-ev (Oct 22): a session run under a second config folder reports its
+// record under that folder, whose projects/ links to the one the sweep reads.
+// The binding kept the reported path; compared with the sweep's as text, the
+// thread was never caught up again, and nothing written between turns arrived.
+runtimeTest(
+  "catches up a thread whose binding names its record through a linked config folder",
+  (h) =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const claudeId = "aaaaaaaa-1111-4111-8111-1111111111e1";
+      const c = claudeSession({ sessionId: claudeId, cwd: h.workspace });
+      const claudePath = h.claudeFile(claudeId);
+      const threadId = importedThreadId(claudeId);
+      yield* h.write(claudePath, [
+        c.user("user-1", "Fix the login bug please", "2026-07-01T10:00:00.000Z"),
+        c.assistant("assistant-1", "I fixed the login bug.", "2026-07-01T10:00:05.000Z"),
+      ]);
+      const importer = yield* h.importer();
+      yield* importer.sweepNow();
+      yield* seedT3Run(h, threadId, CLAUDE);
+
+      const linkedHome = yield* h.makeDir("claude-ev-home");
+      yield* fs.symlink(path.dirname(path.dirname(claudePath)), path.join(linkedHome, "projects"));
+      const reported = path.join(linkedHome, "projects", "-repo", `${claudeId}.jsonl`);
+      const bound = yield* h.binding(threadId);
+      const payload = payloadOf(bound);
+      yield* h.runtimes.upsert({
+        ...bound,
+        runtimePayload: {
+          ...payload,
+          importCursor: { ...(payload.importCursor as object), sourcePath: reported },
+        },
+      });
+      yield* h.append(claudePath, [
+        c.user("user-2", "Typed in the claude-ev terminal", "2026-07-01T10:10:00.000Z"),
+        c.assistant("assistant-2", "Replying under the other folder.", "2026-07-01T10:10:30.000Z"),
+      ]);
+      yield* importer.sweepNow();
+      assert.include(yield* h.texts(threadId), "Replying under the other folder.");
+    }),
+);
+
 runtimeTest(
   "leaves an owned Claude thread alone while a T3 run or a bridged turn is writing it",
   (h) =>
@@ -2419,50 +2462,52 @@ runtimeTest("a stock message T3 once showed as the person's own becomes a notice
 // Claude Code stamps each prompt row with where it came from (2.1.302): a
 // coordinating session's hand-off and a plan to implement are no line of the
 // person's, whatever their words.
-runtimeTest("a prompt its stamp says someone else sent, and a plan to implement, import as notices", (h) =>
-  Effect.gen(function* () {
-    const claudeId = "aaaaaaaa-1111-4111-8111-1111111111f4";
-    const c = claudeSession({ sessionId: claudeId, cwd: h.workspace });
-    const threadId = importedThreadId(claudeId);
-    yield* h.write(h.claudeFile(claudeId), [
-      {
-        ...c.user(
-          "plan-1",
-          "Implement the following plan:\n\n1. Do it.\n\n\nIf you need specific details from before exiting plan mode, read the full transcript at: /x.jsonl",
-          "2026-07-01T10:00:00.000Z",
-        ),
-        origin: { kind: "auto-continuation" },
-        planContent: "1. Do it.\n",
-      },
-      c.assistant("assistant-1", "Done.", "2026-07-01T10:00:05.000Z"),
-      {
-        ...c.user("hand-off-1", "Build the login page.", "2026-07-01T10:01:00.000Z"),
-        origin: { kind: "coordinator" },
-      },
-      c.assistant("assistant-2", "Built.", "2026-07-01T10:01:05.000Z"),
-    ]);
-    yield* (yield* h.importer()).sweepNow();
-    const records = yield* h.threads.getThreadRecords(threadId, ["turnItems"]);
-    assert.deepEqual(
-      records.turnItems
-        .toSorted((left, right) => left.ordinal - right.ordinal)
-        .map((item) =>
-          item.type === "notification"
-            ? `notice: ${item.summary} | ${item.detail ?? ""}`
-            : item.type === "user_message"
-              ? `said: ${item.text}`
-              : item.type === "assistant_message"
-                ? `reply: ${item.text}`
-                : item.type,
-        ),
-      [
-        "notice: Plan to implement | 1. Do it.",
-        "reply: Done.",
-        "notice: coordinator | Build the login page.",
-        "reply: Built.",
-      ],
-    );
-  }),
+runtimeTest(
+  "a prompt its stamp says someone else sent, and a plan to implement, import as notices",
+  (h) =>
+    Effect.gen(function* () {
+      const claudeId = "aaaaaaaa-1111-4111-8111-1111111111f4";
+      const c = claudeSession({ sessionId: claudeId, cwd: h.workspace });
+      const threadId = importedThreadId(claudeId);
+      yield* h.write(h.claudeFile(claudeId), [
+        {
+          ...c.user(
+            "plan-1",
+            "Implement the following plan:\n\n1. Do it.\n\n\nIf you need specific details from before exiting plan mode, read the full transcript at: /x.jsonl",
+            "2026-07-01T10:00:00.000Z",
+          ),
+          origin: { kind: "auto-continuation" },
+          planContent: "1. Do it.\n",
+        },
+        c.assistant("assistant-1", "Done.", "2026-07-01T10:00:05.000Z"),
+        {
+          ...c.user("hand-off-1", "Build the login page.", "2026-07-01T10:01:00.000Z"),
+          origin: { kind: "coordinator" },
+        },
+        c.assistant("assistant-2", "Built.", "2026-07-01T10:01:05.000Z"),
+      ]);
+      yield* (yield* h.importer()).sweepNow();
+      const records = yield* h.threads.getThreadRecords(threadId, ["turnItems"]);
+      assert.deepEqual(
+        records.turnItems
+          .toSorted((left, right) => left.ordinal - right.ordinal)
+          .map((item) =>
+            item.type === "notification"
+              ? `notice: ${item.summary} | ${item.detail ?? ""}`
+              : item.type === "user_message"
+                ? `said: ${item.text}`
+                : item.type === "assistant_message"
+                  ? `reply: ${item.text}`
+                  : item.type,
+          ),
+        [
+          "notice: Plan to implement | 1. Do it.",
+          "reply: Done.",
+          "notice: coordinator | Build the login page.",
+          "reply: Built.",
+        ],
+      );
+    }),
 );
 
 runtimeTest(
