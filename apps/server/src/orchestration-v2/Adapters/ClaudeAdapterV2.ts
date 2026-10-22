@@ -109,7 +109,9 @@ import {
   claudeBridgeWakeOrigin,
   claudeBridgeWakeSender,
   claudeBridgeWakeRequest,
+  claudeBridgeWakeWaiting,
   claudeBridgeQueuedPrompt,
+  claudeBridgeTypedWaiting,
   isClaudeBridgeNoticeFrame,
   isClaudeNarrationBlock,
   isClaudeOriginShownByOrigin,
@@ -4088,6 +4090,91 @@ export function makeClaudeAdapterV2(
             return ordinal;
           });
 
+        /**
+         * What the person typed in the terminal over a bridged session's
+         * running turn, which the session holds until it hands it to the
+         * model: shown where it was typed, as a message sent from T3 to steer
+         * the turn is while it waits. What the session does with it is
+         * passed on as it is for one (see emitSteerDelivery).
+         */
+        const emitTypedWaiting = Effect.fnUntraced(function* (
+          context: ActiveClaudeTurnContext,
+          typed: { readonly uuid: string; readonly text: string },
+        ) {
+          const now = yield* DateTime.now;
+          const messageId = MessageId.make(typed.uuid);
+          steerMessages.set(typed.uuid, { threadId: context.input.threadId, messageId });
+          if (steerMessages.size > 256) {
+            steerMessages.delete(steerMessages.keys().next().value!);
+          }
+          yield* emitProviderEvent({
+            type: "message.updated",
+            driver: CLAUDE_PROVIDER,
+            message: {
+              createdBy: "user",
+              creationSource: "provider",
+              id: messageId,
+              threadId: context.input.threadId,
+              runId: context.input.runId,
+              nodeId: context.input.rootNodeId,
+              role: "user",
+              text: typed.text,
+              attachments: [],
+              streaming: false,
+              createdAt: now,
+              updatedAt: now,
+            },
+          });
+          yield* emitProviderEvent({
+            type: "turn_item.updated",
+            driver: CLAUDE_PROVIDER,
+            turnItem: {
+              createdBy: "user",
+              creationSource: "provider",
+              id: idAllocator.derive.userTurnItem({ messageId }),
+              threadId: context.input.threadId,
+              runId: context.input.runId,
+              nodeId: context.input.rootNodeId,
+              providerThreadId: context.input.providerThread.id,
+              providerTurnId: context.providerTurnId,
+              nativeItemRef: null,
+              parentItemId: null,
+              ordinal: yield* resolveItemOrdinal(context, typed.uuid),
+              status: "pending",
+              title: null,
+              startedAt: now,
+              completedAt: null,
+              updatedAt: now,
+              type: "user_message",
+              messageId,
+              inputIntent: "steer",
+              text: typed.text,
+              attachments: [],
+            },
+          });
+        });
+
+        /**
+         * Whether a turn's opening frame is the session taking what the
+         * person typed over the turn before, shown waiting since: it is
+         * taken now, and already heads the turn.
+         */
+        const takeTypedWaiting = Effect.fnUntraced(function* (message: SDKMessage) {
+          if (message.type !== "user" || message.parent_tool_use_id !== null) return false;
+          const uuid = claudeBridgeWakeWaiting(message);
+          const sent = uuid === null ? undefined : steerMessages.get(uuid);
+          if (uuid === null || sent === undefined) return false;
+          steerMessages.delete(uuid);
+          yield* emitProviderEvent({
+            type: "user_message.delivery",
+            driver: CLAUDE_PROVIDER,
+            threadId: sent.threadId,
+            messageId: sent.messageId,
+            delivery: "taken",
+          });
+          return true;
+        });
+
         const providerTurnPayload = (input: {
           readonly context: ActiveClaudeTurnContext;
           readonly status: OrchestrationV2ProviderTurn["status"];
@@ -5484,7 +5571,10 @@ export function makeClaudeAdapterV2(
           }
           const ordinal =
             thought?.ordinal ??
-            (yield* resolveItemOrdinal(input.context, input.inPlaceOfThought ?? input.nativeItemId));
+            (yield* resolveItemOrdinal(
+              input.context,
+              input.inPlaceOfThought ?? input.nativeItemId,
+            ));
           const artifacts = buildAssistantArtifacts({
             idAllocator,
             turnInput: input.context.input,
@@ -5670,7 +5760,8 @@ export function makeClaudeAdapterV2(
             message.type === "system" &&
             (message.subtype === "status" ||
               message.subtype === "compact_boundary" ||
-              isClaudeBridgeNoticeFrame(message)) &&
+              isClaudeBridgeNoticeFrame(message) ||
+              claudeBridgeTypedWaiting(message) !== null) &&
             bufferedMessages.some(isClaudeTurnStartMessage);
           // A hook's word on that turn (a blocked Stop hook) can also come
           // before its start does: the mod can report the start seconds after
@@ -5712,8 +5803,12 @@ export function makeClaudeAdapterV2(
           // A turn typed into the native process outside T3 (Claude bridge)
           // opens with a user frame carrying the typed text; the continuation
           // run shows it instead of a generic notice.
+          // One the person typed over the turn before, shown waiting since,
+          // heads the run already: its continuation has no line of its own.
           const typedPromptDetail =
-            message.type === "user" && message.parent_tool_use_id === null
+            message.type === "user" &&
+            message.parent_tool_use_id === null &&
+            !(yield* takeTypedWaiting(message))
               ? claudeBridgeWakeDetail(message)
               : null;
           // A turn the bridge opened to carry a request says who asks, and
@@ -5868,7 +5963,9 @@ export function makeClaudeAdapterV2(
             claudeHarnessMessageNotification(detail, wakeBuffer?.sender ?? null) ??
             // A plan the person accepted with "clear context": the box the
             // terminal draws the plan in, not the prompt written around it.
-            (wakeBuffer?.typed === true ? claudePlanPromptNotification(detail, wakeOrigin) : null) ??
+            (wakeBuffer?.typed === true
+              ? claudePlanPromptNotification(detail, wakeOrigin)
+              : null) ??
             // Someone else's prompt whose words name no sender: the line for
             // where the session says it came from.
             (wakeBuffer?.typed === true &&
@@ -6393,6 +6490,12 @@ export function makeClaudeAdapterV2(
             return;
           }
 
+          const typedWaiting = claudeBridgeTypedWaiting(message);
+          if (typedWaiting !== null) {
+            yield* emitTypedWaiting(context, typedWaiting);
+            return;
+          }
+
           // A message the harness handed the model inside this turn (a task
           // reporting back, a subagent's hand-back): the terminal draws it
           // where it arrived, as it draws one that opens a turn.
@@ -6416,6 +6519,7 @@ export function makeClaudeAdapterV2(
               ? claudeBridgeWakeDetail(message)
               : null;
           if (wakeHead !== null) {
+            yield* takeTypedWaiting(message);
             const ownHead =
               isClaudeProviderContinuationTurn(context.input) && context.wakeHeadsSeen === 0;
             context.wakeHeadsSeen += 1;

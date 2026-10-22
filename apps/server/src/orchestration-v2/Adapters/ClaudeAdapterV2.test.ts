@@ -2425,6 +2425,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       let openedOptions: ClaudeAdapterV2.ClaudeAgentSdkQueryOptions | undefined;
       let bridgeCanUseTool: ClaudeAdapterV2.ClaudeAgentSdkQueryOpenInput["bridgeCanUseTool"];
       let bridgeOnNativeState: ClaudeAdapterV2.ClaudeAgentSdkQueryOpenInput["bridgeOnNativeState"];
+      let bridgeOnPromptDelivery: ClaudeAdapterV2.ClaudeAgentSdkQueryOpenInput["bridgeOnPromptDelivery"];
       const adapter = ClaudeAdapterV2.makeClaudeAdapterV2({
         instanceId: ClaudeAdapterV2.CLAUDE_DEFAULT_INSTANCE_ID,
         settings: DEFAULT_CLAUDE_SETTINGS,
@@ -2447,6 +2448,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
               openedOptions = input.options;
               bridgeCanUseTool = input.bridgeCanUseTool;
               bridgeOnNativeState = input.bridgeOnNativeState;
+              bridgeOnPromptDelivery = input.bridgeOnPromptDelivery;
               return {
                 messages: Stream.fromQueue(sdkMessages).pipe(
                   Stream.flatMap((message) =>
@@ -2541,6 +2543,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         getOpenedOptions: () => openedOptions,
         getBridgeCanUseTool: () => bridgeCanUseTool,
         getBridgeOnNativeState: () => bridgeOnNativeState,
+        getBridgeOnPromptDelivery: () => bridgeOnPromptDelivery,
         terminalEvents,
         hasPendingBackgroundWork,
       };
@@ -7081,6 +7084,125 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         assert.equal(notices[0]?.summary, "Message from @Explore");
         assert.equal(notices[0]?.detail, "All paths are found.");
         assert.equal(notices[0]?.source.kind, "subagent");
+      }).pipe(Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+    ),
+  );
+
+  // What the person types in the terminal while a turn runs waits in Claude
+  // Code until the model is handed it, at a tool call or as the next turn.
+  // The runner shows it from the moment it is typed.
+  const TYPED_UUID = "3c1f8a52-9d47-4e0b-8a6c-71e2d5b40f19";
+  const typedWaitingFrame = claudeSdkFrame({
+    type: "system",
+    subtype: "typed_waiting",
+    uuid: TYPED_UUID,
+    session_id: WAKE_NATIVE_SESSION,
+    t3_typed_waiting: { text: "also check the logs" },
+  });
+  const deliveriesOf = (events: ReadonlyArray<ProviderAdapterV2Event>) =>
+    events.flatMap((event) =>
+      event.type === "user_message.delivery"
+        ? [[event.threadId, event.messageId, event.delivery] as const]
+        : [],
+    );
+
+  it.effect("shows what the person typed over a running turn as waiting, until it is taken", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        const now = yield* DateTime.now;
+        const attemptId = RunAttemptId.make("attempt-claude-bridge-typed-waiting");
+        yield* harness.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now,
+            attemptId,
+            text: "Read the logs.",
+            attachments: [],
+          }),
+        );
+        yield* Queue.offer(harness.sdkMessages, typedWaitingFrame);
+        const userItems = () =>
+          harness.events.filter(
+            (event) => event.type === "turn_item.updated" && event.turnItem.type === "user_message",
+          );
+        yield* awaitUntil(() => userItems().length === 1, "the typed message");
+        yield* Queue.offer(harness.sdkMessages, turnOneResult);
+        yield* awaitUntil(() => harness.terminalEvents().length === 1, "turn terminal");
+        const shown = harness.events.flatMap((event) =>
+          event.type === "turn_item.updated" && event.turnItem.type === "user_message"
+            ? [event.turnItem]
+            : [],
+        );
+        assert.equal(shown.length, 1);
+        assert.deepInclude(shown[0], {
+          runId: RunId.make(`run-${attemptId}`),
+          messageId: MessageId.make(TYPED_UUID),
+          createdBy: "user",
+          inputIntent: "steer",
+          status: "pending",
+          text: "also check the logs",
+        });
+        const message = harness.events.flatMap((event) =>
+          event.type === "message.updated" && event.message.id === TYPED_UUID
+            ? [event.message]
+            : [],
+        );
+        assert.deepEqual(
+          message.map((entry) => [entry.role, entry.text]),
+          [["user", "also check the logs"]],
+        );
+        const say = harness.getBridgeOnPromptDelivery();
+        assert.isDefined(say);
+        yield* say!({ promptUuid: TYPED_UUID, delivery: "taken" });
+        yield* awaitUntil(() => deliveriesOf(harness.events).length === 1, "taken");
+        assert.deepEqual(deliveriesOf(harness.events), [
+          [harness.threadId, MessageId.make(TYPED_UUID), "taken"],
+        ]);
+      }).pipe(Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+    ),
+  );
+
+  it.effect("lets a turn begun with what the person typed over the last one be headed by it", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        const now = yield* DateTime.now;
+        yield* harness.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now,
+            attemptId: RunAttemptId.make("attempt-claude-bridge-typed-next"),
+            text: "Read the logs.",
+            attachments: [],
+          }),
+        );
+        yield* Queue.offer(harness.sdkMessages, typedWaitingFrame);
+        yield* Queue.offer(harness.sdkMessages, turnOneResult);
+        yield* awaitUntil(() => harness.terminalEvents().length === 1, "first turn terminal");
+        yield* Queue.offer(
+          harness.sdkMessages,
+          claudeSdkFrame({
+            type: "user",
+            message: { role: "user", content: "also check the logs" },
+            parent_tool_use_id: null,
+            uuid: "00000000-0000-4000-8000-000000000321",
+            session_id: WAKE_NATIVE_SESSION,
+            t3_wake_detail: "also check the logs",
+            t3_wake_waiting: TYPED_UUID,
+          }),
+        );
+        yield* Queue.offer(harness.sdkMessages, wakeTurnInit);
+        yield* awaitUntil(() => harness.continuationRequests.length === 1, "continuation");
+        // The message it waited as is the turn's line: the run has none of its own.
+        assert.isNull(harness.continuationRequests[0]?.detail ?? null);
+        assert.isUndefined(harness.continuationRequests[0]?.createdBy);
+        yield* awaitUntil(() => deliveriesOf(harness.events).length === 1, "taken");
+        assert.deepEqual(deliveriesOf(harness.events), [
+          [harness.threadId, MessageId.make(TYPED_UUID), "taken"],
+        ]);
       }).pipe(Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
     ),
   );

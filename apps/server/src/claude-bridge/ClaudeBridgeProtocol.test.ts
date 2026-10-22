@@ -32,6 +32,7 @@ import {
   makeClaudeBridgeFrameTranslator,
   makeClaudePlainCommandReader,
   parseClaudeBridgeEvent,
+  claudeQueueOperation,
   claudeBridgeWakeAsUser,
   claudeBridgeWakeOrigin,
   claudeBridgeWakeSender,
@@ -1053,6 +1054,45 @@ describe("ClaudeBridgeProtocol record helpers", () => {
     ]);
     assert.isTrue(claudeBridgeAlsoInTerminal({ signal: null, alsoInTerminal: true }));
     assert.isFalse(claudeBridgeAlsoInTerminal({ signal: null }));
+  });
+
+  it("reads what the person typed over a running turn, and the queue rows that hold it", () => {
+    const event = parseClaudeBridgeEvent({
+      seq: 5,
+      at: 1,
+      type: "prompt.typed",
+      turnId: "turn-a",
+      text: "also check the logs",
+    });
+    assert.deepStrictEqual(event, {
+      seq: 5,
+      at: 1,
+      type: "prompt.typed",
+      turnId: "turn-a",
+      text: "also check the logs",
+    });
+    assert.isNull(parseClaudeBridgeEvent({ seq: 6, at: 1, type: "prompt.typed", text: "  " }));
+    assert.deepStrictEqual(
+      claudeQueueOperation({
+        type: "queue-operation",
+        operation: "remove",
+        timestamp: "2026-10-22T03:41:56.215Z",
+        content: "also check the logs",
+        reason: "absorbed_mid_turn",
+      }),
+      {
+        operation: "remove",
+        at: Date.parse("2026-10-22T03:41:56.215Z"),
+        content: "also check the logs",
+      },
+    );
+    assert.strictEqual(
+      claudeQueueOperation({ type: "queue-operation", operation: "dequeue", timestamp: "x" })
+        ?.content,
+      null,
+    );
+    assert.isNull(claudeQueueOperation({ type: "queue-operation", operation: "peek" }));
+    assert.isNull(claudeQueueOperation({ type: "user", operation: "enqueue" }));
   });
 
   it("keeps the permission mode a request offers with an approval", () => {

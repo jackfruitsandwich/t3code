@@ -63,6 +63,8 @@ import {
   claudeTranscriptCommandText,
   claudeCompactingFrame,
   claudeHookNoticeText,
+  claudeQueueOperation,
+  claudeTypedWaitingFrame,
   claudeSessionNoticeFrame,
   claudeSessionNotificationText,
   claudeTranscriptCommandOutput,
@@ -70,6 +72,7 @@ import {
   CLAUDE_BRIDGE_SETTLED_ELSEWHERE,
   CLAUDE_BRIDGE_UPKEEP_COMMAND,
   isClaudeBridgeModRow,
+  isClaudeHarnessPrompt,
   isClaudeTurnEndRow,
   claudeBridgeReplacesDrawnFrame,
   claudeNarrationAsText,
@@ -119,6 +122,16 @@ const DRAWN_MESSAGE_WAIT_MS = 2_500;
 /** How long a reply row's text is remembered, for a drawn copy that arrives after it. */
 const RECORDED_TEXT_MEMORY_MS = 60_000;
 const normalizeDrawn = (text: string) => text.replace(/\s+/gu, " ").trim();
+/** What the person typed, as told by the mod and by the record's queue rows: the same words. */
+const sameTyped = (left: string, right: string) => left.trim() === right.trim();
+/** A uuid's shape (version 4) for the first 16 bytes of a digest. */
+const uuidOfDigest = (digest: Uint8Array) => {
+  const bytes = Array.from(digest.subarray(0, 16));
+  bytes[6] = ((bytes[6] ?? 0) & 0x0f) | 0x40;
+  bytes[8] = ((bytes[8] ?? 0) & 0x3f) | 0x80;
+  const hex = bytes.map((byte) => byte.toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+};
 /** The text of a reply row of the record, as the thread shows it. */
 const assistantRowText = (row: Record<string, unknown>): string => {
   const content = isRecord(row.message) ? row.message.content : null;
@@ -450,6 +463,15 @@ export const layer: Layer.Layer<
          * wait at once, which `pendingPrompt` cannot say.
          */
         heldSteers: new Map<string, { readonly commandId: string }>(),
+        /**
+         * What the person typed in the terminal over the running turn, which
+         * the session holds until it hands it to the model, oldest first: from
+         * the record's queue rows, and shown waiting (under `key`) once the
+         * mod has said the person typed it.
+         */
+        typed: [] as Array<{ readonly key: string; readonly text: string; shown: boolean }>,
+        /** What the mod said the person typed over a running turn that no queue row has held yet. */
+        typedUnheld: [] as Array<string>,
         approvals: new Map<string, AbortController>(),
         /** Requests the session settled without T3: nothing is sent back for them. */
         settledElsewhere: new Set<string>(),
@@ -590,11 +612,97 @@ export const layer: Layer.Layer<
         for (const promptUuid of held) yield* reportDelivery(promptUuid, "dropped");
       });
 
+      /** Shows what the person typed over the turn open here as waiting for the session. */
+      const showTyped = (entry: (typeof state.typed)[number]) =>
+        Effect.gen(function* () {
+          if (entry.shown || !sessionTurnOpen()) return;
+          entry.shown = true;
+          yield* emit([
+            claudeTypedWaitingFrame({ uuid: entry.key, sessionId: sid, text: entry.text }),
+          ]);
+        });
+
+      /**
+       * The session handed the model what the person typed, inside the turn
+       * that was running. Said also of one not shown here: an earlier
+       * attachment may have shown it.
+       */
+      const typedTaken = (text: string) =>
+        Effect.gen(function* () {
+          const index = state.typed.findIndex((entry) => sameTyped(entry.text, text));
+          if (index === -1) return;
+          const [entry] = state.typed.splice(index, 1);
+          if (entry !== undefined) yield* reportDelivery(entry.key, "taken");
+        });
+
+      /**
+       * The session begins a turn with what the person typed over the turn
+       * before: the uuid it was shown waiting under, which then heads the
+       * turn, or null.
+       */
+      const takeTypedTurn = (text: string) => {
+        const index = state.typed.findIndex((entry) => sameTyped(entry.text, text));
+        if (index === -1) return null;
+        const [entry] = state.typed.splice(index, 1);
+        return entry?.shown === true ? entry.key : null;
+      };
+
+      /**
+       * What the person typed is held no more, untaken: taken back into the
+       * prompt to edit, or nothing more will be heard of it here.
+       */
+      const letGoOfTyped = Effect.gen(function* () {
+        const shown = state.typed.filter((entry) => entry.shown);
+        state.typed = [];
+        for (const entry of shown) yield* reportDelivery(entry.key, "dropped");
+      });
+
+      /** Follows the record's account of the prompts the session holds behind its turn. */
+      const followQueue = (queued: NonNullable<ReturnType<typeof claudeQueueOperation>>) =>
+        Effect.gen(function* () {
+          switch (queued.operation) {
+            case "enqueue": {
+              const text = queued.content;
+              // A task's notice, another agent's message: never the person's.
+              if (text === null || text.trim().length === 0 || isClaudeHarnessPrompt(text)) return;
+              if (!sessionTurnOpen()) return;
+              // Made from the queue row: one attachment's word that the
+              // session took it names the message another showed waiting.
+              const key = uuidOfDigest(
+                yield* crypto
+                  .digest("SHA-256", new TextEncoder().encode(`${sid}\n${queued.at}\n${text}`))
+                  .pipe(Effect.orDie),
+              );
+              if (state.typed.some((entry) => entry.key === key)) return;
+              const entry = { key, text, shown: false };
+              state.typed.push(entry);
+              // One the record never said more of (a shape not read here) is
+              // not kept for long.
+              if (state.typed.length > 32) state.typed.shift();
+              const said = state.typedUnheld.findIndex((typed) => sameTyped(typed, text));
+              if (said === -1) return;
+              state.typedUnheld.splice(said, 1);
+              yield* showTyped(entry);
+              return;
+            }
+            case "remove":
+              if (queued.content !== null) yield* typedTaken(queued.content);
+              return;
+            case "popAll":
+              yield* letGoOfTyped;
+              return;
+            case "dequeue":
+              // The turn it begins says which it was (see takeTypedTurn).
+              return;
+          }
+        });
+
       const finish = Effect.gen(function* () {
         if (state.closed) return;
         state.closed = true;
         state.requestTurn = null;
         yield* letGoOfHeldSteers;
+        yield* letGoOfTyped;
         for (const controller of state.approvals.values()) controller.abort();
         state.approvals.clear();
         yield* Queue.end(messages);
@@ -979,6 +1087,8 @@ export const layer: Layer.Layer<
             if (isClaudeTypedMidTurnRow(row)) {
               yield* registry.noteRecordChange(bridgeProcess, "typed-mid-turn");
             }
+            const queued = claudeQueueOperation(row);
+            if (queued !== null) yield* followQueue(queued);
             const recordedMode = claudeTranscriptPermissionMode(row);
             if (recordedMode !== null && recordedMode !== transcriptMode) {
               transcriptMode = recordedMode;
@@ -1475,6 +1585,7 @@ export const layer: Layer.Layer<
             yield* emit(translator.onTurnComplete(pending.event));
           }
           yield* letGoOfHeldSteers;
+          yield* letGoOfTyped;
           yield* emit(translator.onEnded(reason));
           yield* finish;
         });
@@ -1837,7 +1948,18 @@ export const layer: Layer.Layer<
               // A message sent to steer the turn before this one met no tool
               // call there: this turn is the session taking it.
               yield* promptTaken({ promptUuid: event.promptUuid, commandId: event.commandId });
-              yield* emit(translator.onTurnStart(event));
+              // What the person typed over the turn before, which this turn
+              // is the session taking: it heads the turn already.
+              const typedTurn =
+                event.promptUuid === undefined && event.commandId === undefined
+                  ? takeTypedTurn(event.text)
+                  : null;
+              yield* emit(
+                translator.onTurnStart(
+                  event,
+                  typedTurn === null ? undefined : { waiting: typedTurn },
+                ),
+              );
               if (state.compactingUnsaid) {
                 state.compactingUnsaid = false;
                 const uuid = yield* crypto.randomUUIDv4.pipe(Effect.orDie);
@@ -1924,6 +2046,20 @@ export const layer: Layer.Layer<
               if (event.by !== "t3" && event.by !== "detached") {
                 yield* settleElsewhere(event.toolUseId);
               }
+              return;
+            }
+            case "prompt.typed": {
+              // The record's queue row says the session holds it: whichever
+              // is read first waits for the other.
+              const held = state.typed.find(
+                (entry) => !entry.shown && sameTyped(entry.text, event.text),
+              );
+              if (held !== undefined) {
+                yield* showTyped(held);
+                return;
+              }
+              state.typedUnheld.push(event.text);
+              if (state.typedUnheld.length > 8) state.typedUnheld.shift();
               return;
             }
             case "prompt.delivered": {

@@ -18,8 +18,10 @@ import * as ClaudeBridgeRegistry from "../../claude-bridge/ClaudeBridgeRegistry.
 import {
   claudeBridgeCompactSummary,
   claudeBridgeSettledElsewhere,
+  claudeBridgeTypedWaiting,
   claudeBridgeWakeDetail,
   claudeBridgeWakeRequest,
+  claudeBridgeWakeWaiting,
   claudeContinuedInSession,
   type ClaudeBridgeCommandBody,
   claudeBridgeApproveWithMode,
@@ -2039,6 +2041,210 @@ describe("ClaudeBridgeQueryRunner messages sent to steer a turn", () => {
         bridge.process,
       );
       assert.deepStrictEqual(bridge.deliveries, [`taken ${SECOND}`, `taken ${FIRST}`]);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+});
+
+describe("ClaudeBridgeQueryRunner what the person typed over a running turn", () => {
+  // Claude Code holds a message typed in the terminal while a turn runs, and
+  // its record says so at once in a queue row; the mod says the person typed
+  // it. The record's own copy comes only when the model is handed it.
+  const TYPED = "also check the logs";
+  const queueRow = (operation: string, atMs: number, content?: string) =>
+    `${JSON.stringify({
+      type: "queue-operation",
+      operation,
+      timestamp: stamp(atMs),
+      sessionId: "bridge-session",
+      ...(content === undefined ? {} : { content }),
+    })}\n`;
+  // A row after the queue rows a test writes: its frame says they were read.
+  const toolRow = (uuid: string, atMs: number) =>
+    `${JSON.stringify({
+      type: "assistant",
+      uuid,
+      parentUuid: null,
+      isSidechain: false,
+      timestamp: stamp(atMs),
+      message: {
+        id: `msg_${uuid}`,
+        type: "message",
+        role: "assistant",
+        model: "claude-sonnet-4-6",
+        content: [
+          { type: "tool_use", id: `toolu_${uuid}`, name: "Bash", input: { command: "ls" } },
+        ],
+        stop_reason: "tool_use",
+        usage: { input_tokens: 1, output_tokens: 1 },
+      },
+    })}\n`;
+  const turnStart = (bridge: { readonly now: number }, seq: number, turnId: string, text: string) =>
+    ({
+      seq,
+      at: bridge.now,
+      type: "turn.start",
+      turnId,
+      text,
+      transcriptOffset: 0,
+    }) as const;
+  const typed = (bridge: { readonly now: number }, seq: number, text: string) =>
+    ({ seq, at: bridge.now, type: "prompt.typed", turnId: "turn-a", text }) as const;
+  const take = (
+    bridge: { readonly session: ClaudeAdapterV2.ClaudeAgentSdkQuerySession },
+    count: number,
+  ) =>
+    bridge.session.messages.pipe(
+      Stream.take(count),
+      Stream.runCollect,
+      Effect.map((frames) => Array.from(frames)),
+    );
+  const opened = Effect.gen(function* () {
+    const bridge = yield* attach({ protocol: 2, bridgeCanUseTool: () => null, transcript: "" });
+    const fs = yield* FileSystem.FileSystem;
+    const write = (rows: string) =>
+      fs.writeFileString(bridge.process.session.transcriptPath, rows, { flag: "a" });
+    yield* bridge.handler(turnStart(bridge, 1, "turn-a", "go"), bridge.process);
+    assert.deepStrictEqual(
+      (yield* take(bridge, 2)).map((frame) => frame.type),
+      ["user", "system"],
+    );
+    return { bridge, write };
+  });
+
+  it.live("shows it waiting from when it was typed until the model is handed it", () =>
+    Effect.gen(function* () {
+      const { bridge, write } = yield* opened;
+      // The mod's word is heard before the record's queue row is read.
+      yield* bridge.handler(typed(bridge, 2, TYPED), bridge.process);
+      yield* write(queueRow("enqueue", bridge.now + 1_000, TYPED));
+      const [frame] = yield* take(bridge, 1);
+      const waiting = claudeBridgeTypedWaiting(frame);
+      assert.strictEqual(waiting?.text, TYPED);
+      assert.deepStrictEqual(bridge.deliveries, []);
+      // At the next tool call the record writes it as handed over.
+      yield* write(
+        queueRow("remove", bridge.now + 5_000, TYPED) + toolRow("t1", bridge.now + 5_001),
+      );
+      assert.deepStrictEqual(
+        (yield* take(bridge, 1)).map((next) => next.type),
+        ["assistant"],
+      );
+      assert.deepStrictEqual(bridge.deliveries, [`taken ${waiting?.uuid}`]);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.live("shows it once both the queue row and the mod's word are in, whichever comes first", () =>
+    Effect.gen(function* () {
+      const { bridge, write } = yield* opened;
+      yield* write(
+        queueRow("enqueue", bridge.now + 1_000, TYPED) + toolRow("t1", bridge.now + 1_001),
+      );
+      // Nothing yet: the queue row alone does not say who typed it.
+      assert.deepStrictEqual(
+        (yield* take(bridge, 1)).map((next) => next.type),
+        ["assistant"],
+      );
+      yield* bridge.handler(typed(bridge, 2, TYPED), bridge.process);
+      const [frame] = yield* take(bridge, 1);
+      assert.strictEqual(claudeBridgeTypedWaiting(frame)?.text, TYPED);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.live("shows nothing for a prompt the mod does not say the person typed", () =>
+    Effect.gen(function* () {
+      const { bridge, write } = yield* opened;
+      // A schedule firing, a plugin's prompt: queued with its words, typed by nobody.
+      yield* write(
+        queueRow("enqueue", bridge.now + 1_000, "48h check-in") +
+          queueRow("enqueue", bridge.now + 1_001, "<task-notification>\n<task-id>b1</task-id>") +
+          toolRow("t1", bridge.now + 1_002),
+      );
+      // The mod's word of another prompt shows nothing either.
+      yield* bridge.handler(typed(bridge, 2, TYPED), bridge.process);
+      yield* write(
+        queueRow("remove", bridge.now + 2_000, "48h check-in") + toolRow("t2", bridge.now + 2_001),
+      );
+      const frames = yield* take(bridge, 2);
+      assert.deepStrictEqual(
+        frames.map((next) => next.type),
+        ["assistant", "assistant"],
+      );
+      // Taken is still said under the uuid it would have had: an earlier
+      // attachment may have shown it.
+      assert.strictEqual(bridge.deliveries.length, 1);
+      assert.match(
+        bridge.deliveries[0] ?? "",
+        /^taken [0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u,
+      );
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.live("is not taken when the person takes it back into the prompt to edit", () =>
+    Effect.gen(function* () {
+      const { bridge, write } = yield* opened;
+      yield* bridge.handler(typed(bridge, 2, TYPED), bridge.process);
+      yield* write(queueRow("enqueue", bridge.now + 1_000, TYPED));
+      const waiting = claudeBridgeTypedWaiting((yield* take(bridge, 1))[0]);
+      yield* write(
+        queueRow("popAll", bridge.now + 2_000, TYPED) + toolRow("t1", bridge.now + 2_001),
+      );
+      yield* take(bridge, 1);
+      assert.deepStrictEqual(bridge.deliveries, [`dropped ${waiting?.uuid}`]);
+      // Sent again, it is another message, waiting in its turn.
+      yield* bridge.handler(typed(bridge, 3, TYPED), bridge.process);
+      yield* write(queueRow("enqueue", bridge.now + 3_000, TYPED));
+      const again = claudeBridgeTypedWaiting((yield* take(bridge, 1))[0]);
+      assert.notStrictEqual(again?.uuid, waiting?.uuid);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.live("is not taken when the session ends while it waits", () =>
+    Effect.gen(function* () {
+      const { bridge, write } = yield* opened;
+      yield* bridge.handler(typed(bridge, 2, TYPED), bridge.process);
+      yield* write(queueRow("enqueue", bridge.now + 1_000, TYPED));
+      const waiting = claudeBridgeTypedWaiting((yield* take(bridge, 1))[0]);
+      yield* bridge.handler(
+        { seq: 3, at: bridge.now, type: "ended", reason: "exit", sessionId: "bridge-session" },
+        bridge.process,
+      );
+      assert.deepStrictEqual(bridge.deliveries, [`dropped ${waiting?.uuid}`]);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.live("begins the next turn with it under the uuid it waited under", () =>
+    Effect.gen(function* () {
+      const { bridge, write } = yield* opened;
+      yield* bridge.handler(typed(bridge, 2, TYPED), bridge.process);
+      yield* write(queueRow("enqueue", bridge.now + 1_000, TYPED));
+      const waiting = claudeBridgeTypedWaiting((yield* take(bridge, 1))[0]);
+      yield* bridge.handler(
+        {
+          seq: 3,
+          at: bridge.now,
+          type: "turn.complete",
+          turnId: "turn-a",
+          reason: "answer",
+          answer: "done",
+          isAborted: false,
+          durationMs: 10,
+          transcriptOffset: 0,
+        },
+        bridge.process,
+      );
+      yield* bridge.handler(turnStart(bridge, 4, "turn-b", TYPED), bridge.process);
+      const frames = yield* take(bridge, 3);
+      assert.deepStrictEqual(
+        frames.map((next) => next.type),
+        ["result", "user", "system"],
+      );
+      const head = frames[1]!;
+      assert.strictEqual(claudeBridgeWakeWaiting(head), waiting?.uuid);
+      assert.strictEqual(claudeBridgeWakeDetail(head), TYPED);
+      // The thread hears it taken from that head; the runner says nothing more of it.
+      assert.deepStrictEqual(bridge.deliveries, []);
+      yield* bridge.session.close;
+      assert.deepStrictEqual(bridge.deliveries, []);
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 });

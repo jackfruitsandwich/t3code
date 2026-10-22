@@ -92,6 +92,16 @@ export const CLAUDE_BRIDGE_NOTICE_KEY = "t3_session_notice";
  */
 export const CLAUDE_BRIDGE_QUEUED_PROMPT_KEY = "t3_queued_prompt";
 /**
+ * Set on the frame that shows what the person typed in the terminal over a
+ * running turn while the session holds it (see claudeTypedWaitingFrame).
+ */
+export const CLAUDE_BRIDGE_TYPED_WAITING_KEY = "t3_typed_waiting";
+/**
+ * Set on the wake `user` frame of a turn that is the session taking such a
+ * message: the uuid the message was shown under while it waited.
+ */
+export const CLAUDE_BRIDGE_WAKE_WAITING_KEY = "t3_wake_waiting";
+/**
  * Set on a `compact_boundary` frame sent again once the record's summary row
  * has come: the summary the session went on from, the text Claude Code shows
  * when its "Compact summary" row is expanded.
@@ -461,6 +471,13 @@ export type ClaudeBridgeEvent = { readonly seq: number; readonly at: number } & 
       readonly promptUuid?: string;
     }
   | { readonly type: "prompt.dropped"; readonly commandId: string; readonly reason: string }
+  /**
+   * The person typed a prompt in the terminal over the running turn
+   * (`prompt.submit` from the composer, with that turn's id): Claude Code
+   * holds it until it hands it to the model. An older mod never reports
+   * this event.
+   */
+  | { readonly type: "prompt.typed"; readonly turnId: string; readonly text: string }
   /** A prompt sent to steer a running turn was handed to the model inside that turn. */
   | {
       readonly type: "prompt.delivered";
@@ -726,6 +743,14 @@ export function parseClaudeBridgeEvent(value: unknown): ClaudeBridgeEvent | null
         type: "prompt.dropped",
         commandId: value.commandId,
         reason: readOptionalString(value.reason) ?? "dropped",
+      };
+    case "prompt.typed":
+      if (typeof value.text !== "string" || value.text.trim().length === 0) return null;
+      return {
+        ...base,
+        type: "prompt.typed",
+        turnId: readOptionalString(value.turnId) ?? "",
+        text: value.text,
       };
     case "prompt.delivered":
       if (typeof value.commandId !== "string") return null;
@@ -1600,6 +1625,12 @@ export function claudeBridgeWakeDetail(message: SDKMessage): string | null {
   return typeof detail === "string" && detail.length > 0 ? detail : null;
 }
 
+/** The uuid a bridge `user` frame's prompt was shown waiting under (see claudeTypedWaitingFrame), if any. */
+export function claudeBridgeWakeWaiting(message: SDKMessage): string | null {
+  const waiting = Reflect.get(message, CLAUDE_BRIDGE_WAKE_WAITING_KEY);
+  return typeof waiting === "string" && waiting.length > 0 ? waiting : null;
+}
+
 /** Where the session said a bridge `user` frame's prompt came from, if its mod relayed it. */
 export function claudeBridgeWakeOrigin(message: SDKMessage): string | null {
   const origin = Reflect.get(message, CLAUDE_BRIDGE_WAKE_ORIGIN_KEY);
@@ -1683,11 +1714,12 @@ export interface ClaudeBridgeFrameTranslator {
   /**
    * Frames for a turn that began: a wake `user` frame for a foreign turn, then
    * `init`. `request` marks a turn T3 opens itself to carry a request, with
-   * who asks.
+   * who asks. `waiting` marks a turn that is the session taking what the
+   * person typed over the turn before, with the uuid it was shown waiting under.
    */
   readonly onTurnStart: (
     event: Extract<ClaudeBridgeEvent, { type: "turn.start" }>,
-    options?: { readonly request?: ClaudeBridgeRequestTurnBy },
+    options?: { readonly request?: ClaudeBridgeRequestTurnBy; readonly waiting?: string },
   ) => ReadonlyArray<SDKMessage>;
   /** Frames for one transcript line, already parsed from JSON. */
   readonly onTranscriptRow: (row: unknown) => ReadonlyArray<SDKMessage>;
@@ -1721,6 +1753,8 @@ export interface ClaudeBridgeFrameTranslator {
   readonly hasOpenTurn: () => boolean;
   /** The id of the turn open here, or null. */
   readonly openTurnId: () => string | null;
+  /** When the turn open here began, as the session reported it (0 when nothing said), or null. */
+  readonly openTurnStartedAt: () => number | null;
 }
 
 const zeroUsage = (): SDKResultMessage["usage"] =>
@@ -1880,6 +1914,9 @@ export function makeClaudeBridgeFrameTranslator(
           ...(turnOptions?.request === undefined
             ? {}
             : { [CLAUDE_BRIDGE_WAKE_REQUEST_KEY]: turnOptions.request }),
+          ...(turnOptions?.waiting === undefined
+            ? {}
+            : { [CLAUDE_BRIDGE_WAKE_WAITING_KEY]: turnOptions.waiting }),
         } as unknown as SDKUserMessage;
         frames.push(wakeUser);
       }
@@ -2147,6 +2184,7 @@ export function makeClaudeBridgeFrameTranslator(
     },
     hasOpenTurn: () => turn !== null,
     openTurnId: () => turn?.turnId ?? null,
+    openTurnStartedAt: () => turn?.startedAt ?? null,
   };
 }
 
@@ -2297,6 +2335,68 @@ export const claudeBridgeQueuedPrompt = (
         text: queued.text,
         sender: typeof queued.sender === "string" ? queued.sender : null,
       }
+    : null;
+};
+
+/**
+ * A `queue-operation` row: Claude Code's account of the prompts it holds
+ * behind a running turn. `enqueue` is written as a prompt is submitted, with
+ * its text; `remove` as the model is handed one inside the running turn, with
+ * its text; `dequeue` as one begins the next turn; `popAll` as the person
+ * takes them all back into the prompt to edit. Null for every other row.
+ */
+export function claudeQueueOperation(row: unknown): {
+  readonly operation: "enqueue" | "dequeue" | "remove" | "popAll";
+  readonly at: number;
+  readonly content: string | null;
+} | null {
+  if (!isRecord(row) || row.type !== "queue-operation") return null;
+  const operation = row.operation;
+  if (
+    operation !== "enqueue" &&
+    operation !== "dequeue" &&
+    operation !== "remove" &&
+    operation !== "popAll"
+  ) {
+    return null;
+  }
+  const at = typeof row.timestamp === "string" ? Date.parse(row.timestamp) : Number.NaN;
+  return {
+    operation,
+    at: Number.isNaN(at) ? 0 : at,
+    content: typeof row.content === "string" ? row.content : null,
+  };
+}
+
+/**
+ * The frame that shows what the person typed in the terminal over a running
+ * turn, from the moment they typed it: the session holds it until it hands
+ * it to the model at a tool call of that turn, or begins its next turn with
+ * it. `uuid` names it to T3 meanwhile.
+ */
+export const claudeTypedWaitingFrame = (input: {
+  readonly uuid: string;
+  readonly sessionId: string;
+  readonly text: string;
+}): SDKSystemMessage =>
+  ({
+    type: "system",
+    subtype: "typed_waiting",
+    uuid: asUuid(input.uuid),
+    session_id: input.sessionId,
+    [CLAUDE_BRIDGE_TYPED_WAITING_KEY]: { text: input.text },
+  }) as unknown as SDKSystemMessage;
+
+/** What a frame made by claudeTypedWaitingFrame carries. */
+export const claudeBridgeTypedWaiting = (
+  message: unknown,
+): { readonly uuid: string; readonly text: string } | null => {
+  const typed = isRecord(message) ? Reflect.get(message, CLAUDE_BRIDGE_TYPED_WAITING_KEY) : null;
+  return isRecord(message) &&
+    typeof message.uuid === "string" &&
+    isRecord(typed) &&
+    typeof typed.text === "string"
+    ? { uuid: message.uuid, text: typed.text }
     : null;
 };
 
