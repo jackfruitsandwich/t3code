@@ -17,9 +17,18 @@ import { forkParked } from "../../serverActivation.ts";
  * lineCount }). A binding without that marker belongs to a T3-native session
  * and is never touched; a discovered file is only imported incrementally when
  * both the session id and path match the marker. Once a T3 run has happened
- * on an imported thread, T3 owns it: the cursor is dropped and the file is no
- * longer tailed. Sessions T3 itself drives (v2 provider threads) are never
- * imported.
+ * on a thread, T3 owns it, and the thread still catches up with what the
+ * session's record holds that T3's own runs did not write (a terminal, Codex
+ * Desktop); sessions T3 itself drives (v2 provider threads) never become
+ * threads of their own.
+ *
+ * A Codex thread shows what its record holds as the live adapter shows it:
+ * messages, and commands, tool calls, patches, searches, compactions and
+ * interrupted turns as turn items keyed by their provider ids, so a turn T3
+ * drove live is never shown twice. It is titled with Codex's own name for it
+ * (`session_index.jsonl`) unless the person renamed it in T3, shows the
+ * model and goal the record last names, and follows the record into the
+ * later files Codex goes on writing it in (`rollout-…-<thread>_<segment>`).
  *
  * @module import/Layers/SessionImporter
  */
@@ -44,12 +53,15 @@ import {
   type OrchestrationV2AppThread,
   type OrchestrationV2ThreadHeldBy,
   type OrchestrationV2DomainEvent,
+  type OrchestrationV2ProviderGoal,
   type OrchestrationV2ProviderThread,
+  type OrchestrationV2TurnItem,
   type ServerSettings,
 } from "@t3tools/contracts";
 import { claudePromptAsDrawn } from "@t3tools/shared/claudePastedContent";
 import { HostProcessEnvironment } from "@t3tools/shared/hostProcess";
 import * as Clock from "effect/Clock";
+import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -70,6 +82,10 @@ import {
   threadSettingsForClaudeSession,
 } from "../../claude-bridge/ClaudeBridgeProtocol.ts";
 import { ServerConfig } from "../../config.ts";
+import {
+  projectCodexDynamicToolItem,
+  type CodexDynamicToolItem,
+} from "../../orchestration-v2/Adapters/CodexAdapterV2.ts";
 import * as EventSink from "../../orchestration-v2/EventSink.ts";
 import { deriveProviderThread } from "../../orchestration-v2/IdAllocator.ts";
 import * as ProjectStore from "../../orchestration-v2/ProjectStore.ts";
@@ -89,13 +105,19 @@ import {
   isClaudeTaskNoticeText,
   parseClaudeSessionJsonl,
 } from "../claudeSessionParser.ts";
-import { parseCodexRolloutJsonl } from "../codexRolloutParser.ts";
+import {
+  parseCodexRolloutJsonl,
+  parseCodexSessionIndex,
+  type CodexThreadName,
+} from "../codexRolloutParser.ts";
 import {
   isCommandNoiseText,
   isEligibleCliSession,
   isRecord,
   parseJsonlLine,
   type ParsedCliSession,
+  type ParsedSessionGoal,
+  type ParsedSessionItem,
   type ParsedSessionMessage,
   type ParsedSessionNotice,
   type ParsedSessionSystemNotice,
@@ -435,6 +457,18 @@ const importedTurnItemId = (threadId: ThreadId, sourceId: string) =>
 const importEventId = (threadId: ThreadId, facet: string) =>
   EventId.make(`cli-import:v2:${threadId}:${facet}`);
 
+const UUID_PATTERN = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+const CODEX_SEGMENT_FILE = new RegExp(`-(${UUID_PATTERN})_(${UUID_PATTERN})\\.jsonl$`);
+
+/**
+ * `rollout-<time>-<thread>_<segment>.jsonl`: a later file Codex went on
+ * writing a thread in (after a turn it took back, from the point before it).
+ */
+const codexRecordSegment = (filePath: string) => {
+  const match = CODEX_SEGMENT_FILE.exec(filePath);
+  return match === null ? undefined : { threadId: match[1]!, segmentId: match[2]! };
+};
+
 function readImportCursor(runtimePayload: unknown): ImportCursor | undefined {
   if (!isRecord(runtimePayload) || !isRecord(runtimePayload.importCursor)) {
     return undefined;
@@ -645,6 +679,127 @@ function noticeEvent(
   };
 }
 
+/**
+ * The id the live adapter gives the turn item of a provider item
+ * (IdAllocator's `turnItemFromProviderItem`): a row T3 showed live is found
+ * by it, so the record's copy of it is never shown a second time.
+ */
+const liveTurnItemId = (driver: ProviderDriverKind, nativeId: string) =>
+  ["turn-item", "provider", driver, "native-item", nativeId].map(encodeURIComponent).join(":");
+
+/** The record's goal as the thread's provider thread carries it (the live adapter's `providerGoalFromCodex`). */
+const CODEX_GOAL_STATUSES: Readonly<Record<string, OrchestrationV2ProviderGoal["status"]>> = {
+  active: "active",
+  paused: "paused",
+  blocked: "blocked",
+  usageLimited: "usage_limited",
+  budgetLimited: "budget_limited",
+  complete: "complete",
+};
+const providerGoal = (goal: ParsedSessionGoal | null): OrchestrationV2ProviderGoal | null => {
+  const status = goal === null ? undefined : CODEX_GOAL_STATUSES[goal.status];
+  if (goal === null || status === undefined) return null;
+  return {
+    objective: goal.objective,
+    status,
+    tokensUsed: Math.floor(goal.tokensUsed),
+    tokenBudget: goal.tokenBudget === null ? null : Math.max(0, Math.floor(goal.tokenBudget)),
+    timeUsedSeconds: Math.floor(goal.timeUsedSeconds),
+  };
+};
+
+const sameGoal = (
+  left: OrchestrationV2ProviderGoal | null,
+  right: OrchestrationV2ProviderGoal | null,
+) =>
+  left === null || right === null
+    ? left === right
+    : left.objective === right.objective &&
+      left.status === right.status &&
+      (left.tokensUsed ?? 0) === (right.tokensUsed ?? 0) &&
+      (left.tokenBudget ?? null) === (right.tokenBudget ?? null) &&
+      (left.timeUsedSeconds ?? 0) === (right.timeUsedSeconds ?? 0);
+
+/**
+ * A record's messages, in the order given, with its items (record order)
+ * each put before the first message written after it.
+ */
+type RecordRow =
+  | { readonly kind: "message"; readonly row: ParsedSessionMessage }
+  | { readonly kind: "item"; readonly row: ParsedSessionItem };
+const recordRows = (
+  messages: ReadonlyArray<ParsedSessionMessage>,
+  items: ReadonlyArray<ParsedSessionItem>,
+): ReadonlyArray<RecordRow> => {
+  const rows: Array<RecordRow> = [];
+  let next = 0;
+  for (const message of messages) {
+    while (next < items.length && items[next]!.lineIndex < message.lineIndex) {
+      rows.push({ kind: "item", row: items[next]! });
+      next += 1;
+    }
+    rows.push({ kind: "message", row: message });
+  }
+  for (const item of items.slice(next)) rows.push({ kind: "item", row: item });
+  return rows;
+};
+
+/** The timeline row for an item of a Codex record, as the live adapter shows the same item. */
+const recordItemEvent = Effect.fn("SessionImporter.recordItemEvent")(function* (
+  threadId: ThreadId,
+  row: ParsedSessionItem,
+) {
+  const at = dateTime(row.timestamp);
+  const base = {
+    id: importedTurnItemId(threadId, row.sourceId),
+    threadId,
+    runId: null,
+    nodeId: null,
+    providerThreadId: null,
+    providerTurnId: null,
+    nativeItemRef:
+      row.nativeId === undefined
+        ? null
+        : { driver: CODEX_DRIVER, nativeId: row.nativeId, strength: "strong" as const },
+    parentItemId: null,
+    // EventSink assigns the real position (next in the thread's runless band).
+    ordinal: 0,
+    startedAt: at,
+    completedAt: at,
+    updatedAt: at,
+  };
+  const { item } = row;
+  let payload: OrchestrationV2TurnItem;
+  switch (item.type) {
+    case "tool_call": {
+      const projection = yield* projectCodexDynamicToolItem(item.call as CodexDynamicToolItem);
+      payload = { ...base, title: projection.title ?? null, type: "dynamic_tool", ...projection };
+      break;
+    }
+    case "compaction":
+      payload = {
+        ...base,
+        status: "completed",
+        title: "Context compacted",
+        type: "compaction",
+        driver: CODEX_DRIVER,
+      };
+      break;
+    case "system_notice":
+      payload = { ...base, title: item.message, ...item };
+      break;
+    default:
+      payload = { ...base, title: null, ...item };
+  }
+  return {
+    id: importEventId(threadId, `turn-item:${row.sourceId}`),
+    type: "turn-item.updated",
+    threadId,
+    occurredAt: at,
+    payload,
+  } satisfies OrchestrationV2DomainEvent;
+});
+
 const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
   Effect.gen(function* () {
     const eventSink = yield* EventSink.EventSinkV2;
@@ -657,6 +812,7 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
     const sql = yield* SqlClient.SqlClient;
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
+    const crypto = yield* Crypto.Crypto;
 
     const enabled = options?.enabled ?? true;
     const sweepIntervalMs = Math.max(1, options?.sweepIntervalMs ?? DEFAULT_SWEEP_INTERVAL_MS);
@@ -673,6 +829,28 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
     // --- Store: the importer's whole view of T3 state -------------------------
 
     const listBindings = runtimes.list().pipe(Effect.map((rows) => rows.map(toBinding)));
+
+    /** Message and item events for record rows, in the order given. */
+    const recordRowEvents = (
+      threadId: ThreadId,
+      sessionId: string,
+      rows: ReadonlyArray<RecordRow>,
+    ) =>
+      Effect.gen(function* () {
+        const events: Array<OrchestrationV2DomainEvent> = [];
+        for (const entry of rows) {
+          if (entry.kind === "message") {
+            events.push(...messageEvents({ threadId, sessionId, message: entry.row }));
+          } else {
+            events.push(
+              yield* recordItemEvent(threadId, entry.row).pipe(
+                Effect.provideService(Crypto.Crypto, crypto),
+              ),
+            );
+          }
+        }
+        return events;
+      });
 
     /**
      * Shallow-merges `runtimePayload` into the thread's binding (the
@@ -828,6 +1006,66 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
       },
     );
 
+    /**
+     * A Codex thread shows the model the session's record says its latest
+     * turn ran on, and the goal the record last wrote, whoever ran that turn:
+     * the terminal, Codex Desktop, or T3. A run T3 is driving keeps its own.
+     */
+    const showCodexSessionState = Effect.fn("SessionImporter.showCodexSessionState")(
+      function* (input: { readonly threadId: ThreadId; readonly parsed: ParsedCliSession }) {
+        const { parsed } = input;
+        if (parsed.model === undefined && parsed.goal === undefined) return;
+        if ((yield* activeRunStartsMs(input.threadId)).length > 0) return;
+        const records = yield* threads.getThreadRecords(input.threadId, ["providerThreads"]);
+        const thread = records.thread;
+        const at = yield* Clock.currentTimeMillis;
+        const events: Array<OrchestrationV2DomainEvent> = [];
+        if (parsed.model !== undefined && thread.modelSelection.model !== parsed.model) {
+          events.push({
+            // The thread follows what the session says now: not a fact about
+            // a row of the record, so not an id a replay would repeat.
+            id: importEventId(thread.id, `session-model:${at}`),
+            type: "thread.model-selection-updated",
+            threadId: thread.id,
+            providerInstanceId: thread.providerInstanceId,
+            // Seeing a session is not activity in its thread.
+            occurredAt: thread.updatedAt,
+            // The previous model's options belong to that model.
+            payload: {
+              ...thread,
+              modelSelection: { instanceId: thread.modelSelection.instanceId, model: parsed.model },
+            },
+          });
+        }
+        const providerThread = records.providerThreads.find(
+          (candidate) => candidate.id === thread.activeProviderThreadId,
+        );
+        const goal = parsed.goal === undefined ? undefined : providerGoal(parsed.goal);
+        if (
+          goal !== undefined &&
+          providerThread !== undefined &&
+          !sameGoal(providerThread.goal ?? null, goal)
+        ) {
+          events.push({
+            id: importEventId(thread.id, `session-goal:${at}`),
+            type: "provider-thread.updated",
+            threadId: thread.id,
+            driver: CODEX_DRIVER,
+            providerInstanceId: providerThread.providerInstanceId,
+            occurredAt: providerThread.updatedAt,
+            payload: { ...providerThread, goal },
+          });
+        }
+        if (events.length === 0) return;
+        yield* eventSink.write({ events });
+        yield* Effect.logInfo("session.importer.codex-session-state-shown", {
+          threadId: input.threadId,
+          model: parsed.model,
+          goal: goal?.status ?? null,
+        });
+      },
+    );
+
     /** When each run T3 is driving on the thread right now was asked for. */
     const activeRunStartsMs = (threadId: ThreadId) =>
       sql<{ readonly status: string; readonly requested_at: string }>`
@@ -977,6 +1215,32 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
     // Cheap change detection between sweeps; per spec a stale entry only
     // delays a file until it changes again, so process-local state is fine.
     const fileFingerprints = new Map<string, { size: number; mtimeMs: number }>();
+    // Later Codex files read again once their thread's earlier file had its turn.
+    const segmentsWaited = new Set<string>();
+    // Codex's names for its threads, read again when its index changes.
+    let codexNames: ReadonlyMap<string, CodexThreadName> = new Map();
+    let codexNamesFingerprint: string | undefined;
+    // The name each imported Codex thread was last compared with.
+    const codexNamesCompared = new Map<ThreadId, string>();
+    const readCodexNames = (indexPath: string) =>
+      Effect.gen(function* () {
+        const info = yield* fs.stat(indexPath).pipe(Effect.option);
+        if (Option.isNone(info)) {
+          codexNames = new Map();
+          codexNamesFingerprint = undefined;
+          return;
+        }
+        const mtimeMs = Option.match(info.value.mtime, {
+          onNone: () => 0,
+          onSome: (mtime) => mtime.getTime(),
+        });
+        const fingerprint = `${Number(info.value.size)}:${mtimeMs}`;
+        if (fingerprint === codexNamesFingerprint) return;
+        codexNames = parseCodexSessionIndex(
+          yield* fs.readFileString(indexPath).pipe(Effect.orElseSucceed(() => "")),
+        );
+        codexNamesFingerprint = fingerprint;
+      });
     // One record can be reached by two paths: a session run under another
     // config folder (`~/.claude-ev`, its `projects` linked to `~/.claude`'s)
     // reports its record under that folder, and the sweep reads the same
@@ -1140,12 +1404,29 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         timestamp: notice.timestamp,
         lineIndex: notice.lineIndex,
       }));
+      // A Codex record's commands and tool calls take their places as its
+      // messages do.
+      const items = new Map((input.parsed.items ?? []).map((item) => [item.sourceId, item]));
+      const itemRows = [...items.values()].map((item): ParsedSessionMessage => ({
+        role: "assistant",
+        sourceId: item.sourceId,
+        text: "",
+        timestamp: item.timestamp,
+        lineIndex: item.lineIndex,
+      }));
       // Rows in the wrong band move to theirs; within a band, rows that sit
       // above rows written before them go back in the order they were written.
       const reseats =
         input.pass === "bands"
-          ? planImportedRowReseating({ rows: input.parsed.messages, imported, runs: input.runs })
-          : planImportedRowOrdering({ rows: [...input.parsed.messages, ...noticeRows], imported });
+          ? planImportedRowReseating({
+              rows: [...input.parsed.messages, ...itemRows],
+              imported,
+              runs: input.runs,
+            })
+          : planImportedRowOrdering({
+              rows: [...input.parsed.messages, ...noticeRows, ...itemRows],
+              imported,
+            });
       if (reseats.length === 0) return;
       const events: Array<OrchestrationV2DomainEvent> = [];
       for (const reseat of reseats) {
@@ -1156,10 +1437,15 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         `;
         const position = yield* placeImportedRow(threadId, reseat);
         const notice = notices.get(reseat.message.sourceId);
+        const recordItem = items.get(reseat.message.sourceId);
         const item =
-          notice === undefined
-            ? messageEvents({ threadId, sessionId, message: reseat.message })[1]!
-            : noticeEvent(threadId, notice);
+          recordItem !== undefined
+            ? yield* recordItemEvent(threadId, recordItem).pipe(
+                Effect.provideService(Crypto.Crypto, crypto),
+              )
+            : notice === undefined
+              ? messageEvents({ threadId, sessionId, message: reseat.message })[1]!
+              : noticeEvent(threadId, notice);
         events.push({
           ...item,
           // A row can be moved more than once: each place it is given is its own event.
@@ -1182,6 +1468,8 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
       readonly fromLineIndex: number;
       /** Only rows after this instant; the rest are T3's own turns. */
       readonly afterMs?: number;
+      /** Rows of these provider turns stay out too: they are T3's own turns (Codex). */
+      readonly ownTurnIds?: ReadonlySet<string>;
       /** The thread's runs: each row goes after the one that was the latest when it was written. */
       readonly runs?: ReadonlyArray<HealingRun>;
     }) {
@@ -1192,13 +1480,14 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         held === 0
           ? input.parsed.messages
           : input.parsed.messages.slice(0, input.parsed.messages.length - held);
-      const candidates = settled.filter(
-        (message) =>
-          message.lineIndex >= input.fromLineIndex &&
-          (input.afterMs === undefined ||
-            DateTime.toEpochMillis(dateTime(message.timestamp)) > input.afterMs),
-      );
-      if (candidates.length === 0) return 0;
+      const takes = (row: ParsedSessionMessage | ParsedSessionItem) =>
+        row.lineIndex >= input.fromLineIndex &&
+        (row.nativeTurnId === undefined || input.ownTurnIds?.has(row.nativeTurnId) !== true) &&
+        (input.afterMs === undefined ||
+          DateTime.toEpochMillis(dateTime(row.timestamp)) > input.afterMs);
+      const candidates = settled.filter(takes);
+      const itemCandidates = (input.parsed.items ?? []).filter(takes);
+      if (candidates.length === 0 && itemCandidates.length === 0) return 0;
       // Migrated threads hydrate their v1 transcript lazily; finish that first
       // so appended messages take positions after it.
       yield* threads.ensureLegacyTranscript(input.threadId);
@@ -1218,23 +1507,49 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
       const fresh = candidates.filter(
         (message) =>
           !known.has(importedMessageId(input.sessionId, message.sourceId)) &&
-          !knownNative.has(message.sourceId),
+          !knownNative.has(message.sourceId) &&
+          (message.nativeId === undefined || !knownNative.has(message.nativeId)),
       );
-      if (fresh.length === 0) return 0;
+      // An item is shown once: under the id the importer gives it, or the
+      // one a live run gave the same provider item.
+      const shownItems =
+        itemCandidates.length === 0
+          ? []
+          : yield* sql<{ readonly turn_item_id: string; readonly native_id: string | null }>`
+              SELECT
+                turn_item_id,
+                json_extract(payload_json, '$.nativeItemRef.nativeId') AS native_id
+              FROM orchestration_v2_projection_turn_items
+              WHERE thread_id = ${input.threadId}
+            `;
+      const shownItemIds = new Set(shownItems.map((row) => row.turn_item_id));
+      const shownNativeItems = new Set(shownItems.flatMap((row) => row.native_id ?? []));
+      const freshItems = itemCandidates.filter(
+        (item) =>
+          !shownItemIds.has(importedTurnItemId(input.threadId, item.sourceId)) &&
+          (item.nativeId === undefined ||
+            (!shownNativeItems.has(item.nativeId) &&
+              !shownItemIds.has(liveTurnItemId(CODEX_DRIVER, item.nativeId)))),
+      );
+      const rows = recordRows(fresh, freshItems);
+      if (rows.length === 0) return 0;
       if (input.runs !== undefined && input.runs.length > 0) {
-        for (const message of fresh) {
-          yield* placeImportedRow(input.threadId, {
-            message,
-            band: bandForTime(input.runs, DateTime.toEpochMillis(dateTime(message.timestamp))),
+        for (const { row } of rows) {
+          yield* turnItemPositions.allocate({
+            threadId: input.threadId,
+            turnItemId: importedTurnItemId(input.threadId, row.sourceId),
+            runId: null,
+            runOrdinal: bandForTime(input.runs, DateTime.toEpochMillis(dateTime(row.timestamp))),
           });
         }
       }
       const records = yield* threads.getThreadRecords(input.threadId, []);
       const thread = records.thread;
-      const newest = dateTime(fresh[fresh.length - 1]!.timestamp);
-      const events: Array<OrchestrationV2DomainEvent> = fresh.flatMap((message) =>
-        messageEvents({ threadId: input.threadId, sessionId: input.sessionId, message }),
-      );
+      const last = rows[rows.length - 1]!.row;
+      const newest = dateTime(last.timestamp);
+      const events: Array<OrchestrationV2DomainEvent> = [
+        ...(yield* recordRowEvents(input.threadId, input.sessionId, rows)),
+      ];
       const isNewer = DateTime.toEpochMillis(newest) > DateTime.toEpochMillis(thread.updatedAt);
       // Threads imported before the holder stamp existed pick it up on their
       // next appended message, riding the recency bump instead of a sweep.
@@ -1243,7 +1558,7 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
       if (isNewer || stampHeldBy) {
         events.push({
           id: isNewer
-            ? importEventId(input.threadId, `recency:${fresh[fresh.length - 1]!.sourceId}`)
+            ? importEventId(input.threadId, `recency:${last.sourceId}`)
             : importEventId(input.threadId, `held-by:${heldBy}`),
           type: "thread.metadata-updated",
           threadId: input.threadId,
@@ -1257,7 +1572,7 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         });
       }
       yield* eventSink.write({ events });
-      return fresh.length;
+      return rows.length;
     });
 
     const upsertImportBinding = (input: {
@@ -2305,6 +2620,102 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
       }
     });
 
+    /** The native ids of the provider turns T3 has run on a thread. */
+    const t3ProviderTurnIds = (threadId: ThreadId) =>
+      sql<{ readonly native_id: string | null }>`
+        SELECT json_extract(payload_json, '$.nativeTurnRef.nativeId') AS native_id
+        FROM orchestration_v2_projection_provider_turns
+        WHERE thread_id = ${threadId}
+      `.pipe(Effect.map((rows) => new Set(rows.flatMap((row) => row.native_id ?? []))));
+
+    /**
+     * The newest moment of what T3 wrote on a thread before it kept provider
+     * turns (v1, or a v2 thread's migrated history): rows of the record up to
+     * then may be T3's own, and nothing tells them apart.
+     */
+    const legacyT3WatermarkMs = (threadId: ThreadId) =>
+      sql<{ readonly at: string | null }>`
+        SELECT max(updated_at) AS at
+        FROM orchestration_v2_projection_messages
+        WHERE thread_id = ${threadId}
+          AND message_id NOT LIKE 'cli-import-%'
+          AND run_id IS NULL
+      `.pipe(
+        Effect.map((rows) => {
+          const at = rows[0]?.at;
+          return at === undefined || at === null ? undefined : DateTime.toEpochMillis(dateTime(at));
+        }),
+      );
+
+    /**
+     * A Codex thread T3 has run whose session went on without T3 (the Codex
+     * terminal, Codex Desktop) gets the record's rows T3 never wrote, as
+     * imported history, with their commands and tool calls. T3's own turns
+     * stay out by the provider turns T3 ran, which the record's rows name;
+     * rows from before T3 kept provider turns, or rows that name no turn,
+     * stay out up to T3's watermark. While a T3 run is writing the thread,
+     * nothing is taken in.
+     */
+    const catchUpCodexThread = Effect.fn("SessionImporter.catchUpCodexThread")(function* (input: {
+      readonly driver: ProviderDriverKind;
+      readonly sessionId: string;
+      readonly filePath: string;
+      readonly parsed: ParsedCliSession;
+      readonly threadId: ThreadId;
+      readonly fromLineIndex: number;
+      readonly context: Pick<SweepContext, "stats">;
+    }) {
+      // A thread deleted in T3 stays as it is; a run T3 is driving writes its own.
+      if (Option.isNone(yield* getThread(input.threadId))) return;
+      if ((yield* activeRunStartsMs(input.threadId)).length > 0) return;
+      yield* showCodexSessionState({ threadId: input.threadId, parsed: input.parsed });
+      const runs = yield* threadRuns(input.threadId);
+      const reseat = {
+        driver: input.driver,
+        sessionId: input.sessionId,
+        threadId: input.threadId,
+        parsed: input.parsed,
+        runs,
+      };
+      yield* reseatImportedRows({ ...reseat, pass: "bands" });
+      const turnless = [...input.parsed.messages, ...(input.parsed.items ?? [])].some(
+        (row) => row.lineIndex >= input.fromLineIndex && row.nativeTurnId === undefined,
+      );
+      const afterMs = turnless
+        ? yield* ownedWatermarkMs(input.threadId)
+        : yield* legacyT3WatermarkMs(input.threadId);
+      const appendedCount =
+        input.parsed.lineCount <= input.fromLineIndex
+          ? 0
+          : yield* appendMessages({
+              sessionId: input.sessionId,
+              threadId: input.threadId,
+              parsed: input.parsed,
+              fromLineIndex: input.fromLineIndex,
+              runs,
+              ownTurnIds: yield* t3ProviderTurnIds(input.threadId),
+              ...(afterMs === undefined ? {} : { afterMs }),
+            });
+      // What was just added went to the end of its band.
+      if (appendedCount > 0) yield* reseatImportedRows({ ...reseat, pass: "order" });
+      yield* upsertImportBinding({
+        driver: input.driver,
+        sessionId: input.sessionId,
+        threadId: input.threadId,
+        parsed: input.parsed,
+        filePath: input.filePath,
+      });
+      if (appendedCount > 0) {
+        input.context.stats.updatedCount += 1;
+        yield* Effect.logInfo("session.importer.owned-thread-caught-up", {
+          provider: input.driver,
+          sessionId: input.sessionId,
+          threadId: input.threadId,
+          appendedCount,
+        });
+      }
+    });
+
     const importFreshSession = Effect.fn("SessionImporter.importFreshSession")(function* (input: {
       readonly driver: ProviderDriverKind;
       readonly sessionId: string;
@@ -2384,11 +2795,15 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         creationSource: "server",
         id: threadId,
         projectId,
-        title: parsed.title ?? "Imported session",
+        title:
+          (driver === CODEX_DRIVER ? codexNames.get(sessionId)?.name : undefined) ??
+          parsed.title ??
+          "Imported session",
         providerInstanceId: instanceId,
         modelSelection: {
           instanceId,
-          model: observed?.model ?? DEFAULT_MODEL_BY_PROVIDER[driver] ?? DEFAULT_MODEL,
+          model:
+            observed?.model ?? parsed.model ?? DEFAULT_MODEL_BY_PROVIDER[driver] ?? DEFAULT_MODEL,
           ...(observed?.contextWindow === undefined
             ? {}
             : { options: [{ id: "contextWindow", value: observed.contextWindow }] }),
@@ -2436,6 +2851,7 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         handoffIds: [],
         forkedFrom: null,
         pendingBackgroundTasks: [],
+        ...(parsed.goal === undefined ? {} : { goal: providerGoal(parsed.goal) }),
         createdAt,
         updatedAt,
       };
@@ -2449,7 +2865,11 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
             occurredAt: createdAt,
             payload: thread,
           },
-          ...parsed.messages.flatMap((message) => messageEvents({ threadId, sessionId, message })),
+          ...(yield* recordRowEvents(
+            threadId,
+            sessionId,
+            recordRows(parsed.messages, parsed.items ?? []),
+          )),
           {
             id: importEventId(threadId, "provider-thread"),
             type: "provider-thread.updated",
@@ -2495,33 +2915,19 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
       }) {
         const { driver, sessionId, parsed, cursor } = input;
         // A T3 run has happened on this thread since import: T3 drives its
-        // native session now. A Claude session can still grow without T3 (a
-        // terminal without the mod), so its thread keeps catching up from
-        // where T3's own record ends. A Codex thread is handed over for good:
-        // drop the import cursor so this source file is never tailed again and
-        // T3's own turns aren't re-imported as duplicates.
+        // native session now, and the session can still grow without T3 (a
+        // Claude terminal without the mod; the Codex terminal or Codex
+        // Desktop), so its thread keeps catching up with what T3's own runs
+        // did not write.
         if (yield* hasT3Runs(input.binding.threadId)) {
-          if (driver === CLAUDE_DRIVER) {
-            yield* catchUpOwnedThread({
-              driver,
-              sessionId,
-              filePath: input.filePath,
-              parsed,
-              threadId: input.binding.threadId,
-              fromLineIndex: cursor.lineCount,
-              context: input.context,
-            });
-            return;
-          }
-          yield* mergeBinding({
-            threadId: input.binding.threadId,
-            provider: driver,
-            runtimePayload: { importCursor: null },
-          });
-          yield* Effect.logInfo("session.importer.thread-adopted", {
-            provider: driver,
+          yield* (driver === CODEX_DRIVER ? catchUpCodexThread : catchUpOwnedThread)({
+            driver,
             sessionId,
+            filePath: input.filePath,
+            parsed,
             threadId: input.binding.threadId,
+            fromLineIndex: cursor.lineCount,
+            context: input.context,
           });
           return;
         }
@@ -2630,6 +3036,8 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         }
         if (driver === CLAUDE_DRIVER) {
           yield* showLiveSessionSettings({ threadId, sessionId, parsed });
+        } else {
+          yield* showCodexSessionState({ threadId, parsed });
         }
         if (parsed.lineCount <= cursor.lineCount) {
           return;
@@ -2694,10 +3102,14 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
       }
 
       const content = yield* fs.readFileString(filePath);
+      const segment = driver === CODEX_DRIVER ? codexRecordSegment(filePath) : undefined;
       const parsed =
         driver === CLAUDE_DRIVER
           ? parseClaudeSessionJsonl(content)
-          : parseCodexRolloutJsonl(content);
+          : parseCodexRolloutJsonl(
+              content,
+              segment === undefined ? undefined : { segmentId: segment.segmentId },
+            );
       if (parsed.malformedLineCount > 0) {
         yield* Effect.logDebug("session.importer.malformed-lines", {
           filePath,
@@ -2713,10 +3125,13 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         return;
       }
       const key = sourceKey(driver, sessionId);
-      if (context.seenSessionIds.has(key)) {
+      // A thread's later files are read as well as its first one.
+      const isSegment = segment !== undefined && segment.threadId === sessionId;
+      const seenKey = isSegment ? `${key}#${segment.segmentId}` : key;
+      if (context.seenSessionIds.has(seenKey)) {
         return;
       }
-      context.seenSessionIds.add(key);
+      context.seenSessionIds.add(seenKey);
 
       // Human-side sessions register their fork signature so the sweep-end
       // machine placement pass can recognize machine-launched forks of them.
@@ -2784,33 +3199,17 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
           });
         }
         let cursor = readImportCursor(binding.runtimePayload);
-        if (cursor === undefined && driver === CLAUDE_DRIVER) {
-          // A Claude thread T3 took over, in any era, with no cursor: catch it
-          // up from the whole transcript. The watermark keeps T3's own turns
-          // out, and the binding gets a cursor for the sweeps after.
-          if (Option.isSome(yield* getThread(binding.threadId))) {
-            yield* catchUpOwnedThread({
-              driver,
-              sessionId,
-              filePath,
-              parsed,
-              threadId: binding.threadId,
-              fromLineIndex: 0,
-              context,
-            });
-          }
-          return;
-        }
         // Self-heal: an importer-created thread (cli-import- prefix) that
         // lost its cursor although T3 never ran it gets the cursor rebuilt
         // at the current file position. A thread T3 ran — native messages,
-        // a v2 run, or v1's adoption markers on the binding — keeps its
-        // handoff and is never tailed again.
+        // a v2 run, or v1's adoption markers on the binding — keeps reading
+        // the record past T3's own turns, below.
         const payload = isRecord(binding.runtimePayload) ? binding.runtimePayload : undefined;
         const adoptedBeforeV2 =
           binding.status !== "stopped" || Boolean(payload?.activeTurnId) || Boolean(payload?.model);
         if (
           cursor === undefined &&
+          driver === CODEX_DRIVER &&
           binding.threadId.startsWith("cli-import-") &&
           !adoptedBeforeV2 &&
           Option.isSome(yield* getThread(binding.threadId)) &&
@@ -2823,9 +3222,7 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
             lineCount: parsed.lineCount,
             // Epoch-1 chats keep the legacy epoch so the Chats migration
             // below still runs for them; everything else is stamped current.
-            ...(driver === CODEX_DRIVER &&
-            parsed.hasProject !== true &&
-            !isCurrentEpochThread(binding.threadId)
+            ...(parsed.hasProject !== true && !isCurrentEpochThread(binding.threadId)
               ? {}
               : { epoch: IMPORT_EPOCH }),
           };
@@ -2840,8 +3237,40 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
             threadId: binding.threadId,
           });
         }
+        if (cursor === undefined) {
+          // A thread T3 took over, in any era, with no cursor: catch it up
+          // from the whole transcript. T3's own turns stay out (Claude: by
+          // the watermark; Codex: by the provider turns T3 ran, and the
+          // watermark), and the binding gets a cursor for the sweeps after.
+          if (Option.isSome(yield* getThread(binding.threadId))) {
+            yield* (driver === CODEX_DRIVER ? catchUpCodexThread : catchUpOwnedThread)({
+              driver,
+              sessionId,
+              filePath,
+              parsed,
+              threadId: binding.threadId,
+              fromLineIndex: 0,
+              context,
+            });
+          }
+          return;
+        }
+        // Codex went on writing the thread in a later file: the thread
+        // follows it there, from that file's first line.
         if (
-          cursor === undefined ||
+          isSegment &&
+          cursor.sourceSessionId === sessionId &&
+          path.basename(filePath) > path.basename(cursor.sourcePath) &&
+          !(yield* sameRecordFile(cursor.sourcePath, filePath))
+        ) {
+          cursor = { ...cursor, sourcePath: filePath, lineCount: 0 };
+          yield* Effect.logInfo("session.importer.codex-segment-followed", {
+            sessionId,
+            threadId: binding.threadId,
+            filePath,
+          });
+        }
+        if (
           cursor.sourceSessionId !== sessionId ||
           !(yield* sameRecordFile(cursor.sourcePath, filePath))
         ) {
@@ -2861,23 +3290,33 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         return;
       }
 
-      // A session T3 itself started or resumed: it already has its thread. A
-      // Claude one still catches up with rows T3 never wrote (a terminal
-      // without the mod); the binding this creates carries the cursor on.
+      // A session T3 itself started or resumed: it already has its thread. It
+      // still catches up with rows T3 never wrote (a Claude terminal without
+      // the mod; the Codex terminal or Codex Desktop); the binding this
+      // creates carries the cursor on.
       if (context.t3NativeSessions.has(key)) {
-        if (driver === CLAUDE_DRIVER) {
-          const owned = yield* lookupOwnedThread(driver, sessionId);
-          if (owned !== undefined) {
-            yield* catchUpOwnedThread({
-              driver,
-              sessionId,
-              filePath,
-              parsed,
-              threadId: owned,
-              fromLineIndex: 0,
-              context,
-            });
-          }
+        const owned = yield* lookupOwnedThread(driver, sessionId);
+        if (owned !== undefined) {
+          yield* (driver === CODEX_DRIVER ? catchUpCodexThread : catchUpOwnedThread)({
+            driver,
+            sessionId,
+            filePath,
+            parsed,
+            threadId: owned,
+            fromLineIndex: 0,
+            context,
+          });
+        }
+        return;
+      }
+      // A later file that goes on from its thread's earlier one never makes a
+      // thread of its own: it holds only the end of the conversation. The
+      // earlier file gets the thread (it is read first), and this one is
+      // read again on the sweep after, to go on with it.
+      if (isSegment && parsed.continuesEarlierFile === true) {
+        if (!segmentsWaited.has(filePath)) {
+          segmentsWaited.add(filePath);
+          fileFingerprints.delete(filePath);
         }
         return;
       }
@@ -3211,6 +3650,56 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
       }
     });
 
+    /** The titles the importer gave a thread: when it made it, and each Codex name since. */
+    const importerTitles = (threadId: ThreadId) =>
+      sql<{ readonly title: string | null }>`
+        SELECT json_extract(payload_json, '$.title') AS title
+        FROM orchestration_events
+        WHERE application_event_version = 2
+          AND aggregate_kind = 'thread'
+          AND stream_id = ${threadId}
+          AND (
+            event_type = 'thread.created'
+            OR event_id LIKE ${`${importEventId(threadId, "codex-name:")}%`}
+          )
+      `.pipe(Effect.map((rows) => new Set(rows.flatMap((row) => row.title ?? []))));
+
+    /**
+     * An imported Codex thread is titled with the name Codex has for it (its
+     * thread list, `codex resume`), and follows that name when it changes. A
+     * title the person set in T3 is theirs: a thread whose title is not one
+     * the importer gave it keeps it. The thread's place in the list stays.
+     */
+    const followCodexNames = Effect.fn("SessionImporter.followCodexNames")(function* (
+      context: SweepContext,
+    ) {
+      for (const [sessionId, { name, updatedAt }] of codexNames) {
+        const binding = context.bindingsBySource.get(sourceKey(CODEX_DRIVER, sessionId));
+        if (binding === undefined || !binding.threadId.startsWith("cli-import")) continue;
+        const threadId = binding.threadId;
+        if (codexNamesCompared.get(threadId) === name) continue;
+        codexNamesCompared.set(threadId, name);
+        if (Option.isNone(yield* getThread(threadId))) continue;
+        const thread = (yield* threads.getThreadRecords(threadId, [])).thread;
+        if (thread.title === name) continue;
+        if (!(yield* importerTitles(threadId)).has(thread.title)) continue;
+        yield* eventSink.write({
+          events: [
+            {
+              id: importEventId(threadId, `codex-name:${hashHex(name)}:${updatedAt}`),
+              type: "thread.metadata-updated",
+              threadId,
+              providerInstanceId: thread.providerInstanceId,
+              // A name is not activity in the thread.
+              occurredAt: thread.updatedAt,
+              payload: { ...thread, title: name },
+            },
+          ],
+        });
+        yield* Effect.logInfo("session.importer.codex-name-followed", { sessionId, threadId });
+      }
+    });
+
     const buildSweepContext = Effect.gen(function* () {
       const settings = yield* serverSettings.getSettings;
       const claudeProjectsDir = options?.claudeProjectsDir ?? resolveClaudeProjectsDir(settings);
@@ -3272,6 +3761,7 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
 
     const sweep = Effect.gen(function* () {
       const { context, claudeProjectsDir, codexSessionsDir } = yield* buildSweepContext;
+      yield* readCodexNames(path.join(path.dirname(codexSessionsDir), "session_index.jsonl"));
 
       const sources = [
         { driver: CLAUDE_DRIVER, dir: claudeProjectsDir },
@@ -3305,6 +3795,14 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         ),
         Effect.catchDefect((defect) =>
           Effect.logWarning("session.importer.machine-pass-defect", { defect }),
+        ),
+      );
+      yield* followCodexNames(context).pipe(
+        Effect.catch((error) =>
+          Effect.logWarning("session.importer.codex-name-pass-failed", { error }),
+        ),
+        Effect.catchDefect((defect) =>
+          Effect.logWarning("session.importer.codex-name-pass-defect", { defect }),
         ),
       );
       yield* stampForkFamilies().pipe(

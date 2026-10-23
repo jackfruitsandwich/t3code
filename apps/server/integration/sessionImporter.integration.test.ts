@@ -13,15 +13,18 @@ import {
   defaultInstanceIdForDriver,
   EventId,
   MessageId,
+  NodeId,
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
   ProviderThreadId,
+  ProviderTurnId,
   RunId,
   ThreadId,
   TurnItemId,
   type OrchestrationV2AppThread,
   type OrchestrationV2DomainEvent,
+  type OrchestrationV2TurnItem,
 } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
@@ -174,6 +177,180 @@ const codex = {
     type: "response_item",
     payload: { id, type: "reasoning" },
   }),
+};
+
+/**
+ * The rows a paginated Codex record (the TUI and Desktop since October)
+ * writes for a turn: its context, then each item it completed.
+ */
+const codexTurn = {
+  /** Not T3's default model, so a thread that shows it took it from the record. */
+  context: (turnId: string, at: string, model = "gpt-5.6-terra"): Entry => ({
+    timestamp: at,
+    type: "turn_context",
+    payload: { turn_id: turnId, model },
+  }),
+  completed: (turnId: string, item: Entry, at: string): Entry => ({
+    timestamp: at,
+    type: "event_msg",
+    payload: { type: "item_completed", turn_id: turnId, item },
+  }),
+  said: (turnId: string, role: "user" | "assistant", id: string, text: string, at: string): Entry =>
+    codexTurn.completed(
+      turnId,
+      {
+        type: role === "user" ? "UserMessage" : "AgentMessage",
+        id,
+        content: [{ type: "text", text }],
+      },
+      at,
+    ),
+  command: (turnId: string, id: string, command: ReadonlyArray<string>, at: string): Entry =>
+    codexTurn.completed(
+      turnId,
+      {
+        type: "CommandExecution",
+        id,
+        command,
+        aggregated_output: "ok\n",
+        exit_code: 0,
+        status: "completed",
+      },
+      at,
+    ),
+  event: (payload: Entry, at: string): Entry => ({ timestamp: at, type: "event_msg", payload }),
+};
+
+/** A turn item as the thread shows it, in a word: a message's text, an item's kind and native id. */
+const shownItem = (item: OrchestrationV2TurnItem) => {
+  switch (item.type) {
+    case "user_message":
+    case "assistant_message":
+      return item.text;
+    case "system_notice":
+      return `system_notice: ${item.message}`;
+    default:
+      return `${item.type}: ${item.nativeItemRef?.nativeId ?? ""}`;
+  }
+};
+
+const shownTimeline = (h: Harness, threadId: ThreadId) =>
+  h.threads
+    .getThreadRecords(threadId, ["turnItems"])
+    .pipe(
+      Effect.map((records) =>
+        records.turnItems.toSorted((left, right) => left.ordinal - right.ordinal),
+      ),
+    );
+
+/**
+ * A turn T3 drove on a Codex thread: its provider turn, the prompt under
+ * T3's own id, and the reply and a command under the ids the live adapter
+ * gives them.
+ */
+const seedCodexLiveTurn = (
+  h: Harness,
+  threadId: ThreadId,
+  input: {
+    readonly nativeTurnId: string;
+    readonly prompt: string;
+    readonly replyId: string;
+    readonly reply: string;
+    readonly commandId: string;
+    readonly iso: string;
+  },
+) => {
+  const at = DateTime.makeUnsafe(input.iso);
+  const seed = seedRunPayload(threadId, CODEX, "completed", { ordinal: 1, iso: input.iso });
+  const promptId = MessageId.make(`seed-run-message:${threadId}:1`);
+  const replyId = MessageId.make(`message:provider:codex:native-item:${input.replyId}`);
+  const message = (id: MessageId, role: "user" | "assistant", text: string) => ({
+    id: EventId.make(`seed:${threadId}:codex-message:${id}`),
+    type: "message.updated" as const,
+    threadId,
+    occurredAt: at,
+    payload: {
+      createdBy: role === "user" ? ("user" as const) : ("agent" as const),
+      creationSource: role === "user" ? ("web" as const) : ("provider" as const),
+      id,
+      threadId,
+      runId: seed.runId,
+      nodeId: null,
+      role,
+      text,
+      attachments: [],
+      streaming: false,
+      createdAt: at,
+      updatedAt: at,
+    },
+  });
+  return h.eventSink.write({
+    events: [
+      {
+        id: EventId.make(`seed:${threadId}:codex-turn:${input.nativeTurnId}`),
+        type: "provider-turn.updated",
+        threadId,
+        occurredAt: at,
+        payload: {
+          id: ProviderTurnId.make(`provider-turn:provider:codex:native-turn:${input.nativeTurnId}`),
+          providerThreadId: ProviderThreadId.make(`seed-provider-thread:${threadId}`),
+          nodeId: NodeId.make(`seed-node:${threadId}`),
+          runAttemptId: null,
+          nativeTurnRef: { driver: CODEX, nativeId: input.nativeTurnId, strength: "strong" },
+          ordinal: 1,
+          status: "completed",
+          startedAt: at,
+          completedAt: at,
+        },
+      },
+      message(promptId, "user", input.prompt),
+      seedTimelineRow({
+        threadId,
+        key: "codex-prompt",
+        messageId: promptId,
+        role: "user",
+        text: input.prompt,
+        at,
+        runId: seed.runId,
+      }),
+      message(replyId, "assistant", input.reply),
+      seedTimelineRow({
+        threadId,
+        key: "codex-reply",
+        messageId: replyId,
+        role: "assistant",
+        text: input.reply,
+        at,
+        runId: seed.runId,
+      }),
+      {
+        id: EventId.make(`seed:${threadId}:codex-command:${input.commandId}`),
+        type: "turn-item.updated",
+        threadId,
+        occurredAt: at,
+        payload: {
+          id: TurnItemId.make(`turn-item:provider:codex:native-item:${input.commandId}`),
+          threadId,
+          runId: seed.runId,
+          nodeId: null,
+          providerThreadId: null,
+          providerTurnId: null,
+          nativeItemRef: { driver: CODEX, nativeId: input.commandId, strength: "strong" },
+          parentItemId: null,
+          ordinal: 0,
+          status: "completed",
+          title: null,
+          startedAt: at,
+          completedAt: at,
+          updatedAt: at,
+          type: "command_execution",
+          input: "pnpm test",
+          output: "ok\n",
+          exitCode: 0,
+        },
+      },
+    ],
+  });
 };
 
 const iso = (value: DateTime.DateTime) => DateTime.formatIso(value);
@@ -3710,6 +3887,392 @@ runtimeTest("marks Codex Desktop sessions as held by Desktop and keeps the mark 
       "Step one done.",
     ]);
   }),
+);
+
+runtimeTest(
+  "shows a Codex record's commands, tool calls, patches and notices as the live adapter's items",
+  (h) =>
+    Effect.gen(function* () {
+      const codexId = "cccccccc-3333-4333-8333-333333333301";
+      const threadId = importedThreadId(codexId);
+      const file = h.codexFile(`2026-07-29T10-00-00-${codexId}`);
+      const at = (second: number) => `2026-07-29T10:00:${String(second).padStart(2, "0")}.000Z`;
+      yield* h.write(file, [
+        codex.meta(codexId, h.workspace, at(0), GIT),
+        codexTurn.context("turn-1", at(1)),
+        codexTurn.said("turn-1", "user", "u1", "List the repo and fix the readme", at(2)),
+        codexTurn.command("turn-1", "call_ls", ["/bin/zsh", "-lc", "ls -la"], at(3)),
+        codexTurn.completed(
+          "turn-1",
+          {
+            type: "FileChange",
+            id: "call_patch",
+            status: "completed",
+            changes: {
+              "/repo/README.md": { type: "update", unified_diff: "@@ -1 +1 @@\n-a\n+b\n" },
+            },
+          },
+          at(4),
+        ),
+        codexTurn.completed(
+          "turn-1",
+          {
+            type: "McpToolCall",
+            id: "call_mcp",
+            server: "linear",
+            tool: "list_issues",
+            arguments: { team: "T3" },
+            status: "completed",
+            result: { content: [{ type: "text", text: "no issues" }], isError: false },
+          },
+          at(5),
+        ),
+        codexTurn.completed(
+          "turn-1",
+          { type: "WebSearch", id: "ws_1", query: "readme style", action: { type: "search" } },
+          at(6),
+        ),
+        codexTurn.completed("turn-1", { type: "ContextCompaction", id: "cc_1" }, at(7)),
+        codexTurn.said("turn-1", "assistant", "msg_1", "Listed and fixed.", at(8)),
+        codexTurn.context("turn-2", at(9)),
+        codexTurn.said("turn-2", "user", "u2", "Now stop", at(10)),
+        codexTurn.event({ type: "turn_aborted", turn_id: "turn-2", reason: "interrupted" }, at(11)),
+      ]);
+      const importer = yield* h.importer();
+      yield* importer.sweepNow();
+
+      const timeline = yield* shownTimeline(h, threadId);
+      assert.deepEqual(timeline.map(shownItem), [
+        "List the repo and fix the readme",
+        "command_execution: call_ls",
+        "file_change: call_patch",
+        "dynamic_tool: call_mcp",
+        "web_search: ws_1",
+        "compaction: cc_1",
+        "Listed and fixed.",
+        "Now stop",
+        "system_notice: Turn interrupted",
+      ]);
+      const command = timeline.find((item) => item.type === "command_execution");
+      assert.deepInclude(command, {
+        id: TurnItemId.make(`cli-import:v2:${threadId}:line-3`),
+        status: "completed",
+        input: "/bin/zsh -lc 'ls -la'",
+        output: "ok\n",
+        exitCode: 0,
+      });
+      assert.deepInclude(
+        timeline.find((item) => item.type === "file_change"),
+        { fileName: "/repo/README.md", diffStr: "@@ -1 +1 @@\n-a\n+b\n" },
+      );
+      // Every item is an end: none is left for a restart to cancel.
+      assert.deepEqual(timeline.filter((item) => item.status !== "completed").map(shownItem), []);
+      // The thread shows the model the record's turns ran on.
+      assert.equal(
+        (yield* h.threads.getThreadRecords(threadId, [])).thread.modelSelection.model,
+        "gpt-5.6-terra",
+      );
+
+      // A later turn's command lands with it.
+      yield* h.append(file, [
+        codexTurn.context("turn-3", "2026-07-29T10:01:00.000Z"),
+        codexTurn.said("turn-3", "user", "u3", "Show the diff", "2026-07-29T10:01:01.000Z"),
+        codexTurn.command("turn-3", "call_diff", ["git", "diff"], "2026-07-29T10:01:02.000Z"),
+        codexTurn.said("turn-3", "assistant", "msg_3", "Here it is.", "2026-07-29T10:01:03.000Z"),
+      ]);
+      yield* importer.sweepNow();
+      assert.deepEqual((yield* shownTimeline(h, threadId)).map(shownItem).slice(-4), [
+        "system_notice: Turn interrupted",
+        "Show the diff",
+        "command_execution: call_diff",
+        "Here it is.",
+      ]);
+
+      // A quiet record: a fresh sweep writes nothing.
+      const head = yield* h.sequence;
+      yield* (yield* h.importer()).sweepNow();
+      assert.equal(yield* h.sequence, head);
+    }),
+);
+
+runtimeTest(
+  "keeps reading a Codex thread after T3 has run it: terminal turns land, T3's own turns stay out",
+  (h) =>
+    Effect.gen(function* () {
+      const codexId = "cccccccc-3333-4333-8333-333333333302";
+      const threadId = importedThreadId(codexId);
+      const file = h.codexFile(`2026-07-29T11-00-00-${codexId}`);
+      yield* h.write(file, [
+        codex.meta(codexId, h.workspace, "2026-07-29T11:00:00.000Z", GIT),
+        codexTurn.context("turn-1", "2026-07-29T11:00:01.000Z"),
+        codexTurn.said("turn-1", "user", "u1", "First question", "2026-07-29T11:00:02.000Z"),
+        codexTurn.said("turn-1", "assistant", "msg_1", "First answer", "2026-07-29T11:00:03.000Z"),
+      ]);
+      const importer = yield* h.importer();
+      yield* importer.sweepNow();
+
+      // T3 runs a turn on the thread; the record writes it too.
+      yield* seedT3Run(h, threadId, CODEX, "completed", {
+        ordinal: 1,
+        iso: "2026-07-29T11:05:00.000Z",
+      });
+      yield* seedCodexLiveTurn(h, threadId, {
+        nativeTurnId: "turn-t3",
+        prompt: "Sent from T3",
+        replyId: "msg_t3",
+        reply: "Answered in T3",
+        commandId: "call_t3",
+        iso: "2026-07-29T11:05:00.000Z",
+      });
+      yield* h.append(file, [
+        codexTurn.context("turn-t3", "2026-07-29T11:05:00.000Z"),
+        codexTurn.said("turn-t3", "user", "u_t3", "Sent from T3", "2026-07-29T11:05:01.000Z"),
+        codexTurn.command("turn-t3", "call_t3", ["pnpm", "test"], "2026-07-29T11:05:02.000Z"),
+        codexTurn.said(
+          "turn-t3",
+          "assistant",
+          "msg_t3",
+          "Answered in T3",
+          "2026-07-29T11:05:03.000Z",
+        ),
+        // Then the person goes on in the Codex terminal.
+        codexTurn.context("turn-term", "2026-07-29T11:10:00.000Z"),
+        codexTurn.said(
+          "turn-term",
+          "user",
+          "u_term",
+          "Typed in the Codex terminal",
+          "2026-07-29T11:10:01.000Z",
+        ),
+        codexTurn.command("turn-term", "call_term", ["git", "log"], "2026-07-29T11:10:02.000Z"),
+        codexTurn.said(
+          "turn-term",
+          "assistant",
+          "msg_term",
+          "Answered in the terminal",
+          "2026-07-29T11:10:03.000Z",
+        ),
+      ]);
+      yield* importer.sweepNow();
+
+      const shown = (yield* shownTimeline(h, threadId)).map(shownItem);
+      const count = (text: string) => shown.filter((entry) => entry === text).length;
+      assert.equal(count("Typed in the Codex terminal"), 1, shown.join(" | "));
+      assert.equal(count("Answered in the terminal"), 1);
+      assert.equal(count("command_execution: call_term"), 1);
+      // T3's turn shows once: as T3 showed it.
+      assert.equal(count("Sent from T3"), 1);
+      assert.equal(count("Answered in T3"), 1);
+      assert.equal(count("command_execution: call_t3"), 1);
+      assert.isTrue(
+        shown.indexOf("Typed in the Codex terminal") < shown.indexOf("Answered in the terminal"),
+      );
+      // The thread keeps its cursor, so the terminal's next turn lands too.
+      assert.isNotNull(payloadOf(yield* h.binding(threadId)).importCursor);
+      yield* h.append(file, [
+        codexTurn.context("turn-term-2", "2026-07-29T11:20:00.000Z"),
+        codexTurn.said("turn-term-2", "user", "u_term_2", "One more", "2026-07-29T11:20:01.000Z"),
+        codexTurn.said(
+          "turn-term-2",
+          "assistant",
+          "msg_term_2",
+          "Done.",
+          "2026-07-29T11:20:02.000Z",
+        ),
+      ]);
+      yield* importer.sweepNow();
+      assert.deepEqual((yield* shownTimeline(h, threadId)).map(shownItem).slice(-2), [
+        "One more",
+        "Done.",
+      ]);
+
+      const head = yield* h.sequence;
+      yield* (yield* h.importer()).sweepNow();
+      assert.equal(yield* h.sequence, head);
+    }),
+);
+
+runtimeTest(
+  "titles a Codex thread with Codex's own name and follows it, but never over a name set in T3",
+  (h) =>
+    Effect.gen(function* () {
+      const path = yield* Path.Path;
+      const codexId = "cccccccc-3333-4333-8333-333333333303";
+      const threadId = importedThreadId(codexId);
+      const indexPath = path.join(h.chatsRoot, "session_index.jsonl");
+      const named = (name: string, at: string): Entry => ({
+        id: codexId,
+        thread_name: name,
+        updated_at: at,
+      });
+      yield* h.write(indexPath, [named("Fix the flaky CI test", "2026-07-29T12:00:10Z")]);
+      yield* h.write(h.codexFile(`2026-07-29T12-00-00-${codexId}`), [
+        codex.meta(codexId, h.workspace, "2026-07-29T12:00:00.000Z", GIT),
+        codexTurn.context("turn-1", "2026-07-29T12:00:01.000Z"),
+        codexTurn.said("turn-1", "user", "u1", "ci is red again, look", "2026-07-29T12:00:02.000Z"),
+        codexTurn.said("turn-1", "assistant", "msg_1", "Looking.", "2026-07-29T12:00:03.000Z"),
+      ]);
+      const importer = yield* h.importer();
+      yield* importer.sweepNow();
+      assert.equal((yield* h.liveShell(threadId)).title, "Fix the flaky CI test");
+
+      // Renamed in Codex: the thread follows, and keeps its place in the list.
+      const before = yield* h.liveShell(threadId);
+      yield* h.append(indexPath, [named("Flaky CI test fixed", "2026-07-29T13:00:00Z")]);
+      yield* importer.sweepNow();
+      const renamed = yield* h.liveShell(threadId);
+      assert.equal(renamed.title, "Flaky CI test fixed");
+      assert.equal(iso(renamed.updatedAt), iso(before.updatedAt));
+
+      // Renamed in T3: that name is the person's, and stays.
+      yield* h.threads.dispatch({
+        type: "thread.metadata.update",
+        commandId: CommandId.make("test:rename-in-t3"),
+        threadId,
+        title: "My own name for it",
+      });
+      yield* h.append(indexPath, [named("Renamed again in Codex", "2026-07-29T14:00:00Z")]);
+      yield* importer.sweepNow();
+      yield* (yield* h.importer()).sweepNow();
+      assert.equal((yield* h.liveShell(threadId)).title, "My own name for it");
+    }),
+);
+
+runtimeTest("shows the model and goal a Codex record last names", (h) =>
+  Effect.gen(function* () {
+    const codexId = "cccccccc-3333-4333-8333-333333333304";
+    const threadId = importedThreadId(codexId);
+    const file = h.codexFile(`2026-07-29T15-00-00-${codexId}`);
+    const goal = (status: string, tokensUsed: number) =>
+      codexTurn.event(
+        {
+          type: "thread_goal_updated",
+          goal: {
+            objective: "Ship the importer",
+            status,
+            tokensUsed,
+            tokenBudget: null,
+            timeUsedSeconds: 30,
+          },
+        },
+        "2026-07-29T15:00:04.000Z",
+      );
+    yield* h.write(file, [
+      codex.meta(codexId, h.workspace, "2026-07-29T15:00:00.000Z", GIT),
+      codexTurn.context("turn-1", "2026-07-29T15:00:01.000Z", "gpt-5.6-terra"),
+      codexTurn.said("turn-1", "user", "u1", "Work toward the goal", "2026-07-29T15:00:02.000Z"),
+      codexTurn.said("turn-1", "assistant", "msg_1", "On it.", "2026-07-29T15:00:03.000Z"),
+      goal("active", 100),
+    ]);
+    const importer = yield* h.importer();
+    yield* importer.sweepNow();
+    const records = yield* h.threads.getThreadRecords(threadId, ["providerThreads"]);
+    assert.equal(records.thread.modelSelection.model, "gpt-5.6-terra");
+    assert.deepEqual(records.providerThreads[0]?.goal, {
+      objective: "Ship the importer",
+      status: "active",
+      tokensUsed: 100,
+      tokenBudget: null,
+      timeUsedSeconds: 30,
+    });
+
+    // The person switches model in the terminal and the goal completes.
+    yield* h.append(file, [
+      codexTurn.event(
+        { type: "thread_settings_applied", thread_settings: { model: "gpt-6-mini" } },
+        "2026-07-29T15:10:00.000Z",
+      ),
+      codexTurn.context("turn-2", "2026-07-29T15:10:01.000Z", "gpt-6-mini"),
+      codexTurn.said("turn-2", "user", "u2", "Finish it", "2026-07-29T15:10:02.000Z"),
+      codexTurn.said("turn-2", "assistant", "msg_2", "Finished.", "2026-07-29T15:10:03.000Z"),
+      goal("complete", 250),
+    ]);
+    yield* importer.sweepNow();
+    const after = yield* h.threads.getThreadRecords(threadId, ["providerThreads"]);
+    assert.equal(after.thread.modelSelection.model, "gpt-6-mini");
+    assert.equal(after.providerThreads[0]?.goal?.status, "complete");
+    assert.equal(after.providerThreads[0]?.goal?.tokensUsed, 250);
+  }),
+);
+
+runtimeTest("follows a Codex thread into the later file Codex went on writing it in", (h) =>
+  Effect.gen(function* () {
+    const codexId = "cccccccc-3333-4333-8333-333333333305";
+    const segmentId = "cccccccc-3333-4333-8333-3333333333b5";
+    const threadId = importedThreadId(codexId);
+    const first = h.codexFile(`2026-07-29T16-00-00-${codexId}`);
+    const later = h.codexFile(`2026-07-29T16-00-00-${codexId}_${segmentId}`);
+    yield* h.write(first, [
+      codex.meta(codexId, h.workspace, "2026-07-29T16:00:00.000Z", GIT),
+      codexTurn.context("turn-1", "2026-07-29T16:00:01.000Z"),
+      codexTurn.said("turn-1", "user", "u1", "Start here", "2026-07-29T16:00:02.000Z"),
+      codexTurn.said("turn-1", "assistant", "msg_1", "Started.", "2026-07-29T16:00:03.000Z"),
+    ]);
+    const importer = yield* h.importer();
+    yield* importer.sweepNow();
+
+    // Codex goes on in a later file, from the end of the first one.
+    yield* h.write(later, [
+      codex.meta(codexId, h.workspace, "2026-07-29T16:05:00.000Z", {
+        history_base: { thread_id: codexId, end_ordinal_exclusive: 4, end_byte_offset: 600 },
+      }),
+      codexTurn.context("turn-2", "2026-07-29T16:05:01.000Z"),
+      codexTurn.said("turn-2", "user", "u2", "Went on in the new file", "2026-07-29T16:05:02.000Z"),
+      codexTurn.command("turn-2", "call_seg", ["ls"], "2026-07-29T16:05:03.000Z"),
+      codexTurn.said("turn-2", "assistant", "msg_2", "Going on.", "2026-07-29T16:05:04.000Z"),
+    ]);
+    yield* importer.sweepNow();
+    assert.deepEqual((yield* shownTimeline(h, threadId)).map(shownItem), [
+      "Start here",
+      "Started.",
+      "Went on in the new file",
+      "command_execution: call_seg",
+      "Going on.",
+    ]);
+    const cursor = payloadOf(yield* h.binding(threadId)).importCursor as Record<string, unknown>;
+    assert.equal(cursor.sourcePath, later);
+
+    yield* h.append(later, [
+      codexTurn.said("turn-2", "user", "u3", "And on", "2026-07-29T16:06:00.000Z"),
+    ]);
+    yield* importer.sweepNow();
+    assert.equal((yield* h.texts(threadId)).at(-1), "And on");
+  }),
+);
+
+runtimeTest(
+  "a later Codex file read in the same sweep as its first one lands on the sweep after",
+  (h) =>
+    Effect.gen(function* () {
+      const codexId = "cccccccc-3333-4333-8333-333333333306";
+      const segmentId = "cccccccc-3333-4333-8333-3333333333b6";
+      const threadId = importedThreadId(codexId);
+      yield* h.write(h.codexFile(`2026-07-29T17-00-00-${codexId}`), [
+        codex.meta(codexId, h.workspace, "2026-07-29T17:00:00.000Z", GIT),
+        codexTurn.context("turn-1", "2026-07-29T17:00:01.000Z"),
+        codexTurn.said("turn-1", "user", "u1", "Start here", "2026-07-29T17:00:02.000Z"),
+        codexTurn.said("turn-1", "assistant", "msg_1", "Started.", "2026-07-29T17:00:03.000Z"),
+      ]);
+      yield* h.write(h.codexFile(`2026-07-29T17-00-00-${codexId}_${segmentId}`), [
+        codex.meta(codexId, h.workspace, "2026-07-29T17:05:00.000Z", {
+          history_base: { thread_id: codexId, end_ordinal_exclusive: 4, end_byte_offset: 600 },
+        }),
+        codexTurn.context("turn-2", "2026-07-29T17:05:01.000Z"),
+        codexTurn.said("turn-2", "user", "u2", "Went on", "2026-07-29T17:05:02.000Z"),
+        codexTurn.said("turn-2", "assistant", "msg_2", "Going on.", "2026-07-29T17:05:03.000Z"),
+      ]);
+      const importer = yield* h.importer();
+      yield* importer.sweepNow();
+      // The later file never makes a thread of its own: it holds only the end.
+      assert.deepEqual(yield* h.texts(threadId), ["Start here", "Started."]);
+      yield* importer.sweepNow();
+      assert.deepEqual(yield* h.texts(threadId), [
+        "Start here",
+        "Started.",
+        "Went on",
+        "Going on.",
+      ]);
+    }),
 );
 
 function joinPath(...segments: ReadonlyArray<string>) {

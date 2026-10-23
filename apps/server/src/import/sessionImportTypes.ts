@@ -40,6 +40,73 @@ export interface ParsedSessionMessage {
    * conversation, and the terminal no longer draws it (Claude).
    */
   readonly withdrawn?: true;
+  /** The provider's own id for the row (Codex): what T3's live copy of it is keyed by. */
+  readonly nativeId?: string;
+  /** The provider turn the row was written in (Codex). */
+  readonly nativeTurnId?: string;
+}
+
+/**
+ * A row of a Codex record the thread shows as an item of its own: a command,
+ * a tool call, a file change, a web search, a compaction, an interrupted
+ * turn. `item` holds what the turn item shows, as the live adapter shows the
+ * same item; the importer adds the thread's fields.
+ */
+export interface ParsedSessionItem {
+  readonly sourceId: string;
+  readonly timestamp: string;
+  readonly lineIndex: number;
+  /** The provider's id for the item: a live copy of it carries it as its native ref. */
+  readonly nativeId?: string;
+  /** The provider turn the row was written in. */
+  readonly nativeTurnId?: string;
+  readonly item: ParsedRecordItem;
+}
+
+/**
+ * Always an end: a row the record holds is history, and an item still
+ * running is one a live run shows (and a restart cancels).
+ */
+export type ParsedRecordItemStatus = "completed" | "failed" | "cancelled";
+
+export type ParsedRecordItem =
+  | {
+      readonly type: "command_execution";
+      readonly status: ParsedRecordItemStatus;
+      readonly input: string;
+      readonly output?: string;
+      readonly exitCode?: number;
+    }
+  | {
+      readonly type: "file_change";
+      readonly status: ParsedRecordItemStatus;
+      readonly fileName: string;
+      readonly diffStr: string;
+    }
+  | {
+      readonly type: "web_search";
+      readonly status: "completed";
+      readonly patterns: ReadonlyArray<string>;
+    }
+  | { readonly type: "compaction"; readonly status: "completed" }
+  | { readonly type: "system_notice"; readonly status: "completed"; readonly message: string }
+  | {
+      /**
+       * An MCP or dynamic tool call in the app-server's own shape
+       * (`mcpToolCall` / `dynamicToolCall`), which the importer presents as
+       * the live adapter does.
+       */
+      readonly type: "tool_call";
+      readonly call: Record<string, unknown>;
+    };
+
+/** The goal a Codex thread holds, as the record last wrote it (`thread_goal_updated`). */
+export interface ParsedSessionGoal {
+  readonly objective: string;
+  readonly status: string;
+  readonly tokensUsed: number;
+  readonly tokenBudget: number | null;
+  readonly timeUsedSeconds: number;
 }
 
 export interface ParsedSessionNotice {
@@ -112,6 +179,17 @@ export interface ParsedCliSession {
   readonly permissionMode?: string;
   /** The harness's notices between turns, in record order (Claude). */
   readonly systemNotices?: ReadonlyArray<ParsedSessionSystemNotice>;
+  /** The record's rows that show as items of their own, in record order (Codex). */
+  readonly items?: ReadonlyArray<ParsedSessionItem>;
+  /** The model the record's latest turn ran on (Codex `turn_context`). */
+  readonly model?: string;
+  /** The thread's goal as the record last wrote it; null once cleared (Codex). */
+  readonly goal?: ParsedSessionGoal | null;
+  /**
+   * The record goes on from a point of the thread's earlier file, which
+   * holds what came before (Codex `history_base`).
+   */
+  readonly continuesEarlierFile?: true;
 }
 
 const MAX_TITLE_LENGTH = 60;
