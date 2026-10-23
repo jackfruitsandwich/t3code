@@ -24,6 +24,14 @@
     rgb(40 22 16 / 58%) 55%,
     rgb(40 22 16 / 80%)
   );
+  /* Clear glass: a thin fill and a light blur so the thread shows through, with extra
+     saturation so what passes behind keeps its color. The fill still scales with the
+     user's glass opacity setting. */
+  --chat-composer-glass-surface: rgb(255 255 255 / 50%);
+  --glass-blur: 5px;
+  --glass-saturation: 1.8;
+  --composer-glass-popup: rgb(255 255 255 / 50%);
+  --composer-glass-popup-blur: 12px;
   /* Raw tokens: Tailwind's @theme inline compiles utilities straight to these. */
   --accent: rgb(217 119 87 / 10%);
   --primary: rgb(217 119 87);
@@ -53,6 +61,9 @@
     rgb(255 255 255 / 42%) 55%,
     rgb(255 255 255 / 80%)
   );
+  /* LimitBar's base. */
+  --chat-composer-glass-surface: rgb(18 18 20 / 62%);
+  --composer-glass-popup: rgb(22 20 20 / 50%);
   --accent: rgb(255 255 255 / 7%);
   --message-action-hover: rgb(228 138 106);
 }
@@ -143,7 +154,9 @@
   position: relative;
   border-color: transparent;
   border-radius: 14px;
+  background-color: var(--composer-glass-popup);
   background-image: var(--composer-glass-sheen), var(--composer-glass-wash);
+  backdrop-filter: blur(var(--composer-glass-popup-blur)) saturate(var(--glass-saturation));
 }
 
 .dropdown-glass:is([data-composer-glass="claude"], [data-composer-glass="claude"] > *)::after {
