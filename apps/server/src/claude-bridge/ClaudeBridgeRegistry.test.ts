@@ -4,10 +4,13 @@ import { assert, describe, it } from "@effect/vitest";
 import * as Clock from "effect/Clock";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
+import type * as Scope from "effect/Scope";
 import * as TestClock from "effect/testing/TestClock";
 
 import * as ServerConfig from "../config.ts";
@@ -17,6 +20,7 @@ import {
   CLAUDE_BRIDGE_OFFERED_TURN_HOLD_MS,
   ClaudeBridgeRegistry,
   claudeBridgeMissedTurnsAfter,
+  claudeBridgeQuietModDetail,
   claudeBridgeStaleTurnEvents,
   claudeBridgeTurnAwaitingRunSince,
   claudeBridgeTurnsAwaitingRunSince,
@@ -573,4 +577,203 @@ describe("a call T3 has answered", () => {
       ),
     );
   });
+});
+
+// ddba110e (Oct 22): the session's mod went quiet while its turn ran on.
+describe("a session whose mod has gone quiet", () => {
+  const platform = Layer.mergeAll(NodeServices.layer, NodeCrypto.layer);
+  const withRegistry = <A, E>(
+    body: Effect.Effect<
+      A,
+      E,
+      ClaudeBridgeRegistry | FileSystem.FileSystem | Path.Path | Scope.Scope
+    >,
+  ) =>
+    Effect.scoped(body).pipe(
+      Effect.provide(
+        registryLayer.pipe(
+          Layer.provide(
+            ServerConfig.layerTest(process.cwd(), { prefix: "t3-bridge-registry-test-" }),
+          ),
+          Layer.provideMerge(platform),
+        ),
+      ),
+    );
+  /** Writes the mod's file for instance-1 of `sid`, its heartbeat `quietForMs` old. */
+  const writeSession = (sid: string, quietForMs: number, more: Record<string, unknown> = {}) =>
+    Effect.gen(function* () {
+      const registry = yield* ClaudeBridgeRegistry;
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const home = path.join(registry.bridgeDir, "home");
+      const dir = path.join(registry.bridgeDir, "claude", sid, "instance-1");
+      yield* fs.makeDirectory(path.join(dir, "events"), { recursive: true });
+      yield* fs.writeFileString(
+        path.join(dir, "session.json"),
+        yield* encodeJson({
+          sid,
+          instanceId: "instance-1",
+          configDir: home,
+          transcriptPath: path.join(home, "projects", "-work", `${sid}.jsonl`),
+          isInteractive: true,
+          heartbeatAt: (yield* Clock.currentTimeMillis) - quietForMs,
+          ...more,
+        }),
+      );
+      return dir;
+    });
+
+  it.live("passes on what it says to the attachment that still follows it", () =>
+    withRegistry(
+      Effect.gen(function* () {
+        const registry = yield* ClaudeBridgeRegistry;
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const sid = "eeeeeeee-5555-4555-8555-555555555555";
+        const dir = yield* writeSession(sid, 20_000);
+        const heard = yield* Deferred.make<ClaudeBridgeEvent>();
+        yield* registry.subscribe(sid, (event) =>
+          Deferred.succeed(heard, event).pipe(Effect.asVoid),
+        );
+        yield* fs.writeFileString(
+          path.join(dir, "events", "000001.json"),
+          yield* encodeJson({
+            seq: 1,
+            at: yield* Clock.currentTimeMillis,
+            type: "turn.complete",
+            turnId: "turn-1",
+            reason: "answer",
+            answer: "done",
+            isAborted: false,
+            durationMs: 10,
+            transcriptOffset: 0,
+          }),
+        );
+        const event = yield* Deferred.await(heard).pipe(Effect.timeoutOption("5 seconds"));
+        assert.strictEqual(
+          Option.getOrUndefined(event)?.type,
+          "turn.complete",
+          "the turn's end reached the attachment",
+        );
+      }),
+    ),
+  );
+
+  it.live("hands a turn T3 let go of back once the session reports it running again", () =>
+    withRegistry(
+      Effect.gen(function* () {
+        const registry = yield* ClaudeBridgeRegistry;
+        const sid = "ffffffff-6666-4666-8666-666666666666";
+        const activeTurn = {
+          turnId: "turn-1",
+          startedAt: (yield* Clock.currentTimeMillis) - 30_000,
+          transcriptOffset: 0,
+        };
+        yield* writeSession(sid, 0, { activeTurn });
+        const back: Array<string> = [];
+        const handed = yield* Deferred.make<void>();
+        yield* registry.onTurnBack((_entry, turn) =>
+          Effect.sync(() => {
+            back.push(turn.turnId);
+          }).pipe(Effect.andThen(Deferred.succeed(handed, undefined)), Effect.asVoid),
+        );
+        yield* registry.noteLetGo(sid, "turn-1");
+        const got = yield* Deferred.await(handed).pipe(Effect.timeoutOption("5 seconds"));
+        assert.isTrue(Option.isSome(got), "the turn was handed back");
+        // Passes of the pump after it hand it back no more.
+        yield* Effect.sleep("1200 millis");
+        assert.deepStrictEqual(back, ["turn-1"]);
+      }),
+    ),
+  );
+
+  it.live(
+    "is attached to when Claude Code made a copy of its session and the mod reports again",
+    () =>
+      withRegistry(
+        Effect.gen(function* () {
+          const registry = yield* ClaudeBridgeRegistry;
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const sid = "abababab-7777-4777-8777-777777777777";
+          yield* writeSession(sid, 20_000);
+          const claude = path.join(registry.bridgeDir, "fake-claude.sh");
+          // `claude --bg --resume` of a session that runs elsewhere (2.1.309).
+          yield* fs.writeFileString(
+            claude,
+            '#!/bin/sh\ncase "$*" in *--bg*) echo "Session is running; started a copy of it as abcd1234";; esac\nexit 0\n',
+          );
+          yield* fs.chmod(claude, 0o755);
+          // The mod reports again a moment after T3 has looked.
+          yield* writeSession(sid, 0).pipe(Effect.delay("1 second"), Effect.forkScoped);
+          const entry = yield* registry.launch({
+            sid,
+            cwd: registry.bridgeDir,
+            configDir: path.join(registry.bridgeDir, "home"),
+            binaryPath: claude,
+            environment: {},
+          });
+          assert.strictEqual(entry.instanceId, "instance-1");
+        }),
+      ),
+  );
+
+  it.live("is not taken for a process without the plugin when Claude Code made a copy", () =>
+    withRegistry(
+      Effect.gen(function* () {
+        const registry = yield* ClaudeBridgeRegistry;
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const claude = path.join(registry.bridgeDir, "fake-claude.sh");
+        yield* fs.writeFileString(
+          claude,
+          '#!/bin/sh\ncase "$*" in *--bg*) echo "Session is running; started a copy of it as abcd1234";; esac\nexit 0\n',
+        );
+        yield* fs.chmod(claude, 0o755);
+        const launched = (sid: string) =>
+          registry
+            .launch({
+              sid,
+              cwd: registry.bridgeDir,
+              configDir: path.join(registry.bridgeDir, "home"),
+              binaryPath: claude,
+              environment: {},
+            })
+            .pipe(
+              Effect.flip,
+              Effect.map((error) => error.detail),
+            );
+        // No mod in the session's process at all: that is what T3 says.
+        assert.match(
+          yield* launched("cdcdcdcd-8888-4888-8888-888888888888"),
+          /already open in a Claude Code process without the T3 bridge plugin/,
+        );
+      }),
+    ),
+  );
+
+  it.effect("is said to be quiet, for how long, when it does not report again in time", () =>
+    withRegistry(
+      Effect.gen(function* () {
+        const registry = yield* ClaudeBridgeRegistry;
+        const sid = "dededede-9999-4999-8999-999999999999";
+        yield* writeSession(sid, 20_000);
+        const waiting = yield* registry.waitForQuietMod(sid).pipe(Effect.forkScoped);
+        // Real time for the file reads between the waits on the test clock.
+        const settle = TestClock.withLive(Effect.sleep("5 millis"));
+        for (let second = 0; second < 60; second += 1) {
+          yield* settle;
+          yield* TestClock.adjust("1 second");
+        }
+        const quiet = yield* Fiber.join(waiting);
+        assert.strictEqual(quiet?.kind, "quiet");
+        assert.isAtLeast(quiet?.kind === "quiet" ? quiet.quietForMs : 0, 65_000);
+        assert.match(
+          claudeBridgeQuietModDetail(sid, quiet?.kind === "quiet" ? quiet.quietForMs : 0),
+          /^Session .* is open in another Claude Code process\. Its T3 mod last reported \d+ s ago and has not reported since, so T3 cannot reach it now\.$/,
+        );
+        assert.isNull(yield* registry.waitForQuietMod("no-such-session"));
+      }),
+    ),
+  );
 });

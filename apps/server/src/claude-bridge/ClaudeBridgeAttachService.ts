@@ -188,6 +188,8 @@ const make = Effect.gen(function* () {
     },
     /** The turn was running when this server came up: the run recovery left open picks it up. */
     reattachRun = false,
+    /** A turn T3 let go of and is picking back up: offered again, also if it was before. */
+    again = false,
   ) =>
     Effect.gen(function* () {
       yield* afterStartupRecovery;
@@ -195,7 +197,7 @@ const make = Effect.gen(function* () {
       const { turnId } = turn;
       const text = claudeTurnPromptLabel(turn.text);
       const key = `${sid}:${turnId}`;
-      if (offeredTurns.has(key)) return;
+      if (offeredTurns.has(key) && !again) return;
       offeredTurns.add(key);
       if (offeredTurns.size > 512) {
         offeredTurns.delete(offeredTurns.values().next().value!);
@@ -406,6 +408,10 @@ const make = Effect.gen(function* () {
     event.type === "turn.start" ? offerTurn(entry, event) : Effect.void,
   );
   yield* registry.onUnattachedRequest(offerRequest);
+  // A turn T3 let go of when it lost contact with the session, running on now
+  // that the session reports again: a run picks it up from its start, and
+  // what the thread already shows of it is the same rows.
+  yield* registry.onTurnBack((entry, turn) => offerTurn(entry, { ...turn, text: "" }, false, true));
 
   // A turn already running when this server came up (a restart mid-turn).
   // Whoever started it, the terminal or a prompt sent from T3: recovery left

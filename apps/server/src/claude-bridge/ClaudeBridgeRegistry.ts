@@ -44,6 +44,7 @@ import {
   parseClaudeBridgeSlashCommands,
   readTranscriptRows,
   CLAUDE_BRIDGE_MOD_VERSION,
+  type ClaudeBridgeActiveTurn,
   type ClaudeBridgeCommand,
   type ClaudeBridgeCommandBody,
   type ClaudeBridgeEvent,
@@ -229,6 +230,24 @@ export type ClaudeBridgeAnswerCommand = Extract<
   { readonly type: "approval" | "answer" }
 >;
 
+/** Told of a turn a session runs again after T3 let it go (see `noteLetGo`). */
+export type ClaudeBridgeTurnBackHandler = (
+  process: ClaudeBridgeProcess,
+  turn: ClaudeBridgeActiveTurn,
+) => Effect.Effect<void>;
+
+/**
+ * What became of a mod instance of the session that had gone quiet: it
+ * reported again, or it stayed quiet for `quietForMs`.
+ */
+export type ClaudeBridgeQuietMod =
+  | { readonly kind: "reported"; readonly process: ClaudeBridgeProcess }
+  | { readonly kind: "quiet"; readonly quietForMs: number };
+
+/** Why T3 cannot reach a session open in a process whose mod has gone quiet. */
+export const claudeBridgeQuietModDetail = (sid: string, quietForMs: number) =>
+  `Session ${sid} is open in another Claude Code process. Its T3 mod last reported ${Math.round(quietForMs / 1000)} s ago and has not reported since, so T3 cannot reach it now.`;
+
 /** Told of a session that has something to ask and nothing attached to ask it through. */
 export type ClaudeBridgeWaitingHandler = (
   process: ClaudeBridgeProcess,
@@ -382,6 +401,24 @@ export class ClaudeBridgeRegistry extends Context.Service<
     readonly takeMissedTurns: (sid: string) => Effect.Effect<ReadonlyArray<ClaudeBridgeMissedTurn>>;
     /** Notes that a run was offered for a turn the session began while nobody was subscribed. */
     readonly noteTurnOffered: (sid: string, turnId: string) => Effect.Effect<void>;
+    /**
+     * T3 stopped following a turn of the session that the session never said
+     * had ended: its mod went quiet and nothing said the session was still at
+     * work. Should the session report again with that turn still running and
+     * nothing attached, the turn goes to `onTurnBack`, once.
+     */
+    readonly noteLetGo: (sid: string, turnId: string) => Effect.Effect<void>;
+    readonly onTurnBack: (
+      handler: ClaudeBridgeTurnBackHandler,
+    ) => Effect.Effect<void, never, Scope.Scope>;
+    /**
+     * For a session Claude Code says runs in a process T3 cannot see (it made
+     * a copy instead of resuming it, or lists it open in a terminal): a mod
+     * instance of the session that has gone quiet without saying it ended is
+     * that process. Waits up to `LAUNCH_ATTACH_TIMEOUT_MS` for it to report
+     * again; null when there is no such instance.
+     */
+    readonly waitForQuietMod: (sid: string) => Effect.Effect<ClaudeBridgeQuietMod | null>;
     /** Starts a background Claude Code process for the session and waits for its mod to report. */
     readonly launch: (
       input: ClaudeBridgeLaunchInput,
@@ -438,7 +475,7 @@ export type ClaudeBridgeContinuationJudge = (input: {
   readonly to: string;
 }) => Effect.Effect<boolean>;
 
-const isProcessAlive = (pid: number): boolean => {
+export const isProcessAlive = (pid: number): boolean => {
   try {
     process.kill(pid, 0);
     return true;
@@ -618,6 +655,13 @@ const make = Effect.gen(function* () {
     });
   const unattachedHandlers = new Set<ClaudeBridgeEventHandler>();
   const waitingHandlers = new Set<ClaudeBridgeWaitingHandler>();
+  const turnBackHandlers = new Set<ClaudeBridgeTurnBackHandler>();
+  /** The turn T3 let go of, by session (see `noteLetGo`). */
+  const letGo = new Map<string, string>();
+  const noteLetGo = (sid: string, turnId: string) =>
+    Effect.sync(() => {
+      letGo.set(sid, turnId);
+    });
   const recordHandlers = new Set<ClaudeBridgeRecordHandler>();
   const noteRecordChange = (
     entry: ClaudeBridgeProcess,
@@ -870,6 +914,32 @@ const make = Effect.gen(function* () {
       return best;
     });
 
+  const waitForQuietMod = (sid: string) =>
+    Effect.gen(function* () {
+      const deadline = (yield* Clock.currentTimeMillis) + LAUNCH_ATTACH_TIMEOUT_MS;
+      for (;;) {
+        const now = yield* Clock.currentTimeMillis;
+        let freshest: ClaudeBridgeProcess | null = null;
+        for (const instanceId of yield* listDirectories(path.join(claudeDir, sid))) {
+          const entry = yield* readProcess(sid, instanceId);
+          if (entry === null || entry.session.ended !== null) continue;
+          // Quiet this long, it is swept as gone.
+          if (now - entry.session.heartbeatAt > DEAD_PROCESS_SWEEP_MS) continue;
+          if (freshest === null || entry.session.heartbeatAt > freshest.session.heartbeatAt) {
+            freshest = entry;
+          }
+        }
+        if (freshest === null) return null;
+        if (isClaudeBridgeSessionLive(freshest.session, now)) {
+          return { kind: "reported" as const, process: freshest };
+        }
+        if (now >= deadline) {
+          return { kind: "quiet" as const, quietForMs: now - freshest.session.heartbeatAt };
+        }
+        yield* Effect.sleep("300 millis");
+      }
+    });
+
   const readSession = (entry: ClaudeBridgeProcess) =>
     readJson(path.join(entry.dir, "session.json")).pipe(
       Effect.map(parseClaudeBridgeSessionFile),
@@ -1059,6 +1129,7 @@ const make = Effect.gen(function* () {
   const sweepDead = (entry: ClaudeBridgeProcess) =>
     Effect.gen(function* () {
       missedTurns.delete(entry.sid);
+      letGo.delete(entry.sid);
       knownTranscripts.delete(entry.sid);
       recordUnknownToMod.delete(entry.sid);
       yield* fs.remove(entry.dir, { recursive: true }).pipe(Effect.ignore);
@@ -1069,10 +1140,39 @@ const make = Effect.gen(function* () {
       }
     });
 
+  /**
+   * A turn T3 let go of that the session is running again, with nothing
+   * attached, goes to the handlers; one the session ended meanwhile is in
+   * its record, which is compared.
+   */
+  const turnBack = (entry: ClaudeBridgeProcess) =>
+    Effect.gen(function* () {
+      const turnId = letGo.get(entry.sid);
+      if (turnId === undefined || subscribers.has(entry.sid)) return;
+      letGo.delete(entry.sid);
+      const turn = entry.session.activeTurn;
+      if (turn === null || turn.turnId !== turnId) {
+        yield* noteRecordChange(entry, "turn.complete");
+        return;
+      }
+      yield* Effect.logInfo("claude-bridge.turn-back", { sid: entry.sid, turnId });
+      yield* Effect.forEach(turnBackHandlers, (handler) => handler(entry, turn), {
+        discard: true,
+      }).pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("claude-bridge.turn-back-handler-failed", { sid: entry.sid, cause }),
+        ),
+      );
+    });
+
   const pumpOnce = Effect.gen(function* () {
     const { now, processes } = yield* listProcessesAsOfNow;
     for (const { entry, live } of processes) {
-      yield* pumpProcess(entry, live);
+      // A process whose heartbeat has gone quiet while T3 follows it can be
+      // at work all the same (the attachment judges): what it says reaches it.
+      const followed = subscribers.has(entry.sid) && entry.session.ended === null;
+      yield* pumpProcess(entry, live || followed);
+      if (live) yield* turnBack(entry);
       // A call T3 has answered stays listed until the mod takes the answer:
       // no run is offered for it meanwhile.
       const waiting = (entry.session.waiting ?? []).filter(
@@ -1087,7 +1187,7 @@ const make = Effect.gen(function* () {
           ),
         );
       }
-      if (!live && now - entry.session.heartbeatAt > DEAD_PROCESS_SWEEP_MS) {
+      if (!live && !followed && now - entry.session.heartbeatAt > DEAD_PROCESS_SWEEP_MS) {
         yield* sweepDead(entry);
       }
     }
@@ -1101,6 +1201,8 @@ const make = Effect.gen(function* () {
     Effect.acquireRelease(
       Effect.sync(() => {
         subscribers.set(sid, handler);
+        // Attached again: whatever was let go is this attachment's now.
+        letGo.delete(sid);
       }),
       () =>
         Effect.sync(() => {
@@ -1116,6 +1218,17 @@ const make = Effect.gen(function* () {
       () =>
         Effect.sync(() => {
           unattachedHandlers.delete(handler);
+        }),
+    ).pipe(Effect.asVoid);
+
+  const onTurnBack = (handler: ClaudeBridgeTurnBackHandler) =>
+    Effect.acquireRelease(
+      Effect.sync(() => {
+        turnBackHandlers.add(handler);
+      }),
+      () =>
+        Effect.sync(() => {
+          turnBackHandlers.delete(handler);
         }),
     ).pipe(Effect.asVoid);
 
@@ -1347,9 +1460,10 @@ const make = Effect.gen(function* () {
       const text = `${output.stdout}\n${output.stderr}`;
       const copy = /started a copy[^\n]*? as ([0-9a-f]{8})/i.exec(text);
       if (copy !== null) {
-        // The CLI made a copy: the session already runs somewhere without the
-        // mod, or (unexpectedly) its saved options rejected the flags. The
-        // copy must not live on under a new id.
+        // The CLI made a copy: the session already runs somewhere (with the
+        // mod, whose heartbeat has gone quiet, or without it), or
+        // (unexpectedly) its saved options rejected the flags. The copy must
+        // not live on under a new id.
         for (const subcommand of ["stop", "rm"]) {
           yield* runClaude({
             binaryPath: input.binaryPath,
@@ -1359,10 +1473,27 @@ const make = Effect.gen(function* () {
           }).pipe(Effect.ignore);
         }
         const note = /note:[^\n]*/i.exec(text)?.[0].trim() ?? "";
-        const detail = /saved options/i.test(note)
-          ? `Claude Code started a copy of session ${input.sid} instead of resuming it (${note}). The copy was stopped and removed; its transcript ${copy[1]} may remain under ${input.configDir}/projects.`
-          : `Session ${input.sid} is already open in a Claude Code process without the T3 bridge plugin. Close it, or install the plugin (\`claude plugin marketplace add ${plugin.marketplaceDir}\` then \`claude plugin install ${CLAUDE_BRIDGE_PLUGIN_ID}\`) and restart it.`;
-        return yield* new ClaudeBridgeLaunchError({ sid: input.sid, detail });
+        if (/saved options/i.test(note)) {
+          return yield* new ClaudeBridgeLaunchError({
+            sid: input.sid,
+            detail: `Claude Code started a copy of session ${input.sid} instead of resuming it (${note}). The copy was stopped and removed; its transcript ${copy[1]} may remain under ${input.configDir}/projects.`,
+          });
+        }
+        const quiet = yield* waitForQuietMod(input.sid);
+        if (quiet?.kind === "reported") {
+          yield* Effect.logInfo("claude-bridge.running-session-reported", {
+            sid: input.sid,
+            instanceId: quiet.process.instanceId,
+          });
+          return quiet.process;
+        }
+        return yield* new ClaudeBridgeLaunchError({
+          sid: input.sid,
+          detail:
+            quiet === null
+              ? `Session ${input.sid} is already open in a Claude Code process without the T3 bridge plugin. Close it, or install the plugin (\`claude plugin marketplace add ${plugin.marketplaceDir}\` then \`claude plugin install ${CLAUDE_BRIDGE_PLUGIN_ID}\`) and restart it.`
+              : claudeBridgeQuietModDetail(input.sid, quiet.quietForMs),
+        });
       }
       const untrusted = /not trusted[^\n]*/i.exec(text);
       if (untrusted !== null) {
@@ -1427,6 +1558,9 @@ const make = Effect.gen(function* () {
     peekMissedTurns,
     takeMissedTurns,
     noteTurnOffered,
+    noteLetGo,
+    onTurnBack,
+    waitForQuietMod,
     launch,
     findTerminalHome,
     findSessionHome,
@@ -1475,6 +1609,9 @@ export const layerTest = Layer.succeed(
     peekMissedTurns: () => Effect.succeed([]),
     takeMissedTurns: () => Effect.succeed([]),
     noteTurnOffered: () => Effect.void,
+    noteLetGo: () => Effect.void,
+    onTurnBack: () => Effect.void,
+    waitForQuietMod: () => Effect.succeed(null),
     launch: (input) =>
       Effect.fail(
         new ClaudeBridgeLaunchError({ sid: input.sid, detail: "Claude bridge disabled in tests." }),

@@ -11,6 +11,7 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Queue from "effect/Queue";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 
@@ -67,6 +68,14 @@ const attach = (input: {
   readonly activeTurn?: ClaudeBridgeRegistry.ClaudeBridgeProcess["session"]["activeTurn"];
   /** Whether the session's file reads as unreadable (caught mid-write) at the read numbered `read`, from 1. */
   readonly unreadable?: (read: number) => boolean;
+  /** Whether the session's file, at that read, holds a heartbeat 20 s old: the mod has gone quiet. */
+  readonly quiet?: (read: number) => boolean;
+  /**
+   * The session's mod is quiet when the runner opens: no live process, and
+   * Claude Code lists the session open in a terminal; the mod reports again
+   * while the runner waits for it.
+   */
+  readonly quietAtOpen?: boolean;
   /** What the session's mod reports of its effort and status line. */
   readonly reported?: Partial<
     Pick<
@@ -125,6 +134,8 @@ const attach = (input: {
     const subscribed = yield* Deferred.make<ClaudeBridgeRegistry.ClaudeBridgeEventHandler>();
     /** The sessions whose live process the runner asked for. */
     const asked: Array<string> = [];
+    /** The turns the runner said it let go of. */
+    const letGo: Array<string> = [];
     let sessionReads = 0;
     const registry = ClaudeBridgeRegistry.ClaudeBridgeRegistry.of({
       bridgeDir: root,
@@ -134,17 +145,17 @@ const attach = (input: {
       findLiveProcess: (sid) =>
         Effect.sync(() => {
           asked.push(sid);
-          return process;
+          return input.quietAtOpen === true && asked.length === 1 ? null : process;
         }),
       // The process keeps reporting, however far a test moves its clock.
       readSession: () =>
         Effect.suspend(() => {
           sessionReads += 1;
-          return input.unreadable?.(sessionReads) === true
-            ? Effect.succeed(null)
-            : Clock.currentTimeMillis.pipe(
-                Effect.map((heartbeatAt) => ({ ...process.session, heartbeatAt })),
-              );
+          if (input.unreadable?.(sessionReads) === true) return Effect.succeed(null);
+          const quiet = input.quiet?.(sessionReads) === true;
+          return Clock.currentTimeMillis.pipe(
+            Effect.map((now) => ({ ...process.session, heartbeatAt: quiet ? now - 20_000 : now })),
+          );
         }),
       readCommands: () =>
         Effect.succeed(
@@ -193,8 +204,15 @@ const attach = (input: {
           return taken;
         }),
       noteTurnOffered: () => Effect.void,
+      noteLetGo: (_sid, turnId) =>
+        Effect.sync(() => {
+          letGo.push(turnId);
+        }),
+      onTurnBack: () => Effect.void,
+      waitForQuietMod: () =>
+        Effect.succeed(input.quietAtOpen === true ? { kind: "reported" as const, process } : null),
       launch: () => Effect.die("This test must attach without launching Claude."),
-      findTerminalHome: () => Effect.succeed(null),
+      findTerminalHome: () => Effect.succeed(input.quietAtOpen === true ? root : null),
       findSessionHome: () => Effect.succeed(root),
       // The record of the session the test attaches to says where its conversation went.
       continuationOf: (sid) =>
@@ -281,6 +299,7 @@ const attach = (input: {
       recordChanges,
       leftToRecord,
       asked,
+      letGo,
       deliveries,
       offeredModes,
       nativeStates,
@@ -1674,36 +1693,36 @@ describe("ClaudeBridgeQueryRunner slash commands", () => {
       }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
-  it.live("ends the turn as the process gone when the session's file stays unreadable", () =>
-    Effect.gen(function* () {
-      let gone = false;
-      const bridge = yield* attach({
-        protocol: 2,
-        bridgeCanUseTool: () => null,
-        transcript: "",
-        unreadable: () => gone,
-      });
-      const base = { seq: 1, at: bridge.now, transcriptOffset: 0 };
-      yield* bridge.handler(
-        { ...base, type: "turn.start", turnId: "turn-a", text: "count to 5" },
-        bridge.process,
-      );
-      yield* bridge.session.messages.pipe(Stream.take(2), Stream.runCollect);
-      gone = true;
-      const [notice, closed] = Array.from(
-        yield* bridge.session.messages.pipe(Stream.take(2), Stream.runCollect),
-      );
-      assert.strictEqual(
-        isClaudeBridgeNoticeFrame(notice) ? notice.content : null,
-        "Claude Code session ended (process gone).",
-        describe(notice),
-      );
-      assert.strictEqual(
-        closed?.type === "result" && closed.subtype === "success" ? closed.result : null,
-        "",
-        describe(closed),
-      );
-    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  it.live(
+    "lets go of the turn, saying what it saw, when the session's file stays unreadable and nothing says the session works",
+    () =>
+      Effect.gen(function* () {
+        let gone = false;
+        const bridge = yield* attach({
+          protocol: 2,
+          bridgeCanUseTool: () => null,
+          transcript: "",
+          unreadable: () => gone,
+        });
+        const base = { seq: 1, at: bridge.now, transcriptOffset: 0 };
+        yield* bridge.handler(
+          { ...base, type: "turn.start", turnId: "turn-a", text: "count to 5" },
+          bridge.process,
+        );
+        yield* bridge.session.messages.pipe(Stream.take(2), Stream.runCollect);
+        gone = true;
+        const closed = Array.from(
+          yield* bridge.session.messages.pipe(Stream.take(1), Stream.runCollect),
+        )[0];
+        assert.match(
+          closed?.type === "result" && closed.subtype === "error_during_execution"
+            ? (closed.errors[0] ?? "")
+            : "",
+          /^T3 lost contact with Claude Code: its T3 mod has not reported for \d+ s/,
+          describe(closed),
+        );
+        assert.deepStrictEqual(bridge.letGo, ["turn-a"]);
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
   it.effect("sends text that only looks like a command to the model as written", () =>
@@ -1746,6 +1765,270 @@ describe("ClaudeBridgeQueryRunner slash commands", () => {
       assert.strictEqual(result._tag, "Failure");
       assert.strictEqual(yield* Queue.size(bridge.commands), 0);
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+});
+
+// ddba110e (Oct 22): the mod's heartbeat went quiet for a while in a session
+// whose turn ran on (its record grew every few seconds, its job said it was
+// working). T3 ended the turn as "process gone", shown as interrupted by the
+// person, and the turn's 88 tool calls never reached the thread.
+describe("ClaudeBridgeQueryRunner a mod that goes quiet", () => {
+  const describeFrame = (frame: unknown) => String(JSON.stringify(frame)).slice(0, 300);
+  const replyRow = (uuid: string, text: string, at: number) =>
+    `${JSON.stringify({
+      type: "assistant",
+      uuid,
+      parentUuid: null,
+      isSidechain: false,
+      requestId: `req_${uuid}`,
+      timestamp: stamp(at),
+      message: {
+        id: `msg_${uuid}`,
+        type: "message",
+        role: "assistant",
+        model: "claude-sonnet-4-6",
+        content: [{ type: "text", text }],
+        stop_reason: "end_turn",
+        usage: { input_tokens: 3, output_tokens: 2 },
+      },
+    })}\n`;
+  /** Waits, in real time, for what a test expects of the frames shown. */
+  const shown = (predicate: () => boolean, label: string, frames?: ReadonlyArray<SDKMessage>) =>
+    Effect.gen(function* () {
+      for (let attempt = 0; attempt < 200; attempt += 1) {
+        if (predicate()) return;
+        yield* Effect.sleep("50 millis");
+      }
+      return yield* Effect.die(
+        `Timed out waiting for ${label}; shown: ${(frames ?? []).map(describeFrame).join(" | ")}`,
+      );
+    });
+  const results = (frames: ReadonlyArray<SDKMessage>) =>
+    frames.filter((frame) => frame.type === "result");
+  const texts = (frames: ReadonlyArray<SDKMessage>) =>
+    frames.flatMap((frame) =>
+      frame.type === "assistant"
+        ? frame.message.content.flatMap((block) => (block.type === "text" ? [block.text] : []))
+        : [],
+    );
+  const complete = (bridge: { readonly now: number }, answer: string, transcriptOffset: number) =>
+    ({
+      seq: 2,
+      at: bridge.now,
+      type: "turn.complete",
+      turnId: "turn-a",
+      reason: "answer",
+      answer,
+      isAborted: false,
+      durationMs: 10,
+      transcriptOffset,
+    }) as const;
+
+  it.live("keeps the turn while the mod is quiet and the session's record still grows", () =>
+    Effect.gen(function* () {
+      let quiet = false;
+      const bridge = yield* attach({
+        protocol: 2,
+        bridgeCanUseTool: () => null,
+        transcript: "",
+        quiet: () => quiet,
+      });
+      const frames = yield* shownFrames(bridge);
+      const fs = yield* FileSystem.FileSystem;
+      yield* bridge.handler(
+        {
+          seq: 1,
+          at: bridge.now,
+          transcriptOffset: 0,
+          type: "turn.start",
+          turnId: "turn-a",
+          text: "count to 3",
+        },
+        bridge.process,
+      );
+      yield* shown(() => frames.length === 2, "the turn opened");
+      quiet = true;
+      // The record grows for longer than the reads that once ended the turn.
+      let record = "";
+      for (const [index, word] of ["one", "two", "three"].entries()) {
+        const row = replyRow(
+          `00000000-0000-4000-8000-00000000000${index + 1}`,
+          word,
+          bridge.now + index,
+        );
+        record += row;
+        yield* fs.writeFileString(bridge.process.session.transcriptPath, row, { flag: "a" });
+        yield* Effect.sleep("700 millis");
+      }
+      yield* shown(
+        () => texts(frames).length === 3,
+        "the rows written while the mod was quiet",
+        frames,
+      );
+      assert.lengthOf(results(frames), 0, describeFrame(results(frames)[0]));
+      quiet = false;
+      yield* bridge.handler(
+        complete(bridge, "three", new TextEncoder().encode(record).length),
+        bridge.process,
+      );
+      yield* shown(() => results(frames).length === 1, "the turn's end");
+      const closed = results(frames)[0];
+      assert.strictEqual(
+        closed?.type === "result" && closed.subtype === "success" ? closed.result : null,
+        "three",
+        describeFrame(closed),
+      );
+      assert.deepStrictEqual(texts(frames), ["one", "two", "three"]);
+      assert.deepStrictEqual(bridge.letGo, []);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
+  const claudeSays: ReadonlyArray<{
+    readonly name: string;
+    readonly write: (root: string) => Effect.Effect<void, never, FileSystem.FileSystem>;
+  }> = [
+    {
+      name: "its background job is running a turn",
+      write: (root) =>
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          yield* fs.makeDirectory(`${root}/jobs/bridge-s`, { recursive: true });
+          yield* fs.writeFileString(
+            `${root}/jobs/bridge-s/state.json`,
+            encodeJson({ state: "working", tempo: "active", sessionId: "bridge-session" }),
+          );
+        }).pipe(Effect.orDie),
+    },
+    {
+      name: "its process is alive and busy",
+      write: (root) =>
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const pid = globalThis.process.pid;
+          yield* fs.makeDirectory(`${root}/sessions`, { recursive: true });
+          yield* fs.writeFileString(
+            `${root}/sessions/${pid}.json`,
+            encodeJson({ pid, sessionId: "bridge-session", kind: "interactive", status: "busy" }),
+          );
+        }).pipe(Effect.orDie),
+    },
+  ];
+  for (const says of claudeSays) {
+    it.live(`keeps the turn while the mod is quiet and Claude Code says ${says.name}`, () =>
+      Effect.gen(function* () {
+        let quiet = false;
+        const bridge = yield* attach({
+          protocol: 2,
+          bridgeCanUseTool: () => null,
+          transcript: "",
+          quiet: () => quiet,
+        });
+        const frames = yield* shownFrames(bridge);
+        yield* says.write(bridge.process.session.configDir);
+        yield* bridge.handler(
+          {
+            seq: 1,
+            at: bridge.now,
+            transcriptOffset: 0,
+            type: "turn.start",
+            turnId: "turn-a",
+            text: "sleep 2",
+          },
+          bridge.process,
+        );
+        yield* shown(() => frames.length === 2, "the turn opened");
+        quiet = true;
+        yield* Effect.sleep("1500 millis");
+        assert.lengthOf(results(frames), 0, describeFrame(results(frames)[0]));
+        quiet = false;
+        yield* bridge.handler(complete(bridge, "slept", 0), bridge.process);
+        yield* shown(() => results(frames).length === 1, "the turn's end");
+        const closed = results(frames)[0];
+        assert.strictEqual(
+          closed?.type === "result" && closed.subtype === "success" ? closed.result : null,
+          "slept",
+          describeFrame(closed),
+        );
+        assert.deepStrictEqual(bridge.letGo, []);
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+    );
+  }
+
+  it.live(
+    "lets go of the turn when the mod is quiet, the record still and Claude Code says nothing runs, and says what it saw",
+    () =>
+      Effect.gen(function* () {
+        let quiet = false;
+        const bridge = yield* attach({
+          protocol: 2,
+          bridgeCanUseTool: () => null,
+          transcript: "",
+          quiet: () => quiet,
+        });
+        const frames = yield* shownFrames(bridge);
+        yield* bridge.handler(
+          {
+            seq: 1,
+            at: bridge.now,
+            transcriptOffset: 0,
+            type: "turn.start",
+            turnId: "turn-a",
+            text: "count to 5",
+          },
+          bridge.process,
+        );
+        yield* shown(() => frames.length === 2, "the turn opened");
+        quiet = true;
+        yield* shown(() => results(frames).length === 1, "the turn let go");
+        const closed = results(frames)[0];
+        // A failure of T3's own, not the session's end nor an interruption by anyone.
+        assert.match(
+          closed?.type === "result" && closed.subtype === "error_during_execution"
+            ? (closed.errors[0] ?? "")
+            : "",
+          /^T3 lost contact with Claude Code: its T3 mod has not reported for 2\d s, and nothing says the session is still working\.$/,
+          describeFrame(closed),
+        );
+        assert.isUndefined(closed?.type === "result" ? closed.terminal_reason : undefined);
+        assert.isFalse(
+          frames.some((frame) => isClaudeBridgeNoticeFrame(frame)),
+          describeFrame(frames.find((frame) => isClaudeBridgeNoticeFrame(frame))),
+        );
+        assert.deepStrictEqual(bridge.letGo, ["turn-a"]);
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.live(
+    "attaches to a session open in a terminal whose mod had gone quiet once it reports again",
+    () =>
+      Effect.gen(function* () {
+        const bridge = yield* attach({
+          protocol: 2,
+          bridgeCanUseTool: () => null,
+          transcript: "",
+          quietAtOpen: true,
+        });
+        // Opened: the runner is subscribed to the session, and nothing was launched.
+        yield* bridge.handler(
+          {
+            seq: 1,
+            at: bridge.now,
+            transcriptOffset: 0,
+            type: "turn.start",
+            turnId: "turn-a",
+            text: "hi",
+          },
+          bridge.process,
+        );
+        const opened = Array.from(
+          yield* bridge.session.messages.pipe(Stream.take(2), Stream.runCollect),
+        );
+        assert.deepStrictEqual(
+          opened.map((frame) => frame.type),
+          ["user", "system"],
+        );
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 });
 

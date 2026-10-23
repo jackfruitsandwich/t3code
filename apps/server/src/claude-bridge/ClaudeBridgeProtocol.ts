@@ -1738,6 +1738,13 @@ export interface ClaudeBridgeFrameTranslator {
   /** A `result` for a turn this server interrupted and the mod never reported. */
   readonly onEnded: (reason: string) => ReadonlyArray<SDKMessage>;
   /**
+   * A `result` for the turn open here when T3 stops following the session on
+   * its own (see `claudeBridgeLostContactText`): a failure of T3's, saying
+   * what it saw. The session never said the turn ended, nor that anyone
+   * stopped it.
+   */
+  readonly onLostContact: (detail: string) => ReadonlyArray<SDKMessage>;
+  /**
    * A `result` for the turn this process was running when its conversation
    * carried on under another session id. The rest of the turn is that
    * session's; this one closes with nothing more said.
@@ -2154,6 +2161,20 @@ export function makeClaudeBridgeFrameTranslator(
       });
       turn = null;
       return [notice, frame];
+    },
+    onLostContact: (detail) => {
+      if (turn === null) return [];
+      // The detail is what the run ends on, not an error line the session showed.
+      turn.shownError = null;
+      const frame = resultFrame({
+        turnId: turn.turnId,
+        reason: "error",
+        answer: detail,
+        isAborted: false,
+        durationMs: 0,
+      });
+      turn = null;
+      return [frame];
     },
     onContinuedElsewhere: (at) => {
       if (turn === null) return [];

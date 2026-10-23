@@ -46,6 +46,7 @@ import * as Stream from "effect/Stream";
 
 import * as ClaudeBridgeRegistry from "../../claude-bridge/ClaudeBridgeRegistry.ts";
 import {
+  CLAUDE_BRIDGE_LIVE_WINDOW_MS,
   CLAUDE_BRIDGE_T3_HEARTBEAT_MS,
   CLAUDE_BRIDGE_WINDOW_PROTOCOL,
   claudeBridgeAttachmentPaths,
@@ -86,6 +87,7 @@ import {
   type ClaudeBridgeCommandBody,
   type ClaudeBridgeEvent,
   type ClaudeBridgeRequestTurnBy,
+  type ClaudeBridgeSessionFile,
   type ClaudeBridgeWaitingRequest,
 } from "../../claude-bridge/ClaudeBridgeProtocol.ts";
 import { claudeBetweenTurnsNotice } from "../../import/claudeSessionParser.ts";
@@ -118,6 +120,13 @@ const TURN_END_HOLD_READS = 16;
  * lands mid-write finds it empty or cut, and one such read is no death.
  */
 const SESSION_MISSES_TO_END = 3;
+/**
+ * What the thread is told when T3 stops following a session on its own: the
+ * mod has not reported for that long and nothing says the session is still
+ * at work. Not that the session ended, nor that anyone stopped the turn.
+ */
+export const claudeBridgeLostContactText = (quietForMs: number) =>
+  `T3 lost contact with Claude Code: its T3 mod has not reported for ${Math.round(quietForMs / 1000)} s, and nothing says the session is still working.`;
 /** How long a message the terminal drew waits for the record's row before it is shown without one. */
 const DRAWN_MESSAGE_WAIT_MS = 2_500;
 /** How long a reply row's text is remembered, for a drawn copy that arrives after it. */
@@ -368,15 +377,25 @@ export const layer: Layer.Layer<
           cwd,
           configDir,
         });
-        if (terminalHome !== null) {
+        // Open in a terminal T3 does not see reporting: the mod there may
+        // only have gone quiet.
+        const quiet = terminalHome === null ? null : yield* registry.waitForQuietMod(sid);
+        if (quiet?.kind === "reported") {
+          entry = quiet.process;
+        } else if (terminalHome !== null) {
           return yield* runnerError(
             new ClaudeBridgeRegistry.ClaudeBridgeLaunchError({
               sid,
-              detail: `Session ${sid} is open in a Claude Code terminal under ${terminalHome} without the T3 bridge plugin. Install the plugin in that Claude home and restart the session, or close it.`,
+              detail:
+                quiet === null
+                  ? `Session ${sid} is open in a Claude Code terminal under ${terminalHome} without the T3 bridge plugin. Install the plugin in that Claude home and restart the session, or close it.`
+                  : ClaudeBridgeRegistry.claudeBridgeQuietModDetail(sid, quiet.quietForMs),
             }),
             "attach",
           );
         }
+      }
+      if (entry === null) {
         entry = yield* registry
           .launch({
             sid,
@@ -1582,14 +1601,20 @@ export const layer: Layer.Layer<
         yield* emit(translator.onContinuedElsewhere(now));
       });
 
-      const endSession = (reason: string) =>
+      /** `lostContact`: T3 stops following the session on its own; `reason` is what it saw. */
+      const endSession = (reason: string, lostContact = false) =>
         Effect.gen(function* () {
           yield* readNewRows.pipe(Effect.ignore);
           // A command sent from T3 that ended the session (/exit, /background)
           // did what it was sent to do: it is shown as done, not as a turn
           // that failed.
           const sent = state.pendingPrompt;
-          if (sent !== null && sent.label !== null && sent.body.type === "command") {
+          if (
+            !lostContact &&
+            sent !== null &&
+            sent.label !== null &&
+            sent.body.type === "command"
+          ) {
             state.pendingPrompt = null;
             yield* emitCommandTurn({
               turnId: `command-${sent.commandId}`,
@@ -1606,8 +1631,80 @@ export const layer: Layer.Layer<
           }
           yield* letGoOfHeldSteers;
           yield* letGoOfTyped;
-          yield* emit(translator.onEnded(reason));
+          yield* emit(lostContact ? translator.onLostContact(reason) : translator.onEnded(reason));
           yield* finish;
+        });
+
+      /**
+       * Whether Claude Code itself says the session is running a turn: its
+       * `claude --bg` job is active, or a live process of the session says it
+       * is busy. Claude Code writes both; the mod writes neither.
+       */
+      const claudeSaysWorking = (configDir: string) =>
+        Effect.gen(function* () {
+          const readJsonFile = (file: string) =>
+            fs.readFileString(file).pipe(
+              Effect.map(parseJsonlLine),
+              Effect.orElseSucceed((): unknown => undefined),
+            );
+          const job = yield* readJsonFile(
+            path.join(configDir, "jobs", sid.slice(0, 8), "state.json"),
+          );
+          if (
+            isRecord(job) &&
+            job.tempo === "active" &&
+            (job.sessionId === undefined || job.sessionId === sid)
+          ) {
+            return true;
+          }
+          const processesDir = path.join(configDir, "sessions");
+          const names = yield* fs
+            .readDirectory(processesDir)
+            .pipe(Effect.orElseSucceed((): ReadonlyArray<string> => []));
+          for (const name of names) {
+            if (!name.endsWith(".json")) continue;
+            const running = yield* readJsonFile(path.join(processesDir, name));
+            if (
+              isRecord(running) &&
+              running.sessionId === sid &&
+              running.status === "busy" &&
+              typeof running.pid === "number" &&
+              ClaudeBridgeRegistry.isProcessAlive(running.pid)
+            ) {
+              return true;
+            }
+          }
+          return false;
+        });
+
+      /**
+       * A heartbeat gone quiet is no end while the session is still at work:
+       * its record grew within the heartbeat's window, or Claude Code says it
+       * runs a turn. A process kept from running for a while (swap, a long
+       * stretch of work) stops reporting and comes back; its turn goes on.
+       */
+      const stillAtWork = (configDir: string) =>
+        Effect.gen(function* () {
+          // What the record gained since it was last read counts as growth.
+          yield* readNewRows.pipe(Effect.ignore);
+          const now = yield* Clock.currentTimeMillis;
+          if (state.lastRowAt > 0 && now - state.lastRowAt < CLAUDE_BRIDGE_LIVE_WINDOW_MS) {
+            return true;
+          }
+          return yield* claudeSaysWorking(configDir);
+        });
+
+      /**
+       * T3 stops following the session on its own, and says so. A turn open
+       * here is noted as let go: should the session report again with it
+       * still running, a run picks it back up.
+       */
+      const loseContact = (quietForMs: number) =>
+        Effect.gen(function* () {
+          const turnId = sessionTurnOpen() ? translator.openTurnId() : null;
+          if (turnId !== null) yield* registry.noteLetGo(sid, turnId);
+          yield* Effect.logWarning("claude-bridge.lost-contact", { sid, quietForMs, turnId });
+          yield* endSession(claudeBridgeLostContactText(quietForMs), true);
         });
 
       /**
@@ -1660,29 +1757,9 @@ export const layer: Layer.Layer<
         return true;
       });
 
-      const tail = Effect.gen(function* () {
-        let lastHeartbeat = 0;
-        let sessionMisses = 0;
-        while (!state.closed) {
-          const now = yield* Clock.currentTimeMillis;
-          yield* followReloadedMod;
-          if (now - lastHeartbeat >= CLAUDE_BRIDGE_T3_HEARTBEAT_MS) {
-            yield* registry.heartbeat(bridgeProcess, toolEndpoint);
-            lastHeartbeat = now;
-          }
-          const session = yield* registry.readSession(bridgeProcess);
-          if (session === null || !isClaudeBridgeSessionLive(session, now)) {
-            // An end the session itself wrote is final; a file that would not
-            // read, or a heartbeat that has gone quiet, is looked at again.
-            sessionMisses += 1;
-            if (session?.ended == null && sessionMisses < SESSION_MISSES_TO_END) {
-              yield* Effect.sleep(`${TAIL_INTERVAL_MS} millis`);
-              continue;
-            }
-            yield* endSession(session?.ended?.reason ?? "process gone");
-            return;
-          }
-          sessionMisses = 0;
+      /** Takes in what the session's file says of the session itself. */
+      const followSession = (session: ClaudeBridgeSessionFile) =>
+        Effect.gen(function* () {
           // The session names its record's file, and the file can move while
           // the session runs: `/cd <dir>` takes it, as it is, to that
           // directory's project folder. What was read of it stays read.
@@ -1699,6 +1776,54 @@ export const layer: Layer.Layer<
           yield* showNativeSettings(nativeSettings(session), recordChangedMode);
           recordChangedMode = false;
           yield* showNativeState(session);
+        });
+
+      const tail = Effect.gen(function* () {
+        let lastHeartbeat = 0;
+        let sessionMisses = 0;
+        /** The mod's heartbeat as last read here, and whether its going quiet was let pass. */
+        let heardAt = bridgeProcess.session.heartbeatAt;
+        let quietPassed = false;
+        while (!state.closed) {
+          const now = yield* Clock.currentTimeMillis;
+          yield* followReloadedMod;
+          if (now - lastHeartbeat >= CLAUDE_BRIDGE_T3_HEARTBEAT_MS) {
+            yield* registry.heartbeat(bridgeProcess, toolEndpoint);
+            lastHeartbeat = now;
+          }
+          const session = yield* registry.readSession(bridgeProcess);
+          if (session !== null) heardAt = session.heartbeatAt;
+          if (session === null || !isClaudeBridgeSessionLive(session, now)) {
+            // An end the session itself wrote is final; a file that would not
+            // read, or a heartbeat that has gone quiet, is looked at again.
+            if (session?.ended != null) {
+              yield* endSession(session.ended.reason);
+              return;
+            }
+            sessionMisses += 1;
+            if (sessionMisses < SESSION_MISSES_TO_END) {
+              yield* Effect.sleep(`${TAIL_INTERVAL_MS} millis`);
+              continue;
+            }
+            if (!(yield* stillAtWork((session ?? bridgeProcess.session).configDir))) {
+              yield* loseContact(now - heardAt);
+              return;
+            }
+            if (!quietPassed) {
+              quietPassed = true;
+              yield* Effect.logInfo("claude-bridge.quiet-session-at-work", {
+                sid,
+                quietForMs: now - heardAt,
+              });
+            }
+          } else {
+            if (quietPassed) {
+              quietPassed = false;
+              yield* Effect.logInfo("claude-bridge.quiet-session-reported", { sid });
+            }
+            sessionMisses = 0;
+            yield* followSession(session);
+          }
           yield* expireTurnEndHold;
           yield* readNewRows.pipe(
             Effect.catchCause((cause) =>

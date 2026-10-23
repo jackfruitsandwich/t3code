@@ -455,3 +455,127 @@ describe("a turn the session was running when the server came up", () => {
     }),
   );
 });
+
+describe("a turn T3 let go of when it lost contact with the session", () => {
+  const at = "2026-10-22T20:11:21.000Z";
+  const encodePayload = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
+
+  // ddba110e (Oct 22): T3 let go of a turn its own prompt had started, and of
+  // another nothing was attached for, while the turns ran on.
+  it.effect("is offered to a run again once the session reports, also one offered before", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const payload = yield* encodePayload({
+        driver: CLAUDE_PROVIDER,
+        nativeThreadRef: { nativeId: "live" },
+      });
+      yield* sql`
+        INSERT INTO orchestration_v2_projection_threads (
+          thread_id, project_id, title, default_provider, runtime_mode, interaction_mode,
+          created_at, updated_at, payload_json
+        ) VALUES (
+          'thread-live', 'project-1', 'live', ${CLAUDE_PROVIDER}, 'full-access', 'default',
+          ${at}, ${at}, '{}'
+        )
+      `;
+      yield* sql`
+        INSERT INTO orchestration_v2_projection_provider_threads (
+          provider_thread_id, thread_id, provider, status, updated_at, payload_json
+        ) VALUES (
+          'provider-thread-live', 'thread-live', ${CLAUDE_PROVIDER}, 'idle', ${at}, ${payload}
+        )
+      `;
+      const session = parseClaudeBridgeSessionFile({
+        sid: "live",
+        instanceId: "instance-live",
+        heartbeatAt: 1_750_000_000_000,
+        isInteractive: true,
+        transcriptPath: "/records/live.jsonl",
+        activeTurn: { turnId: "turn-1", startedAt: 1_749_999_990_000, transcriptOffset: 0 },
+      });
+      assert.isNotNull(session);
+      const entry = {
+        sid: "live",
+        instanceId: "instance-live",
+        dir: "/bridge/live",
+        session: session!,
+      };
+      let onEvent: ClaudeBridgeRegistry.ClaudeBridgeEventHandler | null = null;
+      let onTurnBack: ClaudeBridgeRegistry.ClaudeBridgeTurnBackHandler | null = null;
+      const offered =
+        yield* Queue.unbounded<ProviderContinuationRequests.ProviderContinuationRequest>();
+      const none = yield* ClaudeBridgeRegistry.ClaudeBridgeRegistry.pipe(
+        Effect.provide(ClaudeBridgeRegistry.layerTest),
+      );
+      yield* Layer.build(attachLayer).pipe(
+        Effect.provideService(
+          ClaudeBridgeRegistry.ClaudeBridgeRegistry,
+          ClaudeBridgeRegistry.ClaudeBridgeRegistry.of({
+            ...none,
+            onUnattachedEvent: (handler) =>
+              Effect.sync(() => {
+                onEvent = handler;
+              }),
+            onTurnBack: (handler) =>
+              Effect.sync(() => {
+                onTurnBack = handler;
+              }),
+          }),
+        ),
+        Effect.provideService(
+          SessionImporter.SessionImporter,
+          SessionImporter.SessionImporter.of({
+            start: () => Effect.void,
+            sweepNow: () => Effect.void,
+            adoptLiveClaudeSession: () => Effect.void,
+            healLiveClaudeSession: () => Effect.void,
+            claudeConversationHolder: () => Effect.succeed(null),
+            claudeSessionHeldElsewhere: () => Effect.succeed(false),
+          }),
+        ),
+        Effect.provideService(
+          ProviderRuntimeRecoveryService.ProviderRuntimeRecoveryService,
+          ProviderRuntimeRecoveryService.ProviderRuntimeRecoveryService.of({
+            reconcile: () => Effect.die("unused"),
+            prepareForShutdown: Effect.void,
+            recover: Effect.die("unused"),
+            awaitStartupRecovery: Effect.void,
+          }),
+        ),
+        Effect.provideService(ProviderContinuationRequests.ProviderContinuationRequests, {
+          offer: (request) => Queue.offer(offered, request).pipe(Effect.asVoid),
+          take: Effect.never,
+        }),
+      );
+      assert.isNotNull(onEvent);
+      assert.isNotNull(onTurnBack, "the service takes up turns T3 let go of");
+      if (onEvent === null || onTurnBack === null) return;
+      // Typed in the terminal with nothing attached: a run is offered for it.
+      yield* (onEvent as ClaudeBridgeRegistry.ClaudeBridgeEventHandler)(
+        {
+          seq: 1,
+          at: 1_749_999_990_000,
+          type: "turn.start",
+          turnId: "turn-1",
+          text: "go on",
+          transcriptOffset: 0,
+        },
+        entry,
+      );
+      const first = yield* Queue.take(offered);
+      assert.strictEqual(first.threadId, "thread-live");
+      // That run let it go; the session reports again with it still running.
+      yield* (onTurnBack as ClaudeBridgeRegistry.ClaudeBridgeTurnBackHandler)(
+        entry,
+        session!.activeTurn!,
+      );
+      const again = Option.getOrUndefined(
+        yield* Queue.take(offered).pipe(Effect.timeoutOption("2 seconds")),
+      );
+      assert.deepStrictEqual(
+        [again?.threadId, again?.providerThreadId, again?.createdBy, again?.reattachRun],
+        ["thread-live", "provider-thread-live", "agent", undefined],
+      );
+    }).pipe(Effect.scoped, Effect.provide(SqlitePersistence.layerMemory)),
+  );
+});
