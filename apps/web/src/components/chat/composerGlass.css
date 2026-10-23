@@ -1,11 +1,24 @@
-/* Claude composer glass: LimitBar's Claude card on the composer and every layer it owns.
-   ChatView sets data-composer-glass="claude" on the composer shell; portaled menus get the
-   same attribute through useComposerMenuProps. Only colors, gradients and the rim change;
+/* Provider composer glass: LimitBar's provider cards on the composer and every layer it owns.
+   ChatView sets data-composer-glass="claude" or "codex" on the composer shell; portaled menus
+   get the same attribute through useComposerMenuProps. Each provider only picks its colors. Only colors, gradients and the rim change;
    the shell geometry, seams and masks stay T3's. */
 
+/* LimitBar's card tints: Claude coral, Codex green. ink and deep are the light-mode rim and text. */
 [data-composer-glass="claude"] {
-  --composer-glass-tint-top: rgb(217 119 87 / 14%);
-  --composer-glass-tint-bottom: rgb(217 119 87 / 5%);
+  --composer-glass-rgb: 217 119 87;
+  --composer-glass-ink: 120 62 42;
+  --composer-glass-deep: 40 22 16;
+}
+
+[data-composer-glass="codex"] {
+  --composer-glass-rgb: 15 163 128;
+  --composer-glass-ink: 20 92 74;
+  --composer-glass-deep: 8 38 31;
+}
+
+[data-composer-glass] {
+  --composer-glass-tint-top: rgb(var(--composer-glass-rgb) / 14%);
+  --composer-glass-tint-bottom: rgb(var(--composer-glass-rgb) / 5%);
   --composer-glass-wash: linear-gradient(
     var(--composer-glass-tint-top),
     var(--composer-glass-tint-bottom)
@@ -15,14 +28,14 @@
   --composer-glass-rim: linear-gradient(
     to bottom right,
     rgb(255 255 255 / 100%),
-    rgb(120 62 42 / 18%) 50%,
-    rgb(120 62 42 / 26%)
+    rgb(var(--composer-glass-ink) / 18%) 50%,
+    rgb(var(--composer-glass-ink) / 26%)
   );
-  --composer-glass-edge: rgb(120 62 42 / 14%);
+  --composer-glass-edge: rgb(var(--composer-glass-ink) / 14%);
   --composer-glass-metal: linear-gradient(
-    rgb(40 22 16 / 88%),
-    rgb(40 22 16 / 58%) 55%,
-    rgb(40 22 16 / 80%)
+    rgb(var(--composer-glass-deep) / 88%),
+    rgb(var(--composer-glass-deep) / 58%) 55%,
+    rgb(var(--composer-glass-deep) / 80%)
   );
   /* Clear glass: a thin fill and a light blur so the thread shows through, with extra
      saturation so what passes behind keeps its color. The fill still scales with the
@@ -33,21 +46,21 @@
   --composer-glass-popup: rgb(255 255 255 / 50%);
   --composer-glass-popup-blur: 12px;
   /* Raw tokens: Tailwind's @theme inline compiles utilities straight to these. */
-  --accent: rgb(217 119 87 / 10%);
-  --primary: rgb(217 119 87);
+  --accent: rgb(var(--composer-glass-rgb) / 10%);
+  --primary: rgb(var(--composer-glass-rgb));
   --primary-foreground: rgb(255 255 255);
-  --message-action: rgb(217 119 87);
-  --message-action-hover: rgb(204 104 72);
+  --message-action: rgb(var(--composer-glass-rgb));
+  --message-action-hover: color-mix(in srgb, rgb(var(--composer-glass-rgb)) 88%, black);
   --message-action-foreground: rgb(255 255 255);
-  --ring: rgb(217 119 87 / 55%);
-  caret-color: rgb(217 119 87);
+  --ring: rgb(var(--composer-glass-rgb) / 55%);
+  caret-color: rgb(var(--composer-glass-rgb));
 }
 
-.dark [data-composer-glass="claude"],
-.dark[data-composer-glass="claude"],
-[data-composer-glass="claude"]:is(.dark *) {
-  --composer-glass-tint-top: rgb(217 119 87 / 19%);
-  --composer-glass-tint-bottom: rgb(217 119 87 / 7.5%);
+.dark [data-composer-glass],
+.dark[data-composer-glass],
+[data-composer-glass]:is(.dark *) {
+  --composer-glass-tint-top: rgb(var(--composer-glass-rgb) / 19%);
+  --composer-glass-tint-bottom: rgb(var(--composer-glass-rgb) / 7.5%);
   --composer-glass-sheen: linear-gradient(rgb(255 255 255 / 7%), rgb(255 255 255 / 0%) 50%);
   --composer-glass-rim: linear-gradient(
     to bottom right,
@@ -65,20 +78,20 @@
   --chat-composer-glass-surface: rgb(18 18 20 / 62%);
   --composer-glass-popup: rgb(22 20 20 / 50%);
   --accent: rgb(255 255 255 / 7%);
-  --message-action-hover: rgb(228 138 106);
+  --message-action-hover: color-mix(in srgb, rgb(var(--composer-glass-rgb)) 85%, white);
 }
 
 /* The glass itself: T3's surface and blur, LimitBar's tint wash and top sheen. */
-[data-slot="composer-shell"][data-composer-glass="claude"]::before,
-[data-composer-glass="claude"]:has([data-composer-banner-surface="attached"])
+[data-slot="composer-shell"][data-composer-glass]::before,
+[data-composer-glass]:has([data-composer-banner-surface="attached"])
   [data-chat-composer-main-surface],
-[data-composer-glass="claude"][data-model-strip-transition] [data-chat-composer-main-surface] {
+[data-composer-glass][data-model-strip-transition] [data-chat-composer-main-surface] {
   background-image: var(--composer-glass-sheen), var(--composer-glass-wash);
 }
 
 /* Rim light: a 1px gradient ring in place of the flat outline. */
-[data-composer-glass="claude"] [data-slot="composer-host"]::after,
-[data-composer-glass="claude"] [data-chat-composer-main-surface]::after {
+[data-composer-glass] [data-slot="composer-host"]::after,
+[data-composer-glass] [data-chat-composer-main-surface]::after {
   border-color: transparent;
   background: var(--composer-glass-rim) border-box;
   mask-image: linear-gradient(#000 0 0), linear-gradient(#000 0 0);
@@ -88,12 +101,15 @@
 }
 
 /* The drawer under the composer: the same wash, half strength. */
-[data-composer-glass="claude"] [data-slot="composer-context-strip"]::before {
+[data-composer-glass] [data-slot="composer-context-strip"]::before {
   border-color: var(--composer-glass-edge);
-  background-image: linear-gradient(rgb(217 119 87 / 7%), rgb(217 119 87 / 2.5%));
+  background-image: linear-gradient(
+    rgb(var(--composer-glass-rgb) / 7%),
+    rgb(var(--composer-glass-rgb) / 2.5%)
+  );
 }
 
-.dark [data-composer-glass="claude"] [data-slot="composer-context-strip"]::before {
+.dark [data-composer-glass] [data-slot="composer-context-strip"]::before {
   background-image:
     linear-gradient(
       to bottom,
@@ -101,11 +117,11 @@
       rgb(0 0 0 / 18%) 1rem,
       transparent calc(1rem + 10px)
     ),
-    linear-gradient(rgb(217 119 87 / 9%), rgb(217 119 87 / 3.5%));
+    linear-gradient(rgb(var(--composer-glass-rgb) / 9%), rgb(var(--composer-glass-rgb) / 3.5%));
 }
 
 /* Banners and the slash/@ drawer that dock on top. Severity tints stay on top of the wash. */
-[data-composer-glass="claude"] [data-composer-banner-surface]::before {
+[data-composer-glass] [data-composer-banner-surface]::before {
   border-color: var(--composer-glass-edge);
   background-image:
     var(--composer-glass-sheen),
@@ -113,15 +129,15 @@
     var(--composer-glass-wash);
 }
 
-[data-composer-glass="claude"] [data-composer-banner-surface][data-variant="warning"]::before {
+[data-composer-glass] [data-composer-banner-surface][data-variant="warning"]::before {
   border-color: rgb(255 159 10 / 32%);
 }
 
-[data-composer-glass="claude"] [data-composer-banner-surface][data-variant="error"]::before {
+[data-composer-glass] [data-composer-banner-surface][data-variant="error"]::before {
   border-color: rgb(255 69 58 / 34%);
 }
 
-.dark [data-composer-glass="claude"] [data-composer-banner-surface="attached"]::before {
+.dark [data-composer-glass] [data-composer-banner-surface="attached"]::before {
   background-image:
     var(--composer-glass-sheen),
     linear-gradient(var(--chat-composer-attached-tint), var(--chat-composer-attached-tint)),
@@ -135,12 +151,12 @@
 }
 
 /* Pressed toggles in the composer read as lit, in the tint. */
-[data-composer-glass="claude"] button[aria-pressed="true"] {
-  background-color: rgb(217 119 87 / 16%);
+[data-composer-glass] button[aria-pressed="true"] {
+  background-color: rgb(var(--composer-glass-rgb) / 16%);
 }
 
 /* The model picker reads as LimitBar's header pill: rounded type, metal fill. */
-[data-composer-glass="claude"] [data-chat-provider-model-picker-label] {
+[data-composer-glass] [data-chat-provider-model-picker-label] {
   font-family: ui-rounded, "SF Pro Rounded", var(--font-sans);
   font-weight: 650;
   color: transparent;
@@ -150,7 +166,7 @@
 }
 
 /* Portaled menus, pickers and selects the composer owns. */
-.dropdown-glass:is([data-composer-glass="claude"], [data-composer-glass="claude"] > *) {
+.dropdown-glass:is([data-composer-glass], [data-composer-glass] > *) {
   position: relative;
   border-color: transparent;
   border-radius: 14px;
@@ -159,7 +175,7 @@
   backdrop-filter: blur(var(--composer-glass-popup-blur)) saturate(var(--glass-saturation));
 }
 
-.dropdown-glass:is([data-composer-glass="claude"], [data-composer-glass="claude"] > *)::after {
+.dropdown-glass:is([data-composer-glass], [data-composer-glass] > *)::after {
   content: "";
   position: absolute;
   inset: -1px;

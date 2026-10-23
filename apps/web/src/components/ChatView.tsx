@@ -486,6 +486,7 @@ import { useLinkedThreadPullRequest } from "./ThreadStatusIndicators";
 import type { ComposerBannerStackItem } from "./chat/ComposerBannerStack";
 import { ComposerSurface } from "./chat/ComposerSurface";
 import "./chat/composerGlass.css";
+import type { ComposerGlass } from "./chat/composerEventScope";
 import { resolveThreadSyncPhase } from "../threadSync";
 import {
   hasAvailableCompactionProvider,
@@ -601,6 +602,12 @@ import {
   ATTACHMENT_ONLY_BOOTSTRAP_PROMPT,
   recallableComposerPrompt,
 } from "./chat/composerPromptHistory";
+
+// Providers whose composer wears their LimitBar card glass.
+const COMPOSER_GLASS_BY_DRIVER: Partial<Record<string, ComposerGlass>> = {
+  claudeAgent: "claude",
+  codex: "codex",
+};
 
 const EMPTY_PROVIDERS: ServerProvider[] = [];
 const EMPTY_PROVIDER_MODELS: ServerProvider["models"] = [];
@@ -3219,6 +3226,33 @@ export default function ChatView(props: ChatViewProps) {
     ],
   );
   const selectedProvider = selectedProviderEntry?.driverKind ?? requestedDriverKind;
+  // The composer's glass follows the model it will send with. That can be another
+  // provider than the thread's when switching hands the thread off, so resolve it
+  // with the composer's own lock rather than the thread's.
+  const composerGlass = useMemo(() => {
+    const composerSelection = resolveComposerProviderSelection({
+      entries: providerInstanceEntries,
+      candidateInstanceIds: [
+        selectedProviderByThreadId,
+        activeRuntime?.providerInstanceId,
+        activeThread?.modelSelection.instanceId,
+        activeProjectDefaultModelSelection?.instanceId,
+      ],
+      lockedProvider: modelPickerLockedProvider,
+      lockedInstanceId:
+        activeRuntime?.providerInstanceId ?? activeThread?.modelSelection.instanceId,
+    });
+    const driverKind =
+      composerSelection.selectedProviderEntry?.driverKind ?? composerSelection.requestedDriverKind;
+    return COMPOSER_GLASS_BY_DRIVER[driverKind];
+  }, [
+    activeProjectDefaultModelSelection?.instanceId,
+    activeThread?.modelSelection.instanceId,
+    activeRuntime?.providerInstanceId,
+    modelPickerLockedProvider,
+    providerInstanceEntries,
+    selectedProviderByThreadId,
+  ]);
   const activeProviderInstanceId = selectedProviderEntry?.instanceId ?? null;
   const activeProviderStatus = selectedProviderEntry?.snapshot ?? null;
   // A started thread whose session keeps its own model and modes shows the
@@ -11313,7 +11347,7 @@ export default function ChatView(props: ChatViewProps) {
                   >
                     <ComposerSurface.Shell
                       contextStrip={showComposerContextStrip || showComposerModelStrip}
-                      glass={selectedProvider === "claudeAgent" ? "claude" : undefined}
+                      glass={composerGlass}
                     >
                       <ComposerSurface.Host
                         inert={isSavingQueuedEdit}
