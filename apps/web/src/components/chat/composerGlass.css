@@ -1,0 +1,161 @@
+/* Claude composer glass: LimitBar's Claude card on the composer and every layer it owns.
+   ChatView sets data-composer-glass="claude" on the composer shell; portaled menus get the
+   same attribute through useComposerMenuProps. Only colors, gradients and the rim change;
+   the shell geometry, seams and masks stay T3's. */
+
+[data-composer-glass="claude"] {
+  --composer-glass-tint-top: rgb(217 119 87 / 14%);
+  --composer-glass-tint-bottom: rgb(217 119 87 / 5%);
+  --composer-glass-wash: linear-gradient(
+    var(--composer-glass-tint-top),
+    var(--composer-glass-tint-bottom)
+  );
+  --composer-glass-sheen: linear-gradient(rgb(255 255 255 / 55%), rgb(255 255 255 / 0%) 50%);
+  /* Light rim: a specular top-left edge over a warm hairline. */
+  --composer-glass-rim: linear-gradient(
+    to bottom right,
+    rgb(255 255 255 / 100%),
+    rgb(120 62 42 / 18%) 50%,
+    rgb(120 62 42 / 26%)
+  );
+  --composer-glass-edge: rgb(120 62 42 / 14%);
+  --composer-glass-metal: linear-gradient(
+    rgb(40 22 16 / 88%),
+    rgb(40 22 16 / 58%) 55%,
+    rgb(40 22 16 / 80%)
+  );
+  /* Raw tokens: Tailwind's @theme inline compiles utilities straight to these. */
+  --accent: rgb(217 119 87 / 10%);
+  --primary: rgb(217 119 87);
+  --primary-foreground: rgb(255 255 255);
+  --message-action: rgb(217 119 87);
+  --message-action-hover: rgb(204 104 72);
+  --message-action-foreground: rgb(255 255 255);
+  --ring: rgb(217 119 87 / 55%);
+  caret-color: rgb(217 119 87);
+}
+
+.dark [data-composer-glass="claude"],
+.dark[data-composer-glass="claude"],
+[data-composer-glass="claude"]:is(.dark *) {
+  --composer-glass-tint-top: rgb(217 119 87 / 19%);
+  --composer-glass-tint-bottom: rgb(217 119 87 / 7.5%);
+  --composer-glass-sheen: linear-gradient(rgb(255 255 255 / 7%), rgb(255 255 255 / 0%) 50%);
+  --composer-glass-rim: linear-gradient(
+    to bottom right,
+    rgb(255 255 255 / 45%),
+    rgb(255 255 255 / 6%) 50%,
+    rgb(255 255 255 / 22.5%)
+  );
+  --composer-glass-edge: rgb(255 255 255 / 10%);
+  --composer-glass-metal: linear-gradient(
+    rgb(255 255 255 / 90%),
+    rgb(255 255 255 / 42%) 55%,
+    rgb(255 255 255 / 80%)
+  );
+  --accent: rgb(255 255 255 / 7%);
+  --message-action-hover: rgb(228 138 106);
+}
+
+/* The glass itself: T3's surface and blur, LimitBar's tint wash and top sheen. */
+[data-slot="composer-shell"][data-composer-glass="claude"]::before,
+[data-composer-glass="claude"]:has([data-composer-banner-surface="attached"])
+  [data-chat-composer-main-surface],
+[data-composer-glass="claude"][data-model-strip-transition] [data-chat-composer-main-surface] {
+  background-image: var(--composer-glass-sheen), var(--composer-glass-wash);
+}
+
+/* Rim light: a 1px gradient ring in place of the flat outline. */
+[data-composer-glass="claude"] [data-slot="composer-host"]::after,
+[data-composer-glass="claude"] [data-chat-composer-main-surface]::after {
+  border-color: transparent;
+  background: var(--composer-glass-rim) border-box;
+  mask-image: linear-gradient(#000 0 0), linear-gradient(#000 0 0);
+  mask-clip: padding-box, border-box;
+  mask-composite: exclude;
+  box-shadow: none;
+}
+
+/* The drawer under the composer: the same wash, half strength. */
+[data-composer-glass="claude"] [data-slot="composer-context-strip"]::before {
+  border-color: var(--composer-glass-edge);
+  background-image: linear-gradient(rgb(217 119 87 / 7%), rgb(217 119 87 / 2.5%));
+}
+
+.dark [data-composer-glass="claude"] [data-slot="composer-context-strip"]::before {
+  background-image:
+    linear-gradient(
+      to bottom,
+      transparent 0 1rem,
+      rgb(0 0 0 / 18%) 1rem,
+      transparent calc(1rem + 10px)
+    ),
+    linear-gradient(rgb(217 119 87 / 9%), rgb(217 119 87 / 3.5%));
+}
+
+/* Banners and the slash/@ drawer that dock on top. Severity tints stay on top of the wash. */
+[data-composer-glass="claude"] [data-composer-banner-surface]::before {
+  border-color: var(--composer-glass-edge);
+  background-image:
+    var(--composer-glass-sheen),
+    linear-gradient(var(--chat-composer-attached-tint), var(--chat-composer-attached-tint)),
+    var(--composer-glass-wash);
+}
+
+[data-composer-glass="claude"] [data-composer-banner-surface][data-variant="warning"]::before {
+  border-color: rgb(255 159 10 / 32%);
+}
+
+[data-composer-glass="claude"] [data-composer-banner-surface][data-variant="error"]::before {
+  border-color: rgb(255 69 58 / 34%);
+}
+
+.dark [data-composer-glass="claude"] [data-composer-banner-surface="attached"]::before {
+  background-image:
+    var(--composer-glass-sheen),
+    linear-gradient(var(--chat-composer-attached-tint), var(--chat-composer-attached-tint)),
+    linear-gradient(
+      to top,
+      transparent 0 var(--chat-composer-attachment-overlap),
+      rgb(0 0 0 / 18%) var(--chat-composer-attachment-overlap),
+      transparent calc(var(--chat-composer-attachment-overlap) + 10px)
+    ),
+    var(--composer-glass-wash);
+}
+
+/* Pressed toggles in the composer read as lit, in the tint. */
+[data-composer-glass="claude"] button[aria-pressed="true"] {
+  background-color: rgb(217 119 87 / 16%);
+}
+
+/* The model picker reads as LimitBar's header pill: rounded type, metal fill. */
+[data-composer-glass="claude"] [data-chat-provider-model-picker-label] {
+  font-family: ui-rounded, "SF Pro Rounded", var(--font-sans);
+  font-weight: 650;
+  color: transparent;
+  background-image: var(--composer-glass-metal);
+  background-clip: text;
+  -webkit-background-clip: text;
+}
+
+/* Portaled menus, pickers and selects the composer owns. */
+.dropdown-glass:is([data-composer-glass="claude"], [data-composer-glass="claude"] > *) {
+  position: relative;
+  border-color: transparent;
+  border-radius: 14px;
+  background-image: var(--composer-glass-sheen), var(--composer-glass-wash);
+}
+
+.dropdown-glass:is([data-composer-glass="claude"], [data-composer-glass="claude"] > *)::after {
+  content: "";
+  position: absolute;
+  inset: -1px;
+  z-index: 1;
+  border: 1px solid transparent;
+  border-radius: inherit;
+  background: var(--composer-glass-rim) border-box;
+  mask-image: linear-gradient(#000 0 0), linear-gradient(#000 0 0);
+  mask-clip: padding-box, border-box;
+  mask-composite: exclude;
+  pointer-events: none;
+}

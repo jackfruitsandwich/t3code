@@ -6,7 +6,7 @@ import {
   formatContextWindowCost,
 } from "./ContextWindowMeter.logic";
 import { Minimize2Icon } from "lucide-react";
-import { composerFloatingLayerProps } from "./composerEventScope";
+import { composerFloatingLayerProps, useComposerGlass } from "./composerEventScope";
 
 function formatPercentage(value: number | null): string | null {
   if (value === null || !Number.isFinite(value)) {
@@ -26,6 +26,7 @@ export function ContextWindowMeter(props: {
   compactDisabledReason?: string | null | undefined;
 }) {
   const { usage, modelDisplayName, onCompact, compactDisabled, compactDisabledReason } = props;
+  const composerGlass = useComposerGlass();
   const usedPercentage = formatPercentage(usage.usedPercentage);
   const normalizedPercentage = Math.max(0, Math.min(100, usage.usedPercentage ?? 0));
   const radius = 9.75;
@@ -94,6 +95,7 @@ export function ContextWindowMeter(props: {
       />
       <PopoverPopup
         {...composerFloatingLayerProps}
+        data-composer-glass={composerGlass}
         tooltipStyle
         side="top"
         align="end"

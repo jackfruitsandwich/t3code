@@ -10,7 +10,7 @@ import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 import { Menu, MenuItem, MenuPopup, MenuTrigger } from "../ui/menu";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
-import { composerFloatingLayerProps } from "./composerEventScope";
+import { composerFloatingLayerProps, useComposerGlass } from "./composerEventScope";
 
 interface ComposerPendingApprovalActionsProps {
   requestId: RuntimeRequestId;
@@ -48,6 +48,7 @@ export const ComposerPendingApprovalActions = memo(function ComposerPendingAppro
   sessionGrant,
   onRespondToApproval,
 }: ComposerPendingApprovalActionsProps) {
+  const composerGlass = useComposerGlass();
   // Mounted per request (keyed by its id), so a note never outlives its request.
   const [note, setNote] = useState<string | null>(null);
   const primaryOptions = options.filter(
@@ -132,7 +133,12 @@ export const ComposerPendingApprovalActions = memo(function ComposerPendingAppro
           >
             <EllipsisIcon />
           </MenuTrigger>
-          <MenuPopup {...composerFloatingLayerProps} side="top" align="end">
+          <MenuPopup
+            {...composerFloatingLayerProps}
+            data-composer-glass={composerGlass}
+            side="top"
+            align="end"
+          >
             {approveWithMode !== undefined ? (
               <MenuItem
                 disabled={isResponding || !canRespond}

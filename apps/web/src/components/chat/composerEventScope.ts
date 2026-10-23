@@ -1,4 +1,14 @@
+import { createContext, useContext } from "react";
+
 import { useComposerHandleContext } from "../../composerHandleContext";
+
+/** The provider look of the composer that owns a floating layer; portaled menus carry it. */
+export type ComposerGlass = "claude";
+export const ComposerGlassContext = createContext<ComposerGlass | undefined>(undefined);
+
+export function useComposerGlass() {
+  return useContext(ComposerGlassContext);
+}
 
 const COMPOSER_FLOATING_LAYER_SELECTOR = [
   '[data-composer-drawer-layer="true"]',
@@ -11,9 +21,11 @@ export const composerFloatingLayerProps = {
 
 export function useComposerMenuProps() {
   const composerRef = useComposerHandleContext();
+  const composerGlass = useComposerGlass();
 
   return {
     ...composerFloatingLayerProps,
+    "data-composer-glass": composerGlass,
     finalFocus: composerRef
       ? () => {
           const activeElement = document.activeElement;

@@ -10,7 +10,7 @@ import { Button } from "../ui/button";
 import { Menu, MenuItem, MenuPopup, MenuTrigger } from "../ui/menu";
 import { Spinner } from "../ui/spinner";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
-import { composerFloatingLayerProps } from "./composerEventScope";
+import { composerFloatingLayerProps, useComposerGlass } from "./composerEventScope";
 import {
   alternateComposerDispatchAction,
   resolveComposerDispatchMode,
@@ -103,6 +103,7 @@ export const ComposerPrimaryActions = memo(function ComposerPrimaryActions({
   onInterrupt,
   onImplementPlanInNewThread,
 }: ComposerPrimaryActionsProps) {
+  const composerGlass = useComposerGlass();
   const pointerFocusProps = preserveComposerFocusOnPointerDown
     ? { onPointerDown: preventPointerFocus }
     : undefined;
@@ -235,7 +236,12 @@ export const ComposerPrimaryActions = memo(function ComposerPrimaryActions({
           >
             <ChevronDownIcon className="size-3.5" />
           </MenuTrigger>
-          <MenuPopup align="end" side="top" {...composerFloatingLayerProps}>
+          <MenuPopup
+            align="end"
+            side="top"
+            {...composerFloatingLayerProps}
+            data-composer-glass={composerGlass}
+          >
             <MenuItem
               disabled={isSendBusy || isSendDisabled || isConnecting || isEnvironmentUnavailable}
               onClick={() => void onImplementPlanInNewThread()}

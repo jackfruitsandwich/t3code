@@ -485,6 +485,7 @@ import {
 import { useLinkedThreadPullRequest } from "./ThreadStatusIndicators";
 import type { ComposerBannerStackItem } from "./chat/ComposerBannerStack";
 import { ComposerSurface } from "./chat/ComposerSurface";
+import "./chat/composerGlass.css";
 import { resolveThreadSyncPhase } from "../threadSync";
 import {
   hasAvailableCompactionProvider,
@@ -11312,6 +11313,7 @@ export default function ChatView(props: ChatViewProps) {
                   >
                     <ComposerSurface.Shell
                       contextStrip={showComposerContextStrip || showComposerModelStrip}
+                      glass={selectedProvider === "claudeAgent" ? "claude" : undefined}
                     >
                       <ComposerSurface.Host
                         inert={isSavingQueuedEdit}

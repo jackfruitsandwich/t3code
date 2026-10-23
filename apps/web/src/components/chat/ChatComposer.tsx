@@ -99,6 +99,7 @@ import {
 import {
   composerFloatingLayerProps,
   useComposerMenuProps,
+  useComposerGlass,
   isInsideCollapsedComposerControls,
   isInsideRestingComposerControlScope,
 } from "./composerEventScope";
@@ -994,6 +995,7 @@ function composerCommandMenuPositionsEqual(
 }
 
 function ComposerCommandMenuLayer(props: { anchor: HTMLElement | null; children: ReactNode }) {
+  const composerGlass = useComposerGlass();
   const [position, setPosition] = useState<ComposerCommandMenuPosition | null>(null);
 
   useLayoutEffect(() => {
@@ -1060,6 +1062,7 @@ function ComposerCommandMenuLayer(props: { anchor: HTMLElement | null; children:
     <div
       className="pointer-events-auto fixed z-40 flex flex-col"
       data-composer-drawer-layer="true"
+      data-composer-glass={composerGlass}
       style={{
         bottom: position.bottom,
         left: position.left,
@@ -5646,9 +5649,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         content: activityStackContent,
       }
     : null;
-  const bannerStackItems = activityStackItem
-    ? [activityStackItem, ...bannerItems]
-    : bannerItems;
+  const bannerStackItems = activityStackItem ? [activityStackItem, ...bannerItems] : bannerItems;
   useEffect(() => {
     if (activeTasksProgress === null || activeTaskSteps === null) {
       setIsTasksDrawerOpen(false);
