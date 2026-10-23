@@ -3,10 +3,7 @@
    every other provider); portaled menus get the same attribute through useComposerMenuProps.
    Each glass only picks its colors; the shell geometry, seams and masks stay T3's. */
 
-/* rgb tints the glass (rgb-end, when set, is the bottom of the wash); accent colors the send
-   button, focus ring and caret (on is its text); ink and deep are the light-mode rim and text.
-   Claude coral and Codex green are LimitBar's cards; default is its aluminium card, between
-   space grey and silver. */
+/* LimitBar's card tints: Claude coral, Codex green. ink and deep are the light-mode rim and text. */
 [data-composer-glass="claude"] {
   --composer-glass-rgb: 217 119 87;
   --composer-glass-ink: 120 62 42;
@@ -19,20 +16,16 @@
   --composer-glass-deep: 8 38 31;
 }
 
-[data-composer-glass="default"] {
-  --composer-glass-rgb: 214 217 222;
-  --composer-glass-rgb-end: 118 121 126;
-  --composer-glass-accent: 88 92 98;
-  --composer-glass-ink: 70 74 80;
-  --composer-glass-deep: 28 30 33;
-}
-
 [data-composer-glass] {
   --composer-glass-tint-top: rgb(var(--composer-glass-rgb) / 14%);
-  --composer-glass-tint-bottom: rgb(var(--composer-glass-rgb-end, var(--composer-glass-rgb)) / 5%);
+  --composer-glass-tint-bottom: rgb(var(--composer-glass-rgb) / 5%);
   --composer-glass-wash: linear-gradient(
     var(--composer-glass-tint-top),
     var(--composer-glass-tint-bottom)
+  );
+  --composer-glass-strip-wash: linear-gradient(
+    rgb(var(--composer-glass-rgb) / 7%),
+    rgb(var(--composer-glass-rgb) / 2.5%)
   );
   --composer-glass-sheen: linear-gradient(rgb(255 255 255 / 55%), rgb(255 255 255 / 0%) 50%);
   /* Light rim: a specular top-left edge over a warm hairline. */
@@ -56,25 +49,25 @@
   --glass-saturation: 1.8;
   --composer-glass-popup: rgb(255 255 255 / 50%);
   --composer-glass-popup-blur: 12px;
-  --composer-glass-lit: var(--composer-glass-accent, var(--composer-glass-rgb));
-  --composer-glass-on-lit: rgb(var(--composer-glass-on, 255 255 255));
   /* Raw tokens: Tailwind's @theme inline compiles utilities straight to these. */
-  --accent: rgb(var(--composer-glass-lit) / 10%);
-  --primary: rgb(var(--composer-glass-lit));
-  --primary-foreground: var(--composer-glass-on-lit);
-  --message-action: rgb(var(--composer-glass-lit));
-  --message-action-hover: color-mix(in srgb, rgb(var(--composer-glass-lit)) 88%, black);
-  --message-action-foreground: var(--composer-glass-on-lit);
-  --ring: rgb(var(--composer-glass-lit) / 55%);
-  caret-color: rgb(var(--composer-glass-lit));
+  --accent: rgb(var(--composer-glass-rgb) / 10%);
+  --primary: rgb(var(--composer-glass-rgb));
+  --primary-foreground: rgb(255 255 255);
+  --message-action: rgb(var(--composer-glass-rgb));
+  --message-action-hover: color-mix(in srgb, rgb(var(--composer-glass-rgb)) 88%, black);
+  --message-action-foreground: rgb(255 255 255);
+  --ring: rgb(var(--composer-glass-rgb) / 55%);
+  caret-color: rgb(var(--composer-glass-rgb));
 }
 
 .dark [data-composer-glass],
 .dark[data-composer-glass],
 [data-composer-glass]:is(.dark *) {
   --composer-glass-tint-top: rgb(var(--composer-glass-rgb) / 19%);
-  --composer-glass-tint-bottom: rgb(
-    var(--composer-glass-rgb-end, var(--composer-glass-rgb)) / 7.5%
+  --composer-glass-tint-bottom: rgb(var(--composer-glass-rgb) / 7.5%);
+  --composer-glass-strip-wash: linear-gradient(
+    rgb(var(--composer-glass-rgb) / 9%),
+    rgb(var(--composer-glass-rgb) / 3.5%)
   );
   --composer-glass-sheen: linear-gradient(rgb(255 255 255 / 7%), rgb(255 255 255 / 0%) 50%);
   --composer-glass-rim: linear-gradient(
@@ -93,17 +86,43 @@
   --chat-composer-glass-surface: rgb(18 18 20 / 62%);
   --composer-glass-popup: rgb(22 20 20 / 50%);
   --accent: rgb(255 255 255 / 7%);
-  --message-action-hover: color-mix(in srgb, rgb(var(--composer-glass-lit)) 85%, white);
+  --message-action-hover: color-mix(in srgb, rgb(var(--composer-glass-rgb)) 85%, white);
 }
 
-/* Aluminium in the dark: the wallframe's "This Mac" card, with a silver send button. */
+/* The stock glass, for every provider without a card of its own: the same clear glass with no
+   tint, and a send button cut from it. */
+[data-composer-glass="default"] {
+  --composer-glass-rgb: 255 255 255;
+  --composer-glass-ink: 0 0 0;
+  --composer-glass-deep: 0 0 0;
+  --composer-glass-wash: linear-gradient(transparent, transparent);
+  --composer-glass-strip-wash: linear-gradient(transparent, transparent);
+  --composer-glass-pressed: rgb(0 0 0 / 6%);
+  --composer-glass-bead-edge:
+    inset 0 0 0 0.5px rgb(0 0 0 / 14%), inset 0 1px 0 rgb(255 255 255 / 85%),
+    0 1px 3px rgb(0 0 0 / 10%);
+  --accent: rgb(0 0 0 / 5%);
+  --primary: var(--foreground);
+  --primary-foreground: var(--background);
+  --message-action: rgb(255 255 255 / 38%);
+  --message-action-hover: rgb(255 255 255 / 62%);
+  --message-action-foreground: var(--foreground);
+  --ring: rgb(0 0 0 / 20%);
+  caret-color: auto;
+}
+
 .dark [data-composer-glass="default"],
 .dark[data-composer-glass="default"],
 [data-composer-glass="default"]:is(.dark *) {
-  --composer-glass-tint-top: rgb(214 217 222 / 16%);
-  --composer-glass-tint-bottom: rgb(118 121 126 / 7%);
-  --composer-glass-accent: 214 217 222;
-  --composer-glass-on: 22 23 25;
+  --composer-glass-strip-wash: linear-gradient(transparent, transparent);
+  --composer-glass-pressed: rgb(255 255 255 / 10%);
+  --composer-glass-bead-edge:
+    inset 0 0 0 0.5px rgb(255 255 255 / 22%), inset 0 1px 0 rgb(255 255 255 / 20%),
+    0 1px 4px rgb(0 0 0 / 30%);
+  --accent: rgb(255 255 255 / 7%);
+  --message-action: rgb(255 255 255 / 12%);
+  --message-action-hover: rgb(255 255 255 / 18%);
+  --ring: rgb(255 255 255 / 32%);
 }
 
 /* The glass itself: T3's surface and blur, LimitBar's tint wash and top sheen. */
@@ -128,10 +147,7 @@
 /* The drawer under the composer: the same wash, half strength. */
 [data-composer-glass] [data-slot="composer-context-strip"]::before {
   border-color: var(--composer-glass-edge);
-  background-image: linear-gradient(
-    rgb(var(--composer-glass-rgb) / 7%),
-    rgb(var(--composer-glass-rgb) / 2.5%)
-  );
+  background-image: var(--composer-glass-strip-wash);
 }
 
 .dark [data-composer-glass] [data-slot="composer-context-strip"]::before {
@@ -142,7 +158,7 @@
       rgb(0 0 0 / 18%) 1rem,
       transparent calc(1rem + 10px)
     ),
-    linear-gradient(rgb(var(--composer-glass-rgb) / 9%), rgb(var(--composer-glass-rgb) / 3.5%));
+    var(--composer-glass-strip-wash);
 }
 
 /* Banners and the slash/@ drawer that dock on top. Severity tints stay on top of the wash. */
@@ -177,7 +193,12 @@
 
 /* Pressed toggles in the composer read as lit, in the tint. */
 [data-composer-glass] button[aria-pressed="true"] {
-  background-color: rgb(var(--composer-glass-lit) / 16%);
+  background-color: var(--composer-glass-pressed, rgb(var(--composer-glass-rgb) / 16%));
+}
+
+/* The stock glass's send button: a bead of the same glass, its edge lit. */
+[data-composer-glass="default"] .bg-message-action {
+  box-shadow: var(--composer-glass-bead-edge);
 }
 
 /* The model picker reads as LimitBar's header pill: rounded type, metal fill. */
