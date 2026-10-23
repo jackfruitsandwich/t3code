@@ -966,14 +966,19 @@ async function runSlashCommand($, command) {
       return
     }
   }
-  // A command that has not come back after a few seconds is one of three
-  // things. It waits behind what holds the terminal (a running turn, a dialog,
-  // a panel an earlier command opened); or it opened a panel itself, which
-  // only the person at that terminal can close; or it is simply still working
-  // (a compaction takes minutes). Claude Code says whether a dialog is open,
-  // so the three are told apart and only the second is remembered as a panel.
+  // A command that has not come back is one of three things. It waits behind
+  // what holds the terminal (a running turn, a dialog, a panel an earlier
+  // command opened); or it opened a panel itself, which only the person at
+  // that terminal can close; or it is simply still working (a compaction
+  // takes minutes). Claude Code says whether a dialog is open, so the three
+  // are told apart and only the second is remembered as a panel. A dialog of
+  // its own is looked for every second from the start: on a busy Mac a first
+  // look after a few seconds left T3 saying nothing while the terminal asked
+  // (/effort <level> on Claude Code 2.1.309, measured). Waiting behind is
+  // said only once the few seconds are over.
   const blockedAtSend = activeTurn !== null || panelsOpen > 0 || (await dialogOpen($))
-  pendingCommand = { id: command.id, text: label, promptUuid: command.promptUuid, at: Date.now() }
+  const askedAt = Date.now()
+  pendingCommand = { id: command.id, text: label, promptUuid: command.promptUuid, at: askedAt }
   let settled = false
   let holdsPanel = false
   const panelClosed = () => {
@@ -986,6 +991,10 @@ async function runSlashCommand($, command) {
   const stillOut = async () => {
     if (settled || !mine()) return
     if (blockedAtSend || activeTurn !== null) {
+      if (!blockedAtSend && Date.now() - askedAt < COMMAND_PANEL_WAIT_MS) {
+        lookAgain(COMMAND_PANEL_RELOOK_MS)
+        return
+      }
       settled = true
       pendingCommand = null
       await report({
@@ -1014,7 +1023,7 @@ async function runSlashCommand($, command) {
       text: label + ' opened a panel in the Claude Code terminal and is waiting there for an answer only that terminal can give. Nothing else runs in this session until then.',
     })
   }
-  lookAgain(COMMAND_PANEL_WAIT_MS)
+  lookAgain(blockedAtSend ? COMMAND_PANEL_WAIT_MS : COMMAND_PANEL_RELOOK_MS)
   const sentAt = Date.now()
   // A command may start an agent and no turn (a skill that runs in the
   // background): what that agent asks is asked where the command came from.

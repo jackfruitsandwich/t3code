@@ -11,6 +11,8 @@ type Hook = ($: unknown, e: Record<string, unknown>, next: (e: unknown) => unkno
  */
 const loadMod = (
   session: { readonly usage?: unknown; readonly surfaces?: ReadonlyArray<string> } = {},
+  /** What `$.command.run` gives back for a command T3 sent: it stays out until this settles. */
+  commandRun?: () => Promise<unknown>,
 ) => {
   const register = new Function(
     `${claudeBridgeRegisterJs([]).replace("export function register(on)", "function register(on)")}\nreturn register`,
@@ -26,7 +28,7 @@ const loadMod = (
   const writes = new Map<string, string>();
   const timers = new Map<number, () => void>();
   const submits: Array<unknown> = [];
-  const afters: Array<() => void> = [];
+  const afters: Array<{ readonly ms: number; readonly run: () => void }> = [];
   // The terminal's prompt box: what the person has typed, where the cursor is,
   // and whether a dialog holds the keys.
   const box = { text: "", cursor: 0, dialog: false };
@@ -56,14 +58,14 @@ const loadMod = (
         return session.usage;
       },
     },
-    command: { list: () => [] },
+    command: { list: () => [], run: () => commandRun?.() },
     agent: { list: () => [] },
     clock: {
       every: (ms, tick) => {
         timers.set(Number(ms), tick as () => void);
       },
-      after: (_ms, run) => {
-        afters.push(run as () => void);
+      after: (ms, run) => {
+        afters.push({ ms: Number(ms), run: run as () => void });
       },
     },
     prompt: {
@@ -147,7 +149,14 @@ const loadMod = (
   };
   /** What the mod set to run soon (a session file write after a change of the box) runs now. */
   const settle = async () => {
-    while (afters.length > 0) afters.shift()?.();
+    while (afters.length > 0) afters.shift()?.run();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  };
+  /** What the mod set to run within `ms` of now runs now, once; what it sets meanwhile waits. */
+  const within = async (ms: number) => {
+    const due = afters.filter((after) => after.ms <= ms);
+    for (const after of due) afters.splice(afters.indexOf(after), 1);
+    for (const after of due) after.run();
     await new Promise((resolve) => setTimeout(resolve, 0));
   };
   /** The mod's next heartbeat. */
@@ -155,7 +164,7 @@ const loadMod = (
     timers.get(3000)?.();
     await new Promise((resolve) => setTimeout(resolve, 0));
   };
-  return { fire, sessionFile, events, send, submits, put, box, fills, settle, beat };
+  return { fire, sessionFile, events, send, submits, put, box, fills, settle, within, beat };
 };
 
 const effort = (level: string) => ({ effort: { level } });
@@ -497,5 +506,54 @@ describe("the mod's share of the prompt box's draft", () => {
     mod.box.dialog = false;
     await mod.beat();
     assert.equal(mod.box.text, "next step");
+  });
+});
+
+describe("the mod's report of a command T3 sent that the terminal holds", () => {
+  const started = async (commandRun: () => Promise<unknown>) => {
+    const mod = loadMod({}, commandRun);
+    await mod.fire("session.start", { cwd: "/repo", surface: "terminal", isInteractive: true });
+    return mod;
+  };
+  const effortHigh = { type: "command", id: "c1", name: "effort", args: "high", promptUuid: "p1" };
+  const results = (mod: Awaited<ReturnType<typeof started>>) =>
+    mod.events().filter((event) => event.type === "command.result");
+
+  it("says the command waits there for an answer within a second of its own dialog opening", async () => {
+    // Claude Code 2.1.309: /effort <level> mid-conversation asks in a dialog of its own, and the
+    // run stays out until the person answers there.
+    const mod = await started(() => new Promise(() => {}));
+    await mod.send(effortHigh);
+    mod.box.dialog = true;
+    await mod.within(1000);
+    const said = results(mod);
+    assert.lengthOf(said, 1);
+    assert.include(said[0], { interim: true, waitingInTerminal: true });
+    assert.include(
+      String(said[0]?.text),
+      "/effort high opened a panel in the Claude Code terminal and is waiting there for an answer",
+    );
+  });
+
+  it("says nothing early of a command still at work with no dialog open", async () => {
+    const mod = await started(() => new Promise(() => {}));
+    await mod.send({ ...effortHigh, name: "compact", args: "keep it short" });
+    await mod.within(1000);
+    await mod.within(1000);
+    assert.lengthOf(results(mod), 0);
+  });
+
+  it("says a command waits behind the turn running at send only once the wait is over", async () => {
+    const mod = await started(() => new Promise(() => {}));
+    await mod.fire("prompt.submit", { text: "go", origin: { kind: "composer" } });
+    await mod.fire("turn.start", { turnId: "t1", text: "go" });
+    await mod.send(effortHigh);
+    await mod.within(1000);
+    assert.lengthOf(results(mod), 0);
+    await mod.within(6000);
+    assert.include(
+      String(results(mod)[0]?.text),
+      "/effort high is waiting in the Claude Code terminal behind what is running or open there",
+    );
   });
 });
