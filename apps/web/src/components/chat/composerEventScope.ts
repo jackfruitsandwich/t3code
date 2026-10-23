@@ -3,7 +3,7 @@ import { createContext, useContext } from "react";
 import { useComposerHandleContext } from "../../composerHandleContext";
 
 /** The provider look of the composer that owns a floating layer; portaled menus carry it. */
-export type ComposerGlass = "claude";
+export type ComposerGlass = "claude" | "codex";
 export const ComposerGlassContext = createContext<ComposerGlass | undefined>(undefined);
 
 export function useComposerGlass() {
