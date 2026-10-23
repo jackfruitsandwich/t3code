@@ -603,7 +603,8 @@ import {
   recallableComposerPrompt,
 } from "./chat/composerPromptHistory";
 
-// Providers whose composer wears their LimitBar card glass.
+// Providers whose composer wears their own LimitBar card glass. Every other provider,
+// wuwei included, wears the stock aluminium glass.
 const COMPOSER_GLASS_BY_DRIVER: Partial<Record<string, ComposerGlass>> = {
   claudeAgent: "claude",
   codex: "codex",
@@ -3244,7 +3245,7 @@ export default function ChatView(props: ChatViewProps) {
     });
     const driverKind =
       composerSelection.selectedProviderEntry?.driverKind ?? composerSelection.requestedDriverKind;
-    return COMPOSER_GLASS_BY_DRIVER[driverKind];
+    return COMPOSER_GLASS_BY_DRIVER[driverKind] ?? "default";
   }, [
     activeProjectDefaultModelSelection?.instanceId,
     activeThread?.modelSelection.instanceId,
