@@ -1075,6 +1075,42 @@ describe("ClaudeBridgeQueryRunner requests with no turn open", () => {
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
+  // latereq.py d (Oct 24): the run T3 opened for a subagent's request
+  // started 18 s later, behind its checkpoint baseline.
+  it.effect("waits for the run of the turn it opened, though that run starts late", () =>
+    Effect.gen(function* () {
+      let runStarted = false;
+      let shown = 0;
+      let answerNow: (result: PermissionResult) => void = () => {};
+      const answered = new Promise<PermissionResult>((resolve) => {
+        answerNow = resolve;
+      });
+      const bridge = yield* attach({
+        protocol: 2,
+        bridgeCanUseTool: () => {
+          if (!runStarted) return null;
+          shown += 1;
+          return answered;
+        },
+      });
+      const frames = yield* shownFrames(bridge);
+      yield* ask(bridge);
+      yield* until(() => frames.length === 2, "the request's turn");
+      yield* TestClock.adjust("18 seconds");
+      assert.strictEqual(yield* Queue.size(bridge.commands), 0);
+      runStarted = true;
+      yield* TestClock.adjust("300 millis");
+      yield* until(() => shown === 1, "the request shown in the run");
+      assert.strictEqual(yield* Queue.size(bridge.commands), 0);
+      answerNow({ behavior: "allow" });
+      assert.deepStrictEqual(yield* Queue.take(bridge.commands), {
+        type: "approval",
+        toolUseId: "agent-tool",
+        decision: "allow",
+      });
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
   it.effect("hands the request back to Claude Code's own dialog when no run takes it", () =>
     Effect.gen(function* () {
       let calls = 0;
@@ -1088,7 +1124,7 @@ describe("ClaudeBridgeQueryRunner requests with no turn open", () => {
       const frames = yield* shownFrames(bridge);
       yield* ask(bridge);
       yield* until(() => frames.length === 2, "the request's turn");
-      yield* TestClock.adjust("16 seconds");
+      yield* TestClock.adjust("121 seconds");
       assert.deepStrictEqual(yield* Queue.take(bridge.commands), {
         type: "approval",
         toolUseId: "agent-tool",
@@ -1227,7 +1263,7 @@ describe("ClaudeBridgeQueryRunner questions", () => {
         bridge.process,
       );
       yield* until(() => frames.length === 2, "the turn opened for the question");
-      yield* TestClock.adjust("16 seconds");
+      yield* TestClock.adjust("121 seconds");
       assert.deepStrictEqual(yield* Queue.take(bridge.commands), {
         type: "answer",
         toolUseId: "ask-2",

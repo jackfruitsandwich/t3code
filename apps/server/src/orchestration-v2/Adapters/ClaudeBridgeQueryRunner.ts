@@ -215,9 +215,16 @@ const HELD_FOR_TURN_MS = 5_000;
 /**
  * How long a request the session raised waits for a turn of the thread to
  * take it: the turn it belongs to, whose run is still starting, or one T3
- * opens for it. After that it goes back to Claude Code's own dialog.
+ * opens for it, counted from when that turn's run has started. After that
+ * it goes back to Claude Code's own dialog.
  */
 const REQUEST_TURN_WAIT_MS = 15_000;
+/**
+ * How long, at most from the request, it waits for the run of the turn T3
+ * opened for it to start: the run's checkpoint baseline alone can take
+ * longer than REQUEST_TURN_WAIT_MS on a busy machine.
+ */
+const REQUEST_RUN_START_WAIT_MS = 120_000;
 const REQUEST_TURN_POLL_MS = 250;
 /** How long an agent's request waits for the line of the command that started it. */
 const COMMAND_LINE_WAIT_MS = 3_000;
@@ -1320,6 +1327,7 @@ export const layer: Layer.Layer<
         readonly openTurn: Effect.Effect<void>;
       }) =>
         Effect.gen(function* () {
+          const askedAt = yield* Clock.currentTimeMillis;
           const attempt = Effect.result(
             Effect.tryPromise({
               try: input.ask,
@@ -1329,14 +1337,24 @@ export const layer: Layer.Layer<
           let result = yield* attempt;
           // A session whose mod asks T3 alone takes no second answer.
           if (bridgeProcess.session.protocol < CLAUDE_BRIDGE_WINDOW_PROTOCOL) return result;
-          const deadline = (yield* Clock.currentTimeMillis) + REQUEST_TURN_WAIT_MS;
+          let deadline = (yield* Clock.currentTimeMillis) + REQUEST_TURN_WAIT_MS;
           while (
             result._tag === "Success" &&
             result.success === null &&
             !state.closed &&
-            !input.signal.aborted &&
-            (yield* Clock.currentTimeMillis) < deadline
+            !input.signal.aborted
           ) {
+            const now = yield* Clock.currentTimeMillis;
+            // The turn T3 opened for requests is open and nothing takes the
+            // request: its run has not started. The wait counts from when it
+            // can take it, up to a bound in case it never starts.
+            if (state.requestTurn !== null) {
+              deadline = Math.max(
+                deadline,
+                Math.min(now + REQUEST_TURN_WAIT_MS, askedAt + REQUEST_RUN_START_WAIT_MS),
+              );
+            }
+            if (now >= deadline) break;
             yield* input.openTurn;
             state.unplaced.add(input.toolUseId);
             yield* Effect.sleep(`${REQUEST_TURN_POLL_MS} millis`).pipe(
