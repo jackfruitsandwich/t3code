@@ -102,6 +102,7 @@ import { resolveCodexHomeLayout } from "../../provider/Drivers/CodexHomeLayout.t
 import { ServerSettingsService } from "../../serverSettings.ts";
 import {
   claudeTaskNotice,
+  claudeTaskNoticeEnd,
   isClaudeTaskNoticeText,
   parseClaudeSessionJsonl,
 } from "../claudeSessionParser.ts";
@@ -1885,6 +1886,98 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
     );
 
     /**
+     * A background subagent the thread shows running whose end the record
+     * reports. A subagent that ends after the one-turn process of a
+     * session's first turn has replied ends in a wake that process runs on
+     * its own: T3 takes that wake in from the record, and the provider frame
+     * that would end the subagent never reaches it. The report ends it.
+     */
+    const settleEndedSubagents = Effect.fn("SessionImporter.settleEndedSubagents")(
+      function* (input: {
+        readonly threadId: ThreadId;
+        readonly rows: ReadonlyArray<ParsedSessionMessage>;
+      }) {
+        const { threadId } = input;
+        // The record's last report of each task, where it says the task ended.
+        const ended = new Map(
+          input.rows.flatMap((row) => {
+            const end =
+              row.role === "user" && row.notice !== undefined
+                ? claudeTaskNoticeEnd(row.text)
+                : null;
+            return end === null ? [] : [[end.taskId, { ...end, at: dateTime(row.timestamp) }]];
+          }),
+        );
+        if (ended.size === 0) return;
+        const records = yield* threads.getThreadRecords(threadId, ["subagents", "turnItems"]);
+        const events: Array<OrchestrationV2DomainEvent> = [];
+        for (const subagent of records.subagents) {
+          const taskId = subagent.nativeTaskRef?.nativeId;
+          const end = taskId == null ? undefined : ended.get(taskId);
+          if (
+            end === undefined ||
+            subagent.driver !== CLAUDE_DRIVER ||
+            (subagent.status !== "pending" &&
+              subagent.status !== "running" &&
+              subagent.status !== "waiting") ||
+            // A report from before it was started again is of an earlier run.
+            (subagent.startedAt !== null &&
+              DateTime.toEpochMillis(end.at) < DateTime.toEpochMillis(subagent.startedAt))
+          ) {
+            continue;
+          }
+          const key = `${subagent.id}:${DateTime.formatIso(end.at)}`;
+          events.push({
+            id: importEventId(threadId, `subagent-ended:${key}`),
+            type: "subagent.updated",
+            threadId,
+            ...(subagent.runId === null ? {} : { runId: subagent.runId }),
+            nodeId: subagent.id,
+            driver: subagent.driver,
+            providerInstanceId: subagent.providerInstanceId,
+            occurredAt: end.at,
+            payload: {
+              ...subagent,
+              status: end.status,
+              result: subagent.result ?? end.summary,
+              completedAt: end.at,
+              updatedAt: end.at,
+            },
+          });
+          for (const item of records.turnItems) {
+            if (item.type !== "subagent" || item.subagentId !== subagent.id) continue;
+            if (
+              item.status !== "pending" &&
+              item.status !== "running" &&
+              item.status !== "waiting"
+            ) {
+              continue;
+            }
+            events.push({
+              id: importEventId(threadId, `subagent-item-ended:${key}`),
+              type: "turn-item.updated",
+              threadId,
+              occurredAt: end.at,
+              payload: {
+                ...item,
+                status: end.status,
+                result: item.result ?? end.summary,
+                completedAt: end.at,
+                updatedAt: end.at,
+              },
+            });
+          }
+        }
+        if (events.length === 0) return;
+        yield* eventSink.write({ events });
+        yield* Effect.logInfo("session.importer.ended-subagents-settled", {
+          threadId,
+          count: events.length,
+        });
+      },
+    );
+
+    /**
      * A reply can reach a thread twice: once from what the terminal drew,
      * under that message's own id, and once as the record's row for it (the
      * record can be seconds behind, and a restarted T3 reads a running turn
@@ -2536,6 +2629,7 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
       yield* retireInventedPrompts({ threadId, rows: parsed.messages });
       if (parsed.messages.some((message) => message.notice !== undefined)) {
         yield* retireTaskNoticePrompts({ threadId, rows: parsed.messages });
+        yield* settleEndedSubagents({ threadId, rows: parsed.messages });
       }
       yield* blankDoubledReplies({ threadId, rows: parsed.messages });
       // The cursor says how far the file has been taken in; with a turn or a

@@ -4389,6 +4389,132 @@ runtimeTest("shows the goal a Claude record last wrote, over one T3 took for met
   }),
 );
 
+// Oct 24 rig-b bgagentprobe: a session's first turn runs in a process of its
+// own; the subagent it started in the background ended 1.4 s after the turn's
+// reply, in a wake that process ran on its own. T3 took the wake in from the
+// record, and showed the subagent running.
+runtimeTest(
+  "ends a background subagent the thread shows running when the record reports its end",
+  (h) =>
+    Effect.gen(function* () {
+      const claudeId = "aaaaaaaa-1111-4111-8111-1111111111f8";
+      const c = claudeSession({ sessionId: claudeId, cwd: h.workspace });
+      const claudePath = h.claudeFile(claudeId);
+      const threadId = importedThreadId(claudeId);
+      yield* h.write(claudePath, [
+        c.user("user-1", "Fix the login bug please", "2026-07-01T10:00:00.000Z"),
+        c.assistant("assistant-1", "I fixed the login bug.", "2026-07-01T10:00:05.000Z"),
+      ]);
+      const importer = yield* h.importer();
+      yield* importer.sweepNow();
+      const when = { ordinal: 1, iso: "2026-07-01T10:05:00.000Z" };
+      yield* seedT3Run(h, threadId, CLAUDE, "completed", when);
+      const seed = seedRunPayload(threadId, CLAUDE, "completed", when);
+      const subagent = {
+        id: NodeId.make(`seed-subagent:${threadId}`),
+        threadId,
+        runId: seed.runId,
+        parentNodeId: NodeId.make(`seed-root:${threadId}`),
+        origin: "provider_native" as const,
+        createdBy: "agent" as const,
+        driver: CLAUDE,
+        providerInstanceId: seed.instanceId,
+        providerThreadId: null,
+        childThreadId: null,
+        nativeTaskRef: {
+          driver: CLAUDE,
+          nativeId: "aad879f9f2191f87e",
+          strength: "strong" as const,
+        },
+        prompt: "Reply with bg-done.",
+        title: "bg probe",
+        model: null,
+        status: "running" as const,
+        result: null,
+        startedAt: seed.at,
+        completedAt: null,
+        updatedAt: seed.at,
+      };
+      yield* h.eventSink.write({
+        events: [
+          {
+            id: EventId.make(`seed:${threadId}:subagent`),
+            type: "subagent.updated" as const,
+            threadId,
+            runId: seed.runId,
+            nodeId: subagent.id,
+            driver: CLAUDE,
+            providerInstanceId: seed.instanceId,
+            occurredAt: seed.at,
+            payload: subagent,
+          },
+          {
+            id: EventId.make(`seed:${threadId}:subagent-item`),
+            type: "turn-item.updated" as const,
+            threadId,
+            occurredAt: seed.at,
+            payload: {
+              id: TurnItemId.make(`seed-item:${threadId}:subagent`),
+              threadId,
+              runId: seed.runId,
+              nodeId: subagent.id,
+              providerThreadId: null,
+              providerTurnId: null,
+              nativeItemRef: {
+                driver: CLAUDE,
+                nativeId: "aad879f9f2191f87e",
+                strength: "strong" as const,
+              },
+              parentItemId: null,
+              ordinal: 0,
+              status: "running" as const,
+              title: "bg probe",
+              startedAt: seed.at,
+              completedAt: null,
+              updatedAt: seed.at,
+              type: "subagent" as const,
+              subagentId: subagent.id,
+              origin: "provider_native" as const,
+              driver: CLAUDE,
+              providerInstanceId: seed.instanceId,
+              childThreadId: null,
+              prompt: "Reply with bg-done.",
+              result: null,
+            },
+          },
+        ],
+      });
+      const shown = h.threads
+        .getThreadRecords(threadId, ["subagents", "turnItems"])
+        .pipe(
+          Effect.map((records) => [
+            records.subagents.find((candidate) => candidate.id === subagent.id)?.status,
+            records.turnItems.find((item) => item.type === "subagent")?.status,
+          ]),
+        );
+      assert.deepEqual(yield* shown, ["running", "running"]);
+
+      // The turn's reply, as T3's run showed it.
+      yield* h.append(claudePath, [
+        c.assistant("assistant-2", "bg-started", "2026-07-01T10:05:02.000Z"),
+      ]);
+      yield* seedNativeReply(h, threadId, "assistant-2", "bg-started", "2026-07-01T10:05:02.000Z");
+      yield* h.append(claudePath, [
+        {
+          ...c.user(
+            "task-1",
+            '<task-notification>\n<task-id>aad879f9f2191f87e</task-id>\n<status>completed</status>\n<summary>Agent "bg probe" finished</summary>\n<result>bg-done</result>\n</task-notification>',
+            "2026-07-01T10:05:03.000Z",
+          ),
+          origin: { kind: "task-notification" },
+        },
+        c.assistant("assistant-3", "The background probe finished.", "2026-07-01T10:05:04.000Z"),
+      ]);
+      yield* importer.sweepNow();
+      assert.deepEqual(yield* shown, ["completed", "completed"]);
+    }),
+);
+
 runtimeTest("follows a Codex thread into the later file Codex went on writing it in", (h) =>
   Effect.gen(function* () {
     const codexId = "cccccccc-3333-4333-8333-333333333305";
