@@ -73,6 +73,26 @@ describe("reconcileSessionDraft", () => {
     expect(step(agreed, "", "fix it").offer).toEqual({ text: "", base: "fix it" });
   });
 
+  it("still knows its own text in the terminal's box after losing sight of the box, and takes none of it back after a send", () => {
+    // Oct 23: a draft typed here reached the terminal's box half-typed, the box went out of
+    // sight, and after the send T3 took the half-typed copy back as the terminal's own.
+    const agreed = step(SESSION_DRAFT_SHARE_START, "ok lets", "ok lets").share;
+    const typed = step(agreed, "ok lets try", "ok lets");
+    expect(typed.offer).toEqual({ text: "ok lets try", base: "ok lets" });
+    const gone = step(sessionDraftOffered(typed.share, "ok lets try"), "ok lets try this", null);
+    const back = step(gone.share, "ok lets try this", "ok lets try");
+    expect(back).toMatchObject({
+      take: null,
+      offer: { text: "ok lets try this", base: "ok lets try" },
+      differs: false,
+    });
+    expect(step(back.share, "", "ok lets try")).toMatchObject({
+      take: null,
+      offer: { text: "", base: "ok lets try" },
+      differs: false,
+    });
+  });
+
   it("offers nothing that carries attachments, and forgets the share without a terminal box", () => {
     const agreed = step(SESSION_DRAFT_SHARE_START, "fix", "fix").share;
     expect(step(agreed, "fix this image", "fix", false)).toMatchObject({

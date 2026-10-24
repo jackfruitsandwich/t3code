@@ -48,6 +48,20 @@ export const SESSION_DRAFT_SHARE_START: SessionDraftShare = {
 
 const OFFERED_KEPT = 8;
 
+const sharesByThread = new Map<string, SessionDraftShare>();
+
+/**
+ * A thread's share as its message box last left it, kept while the app runs:
+ * a message box opened again must still know the text it put in the session's
+ * box, or it takes that text back as the session's own.
+ */
+export const sessionDraftShareOf = (threadKey: string): SessionDraftShare =>
+  sharesByThread.get(threadKey) ?? SESSION_DRAFT_SHARE_START;
+
+export const keepSessionDraftShare = (threadKey: string, share: SessionDraftShare): void => {
+  sharesByThread.set(threadKey, share);
+};
+
 /** The share after `text` went to the session. */
 export function sessionDraftOffered(share: SessionDraftShare, text: string): SessionDraftShare {
   return { ...share, offered: [...share.offered, text].slice(-OFFERED_KEPT) };
@@ -78,8 +92,16 @@ export function reconcileSessionDraft(input: {
   readonly differs: boolean;
 } {
   const { local, session, plain } = input;
-  const settled = (share: SessionDraftShare) => ({ share, take: null, offer: null, differs: false });
-  if (session === null) return settled(SESSION_DRAFT_SHARE_START);
+  const settled = (share: SessionDraftShare) => ({
+    share,
+    take: null,
+    offer: null,
+    differs: false,
+  });
+  // Out of sight (no live process for a moment, a watch starting again), the
+  // session's box may change unseen; a text this box offered is still its own.
+  if (session === null)
+    return settled({ ...SESSION_DRAFT_SHARE_START, offered: input.share.offered });
   const agreed: SessionDraftShare = { shared: session, offered: [], found: null };
   if (session === local) return settled(agreed);
   let share = input.share;

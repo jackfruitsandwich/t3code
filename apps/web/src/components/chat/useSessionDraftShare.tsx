@@ -1,12 +1,13 @@
 import {
+  keepSessionDraftShare,
   reconcileSessionDraft,
-  SESSION_DRAFT_SHARE_START,
   sessionDraftNotice,
   sessionDraftOffered,
+  sessionDraftShareOf,
 } from "@t3tools/client-runtime/state/sessionDraft";
 import type { EnvironmentId, ThreadId } from "@t3tools/contracts";
 import { TerminalIcon } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 import { useEnvironmentQuery } from "../../state/query";
 import { sessionDraftEnvironment } from "../../state/sessionDraft";
@@ -39,20 +40,24 @@ export function useSessionDraftShare(input: {
   );
   const session = draftQuery.data?.text ?? null;
   const sendOffer = useAtomCommand(sessionDraftEnvironment.offer, { reportFailure: false });
-  const shareRef = useRef(SESSION_DRAFT_SHARE_START);
   const [differing, setDiffering] = useState<string | null>(null);
   const [dismissed, setDismissed] = useState<string | null>(null);
 
   useEffect(() => {
-    shareRef.current = SESSION_DRAFT_SHARE_START;
     setDiffering(null);
     setDismissed(null);
   }, [environmentId, threadId]);
 
   useEffect(() => {
     if (threadId === null) return;
-    const step = reconcileSessionDraft({ share: shareRef.current, local: prompt, session, plain });
-    shareRef.current = step.share;
+    const threadKey = `${environmentId}:${threadId}`;
+    const step = reconcileSessionDraft({
+      share: sessionDraftShareOf(threadKey),
+      local: prompt,
+      session,
+      plain,
+    });
+    keepSessionDraftShare(threadKey, step.share);
     setDiffering(step.differs ? session : null);
     if (step.take !== null) {
       setPrompt(step.take);
@@ -61,7 +66,10 @@ export function useSessionDraftShare(input: {
     const offer = step.offer;
     if (offer === null) return;
     const timer = setTimeout(() => {
-      shareRef.current = sessionDraftOffered(shareRef.current, offer.text);
+      keepSessionDraftShare(
+        threadKey,
+        sessionDraftOffered(sessionDraftShareOf(threadKey), offer.text),
+      );
       void sendOffer({ environmentId, input: { threadId, text: offer.text, base: offer.base } });
     }, OFFER_DEBOUNCE_MS);
     return () => clearTimeout(timer);
