@@ -100,6 +100,15 @@ export type ParsedRecordItem =
       readonly call: Record<string, unknown>;
     };
 
+/** The `/goal` a Claude Code session holds, as its record last wrote it. */
+export interface ParsedClaudeGoal {
+  readonly objective: string;
+  readonly status: "active" | "paused" | "complete";
+  /** The evaluator's checks so far, and what the latest one said. */
+  readonly checks?: number;
+  readonly lastCheck?: string;
+}
+
 /** The goal a Codex thread holds, as the record last wrote it (`thread_goal_updated`). */
 export interface ParsedSessionGoal {
   readonly objective: string;
@@ -185,6 +194,8 @@ export interface ParsedCliSession {
   readonly model?: string;
   /** The thread's goal as the record last wrote it; null once cleared (Codex). */
   readonly goal?: ParsedSessionGoal | null;
+  /** The session's goal as the record last wrote it; null once cleared (Claude). */
+  readonly claudeGoal?: ParsedClaudeGoal | null;
   /**
    * The record goes on from a point of the thread's earlier file, which
    * holds what came before (Codex `history_base`).

@@ -4302,6 +4302,93 @@ runtimeTest("shows the model and goal a Codex record last names", (h) =>
   }),
 );
 
+runtimeTest("shows the goal a Claude record last wrote, over one T3 took for met", (h) =>
+  Effect.gen(function* () {
+    const claudeId = "aaaaaaaa-1111-4111-8111-1111111111f7";
+    const c = claudeSession({ sessionId: claudeId, cwd: h.workspace });
+    const claudePath = h.claudeFile(claudeId);
+    const threadId = importedThreadId(claudeId);
+    const goalStatus = (uuid: string, at: string, status: Entry): Entry => ({
+      type: "attachment",
+      uuid,
+      parentUuid: null,
+      sessionId: claudeId,
+      cwd: h.workspace,
+      timestamp: at,
+      isSidechain: false,
+      attachment: { type: "goal_status", condition: "Ship the importer", ...status },
+    });
+    yield* h.write(claudePath, [
+      c.user(
+        "goal-1",
+        "<local-command-stdout>Goal set: Ship the importer</local-command-stdout>",
+        "2026-07-01T10:00:00.000Z",
+      ),
+      c.user("user-1", "Work toward the goal", "2026-07-01T10:00:01.000Z"),
+      c.assistant("assistant-1", "One test still fails.", "2026-07-01T10:00:05.000Z"),
+      goalStatus("check-1", "2026-07-01T10:00:06.000Z", {
+        met: false,
+        reason: "A test still fails.",
+        iterations: 1,
+      }),
+    ]);
+    const importer = yield* h.importer();
+    yield* importer.sweepNow();
+    const goal = h.threads
+      .getThreadRecords(threadId, ["providerThreads"])
+      .pipe(Effect.map((records) => records.providerThreads[0]?.goal));
+    assert.deepEqual(yield* goal, {
+      objective: "Ship the importer",
+      status: "active",
+      checks: 1,
+      lastCheck: "A test still fails.",
+    });
+
+    // Oct 22: a turn ended while the check waited on background work, and T3
+    // took the goal for met. The record restates it, still unmet.
+    const records = yield* h.threads.getThreadRecords(threadId, ["providerThreads"]);
+    const providerThread = records.providerThreads[0]!;
+    yield* h.eventSink.write({
+      events: [
+        {
+          id: EventId.make(`seed:${threadId}:goal-taken-for-met`),
+          type: "provider-thread.updated" as const,
+          threadId,
+          driver: providerThread.driver,
+          providerInstanceId: providerThread.providerInstanceId,
+          occurredAt: providerThread.updatedAt,
+          payload: {
+            ...providerThread,
+            goal: { objective: "Ship the importer", status: "complete" as const, checks: 1 },
+          },
+        },
+      ],
+    });
+    assert.equal((yield* goal)?.status, "complete");
+    yield* h.append(claudePath, [
+      goalStatus("restated-1", "2026-07-01T11:00:00.000Z", { met: false, sentinel: true }),
+    ]);
+    yield* importer.sweepNow();
+    assert.equal((yield* goal)?.status, "active");
+
+    // Met at the next check.
+    yield* h.append(claudePath, [
+      goalStatus("check-2", "2026-07-01T11:10:00.000Z", {
+        met: true,
+        reason: "All tests pass.",
+        iterations: 2,
+      }),
+    ]);
+    yield* importer.sweepNow();
+    assert.deepEqual(yield* goal, {
+      objective: "Ship the importer",
+      status: "complete",
+      checks: 2,
+      lastCheck: "All tests pass.",
+    });
+  }),
+);
+
 runtimeTest("follows a Codex thread into the later file Codex went on writing it in", (h) =>
   Effect.gen(function* () {
     const codexId = "cccccccc-3333-4333-8333-333333333305";

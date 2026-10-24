@@ -38,6 +38,7 @@ import {
   readString,
   splitCompleteJsonlLines,
   truncateSessionTitle,
+  type ParsedClaudeGoal,
   type ParsedCliSession,
   type ParsedSessionMessage,
   type ParsedSessionNotice,
@@ -286,7 +287,7 @@ export function claudeChannelNotification(text: string | null): OrchestrationV2N
           .join("")
           .trimEnd()}…`
       : said.join("");
-  const from =`${peerName(server) || "channel"}${user === undefined ? "" : ` · ${peerName(attributeEntities(user))}`}`;
+  const from = `${peerName(server) || "channel"}${user === undefined ? "" : ` · ${peerName(attributeEntities(user))}`}`;
   return {
     source: { kind: "background_task" },
     outcome: "updated",
@@ -581,6 +582,58 @@ function withdrawnPrompts(
   return withdrawn;
 }
 
+/**
+ * The session's `/goal` after one row of its record, or undefined when the row
+ * says nothing of it: the goal set, each evaluator check (met or not), the
+ * goal restated as the context is rebuilt, and the harness's lines that pause
+ * or clear it. Null once cleared.
+ */
+export function claudeGoalAfter(
+  current: ParsedClaudeGoal | null,
+  entry: Record<string, unknown>,
+): ParsedClaudeGoal | null | undefined {
+  if (entry.isSidechain === true) return undefined;
+  if (entry.type === "attachment" && isRecord(entry.attachment)) {
+    const status = entry.attachment;
+    if (status.type !== "goal_status") return undefined;
+    const objective = readString(status.condition)?.trim() || current?.objective;
+    if (objective === undefined) return undefined;
+    const checks = typeof status.iterations === "number" ? status.iterations : current?.checks;
+    const lastCheck = readString(status.reason) ?? current?.lastCheck;
+    return {
+      objective,
+      status: status.met === true ? "complete" : "active",
+      ...(checks === undefined ? {} : { checks }),
+      ...(lastCheck === undefined ? {} : { lastCheck }),
+    };
+  }
+  if (entry.type === "system" && entry.subtype === "informational") {
+    const said = readString(entry.content) ?? "";
+    if (said.startsWith("Goal cleared")) return null;
+    if (current === null) return undefined;
+    if (said.startsWith("Goal paused")) return { ...current, status: "paused" };
+    if (said.startsWith("Goal still active")) return { ...current, status: "active" };
+    return undefined;
+  }
+  // What `/goal` printed in the terminal.
+  const printed =
+    entry.type === "system" && entry.subtype === "local_command"
+      ? readString(entry.content)
+      : entry.type === "user" && isRecord(entry.message)
+        ? extractTextContent(entry.message.content)
+        : undefined;
+  const output = /^<local-command-stdout>([\s\S]*?)(?:<\/local-command-stdout>)?$/u.exec(
+    printed?.trim() ?? "",
+  )?.[1];
+  if (output === undefined) return undefined;
+  if (output.startsWith("Goal set: ")) {
+    const objective = output.slice("Goal set: ".length).trim();
+    return objective.length === 0 ? undefined : { objective, status: "active", checks: 0 };
+  }
+  if (output.startsWith("Goal cleared") || output.startsWith("No goal set")) return null;
+  return undefined;
+}
+
 export function parseClaudeSessionJsonl(content: string): ParsedCliSession {
   const lines = splitCompleteJsonlLines(content);
   const messages: ParsedSessionMessage[] = [];
@@ -597,6 +650,7 @@ export function parseClaudeSessionJsonl(content: string): ParsedCliSession {
   let entrypoint: string | undefined;
   let permissionMode: string | undefined;
   let malformedLineCount = 0;
+  let claudeGoal: ParsedClaudeGoal | null | undefined;
   // Where each row of the main conversation goes on from, to tell the prompts
   // the session took back from the ones it went on with.
   const parentOf = new Map<string, string | null>();
@@ -629,6 +683,8 @@ export function parseClaudeSessionJsonl(content: string): ParsedCliSession {
     }
     // A command whose rows carry no markup: told by where its rows sit.
     const plain = plainCommand(entry);
+    const goalNow = claudeGoalAfter(claudeGoal ?? null, entry);
+    if (goalNow !== undefined) claudeGoal = goalNow;
 
     // The record notes each change of permission mode in a row of its own.
     const recordedMode = claudeTranscriptPermissionMode(entry);
@@ -896,5 +952,6 @@ export function parseClaudeSessionJsonl(content: string): ParsedCliSession {
     forkSignature,
     ...(permissionMode === undefined ? {} : { permissionMode }),
     ...(systemNotices.length === 0 ? {} : { systemNotices }),
+    ...(claudeGoal === undefined ? {} : { claudeGoal }),
   };
 }

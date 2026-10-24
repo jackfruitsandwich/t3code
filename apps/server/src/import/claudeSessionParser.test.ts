@@ -12,6 +12,7 @@ import {
   claudePeerMessageNotification,
   claudeTaskNotification,
   claudeTeammateMessageNotification,
+  claudeGoalAfter,
   parseClaudeSessionJsonl,
 } from "./claudeSessionParser.ts";
 import { isEligibleCliSession } from "./sessionImportTypes.ts";
@@ -1078,7 +1079,11 @@ describe("what the terminal draws that is not a text block", () => {
       claudeTeammateMessageNotification(
         teammate("", idle({ idleReason: "failed", failureReason: "out of\nturns" })),
       ),
-      { source: { kind: "subagent" }, outcome: "failed", summary: "Teammate @helper failed: out of turns" },
+      {
+        source: { kind: "subagent" },
+        outcome: "failed",
+        summary: "Teammate @helper failed: out of turns",
+      },
     );
     assert.equal(
       claudeTeammateMessageNotification(teammate("", idle({ idleReason: "interrupted" })))?.summary,
@@ -1107,7 +1112,8 @@ describe("what the terminal draws that is not a text block", () => {
     assert.deepEqual(claudeChannelNotification(relayed), {
       source: { kind: "background_task" },
       outcome: "updated",
-      summary: "telegram \u00b7 jack: Is the build green yet? It has been running for a while now\u2026",
+      summary:
+        "telegram \u00b7 jack: Is the build green yet? It has been running for a while now\u2026",
       detail: "Is the build green yet? It has been running for a while now and I need it.",
     });
     assert.equal(
@@ -1115,7 +1121,9 @@ describe("what the terminal draws that is not a text block", () => {
       "webhook: ping",
     );
     assert.isNull(claudeChannelNotification("fix the login bug"));
-    assert.isNull(claudeChannelNotification('<channel source="x">\nhi\n</channel>\n\nmy own words'));
+    assert.isNull(
+      claudeChannelNotification('<channel source="x">\nhi\n</channel>\n\nmy own words'),
+    );
   });
 
   it("reads every kind of harness message through one place", () => {
@@ -1253,5 +1261,68 @@ describe("a prompt the session took back", () => {
       ),
       [],
     );
+  });
+});
+
+describe("the session's /goal", () => {
+  it("follows the goal from the terminal's /goal through its checks, a pause and a clear", () => {
+    const steps: ReadonlyArray<Record<string, unknown>> = [
+      {
+        type: "system",
+        subtype: "local_command",
+        content: "<local-command-stdout>Goal set: Ship the importer</local-command-stdout>",
+      },
+      {
+        type: "attachment",
+        attachment: { type: "goal_status", met: false, reason: "Tests fail.", iterations: 1 },
+      },
+      // A subagent's record lines are not the session's.
+      { type: "attachment", isSidechain: true, attachment: { type: "goal_status", met: true } },
+      {
+        type: "system",
+        subtype: "informational",
+        content: "Goal paused · goal checks kept finding it unmet",
+      },
+      {
+        type: "attachment",
+        attachment: {
+          type: "goal_status",
+          met: false,
+          sentinel: true,
+          condition: "Ship the importer",
+        },
+      },
+      {
+        type: "attachment",
+        attachment: { type: "goal_status", met: true, reason: "All pass.", iterations: 2 },
+      },
+      {
+        type: "system",
+        subtype: "informational",
+        content: "Goal cleared after an unrecoverable error",
+      },
+    ];
+    const seen: Array<unknown> = [];
+    let goal: ReturnType<typeof claudeGoalAfter> = null;
+    for (const step of steps) {
+      const next = claudeGoalAfter(goal ?? null, step);
+      if (next !== undefined) goal = next;
+      seen.push(
+        next === undefined
+          ? "nothing"
+          : next === null
+            ? null
+            : `${next.status} ${next.checks ?? "-"}`,
+      );
+    }
+    assert.deepEqual(seen, [
+      "active 0",
+      "active 1",
+      "nothing",
+      "paused 1",
+      "active 1",
+      "complete 2",
+      null,
+    ]);
   });
 });

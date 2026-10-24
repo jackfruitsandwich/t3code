@@ -116,6 +116,7 @@ import {
   isRecord,
   parseJsonlLine,
   type ParsedCliSession,
+  type ParsedClaudeGoal,
   type ParsedSessionGoal,
   type ParsedSessionItem,
   type ParsedSessionMessage,
@@ -708,6 +709,17 @@ const providerGoal = (goal: ParsedSessionGoal | null): OrchestrationV2ProviderGo
   };
 };
 
+/** A Claude record's goal as the thread's provider thread carries it. */
+const claudeProviderGoal = (goal: ParsedClaudeGoal | null): OrchestrationV2ProviderGoal | null =>
+  goal === null
+    ? null
+    : {
+        objective: goal.objective,
+        status: goal.status,
+        ...(goal.checks === undefined ? {} : { checks: goal.checks }),
+        ...(goal.lastCheck === undefined ? {} : { lastCheck: goal.lastCheck }),
+      };
+
 const sameGoal = (
   left: OrchestrationV2ProviderGoal | null,
   right: OrchestrationV2ProviderGoal | null,
@@ -1065,6 +1077,60 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         });
       },
     );
+
+    /**
+     * A Claude thread shows the `/goal` the session's record last wrote: set,
+     * each check met or not, paused, cleared. Whoever ran the turns, the
+     * record says whether the goal was met; a run T3 is driving keeps its own.
+     */
+    const showClaudeGoal = Effect.fn("SessionImporter.showClaudeGoal")(function* (input: {
+      readonly threadId: ThreadId;
+      readonly parsed: ParsedCliSession;
+    }) {
+      const recorded = input.parsed.claudeGoal;
+      if (recorded === undefined) return;
+      if ((yield* activeRunStartsMs(input.threadId)).length > 0) return;
+      const records = yield* threads.getThreadRecords(input.threadId, ["providerThreads"]);
+      const providerThread = records.providerThreads.find(
+        (candidate) => candidate.id === records.thread.activeProviderThreadId,
+      );
+      if (providerThread === undefined || providerThread.driver !== CLAUDE_DRIVER) return;
+      const goal = claudeProviderGoal(recorded);
+      const shown = providerThread.goal ?? null;
+      if (
+        goal === null
+          ? shown === null
+          : shown !== null &&
+            shown.objective === goal.objective &&
+            shown.status === goal.status &&
+            shown.checks === goal.checks &&
+            shown.lastCheck === goal.lastCheck
+      ) {
+        return;
+      }
+      const at = yield* Clock.currentTimeMillis;
+      yield* eventSink.write({
+        events: [
+          {
+            // Two changes inside one millisecond are two events.
+            id: importEventId(
+              input.threadId,
+              `session-goal:${at}:${goal?.status ?? "cleared"}:${goal?.checks ?? 0}`,
+            ),
+            type: "provider-thread.updated",
+            threadId: input.threadId,
+            driver: CLAUDE_DRIVER,
+            providerInstanceId: providerThread.providerInstanceId,
+            occurredAt: providerThread.updatedAt,
+            payload: { ...providerThread, goal },
+          },
+        ],
+      });
+      yield* Effect.logInfo("session.importer.claude-goal-shown", {
+        threadId: input.threadId,
+        goal: goal?.status ?? null,
+      });
+    });
 
     /** When each run T3 is driving on the thread right now was asked for. */
     const activeRunStartsMs = (threadId: ThreadId) =>
@@ -2541,6 +2607,9 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
       // No mod process holds the session: a run of T3's own is writing the
       // thread, and what it writes is T3's to show.
       if (live === null && activeRuns.length > 0) return;
+      if (input.driver === CLAUDE_DRIVER) {
+        yield* showClaudeGoal({ threadId: input.threadId, parsed: input.parsed });
+      }
       // A session that is always working is never idle: everything from
       // before the turn in flight is compared now, not when it stops.
       // A turn just over in a session a mod process holds is its run's to
@@ -2671,6 +2740,7 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
       if (Option.isNone(yield* getThread(input.threadId))) return;
       if ((yield* activeRunStartsMs(input.threadId)).length > 0) return;
       yield* showCodexSessionState({ threadId: input.threadId, parsed: input.parsed });
+      yield* showClaudeGoal({ threadId: input.threadId, parsed: input.parsed });
       const runs = yield* threadRuns(input.threadId);
       const reseat = {
         driver: input.driver,
@@ -2854,6 +2924,7 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         forkedFrom: null,
         pendingBackgroundTasks: [],
         ...(parsed.goal === undefined ? {} : { goal: providerGoal(parsed.goal) }),
+        ...(parsed.claudeGoal === undefined ? {} : { goal: claudeProviderGoal(parsed.claudeGoal) }),
         createdAt,
         updatedAt,
       };
@@ -3038,6 +3109,7 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         }
         if (driver === CLAUDE_DRIVER) {
           yield* showLiveSessionSettings({ threadId, sessionId, parsed });
+          yield* showClaudeGoal({ threadId, parsed });
         } else {
           yield* showCodexSessionState({ threadId, parsed });
         }
