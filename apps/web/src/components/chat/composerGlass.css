@@ -47,8 +47,8 @@
   --chat-composer-glass-surface: rgb(255 255 255 / 50%);
   --glass-blur: 5px;
   --glass-saturation: 1.8;
-  --composer-glass-popup: rgb(255 255 255 / 36%);
-  --composer-glass-popup-blur: 16px;
+  --composer-glass-popup: rgb(255 255 255 / 22%);
+  --composer-glass-popup-blur: 7px;
   /* Raw tokens: Tailwind's @theme inline compiles utilities straight to these. */
   --accent: rgb(var(--composer-glass-rgb) / 10%);
   --primary: rgb(var(--composer-glass-rgb));
@@ -85,6 +85,7 @@
   /* LimitBar's base. */
   --chat-composer-glass-surface: rgb(18 18 20 / 62%);
   --composer-glass-popup: rgb(22 20 20 / 40%);
+  --composer-glass-popup-blur: 16px;
   --accent: rgb(255 255 255 / 7%);
   --message-action-hover: color-mix(in srgb, rgb(var(--composer-glass-rgb)) 85%, white);
 }
@@ -138,29 +139,20 @@
 .dark [data-composer-glass="default"],
 .dark[data-composer-glass="default"],
 [data-composer-glass="default"]:is(.dark *) {
-  /* Glass in the dark is a touch lighter than what it sits on, not a smoked panel. */
-  --chat-composer-glass-surface: rgb(255 255 255 / 5%);
-  --composer-glass-sheen: linear-gradient(
-    165deg,
-    rgb(255 255 255 / 20%),
-    rgb(255 255 255 / 4%) 35%,
-    rgb(255 255 255 / 0%) 60%
-  );
-  --composer-glass-wash: radial-gradient(
-    120% 70% at 50% 125%,
-    rgb(255 255 255 / 12%),
-    rgb(255 255 255 / 0%) 70%
-  );
+  /* In the dark the stock glass stays the plain one: the shared fill, sheen and rim, no pooled
+     light and no lift. */
+  --chat-composer-glass-surface: rgb(18 18 20 / 62%);
+  --glass-blur: 5px;
+  --glass-saturation: 1.8;
+  --composer-glass-sheen: linear-gradient(rgb(255 255 255 / 7%), rgb(255 255 255 / 0%) 50%);
+  --composer-glass-wash: linear-gradient(transparent, transparent);
   --composer-glass-rim: linear-gradient(
     to bottom right,
-    rgb(255 255 255 / 90%),
-    rgb(255 255 255 / 12%) 50%,
-    rgb(255 255 255 / 45%)
+    rgb(255 255 255 / 45%),
+    rgb(255 255 255 / 6%) 50%,
+    rgb(255 255 255 / 22.5%)
   );
-  --composer-glass-body:
-    inset 0 1px 0 rgb(255 255 255 / 30%), inset 0 0 0 1px rgb(255 255 255 / 7%),
-    inset 0 10px 24px -16px rgb(255 255 255 / 6%), inset 0 -16px 30px -18px rgb(255 255 255 / 16%),
-    0 16px 40px -14px rgb(0 0 0 / 80%);
+  --composer-glass-body: none;
   --composer-glass-popup: rgb(36 36 40 / 36%);
   --composer-glass-strip-wash: linear-gradient(transparent, transparent);
   --composer-glass-pressed: rgb(255 255 255 / 10%);
