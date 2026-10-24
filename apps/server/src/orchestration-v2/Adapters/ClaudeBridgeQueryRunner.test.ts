@@ -1124,7 +1124,7 @@ describe("ClaudeBridgeQueryRunner requests with no turn open", () => {
       const frames = yield* shownFrames(bridge);
       yield* ask(bridge);
       yield* until(() => frames.length === 2, "the request's turn");
-      yield* TestClock.adjust("121 seconds");
+      yield* TestClock.adjust("61 seconds");
       assert.deepStrictEqual(yield* Queue.take(bridge.commands), {
         type: "approval",
         toolUseId: "agent-tool",
@@ -1263,7 +1263,7 @@ describe("ClaudeBridgeQueryRunner questions", () => {
         bridge.process,
       );
       yield* until(() => frames.length === 2, "the turn opened for the question");
-      yield* TestClock.adjust("121 seconds");
+      yield* TestClock.adjust("61 seconds");
       assert.deepStrictEqual(yield* Queue.take(bridge.commands), {
         type: "answer",
         toolUseId: "ask-2",

@@ -224,7 +224,7 @@ const REQUEST_TURN_WAIT_MS = 15_000;
  * opened for it to start: the run's checkpoint baseline alone can take
  * longer than REQUEST_TURN_WAIT_MS on a busy machine.
  */
-const REQUEST_RUN_START_WAIT_MS = 120_000;
+const REQUEST_RUN_START_WAIT_MS = 60_000;
 const REQUEST_TURN_POLL_MS = 250;
 /** How long an agent's request waits for the line of the command that started it. */
 const COMMAND_LINE_WAIT_MS = 3_000;
