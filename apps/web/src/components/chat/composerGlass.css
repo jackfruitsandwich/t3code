@@ -47,8 +47,8 @@
   --chat-composer-glass-surface: rgb(255 255 255 / 50%);
   --glass-blur: 5px;
   --glass-saturation: 1.8;
-  --composer-glass-popup: rgb(255 255 255 / 50%);
-  --composer-glass-popup-blur: 12px;
+  --composer-glass-popup: rgb(255 255 255 / 36%);
+  --composer-glass-popup-blur: 16px;
   /* Raw tokens: Tailwind's @theme inline compiles utilities straight to these. */
   --accent: rgb(var(--composer-glass-rgb) / 10%);
   --primary: rgb(var(--composer-glass-rgb));
@@ -84,18 +84,42 @@
   );
   /* LimitBar's base. */
   --chat-composer-glass-surface: rgb(18 18 20 / 62%);
-  --composer-glass-popup: rgb(22 20 20 / 50%);
+  --composer-glass-popup: rgb(22 20 20 / 40%);
   --accent: rgb(255 255 255 / 7%);
   --message-action-hover: color-mix(in srgb, rgb(var(--composer-glass-rgb)) 85%, white);
 }
 
-/* The stock glass, for every provider without a card of its own: the same clear glass with no
-   tint, and a send button cut from it. */
+/* The stock glass, for every provider without a card of its own: clear glass with no tint, so
+   it leans on the material instead. That means a thinner fill, a raking sheen, light pooling at
+   the bottom edge, a lit inner edge and a lift off the thread. The send button is cut from it. */
 [data-composer-glass="default"] {
   --composer-glass-rgb: 255 255 255;
   --composer-glass-ink: 0 0 0;
   --composer-glass-deep: 0 0 0;
-  --composer-glass-wash: linear-gradient(transparent, transparent);
+  --chat-composer-glass-surface: rgb(255 255 255 / 22%);
+  --glass-blur: 7px;
+  --glass-saturation: 2;
+  --composer-glass-sheen: linear-gradient(
+    165deg,
+    rgb(255 255 255 / 80%),
+    rgb(255 255 255 / 15%) 35%,
+    rgb(255 255 255 / 0%) 60%
+  );
+  --composer-glass-wash: radial-gradient(
+    120% 70% at 50% 125%,
+    rgb(255 255 255 / 60%),
+    rgb(255 255 255 / 0%) 70%
+  );
+  --composer-glass-rim: linear-gradient(
+    to bottom right,
+    rgb(255 255 255 / 100%),
+    rgb(0 0 0 / 8%) 50%,
+    rgb(0 0 0 / 14%)
+  );
+  --composer-glass-body:
+    inset 0 1px 0 rgb(255 255 255 / 100%), inset 0 0 0 1px rgb(255 255 255 / 35%),
+    inset 0 -1px 0 rgb(255 255 255 / 70%), inset 0 -16px 28px -18px rgb(255 255 255 / 80%),
+    0 16px 36px -16px rgb(0 0 0 / 26%);
   --composer-glass-strip-wash: linear-gradient(transparent, transparent);
   --composer-glass-pressed: rgb(0 0 0 / 6%);
   --composer-glass-bead-edge:
@@ -114,6 +138,30 @@
 .dark [data-composer-glass="default"],
 .dark[data-composer-glass="default"],
 [data-composer-glass="default"]:is(.dark *) {
+  /* Glass in the dark is a touch lighter than what it sits on, not a smoked panel. */
+  --chat-composer-glass-surface: rgb(255 255 255 / 5%);
+  --composer-glass-sheen: linear-gradient(
+    165deg,
+    rgb(255 255 255 / 20%),
+    rgb(255 255 255 / 4%) 35%,
+    rgb(255 255 255 / 0%) 60%
+  );
+  --composer-glass-wash: radial-gradient(
+    120% 70% at 50% 125%,
+    rgb(255 255 255 / 12%),
+    rgb(255 255 255 / 0%) 70%
+  );
+  --composer-glass-rim: linear-gradient(
+    to bottom right,
+    rgb(255 255 255 / 90%),
+    rgb(255 255 255 / 12%) 50%,
+    rgb(255 255 255 / 45%)
+  );
+  --composer-glass-body:
+    inset 0 1px 0 rgb(255 255 255 / 30%), inset 0 0 0 1px rgb(255 255 255 / 7%),
+    inset 0 10px 24px -16px rgb(255 255 255 / 6%), inset 0 -16px 30px -18px rgb(255 255 255 / 16%),
+    0 16px 40px -14px rgb(0 0 0 / 80%);
+  --composer-glass-popup: rgb(36 36 40 / 36%);
   --composer-glass-strip-wash: linear-gradient(transparent, transparent);
   --composer-glass-pressed: rgb(255 255 255 / 10%);
   --composer-glass-bead-edge:
@@ -131,6 +179,11 @@
   [data-chat-composer-main-surface],
 [data-composer-glass][data-model-strip-transition] [data-chat-composer-main-surface] {
   background-image: var(--composer-glass-sheen), var(--composer-glass-wash);
+}
+
+/* The stock glass's body: its lit inner edge and its lift. */
+[data-slot="composer-shell"][data-composer-glass="default"]::before {
+  box-shadow: var(--composer-glass-body);
 }
 
 /* Rim light: a 1px gradient ring in place of the flat outline. */
@@ -219,6 +272,18 @@
   background-color: var(--composer-glass-popup);
   background-image: var(--composer-glass-sheen), var(--composer-glass-wash);
   backdrop-filter: blur(var(--composer-glass-popup-blur)) saturate(var(--glass-saturation));
+  box-shadow:
+    inset 0 1px 0 rgb(255 255 255 / 30%),
+    0 18px 44px -18px rgb(0 0 0 / 60%);
+}
+
+/* The model picker's rail and list paint their own fills; on glass they let it through. */
+[data-composer-glass] [data-model-picker-sidebar] {
+  background-color: rgb(128 128 128 / 6%);
+}
+
+[data-composer-glass] [data-model-picker-content] > :not([data-model-picker-sidebar]) {
+  background-color: transparent;
 }
 
 .dropdown-glass:is([data-composer-glass], [data-composer-glass] > *)::after {
