@@ -2038,7 +2038,9 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         ORDER BY place.ordinal
       `;
       const written = new Map<string, { readonly line: number; readonly atMs: number }>();
-      for (const message of input.parsed.messages) {
+      // A notice the harness wrote between turns (a recap) is added when the
+      // sweep gets to it, at the end of its band: its line seats it as well.
+      for (const message of [...input.parsed.messages, ...(input.parsed.systemNotices ?? [])]) {
         if (written.has(message.sourceId)) continue;
         written.set(message.sourceId, {
           line: message.lineIndex,

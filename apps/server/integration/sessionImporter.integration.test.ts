@@ -3345,6 +3345,113 @@ runtimeTest(
     }),
 );
 
+runtimeTest(
+  "a recap added after the rows around it sits where the record wrote it, in a thread kept in the record's order",
+  (h) =>
+    Effect.gen(function* () {
+      // Oct 23: every recap of a day, added between turns, stood at the foot of the thread.
+      const claudeId = "aaaaaaaa-1111-4111-8111-1111111111f6";
+      const c = claudeSession({ sessionId: claudeId, cwd: h.workspace });
+      const claudePath = h.claudeFile(claudeId);
+      const threadId = importedThreadId(claudeId);
+      const recapAt = "2026-07-01T10:30:00.000Z";
+      yield* h.write(claudePath, [
+        c.user("user-1", "Fix the login bug please", "2026-07-01T10:00:00.000Z"),
+        c.assistant("assistant-1", "I fixed the login bug.", "2026-07-01T10:00:05.000Z"),
+        {
+          type: "system",
+          subtype: "away_summary",
+          uuid: "recap-1",
+          parentUuid: "assistant-1",
+          sessionId: claudeId,
+          cwd: h.workspace,
+          timestamp: recapAt,
+          isSidechain: false,
+          isMeta: false,
+          content: "Goal was the login bug; it is fixed.",
+        },
+        c.user("user-2", "And the logout bug", "2026-07-01T11:00:00.000Z"),
+        c.assistant("assistant-2", "Both fixed.", "2026-07-01T11:00:05.000Z"),
+      ]);
+      const bridgeDir = yield* h.makeDir("bridge");
+      yield* (yield* h.importer({ bridgeDir })).sweepNow();
+      // T3 ran a turn here once, after all of this.
+      yield* seedT3Run(h, threadId, CLAUDE, "completed", {
+        ordinal: 1,
+        iso: "2026-07-01T12:00:00.000Z",
+      });
+      const at = DateTime.makeUnsafe(recapAt);
+      yield* h.eventSink.write({
+        events: [
+          {
+            id: EventId.make(`seed:${threadId}:recap-1`),
+            type: "turn-item.updated" as const,
+            threadId,
+            occurredAt: at,
+            payload: {
+              id: TurnItemId.make(`cli-import:v2:${threadId}:recap-1`),
+              threadId,
+              runId: null,
+              nodeId: null,
+              providerThreadId: null,
+              providerTurnId: null,
+              nativeItemRef: null,
+              parentItemId: null,
+              ordinal: 0,
+              status: "completed" as const,
+              title: "recap: Goal was the login bug; it is fixed.",
+              startedAt: at,
+              completedAt: at,
+              updatedAt: at,
+              type: "system_notice" as const,
+              message: "recap: Goal was the login bug; it is fixed.",
+            },
+          },
+        ],
+      });
+      const reads = h.threads
+        .getThreadRecords(threadId, ["turnItems"])
+        .pipe(
+          Effect.map((records) =>
+            records.turnItems
+              .toSorted((left, right) => left.ordinal - right.ordinal)
+              .flatMap((item) =>
+                item.type === "user_message" || item.type === "assistant_message"
+                  ? [item.text]
+                  : item.type === "system_notice"
+                    ? [item.message]
+                    : [],
+              ),
+          ),
+        );
+      assert.deepEqual(yield* reads, [
+        "Fix the login bug please",
+        "I fixed the login bug.",
+        "And the logout bug",
+        "Both fixed.",
+        "recap: Goal was the login bug; it is fixed.",
+      ]);
+      const instanceDir = yield* h.makeDir("bridge", "claude", claudeId, "inst-1");
+      yield* h.write(joinPath(instanceDir, "session.json"), [
+        {
+          sid: claudeId,
+          instanceId: "inst-1",
+          heartbeatAt: yield* Clock.currentTimeMillis,
+          activeTurn: null,
+        },
+      ]);
+      const importer = yield* h.importer({ bridgeDir, recordOrderThreads: new Set([threadId]) });
+      yield* importer.healLiveClaudeSession({ sessionId: claudeId, transcriptPath: claudePath });
+      assert.deepEqual(yield* reads, [
+        "Fix the login bug please",
+        "I fixed the login bug.",
+        "recap: Goal was the login bug; it is fixed.",
+        "And the logout bug",
+        "Both fixed.",
+      ]);
+    }),
+);
+
 runtimeTest("a message sent into a turn that took it after its reply moves below that reply", (h) =>
   Effect.gen(function* () {
     const claudeId = "aaaaaaaa-1111-4111-8111-1111111111f5";
