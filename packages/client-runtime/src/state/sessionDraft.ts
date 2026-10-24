@@ -99,9 +99,16 @@ export function reconcileSessionDraft(input: {
     differs: false,
   });
   // Out of sight (no live process for a moment, a watch starting again), the
-  // session's box may change unseen; a text this box offered is still its own.
-  if (session === null)
-    return settled({ ...SESSION_DRAFT_SHARE_START, offered: input.share.offered });
+  // session's box may change unseen. Found holding the text both last had, or
+  // one this box offered, it is still on this box's draft; anything else is met
+  // as a new box.
+  if (session === null) {
+    const { shared, offered } = input.share;
+    return settled({
+      ...SESSION_DRAFT_SHARE_START,
+      offered: (shared === null ? offered : [shared, ...offered]).slice(-OFFERED_KEPT),
+    });
+  }
   const agreed: SessionDraftShare = { shared: session, offered: [], found: null };
   if (session === local) return settled(agreed);
   let share = input.share;

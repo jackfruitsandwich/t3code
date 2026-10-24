@@ -91,6 +91,19 @@ describe("reconcileSessionDraft", () => {
       offer: { text: "", base: "ok lets try" },
       differs: false,
     });
+    // Out of sight after the box caught up, with typing here not yet offered (the thread closed
+    // within the pause before an offer, its watch started again on opening).
+    const caught = step(SESSION_DRAFT_SHARE_START, "ok lets try", "ok lets try").share;
+    const reopened = step(
+      step(caught, "ok lets try this", null).share,
+      "ok lets try this",
+      "ok lets try",
+    );
+    expect(reopened).toMatchObject({
+      take: null,
+      offer: { text: "ok lets try this", base: "ok lets try" },
+      differs: false,
+    });
   });
 
   it("offers nothing that carries attachments, and forgets the share without a terminal box", () => {
@@ -99,11 +112,14 @@ describe("reconcileSessionDraft", () => {
       offer: null,
       differs: false,
     });
-    expect(step(agreed, "fix", null)).toEqual({
-      share: SESSION_DRAFT_SHARE_START,
+    const gone = step(agreed, "fix", null);
+    expect(gone).toEqual({
+      share: { shared: null, offered: ["fix"], found: null },
       take: null,
       offer: null,
       differs: false,
     });
+    // Back as a new, empty box: the message box keeps its draft and says so.
+    expect(step(gone.share, "fix", "")).toMatchObject({ take: null, offer: null, differs: true });
   });
 });
