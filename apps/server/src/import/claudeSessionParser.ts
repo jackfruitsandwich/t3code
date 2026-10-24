@@ -104,6 +104,26 @@ export function claudeTaskNotice(text: string): ParsedSessionNotice {
   return { summary: clipped.length > 0 ? clipped : NOTICE_WITHOUT_WORDS, outcome };
 }
 
+const NOTICE_TASK_ID = /<task-id>\s*([^<\s]+)\s*<\/task-id>/u;
+
+/**
+ * The task a background task's report says has ended, how, and its line. Null
+ * for any other prompt, and for a report of a task that runs on (one Claude
+ * Code restarted after its process ended).
+ */
+export function claudeTaskNoticeEnd(text: string | null): {
+  readonly taskId: string;
+  readonly status: "completed" | "failed" | "cancelled";
+  readonly summary: string;
+} | null {
+  if (text === null || !isClaudeTaskNoticeText(text)) return null;
+  const taskId = NOTICE_TASK_ID.exec(text)?.[1];
+  const notice = claudeTaskNotice(text);
+  return taskId === undefined || notice.outcome === "updated"
+    ? null
+    : { taskId, status: notice.outcome, summary: notice.summary };
+}
+
 /**
  * The notice a turn the harness opened shows, when what opened it is a
  * background task reporting back: the task's own line, as the terminal draws

@@ -124,6 +124,7 @@ import {
   claudeHarnessMessageNotification,
   claudeOriginNotification,
   claudePlanPromptNotification,
+  claudeTaskNoticeEnd,
 } from "../../import/claudeSessionParser.ts";
 import { expandHomePath } from "../../pathExpansion.ts";
 import {
@@ -6100,6 +6101,22 @@ export function makeClaudeAdapterV2(
           return true;
         });
 
+        // A bridged session reports a background subagent's end only in the
+        // words it hands the model (the SDK's task_notification is not in
+        // its record), often in a later turn than the one that started it:
+        // that report ends the subagent, as task_notification does.
+        const settleSubagentFromNotice = (context: ActiveClaudeTurnContext, text: string) => {
+          const ended = claudeTaskNoticeEnd(text);
+          return ended === null || context.ignoredTaskIds.has(ended.taskId)
+            ? Effect.void
+            : updateClaudeSubagentNode({
+                context,
+                taskId: ended.taskId,
+                result: ended.summary,
+                status: ended.status,
+              });
+        };
+
         // A notice in a turn's own run, where the harness's message arrived.
         const emitHarnessNotice = Effect.fnUntraced(function* (
           context: ActiveClaudeTurnContext,
@@ -6501,6 +6518,7 @@ export function makeClaudeAdapterV2(
           // where it arrived, as it draws one that opens a turn.
           const queuedPrompt = claudeBridgeQueuedPrompt(message);
           if (queuedPrompt !== null) {
+            yield* settleSubagentFromNotice(context, queuedPrompt.text);
             const notification = claudeHarnessMessageNotification(
               queuedPrompt.text,
               queuedPrompt.sender,
@@ -6520,6 +6538,7 @@ export function makeClaudeAdapterV2(
               : null;
           if (wakeHead !== null) {
             yield* takeTypedWaiting(message);
+            yield* settleSubagentFromNotice(context, wakeHead);
             const ownHead =
               isClaudeProviderContinuationTurn(context.input) && context.wakeHeadsSeen === 0;
             context.wakeHeadsSeen += 1;

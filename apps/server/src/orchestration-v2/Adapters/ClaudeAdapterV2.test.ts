@@ -8048,6 +8048,97 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     ),
   );
 
+  // A session's first turn runs in a process of its own that closes with the
+  // turn; a subagent it left running is restarted by the terminal's session,
+  // whose record reports its end in a later turn only in the words the model
+  // is handed (Oct 22, session ddba110e: shown running until a restart).
+  it.effect("ends a background subagent when a bridged later turn is told it finished", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        const now = yield* DateTime.now;
+        const taskId = "ae279c2eaa40622d1";
+        const toolUseId = "toolu_bridged_subagent_end";
+        const userTurn = (attempt: string, providerTurnOrdinal: number) =>
+          harness.runtime.startTurn(
+            makeClaudeTestTurnInput({
+              threadId: harness.threadId,
+              providerThread: harness.providerThread,
+              now,
+              attemptId: RunAttemptId.make(attempt),
+              text: "Go on.",
+              attachments: [],
+              providerTurnOrdinal,
+            }),
+          );
+        const told = (uuid: string, text: string) =>
+          claudeSdkFrame({
+            type: "system",
+            subtype: "queued_command",
+            uuid,
+            session_id: WAKE_NATIVE_SESSION,
+            t3_queued_prompt: { text, sender: null },
+          });
+        const statuses = () =>
+          harness.events.flatMap((event) =>
+            event.type === "subagent.updated" && event.subagent.nativeTaskRef?.nativeId === taskId
+              ? [event.subagent.status]
+              : [],
+          );
+
+        yield* userTurn("attempt-bridged-end-1", 1);
+        yield* Queue.offer(
+          harness.sdkMessages,
+          makeSubagentTaskStartedFrame({
+            taskId,
+            toolUseId,
+            uuid: "00000000-0000-4000-8000-000000000921",
+          }),
+        );
+        yield* Queue.offer(
+          harness.sdkMessages,
+          makeResultFrame({ uuid: "00000000-0000-4000-8000-000000000922", result: "Started." }),
+        );
+        yield* awaitUntil(() => harness.terminalEvents().length === 1, "first turn terminal");
+
+        yield* userTurn("attempt-bridged-end-2", 2);
+        // Restarted after the process that started it ended: it runs on.
+        yield* Queue.offer(
+          harness.sdkMessages,
+          told(
+            "00000000-0000-4000-8000-000000000923",
+            `<task-notification>\n<task-id>${taskId}</task-id>\n<summary>Background agent "Audit recent commits" was restarted after the previous session ended</summary>\n</task-notification>`,
+          ),
+        );
+        yield* Queue.offer(
+          harness.sdkMessages,
+          told(
+            "00000000-0000-4000-8000-000000000924",
+            `<task-notification>\n<task-id>${taskId}</task-id>\n<status>completed</status>\n<summary>Agent "Audit recent commits" finished</summary>\n<result>All five are fine.</result>\n</task-notification>`,
+          ),
+        );
+        yield* Queue.offer(
+          harness.sdkMessages,
+          makeResultFrame({ uuid: "00000000-0000-4000-8000-000000000925", result: "Read it." }),
+        );
+        yield* awaitUntil(() => harness.terminalEvents().length === 2, "second turn terminal");
+
+        assert.deepEqual(statuses(), ["running", "completed"]);
+        const item = harness.events.findLast(
+          (event) =>
+            event.type === "turn_item.updated" &&
+            event.turnItem.type === "subagent" &&
+            event.turnItem.nativeItemRef?.nativeId === taskId,
+        );
+        assert.equal(item?.type === "turn_item.updated" ? item.turnItem.status : null, "completed");
+        assert.equal(
+          item?.type === "turn_item.updated" ? item.turnItem.runId : null,
+          RunId.make("run-attempt-bridged-end-1"),
+        );
+      }).pipe(Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+    ),
+  );
+
   it.effect("a turn that fails to start does not expire a queued wake's report", () =>
     Effect.scoped(
       Effect.gen(function* () {
