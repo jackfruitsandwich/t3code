@@ -1402,8 +1402,9 @@ export const layer: Layer.Layer<
 
       /**
        * Asked for a call T3 has answered already: the answer had not reached
-       * the session when the run that sent it ended. The same answer goes
-       * again, and the person is not asked twice.
+       * the session when the run that sent it ended, or the session repeated
+       * the request before it read the answer. The same answer goes again,
+       * and the person is not asked twice.
        */
       const answerAgain = (toolUseId: string) =>
         Effect.gen(function* () {

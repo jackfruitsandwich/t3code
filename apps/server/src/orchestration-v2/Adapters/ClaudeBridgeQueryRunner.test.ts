@@ -165,10 +165,7 @@ const attach = (input: {
         ),
       send: (_process, command) =>
         Effect.suspend(() => {
-          if (
-            (command.type === "approval" || command.type === "answer") &&
-            command.decision !== "ask"
-          ) {
+          if (command.type === "approval" || command.type === "answer") {
             sentAnswers.set(command.toolUseId, command);
           }
           return Queue.offer(commands, command).pipe(Effect.as("command-1"));

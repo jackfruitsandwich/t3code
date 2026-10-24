@@ -577,6 +577,62 @@ describe("a call T3 has answered", () => {
       ),
     );
   });
+
+  // Handed back to the terminal, the call is the terminal's: the mod stops
+  // waiting for T3 once it reads that, and a request it repeated before then
+  // is not asked in T3 again (the card's answer would reach nothing).
+  it.live("takes a hand-back to the terminal as the call's answer", () => {
+    const platform = Layer.mergeAll(NodeServices.layer, NodeCrypto.layer);
+    return Effect.scoped(
+      Effect.gen(function* () {
+        const registry = yield* ClaudeBridgeRegistry;
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const sid = "dddddddd-5555-4555-8555-555555555555";
+        const dir = path.join(registry.bridgeDir, "claude", sid, "instance-1");
+        yield* fs.makeDirectory(path.join(dir, "events"), { recursive: true });
+        yield* fs.writeFileString(
+          path.join(dir, "session.json"),
+          yield* encodeJson({
+            sid,
+            instanceId: "instance-1",
+            configDir: path.join(registry.bridgeDir, "home"),
+            heartbeatAt: yield* Clock.currentTimeMillis,
+            isInteractive: true,
+            waiting: [
+              { toolUseId: "tool-1", kind: "approval" },
+              { toolUseId: "tool-2", kind: "question" },
+              { toolUseId: "tool-3", kind: "approval" },
+            ],
+          }),
+        );
+        const live = yield* registry.findLiveProcess(sid);
+        assert.isNotNull(live);
+        if (live === null) return;
+        const handBack = { type: "approval", toolUseId: "tool-1", decision: "ask" } as const;
+        yield* registry.send(live, handBack);
+        yield* registry.send(live, { type: "answer", toolUseId: "tool-2", decision: "ask" });
+        const offered = yield* Deferred.make<ReadonlyArray<string>>();
+        yield* registry.onUnattachedRequest((_process, waiting) =>
+          Deferred.succeed(
+            offered,
+            waiting.map((request) => request.toolUseId),
+          ).pipe(Effect.asVoid),
+        );
+        assert.deepStrictEqual(yield* Deferred.await(offered), ["tool-3"]);
+        assert.deepStrictEqual(yield* registry.sentAnswer(live, "tool-1"), handBack);
+      }),
+    ).pipe(
+      Effect.provide(
+        registryLayer.pipe(
+          Layer.provide(
+            ServerConfig.layerTest(process.cwd(), { prefix: "t3-bridge-registry-test-" }),
+          ),
+          Layer.provideMerge(platform),
+        ),
+      ),
+    );
+  });
 });
 
 // ddba110e (Oct 22): the session's mod went quiet while its turn ran on.

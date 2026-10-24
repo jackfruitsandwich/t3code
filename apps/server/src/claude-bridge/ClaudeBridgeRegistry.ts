@@ -321,10 +321,10 @@ export class ClaudeBridgeRegistry extends Context.Service<
       body: ClaudeBridgeCommandBody,
     ) => Effect.Effect<string>;
     /**
-     * The allow, refusal or answer T3 sent for a call the session held, while
-     * this server runs. The session can list the call, or ask it again, until
-     * its mod has taken that answer; a run attached meanwhile sends it again
-     * rather than asking the person twice.
+     * The allow, refusal, answer or hand-back T3 sent for a call the session
+     * held, while this server runs. The session can list the call, or ask it
+     * again, until its mod has taken that answer; a run attached meanwhile
+     * sends it again rather than asking the person twice.
      */
     readonly sentAnswer: (
       process: ClaudeBridgeProcess,
@@ -980,7 +980,10 @@ const make = Effect.gen(function* () {
         Effect.provideService(Path.Path, path),
         Effect.orDie,
       );
-      if ((body.type === "approval" || body.type === "answer") && body.decision !== "ask") {
+      // A hand-back to the terminal ("ask") is kept too: the mod stops waiting
+      // for T3 once it reads one, so a request it repeated before reading it
+      // takes the same hand-back, and no card is shown that nothing reads.
+      if (body.type === "approval" || body.type === "answer") {
         const key = answerKey(entry.sid, body.toolUseId);
         sentAnswers.delete(key);
         sentAnswers.set(key, body);
