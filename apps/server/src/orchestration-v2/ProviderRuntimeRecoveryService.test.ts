@@ -414,51 +414,51 @@ it.effect(
   "records cancelled work on the provider thread that lost it after a provider switch",
   () => {
     const threadId = ThreadId.make("thread_switch_note");
-    const claudeRunId = RunId.make("run_switch_note_claude");
     const codexRunId = RunId.make("run_switch_note_codex");
-    const claudeThreadId = ProviderThreadId.make("provider_thread_switch_note_claude");
+    const claudeRunId = RunId.make("run_switch_note_claude");
     const codexThreadId = ProviderThreadId.make("provider_thread_switch_note_codex");
+    const claudeThreadId = ProviderThreadId.make("provider_thread_switch_note_claude");
     const claude = ProviderInstanceId.make("claude");
     const codex = ProviderInstanceId.make("codex");
     let committedInput: Parameters<EventSink.EventSinkV2["Service"]["commitCommand"]>[0] | null =
       null;
-    // Claude launched a background subagent, then the thread switched to Codex.
+    // Codex launched a background subagent, then the thread switched to Claude.
     const projection = {
       thread: { id: threadId },
       runtimeRequests: [],
       providerSessions: [],
       providerThreads: [
         {
-          id: claudeThreadId,
-          ownerNodeId: null,
-          driver: ProviderDriverKind.make("claudeAgent"),
-          providerInstanceId: claude,
-          status: "idle",
-          pendingBackgroundTasks: [{ taskId: "task-claude", description: "Watch the build" }],
-        },
-        {
           id: codexThreadId,
           ownerNodeId: null,
           driver: ProviderDriverKind.make("codex"),
           providerInstanceId: codex,
+          status: "idle",
+          pendingBackgroundTasks: [{ taskId: "task-codex", description: "Watch the build" }],
+        },
+        {
+          id: claudeThreadId,
+          ownerNodeId: null,
+          driver: ProviderDriverKind.make("claudeAgent"),
+          providerInstanceId: claude,
           status: "idle",
         },
       ],
       providerTurns: [],
       runs: [
         {
-          id: claudeRunId,
-          ordinal: 1,
-          status: "completed",
-          providerInstanceId: claude,
-          providerThreadId: claudeThreadId,
-        },
-        {
           id: codexRunId,
-          ordinal: 2,
+          ordinal: 1,
           status: "completed",
           providerInstanceId: codex,
           providerThreadId: codexThreadId,
+        },
+        {
+          id: claudeRunId,
+          ordinal: 2,
+          status: "completed",
+          providerInstanceId: claude,
+          providerThreadId: claudeThreadId,
         },
       ],
       attempts: [],
@@ -468,9 +468,9 @@ it.effect(
       turnItems: [
         {
           id: TurnItemId.make("turn_item_switch_note_subagent"),
-          runId: claudeRunId,
+          runId: codexRunId,
           nodeId: null,
-          providerThreadId: claudeThreadId,
+          providerThreadId: codexThreadId,
           nativeItemRef: null,
           type: "subagent",
           title: "Background subagent",
@@ -508,13 +508,13 @@ it.effect(
       const recorded = (committedInput?.events ?? []).flatMap((event) =>
         event.type === "run.background-work-cancelled" ? [event.payload] : [],
       );
-      // The Codex run is later, but only Claude's turns may be told about it.
+      // The Claude run is later, but only Codex's turns may be told about it.
       assert.deepEqual(
         recorded.map((entry) => ({
           runId: entry.runId,
           kinds: entry.restartCancelledBackgroundWork.map((work) => work.kind),
         })),
-        [{ runId: claudeRunId, kinds: ["subagent", "task"] }],
+        [{ runId: codexRunId, kinds: ["subagent", "task"] }],
       );
     }).pipe(Effect.provide(layer));
   },

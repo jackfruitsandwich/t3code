@@ -348,6 +348,13 @@ export const make = Effect.gen(function* () {
       ) => {
         // A session that runs on still has its work: nothing to tell its next turn.
         if (providerThreadId == null || liveSessions.has(providerThreadId)) return;
+        // Claude Code tells its own next turn which background shells and agents
+        // its last process left unfinished (READ in records, Oct 2026), and a
+        // stale item here would tell it of work that long finished.
+        const driver = projection.providerThreads.find(
+          (candidate) => candidate.id === providerThreadId,
+        )?.driver;
+        if (driver === "claudeAgent") return;
         const existing = cancelledBackgroundWork.get(providerThreadId);
         if (existing === undefined) cancelledBackgroundWork.set(providerThreadId, [work]);
         else existing.push(work);

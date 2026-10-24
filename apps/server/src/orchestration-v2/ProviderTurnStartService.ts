@@ -999,8 +999,10 @@ export const layer: Layer.Layer<
       // turn its session went on running: that turn already has its prompt
       // and context, and is sent nothing (the orchestrator's `run.reattach`).
       const reattaching = attempt.reason === "provider_recovery";
+      // Claude Code tells its own turn what its last process left unfinished:
+      // a note recorded before recovery stopped keeping them is not sent.
       const restartNote =
-        reattaching || restartCancelledWork.length === 0
+        reattaching || restartCancelledWork.length === 0 || providerThread.driver === "claudeAgent"
           ? ""
           : restartCancelledBackgroundWorkNote(restartCancelledWork);
       const tokenCap = yield* handoffTokenCapConfig.pipe(

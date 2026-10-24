@@ -296,7 +296,7 @@ it.effect("completes the run when the turn the session runs began after it", () 
   }),
 );
 
-it.effect("tells no later turn that a live session's background work was cancelled", () =>
+it.effect("tells no later Claude turn that its background work was cancelled", () =>
   Effect.gen(function* () {
     for (const live of [running, { state: "idle" } as const]) {
       const { committed } = yield* reconcile({ trigger: "startup", live });
@@ -305,14 +305,12 @@ it.effect("tells no later turn that a live session's background work was cancell
         [],
       );
     }
-    // The same thread whose session ended with the server is told.
+    // Nor when its session ended: Claude Code tells its next turn itself.
     const { committed } = yield* reconcile({ trigger: "startup" });
-    const recorded = committed.flatMap((event) =>
-      event.type === "run.background-work-cancelled"
-        ? event.payload.restartCancelledBackgroundWork.map((work) => work.kind)
-        : [],
+    assert.deepEqual(
+      committed.filter((event) => event.type === "run.background-work-cancelled"),
+      [],
     );
-    assert.isAbove(recorded.length, 0);
   }),
 );
 

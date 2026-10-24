@@ -1,6 +1,12 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
-import { ProviderDriverKind, type ProviderReplayEntry } from "@t3tools/contracts";
+import {
+  CommandId,
+  EventId,
+  ProviderDriverKind,
+  type ProviderReplayEntry,
+} from "@t3tools/contracts";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -12,6 +18,8 @@ import {
 } from "../Adapters/ClaudeAdapterV2.testkit.ts";
 import * as IdAllocator from "../IdAllocator.ts";
 import * as EffectWorker from "../EffectWorker.ts";
+import * as EventSink from "../EventSink.ts";
+import * as Orchestrator from "../Orchestrator.ts";
 import * as SqlitePersistence from "../../persistence/Sqlite.ts";
 import { provideDeterministicTestRuntime } from "./DeterministicRuntime.ts";
 import { CLAUDE_BACKGROUND_SUBAGENT_AFTER_ROOT_PROMPT } from "./fixtures/claude_background_subagent_after_root/input.ts";
@@ -30,10 +38,6 @@ const SCENARIO = "claude_background_subagent_after_root";
 const SESSION_ID = "cca274e4-25ae-4171-b972-bbb31118517e";
 const FIRST_AFTER_RESTART = "Is the background subagent done yet?";
 const SECOND_AFTER_RESTART = "Thanks. Anything else?";
-const NOTE = [
-  "Note: the T3 server restarted, and this background work was cancelled before it finished. It will not report back:",
-  "- subagent: Background subagent test",
-].join("\n");
 
 /**
  * The recorded background-subagent session cut by a restart right after the
@@ -135,6 +139,8 @@ const runRestart = Effect.fn("runRestart")(function* (input: {
   readonly resumedPrompts: ReadonlyArray<string>;
   readonly userMessagesAfterRestart: ReadonlyArray<string>;
   readonly continueThreadsAfterServerUpdate: boolean;
+  /** A note an older build kept for the next turn when the restart cut the subagent. */
+  readonly keptNote?: boolean;
 }) {
   const transcript = yield* readRestartTranscript(input.resumedPrompts);
   const workspace = yield* checkpointWorkspace(SCENARIO);
@@ -188,6 +194,34 @@ const runRestart = Effect.fn("runRestart")(function* (input: {
     Effect.gen(function* () {
       const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
       yield* worker.drain();
+      if (input.keptNote === true) {
+        const threadId = materialized.projectionThreadIds[0]!;
+        const run = (yield* (yield* Orchestrator.OrchestratorV2).getThreadProjection(threadId))
+          .runs[0]!;
+        const now = yield* DateTime.now;
+        yield* (yield* EventSink.EventSinkV2).commitCommand({
+          commandId: CommandId.make("restart-note-older-build"),
+          threadId,
+          commandType: "provider-runtime.reconcile",
+          acceptedAt: now,
+          events: [
+            {
+              id: EventId.make("restart-note-older-build-work"),
+              type: "run.background-work-cancelled",
+              threadId,
+              runId: run.id,
+              occurredAt: now,
+              payload: {
+                runId: run.id,
+                restartCancelledBackgroundWork: [
+                  { kind: "subagent", label: "Background subagent test" },
+                ],
+              },
+            },
+          ],
+          effects: [],
+        });
+      }
       return yield* runOrchestratorV2Scenario(restartScenario);
     }).pipe(
       Effect.provide(
@@ -205,7 +239,12 @@ const runRestart = Effect.fn("runRestart")(function* (input: {
     ["completed"],
   );
   assert.equal(recovered.subagents[0]?.status, "cancelled");
-  assert.equal(recovered.runs[0]?.restartCancelledBackgroundWork?.[0]?.kind, "subagent");
+  // Claude Code tells its next turn itself which background work its last
+  // process left unfinished, so nothing is kept for T3 to tell it.
+  assert.equal(
+    recovered.runs[0]?.restartCancelledBackgroundWork !== undefined,
+    input.keptNote === true,
+  );
 
   const after = yield* Effect.scoped(
     runOrchestratorV2ProviderReplayScenario(scenario("after-restart", phase2Steps), harness, {
@@ -224,19 +263,20 @@ const userTexts = (projection: ReturnType<typeof projectionFor>) =>
   projection.turnItems.flatMap((item) => (item.type === "user_message" ? [item.text] : []));
 
 describe("restart-cancelled background work", () => {
-  it.effect.each([false, true])(
-    "keeps the thread settled and tells the next user turn once when continuation is %s",
-    (continueThreadsAfterServerUpdate) =>
+  it.effect.each([
+    { continueThreadsAfterServerUpdate: false, keptNote: false },
+    { continueThreadsAfterServerUpdate: true, keptNote: false },
+    { continueThreadsAfterServerUpdate: false, keptNote: true },
+  ])(
+    "keeps the thread settled and sends the next user turns as typed (continuation $continueThreadsAfterServerUpdate, a note kept by an older build $keptNote)",
+    ({ continueThreadsAfterServerUpdate, keptNote }) =>
       Effect.scoped(
         Effect.gen(function* () {
           const projection = yield* runRestart({
-            // The first turn after the restart carries the note; the second does not.
-            resumedPrompts: [
-              `${NOTE}\n\nUser message:\n${FIRST_AFTER_RESTART}`,
-              SECOND_AFTER_RESTART,
-            ],
+            resumedPrompts: [FIRST_AFTER_RESTART, SECOND_AFTER_RESTART],
             userMessagesAfterRestart: [FIRST_AFTER_RESTART, SECOND_AFTER_RESTART],
             continueThreadsAfterServerUpdate,
+            keptNote,
           });
           assert.deepEqual(
             projection.runs.map((run) => run.status),
@@ -245,7 +285,6 @@ describe("restart-cancelled background work", () => {
           assert.isFalse(
             projection.runs.some((run) => run.restartContinuationOfRunId !== undefined),
           );
-          // The note reaches the provider only; the timeline keeps what the user sent.
           assert.deepEqual(userTexts(projection), [
             CLAUDE_BACKGROUND_SUBAGENT_AFTER_ROOT_PROMPT,
             FIRST_AFTER_RESTART,
