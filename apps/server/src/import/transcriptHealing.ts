@@ -60,13 +60,35 @@ const timeMs = (iso: string) => {
   return Number.isNaN(value) ? 0 : value;
 };
 
+/**
+ * A prompt's words with each context item (an image) read as its label: T3
+ * keeps one as `![label](t3-context://…)`, and hands the session
+ * `[Kind: label; ref=id]` in its place, a `<t3_context>` envelope, and notes
+ * on where an attachment is saved (projectComposerContextForProvider,
+ * providerMessageTextWithAttachmentPaths, claudeBridgeImageNote).
+ */
+const promptWords = (text: string) =>
+  normalize(
+    text
+      .replace(/<t3_context version="[^"]*">[\s\S]*?<\/t3_context>/gu, " ")
+      .replace(/\[Attached [^\]\n]*? is saved at: [^\]\n]+\]/gu, " ")
+      .replace(/\[T3: the user attached [^\]]*\]/gu, " ")
+      .replace(/!\[([^\]]*)\]\(t3-context:\/\/v1\/[^)]*\)/gu, "$1")
+      .replace(/\[[A-Z][A-Za-z ]*: ([^;\]\n]*); ref=[^\]\n]+\]/gu, "$1"),
+  );
+
 /** T3 may wrap a prompt (an effort prefix, attachment notes); the typed text stays inside it. */
-const samePrompt = (shown: string, written: string) =>
-  shown === written ||
-  (shown.length >= MIN_PARTIAL_MATCH_LENGTH &&
-    (written.endsWith(shown) || written.startsWith(shown))) ||
-  (written.length >= MIN_PARTIAL_MATCH_LENGTH &&
-    (shown.endsWith(written) || shown.startsWith(written)));
+const samePrompt = (shownText: string, writtenText: string) => {
+  const shown = promptWords(shownText);
+  const written = promptWords(writtenText);
+  return (
+    shown === written ||
+    (shown.length >= MIN_PARTIAL_MATCH_LENGTH &&
+      (written.endsWith(shown) || written.startsWith(shown))) ||
+    (written.length >= MIN_PARTIAL_MATCH_LENGTH &&
+      (shown.endsWith(written) || shown.startsWith(written)))
+  );
+};
 
 /** The band a row written at `atMs` belongs to: the latest run that had started by then. */
 export const bandForTime = (runs: ReadonlyArray<HealingRun>, atMs: number): number => {

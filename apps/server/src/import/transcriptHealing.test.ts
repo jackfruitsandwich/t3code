@@ -208,6 +208,47 @@ describe("planTranscriptHealing: a message typed into a running turn", () => {
     const known = [shown("cli-import-s-q1", "user", "also check the logs", 11)];
     assert.deepEqual(plan([typed], known, [{ id: "run-1", ordinal: 1, minute: 10 }]), []);
   });
+
+  it("is not added when T3 sent it with an image: T3 shows it in its own words", () => {
+    // The row holds what T3 handed the session for the image, around the words.
+    const steer: ParsedSessionMessage = {
+      ...row(
+        "user",
+        "q1",
+        [
+          "a bug  [Image: shot 9.06.54 PM.png; ref=image_80bc]",
+          '<t3_context version="1">\n<context kind="image" id="image_80bc">\nname: shot 9.06.54 PM.png\nmimeType: image/png\n</context>\n</t3_context>',
+          '[Attached image "shot 9.06.54 PM.png" is saved at: /t3/attachments/x.png]',
+          '[T3: the user attached an image to this message. This Claude Code process receives only the text, so before answering open each attached image with the Read tool at its "is saved at" path above.]',
+        ].join("\n\n"),
+        11,
+      ),
+      midTurn: true,
+    };
+    const rows = [
+      row("user", "u1", "fix the bug", 10),
+      steer,
+      row("assistant", "a1", "fixed, and the shot is clean", 12),
+    ];
+    const known = [
+      shown("message:run-1:prompt", "user", "fix the bug", 10, "run-1"),
+      shown(
+        "t3-steer",
+        "user",
+        "a bug  ![shot 9.06.54 PM.png](t3-context://v1/image/image_80bc)",
+        11,
+        "run-1",
+      ),
+      shown(
+        "message:provider:claudeAgent:native-item:a1",
+        "assistant",
+        "fixed, and the shot is clean",
+        12,
+        "run-1",
+      ),
+    ];
+    assert.deepEqual(plan(rows, known, [{ id: "run-1", ordinal: 1, minute: 10 }]), []);
+  });
 });
 
 describe("planNoticeHealing", () => {
