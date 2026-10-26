@@ -91,8 +91,10 @@ const COMMANDS_REFRESH_MS = 60000
 const COMMANDS_EARLY_MS = [3000, 10000]
 // Claude Code refuses a plugin's prompt that begins with / (it would run a
 // command as the person). Typed, such text (a path) goes to the model unless it
-// names a command: T3's goes in behind this mark, which this mod's own
-// prompt.submit hook takes off again, so the session holds the words as written.
+// names a command: T3's goes in behind this mark, which this mod's
+// session.append hook takes off the row before it is stored (a plugin's own
+// hooks do not see its own prompt.submit), so the model and the record get the
+// words as written.
 const SLASH_MARK = '\\u2060'
 // How old T3's heartbeat (one every 3 s) may be before T3 counts as gone. A
 // server busy starting up can miss several beats; a prompt handed back or
@@ -1523,6 +1525,16 @@ export function register(on) {
         }
       }
     } catch {}
+    // T3's text that begins with / goes in behind SLASH_MARK (submitPrompt):
+    // the row, and its queue entry, keep the words as written.
+    const row = e && (e.door === 'prompt' || e.door === 'queue') ? e.message : null
+    if (row && typeof row.content === 'string' && row.content.charAt(0) === SLASH_MARK) {
+      return next({ ...e, message: { ...row, content: row.content.slice(SLASH_MARK.length) } })
+    }
+    const head = row && Array.isArray(row.content) ? row.content[0] : null
+    if (head && head.type === 'text' && typeof head.text === 'string' && head.text.charAt(0) === SLASH_MARK) {
+      return next({ ...e, message: { ...row, content: [{ ...head, text: head.text.slice(SLASH_MARK.length) }, ...row.content.slice(1)] } })
+    }
     return next(e)
   })
 
@@ -1588,9 +1600,6 @@ export function register(on) {
       } catch {}
     }
     const plugin = e.origin && e.origin.kind === 'plugin' && typeof e.origin.name === 'string' ? e.origin.name : undefined
-    // T3's text that begins with / (submitPrompt): the words as written.
-    const ownSlash = plugin === '${CLAUDE_BRIDGE_PLUGIN_NAME}' && !e.command && typeof e.text === 'string' && e.text.charAt(0) === SLASH_MARK
-    if (ownSlash) e = { ...e, text: e.text.slice(SLASH_MARK.length) }
     submitted ={ text: e.text, origin: e.origin && typeof e.origin.kind === 'string' ? e.origin.kind : undefined, plugin: plugin, asUser: plugin !== undefined && e.origin.asUser === true }
     // The person typed it over the running turn: the session holds it until
     // the model is handed it, and T3 shows it waiting meanwhile.
@@ -1598,7 +1607,7 @@ export function register(on) {
       await emit($, 'prompt.typed', { turnId: e.turnId, text: e.text })
     }
     // A plain prompt: the turn it starts is no command's.
-    if (ownSlash || (typeof e.text === 'string' && e.text.trim().charAt(0) !== '/')) commandPending = false
+    if (typeof e.text === 'string' && e.text.trim().charAt(0) !== '/') commandPending = false
     const result = await next(e)
     // Sent from the box: the box is empty now.
     if (!passive && e.origin && e.origin.kind === 'composer' && !(result && result.drop)) noteDraft($, '')

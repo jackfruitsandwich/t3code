@@ -600,13 +600,26 @@ describe("the mod's prompts from T3 that begin with /", () => {
     assert.lengthOf(mod.submits, 1);
     const sent = (mod.submits[0] as { text: string }).text;
     assert.notEqual(sent.trim().charAt(0), "/");
-    let taken: unknown;
-    await mod.fire(
-      "prompt.submit",
-      { text: sent, origin: { kind: "plugin", name: "t3bridge", asUser: true } },
-      { next: async (passed) => (taken = passed) },
-    );
-    assert.include(taken, { text: "/Users/me/notes.txt what is this" });
+    // The row it makes, and its queue entry, are stored with the words as written.
+    for (const content of [[{ type: "text", text: sent }], sent]) {
+      let taken: { message?: { content?: unknown } } | undefined;
+      await mod.fire(
+        "session.append",
+        {
+          door: "prompt",
+          uuid: "u1",
+          origin: { kind: "plugin", name: "t3bridge" },
+          message: { type: "user", role: "user", content },
+        },
+        { next: async (passed) => (taken = passed as typeof taken) },
+      );
+      assert.deepEqual(
+        taken?.message?.content,
+        typeof content === "string"
+          ? "/Users/me/notes.txt what is this"
+          : [{ type: "text", text: "/Users/me/notes.txt what is this" }],
+      );
+    }
     assert.isUndefined(lastOf(mod, "prompt.dropped"));
   });
 
