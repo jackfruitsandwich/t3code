@@ -86,6 +86,14 @@ const DRAFT_PUBLISH_MS = 250
 // A draft longer than this is not shared (session.json is rewritten on every change).
 const DRAFT_MAX_CHARS = 32000
 const COMMANDS_REFRESH_MS = 60000
+// Some commands register a few seconds after the session starts (/diff since
+// Claude Code 2.1.309): the list is read again then, not a minute later.
+const COMMANDS_EARLY_MS = [3000, 10000]
+// Claude Code refuses a plugin's prompt that begins with / (it would run a
+// command as the person). Typed, such text (a path) goes to the model unless it
+// names a command: T3's goes in behind this mark, which this mod's own
+// prompt.submit hook takes off again, so the session holds the words as written.
+const SLASH_MARK = '\\u2060'
 // How old T3's heartbeat (one every 3 s) may be before T3 counts as gone. A
 // server busy starting up can miss several beats; a prompt handed back or
 // asked twice over a lapse is worse than one held a little longer.
@@ -861,6 +869,9 @@ async function openSessionDir($) {
   await heartbeat($)
   await refreshCommands($)
   await heartbeat($)
+  for (const ms of COMMANDS_EARLY_MS) {
+    $.clock.after(ms, () => { refreshCommands($).then(() => heartbeat($)).catch(() => {}) })
+  }
 }
 
 // When the server ships a newer mod, load it here without the person doing
@@ -1188,16 +1199,31 @@ async function runShellCommand($, command) {
 }
 
 // Submits a prompt T3 sent as a turn of its own (Claude Code runs it once the session is idle).
-function submitPrompt($, command) {
+async function submitPrompt($, command) {
   // Claude Code would refuse it below its submit hook and leave the prompt
   // unanswered; T3's is refused here in its words.
   if (endedByModel) {
     emit($, 'prompt.dropped', { commandId: command.id, reason: ENDED_BY_MODEL }).catch(() => {})
     return
   }
-  pendingCommand = { id: command.id, text: command.text, promptUuid: command.promptUuid, at: Date.now() }
+  // T3 sends text that only looks like a command behind a space (SLASH_MARK).
+  const words = command.text.replace(/^ (?=\\/)/, '')
+  let text = command.text
+  if (words.charAt(0) === '/') {
+    // A command T3 had not seen listed yet runs only as one: sent again, it is.
+    const name = words.slice(1).split(/\\s/)[0]
+    let listed = []
+    try { listed = await $.command.list() } catch {}
+    if (name && listed.some((c) => c && c.name === name)) {
+      await refreshCommands($)
+      emit($, 'prompt.dropped', { commandId: command.id, reason: '/' + name + ' is a command of this session that T3 had not seen yet. Send it again and it runs as a command.' }).catch(() => {})
+      return
+    }
+    text = SLASH_MARK + words
+  }
+  pendingCommand = { id: command.id, text: words, promptUuid: command.promptUuid, at: Date.now() }
   // The person's half-typed draft stays where it is: a submit does not touch it.
-  $.prompt.submit({ text: command.text, asUser: true }).then(async (result) => {
+  $.prompt.submit({ text: text, asUser: true }).then(async (result) => {
     if (result && result.drop) {
       if (pendingCommand && pendingCommand.id === command.id) pendingCommand = null
       await emit($, 'prompt.dropped', { commandId: command.id, reason: String(result.drop) })
@@ -1562,14 +1588,17 @@ export function register(on) {
       } catch {}
     }
     const plugin = e.origin && e.origin.kind === 'plugin' && typeof e.origin.name === 'string' ? e.origin.name : undefined
-    submitted = { text: e.text, origin: e.origin && typeof e.origin.kind === 'string' ? e.origin.kind : undefined, plugin: plugin, asUser: plugin !== undefined && e.origin.asUser === true }
+    // T3's text that begins with / (submitPrompt): the words as written.
+    const ownSlash = plugin === '${CLAUDE_BRIDGE_PLUGIN_NAME}' && !e.command && typeof e.text === 'string' && e.text.charAt(0) === SLASH_MARK
+    if (ownSlash) e = { ...e, text: e.text.slice(SLASH_MARK.length) }
+    submitted ={ text: e.text, origin: e.origin && typeof e.origin.kind === 'string' ? e.origin.kind : undefined, plugin: plugin, asUser: plugin !== undefined && e.origin.asUser === true }
     // The person typed it over the running turn: the session holds it until
     // the model is handed it, and T3 shows it waiting meanwhile.
     if (typeof e.turnId === 'string' && !e.command && e.isMeta !== true && e.origin && (e.origin.kind === 'composer' || e.origin.kind === 'bridge') && typeof e.text === 'string' && e.text.trim() !== '') {
       await emit($, 'prompt.typed', { turnId: e.turnId, text: e.text })
     }
     // A plain prompt: the turn it starts is no command's.
-    if (typeof e.text === 'string' && e.text.trim().charAt(0) !== '/') commandPending = false
+    if (ownSlash || (typeof e.text === 'string' && e.text.trim().charAt(0) !== '/')) commandPending = false
     const result = await next(e)
     // Sent from the box: the box is empty now.
     if (!passive && e.origin && e.origin.kind === 'composer' && !(result && result.drop)) noteDraft($, '')

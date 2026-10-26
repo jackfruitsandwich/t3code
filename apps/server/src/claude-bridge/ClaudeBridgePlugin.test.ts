@@ -10,7 +10,12 @@ type Hook = ($: unknown, e: Record<string, unknown>, next: (e: unknown) => unkno
  * mod makes resolves to nothing unless named here, and what it writes is kept.
  */
 const loadMod = (
-  session: { readonly usage?: unknown; readonly surfaces?: ReadonlyArray<string> } = {},
+  session: {
+    readonly usage?: unknown;
+    readonly surfaces?: ReadonlyArray<string>;
+    /** The session's slash commands, as `$.command.list()` gives them; read at each call. */
+    readonly commands?: Array<{ readonly name: string }>;
+  } = {},
   /** What `$.command.run` gives back for a command T3 sent: it stays out until this settles. */
   commandRun?: () => Promise<unknown>,
 ) => {
@@ -58,7 +63,7 @@ const loadMod = (
         return session.usage;
       },
     },
-    command: { list: () => [], run: () => commandRun?.() },
+    command: { list: () => session.commands ?? [], run: () => commandRun?.() },
     agent: { list: () => [] },
     clock: {
       every: (ms, tick) => {
@@ -164,7 +169,25 @@ const loadMod = (
     timers.get(3000)?.();
     await new Promise((resolve) => setTimeout(resolve, 0));
   };
-  return { fire, sessionFile, events, send, submits, put, box, fills, settle, within, beat };
+  /** What the mod last wrote as the session's command list. */
+  const commandsFile = () => {
+    const path = [...writes.keys()].findLast((key) => key.endsWith("/commands.json"));
+    return path === undefined ? "" : (writes.get(path) ?? "");
+  };
+  return {
+    fire,
+    sessionFile,
+    events,
+    send,
+    submits,
+    put,
+    box,
+    fills,
+    settle,
+    within,
+    beat,
+    commandsFile,
+  };
 };
 
 const effort = (level: string) => ({ effort: { level } });
@@ -555,5 +578,55 @@ describe("the mod's report of a command T3 sent that the terminal holds", () => 
       String(results(mod)[0]?.text),
       "/effort high is waiting in the Claude Code terminal behind what is running or open there",
     );
+  });
+});
+
+describe("the mod's prompts from T3 that begin with /", () => {
+  const lastOf = (mod: ReturnType<typeof loadMod>, type: string) =>
+    mod.events().findLast((event) => event.type === type);
+  const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+  it("hands over text that only looks like a command, and the session takes the words as written", async () => {
+    const mod = loadMod({ commands: [{ name: "diff" }] });
+    await mod.fire("session.start", { cwd: "/repo", surface: "terminal", isInteractive: true });
+    // T3 sends it behind a space; Claude Code refuses a plugin's prompt that begins with /.
+    await mod.send({
+      type: "prompt",
+      id: "c1",
+      text: " /Users/me/notes.txt what is this",
+      promptUuid: "p1",
+    });
+    await tick();
+    assert.lengthOf(mod.submits, 1);
+    const sent = (mod.submits[0] as { text: string }).text;
+    assert.notEqual(sent.trim().charAt(0), "/");
+    let taken: unknown;
+    await mod.fire(
+      "prompt.submit",
+      { text: sent, origin: { kind: "plugin", name: "t3bridge", asUser: true } },
+      { next: async (passed) => (taken = passed) },
+    );
+    assert.include(taken, { text: "/Users/me/notes.txt what is this" });
+    assert.isUndefined(lastOf(mod, "prompt.dropped"));
+  });
+
+  it("does not hand a command T3 had not seen listed to the model: sent again, it runs as one", async () => {
+    const mod = loadMod({ commands: [{ name: "diff" }] });
+    await mod.fire("session.start", { cwd: "/repo", surface: "terminal", isInteractive: true });
+    await mod.send({ type: "prompt", id: "c1", text: " /diff", promptUuid: "p1" });
+    await tick();
+    assert.deepEqual(mod.submits, []);
+    assert.include(String(lastOf(mod, "prompt.dropped")?.reason), "/diff is a command");
+  });
+
+  it("reads the session's commands again a few seconds after it starts", async () => {
+    const commands: Array<{ readonly name: string }> = [];
+    const mod = loadMod({ commands });
+    await mod.fire("session.start", { cwd: "/repo", surface: "terminal", isInteractive: true });
+    // /diff registers a few seconds after the session starts (Claude Code 2.1.309).
+    commands.push({ name: "diff" });
+    await mod.within(3000);
+    await tick();
+    assert.include(mod.commandsFile(), "diff");
   });
 });
