@@ -542,6 +542,8 @@ export const layer: Layer.Layer<
         setAside: [] as Array<{
           readonly turn: ClaudeBridgeActiveTurn;
           end: Extract<ClaudeBridgeEvent, { type: "turn.complete" }> | null;
+          /** What the session drew in it, and after it, until it opens here; oldest first. */
+          heard: Array<ClaudeBridgeRegistry.ClaudeBridgeHeardInTurn>;
         }>,
         /** The mod's own reload command was just read: what it printed is skipped too. */
         upkeepOutputDue: false,
@@ -802,7 +804,11 @@ export const layer: Layer.Layer<
           return;
         }
         if (turn.complete !== null && !justOver(turn)) return;
-        state.setAside.push({ turn: turnOf(turn.start), end: turn.complete });
+        state.setAside.push({
+          turn: turnOf(turn.start),
+          end: turn.complete,
+          heard: [...(turn.heard ?? [])],
+        });
       };
       let replayedTurnId: string | null = null;
       if (activeTurn !== null && missedTurn === undefined) {
@@ -1546,6 +1552,8 @@ export const layer: Layer.Layer<
         }
       });
 
+      /** The calls heard before this attached that are shown here already, by `seq`. */
+      const heardTaken = new Set<number>();
       /**
        * Opens here the next turn set aside at attach, once the turn before it
        * has closed: its rows follow, for the run offered for it.
@@ -1559,8 +1567,21 @@ export const layer: Layer.Layer<
         state.byteOffset = Math.max(state.byteOffset, next.turn.transcriptOffset);
         state.turnEndsAtTurnStart = state.turnEndsRead;
         yield* promptTaken({ promptUuid: next.turn.promptUuid, commandId: undefined });
-        if (next.end !== null) {
-          state.pendingComplete = { event: next.end, seenAt: yield* Clock.currentTimeMillis };
+        // What the session drew in it shows in it; what it drew after its end
+        // is kept after it once it closes here (pendingComplete).
+        const end = next.end;
+        const heard = next.heard.filter((event) => !heardTaken.has(event.seq));
+        for (const event of heard) heardTaken.add(event.seq);
+        const inIt = (event: ClaudeBridgeRegistry.ClaudeBridgeHeardInTurn) =>
+          end === null || event.seq < end.seq;
+        yield* Effect.forEach(heard.filter(inIt), handleEvent, { discard: true });
+        if (end !== null) {
+          state.pendingComplete = { event: end, seenAt: yield* Clock.currentTimeMillis };
+          yield* Effect.forEach(
+            heard.filter((event) => !inIt(event)),
+            handleEvent,
+            { discard: true },
+          );
         }
         yield* Effect.logInfo("claude-bridge.set-aside-turn-taken-up", {
           sid,
@@ -2125,7 +2146,14 @@ export const layer: Layer.Layer<
                 yield* keepNoticesAfterEnd;
               }
               // The turns set aside at attach are over by now; this one is shown.
-              state.setAside = [];
+              // A call one of them heard and never showed is kept between turns.
+              for (const held of state.setAside.splice(0)) {
+                for (const heard of held.heard) {
+                  if (heardTaken.has(heard.seq) || heard.type !== "notification") continue;
+                  heardTaken.add(heard.seq);
+                  yield* keepBetweenTurns(heard);
+                }
+              }
               state.turnEndsAtTurnStart = state.turnEndsRead;
               if (
                 state.pendingPrompt !== null &&
@@ -2401,7 +2429,6 @@ export const layer: Layer.Layer<
       // attached, is shown as it would have been, once: in the turn up to its
       // end, after it from there. One over too long ago to show keeps it
       // between turns. The registry hands what came after `peek` over at `take`.
-      const heardTaken = new Set<number>();
       const takeUpHeard = (
         turn: ClaudeBridgeRegistry.ClaudeBridgeMissedTurn | undefined,
         upToItsEnd: boolean,
@@ -2439,8 +2466,20 @@ export const layer: Layer.Layer<
           yield* takeUpHeard(missedTurn, false);
         }
       }
+      // While a turn waits here to open, what the session draws is that
+      // turn's (or after it), shown when it opens.
+      const heldForSetAside = (event: ClaudeBridgeEvent) => {
+        if (event.type !== "notification" && event.type !== "message.display") return false;
+        const held =
+          event.type === "notification"
+            ? state.setAside.at(-1)
+            : state.setAside.find((entry) => entry.turn.turnId === event.turnId);
+        if (held === undefined) return false;
+        held.heard.push(event);
+        return true;
+      };
       yield* registry
-        .subscribe(sid, (event) => handleEvent(event))
+        .subscribe(sid, (event) => (heldForSetAside(event) ? Effect.void : handleEvent(event)))
         .pipe(Effect.provideService(Scope.Scope, sessionScope));
       // From here the session's events come to this attachment. What reached
       // the list before this point is taken up now: the end of a turn open
@@ -2461,6 +2500,8 @@ export const layer: Layer.Layer<
         const open = translator.openTurnId();
         if (held !== undefined) {
           held.end ??= turn.complete;
+          const kept = new Set(held.heard.map((event) => event.seq));
+          held.heard.push(...(turn.heard ?? []).filter((event) => !kept.has(event.seq)));
         } else if (open === turnId) {
           if (turn.complete !== null && state.pendingComplete?.event.turnId !== turnId) {
             yield* handleEvent(turn.complete);

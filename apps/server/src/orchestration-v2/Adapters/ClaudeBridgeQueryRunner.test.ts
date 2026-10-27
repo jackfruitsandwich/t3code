@@ -4073,6 +4073,59 @@ describe("ClaudeBridgeQueryRunner missed turns", () => {
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
+  it.live("shows what the session drew in the turn begun since in that turn, once it opens", () =>
+    Effect.gen(function* () {
+      const now = yield* Clock.currentTimeMillis;
+      const first = quickRows(now);
+      const transcript = first + nextRow(now);
+      const toast = (seq: number, message: string) =>
+        ({
+          seq,
+          at: now,
+          type: "notification",
+          message,
+          title: "",
+          kind: "ui.toast",
+          dialog: false,
+        }) as const;
+      const bridge = yield* attach({
+        protocol: 2,
+        bridgeCanUseTool: () => null,
+        transcript,
+        missedTurns: (at) => [
+          { ...turn(at, 8_000, first), offered: true },
+          {
+            start: nextStart(at - 1_000, Buffer.byteLength(first)),
+            complete: null,
+            offered: true,
+            heard: [toast(5, "Indexed 40 files")],
+          },
+        ],
+        activeTurn: {
+          turnId: "turn-next",
+          startedAt: now - 1_000,
+          transcriptOffset: Buffer.byteLength(first),
+        },
+      });
+      const frames = yield* shownFrames(bridge);
+      yield* bridge.handler(
+        { ...nextEnd(now, Buffer.byteLength(transcript)), seq: 6 },
+        bridge.process,
+      );
+      yield* bridge.handler(toast(7, "Index saved"), bridge.process);
+      yield* settled(
+        () => closed(frames).length === 2 && bridge.noticesBetweenTurns.length > 0,
+        "both turns' ends",
+      );
+      const noticesIn = (part: ReadonlyArray<SDKMessage>) =>
+        part.flatMap((frame) => (isClaudeBridgeNoticeFrame(frame) ? [frame.content] : []));
+      const firstEnd = frames.findIndex((frame) => frame.type === "result");
+      assert.deepStrictEqual(noticesIn(frames.slice(0, firstEnd)), []);
+      assert.deepStrictEqual(noticesIn(frames.slice(firstEnd + 1)), ["Indexed 40 files"]);
+      assert.deepStrictEqual(bridge.noticesBetweenTurns, ["Index saved"]);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
   it.live("closes a replayed turn before a turn that begins as it attaches", () =>
     Effect.gen(function* () {
       const now = yield* Clock.currentTimeMillis;
