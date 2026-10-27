@@ -390,6 +390,56 @@ describe("the mod's requests for a choice only the terminal's dialog can give", 
   });
 });
 
+describe("the mod's call for the person about a request T3 is not told of yet", () => {
+  const told = (mod: ReturnType<typeof loadMod>) =>
+    mod
+      .events()
+      .map((event) => event.type)
+      .filter((type) => type === "approval.request" || type === "notification");
+  const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+  it("is passed on after T3 is told of the request, which T3 then shows as a card", async () => {
+    const mod = loadMod();
+    await mod.fire("session.start", { cwd: "/repo", surface: "terminal", isInteractive: true });
+    await mod.fire("turn.start", { turnId: "t1", text: "go" });
+    await mod.fire(
+      "tool.check",
+      { tool: "Write", tool_use_id: "tu1", input: {} },
+      { next: async () => ({ decision: "ask" }) },
+    );
+    const answer = mod.fire(
+      "classic.PermissionRequest",
+      { tool_name: "Write", tool_input: {} },
+      { next: async () => "the terminal's dialog" },
+    );
+    await tick();
+    // T3 attaches to the session after its dialog opened: the call comes first.
+    await mod.fire("classic.Notification", {
+      message: "Claude needs your permission",
+      notification_type: "permission_prompt",
+    });
+    await tick();
+    assert.deepEqual(told(mod), []);
+    mod.put("t3.json", { heartbeatAt: Date.now(), pid: 1 });
+    for (let waited = 0; waited < 40 && told(mod).length < 2; waited += 1) await tick();
+    assert.deepEqual(told(mod), ["approval.request", "notification"]);
+    await mod.fire("session.append", {
+      message: { content: [{ type: "tool_result", tool_use_id: "tu1" }] },
+    });
+    assert.equal(await answer, "the terminal's dialog");
+  });
+
+  it("is passed on at once when no request waits for T3", async () => {
+    const mod = loadMod();
+    await mod.fire("session.start", { cwd: "/repo", surface: "terminal", isInteractive: true });
+    await mod.fire("classic.Notification", {
+      message: "Claude needs your permission",
+      notification_type: "permission_prompt",
+    });
+    assert.deepEqual(told(mod), ["notification"]);
+  });
+});
+
 describe("the mod's report of another plugin's lines", () => {
   const notices = (mod: ReturnType<typeof loadMod>) =>
     mod

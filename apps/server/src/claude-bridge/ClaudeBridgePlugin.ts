@@ -236,6 +236,9 @@ const answers = new Map()
 // to this session (it was restarted, or let the session go) reads it there
 // and attaches, and is then told the request itself.
 const waiting = new Map()
+// The requests among them T3 has not been told of yet: held while T3
+// attaches to a session whose dialog opened before it did.
+const untold = new Set()
 // The draft in this terminal's prompt box, shared with T3's message box for
 // the thread: what the box holds, and a count that moves with each change of
 // it, whoever made the change. T3's draft comes back as a 'draft' command.
@@ -915,6 +918,11 @@ async function pollInbox($) {
   }
 }
 
+async function tellOnceTold($, call) {
+  for (let waited = 0; untold.size > 0 && waited < T3_ATTACH_GRACE_S + 2; waited += 1) await sleepOutsideBudget($)
+  await emit($, 'notification', call)
+}
+
 async function sleepOutsideBudget($) {
   try { await $.process.run(['sleep', '1'], { timeoutMs: 5000 }) } catch {}
 }
@@ -1426,7 +1434,12 @@ export function register(on) {
       if (e && typeof e.message === 'string' && e.message.trim()) {
         // Whether it calls the person to something open in the terminal.
         const dialog = await dialogOpen($)
-        await emit($, 'notification', { message: e.message, title: typeof e.title === 'string' ? e.title : '', kind: String(e.notification_type || ''), dialog: dialog })
+        const call = { message: e.message, title: typeof e.title === 'string' ? e.title : '', kind: String(e.notification_type || ''), dialog: dialog }
+        // A call about a request held for T3 is passed on once T3 has been
+        // told of the request (T3 then shows it as a card, not as a dialog
+        // only the terminal can answer) or the terminal's dialog took it.
+        if (call.kind === 'permission_prompt' && untold.size > 0) tellOnceTold($, call).catch(() => {})
+        else await emit($, 'notification', call)
       }
     } catch {}
     return next(e)
@@ -1852,15 +1865,20 @@ export function register(on) {
     // Held for T3 from here on, and listed as waiting for as long: a T3 that
     // is running with nothing attached to this session attaches for it.
     await noteWaiting($, toolUseId, { toolUseId: toolUseId, kind: 'approval', agentType: e.agent_id ? String(e.agent_type || 'subagent') : undefined })
+    untold.add(toolUseId)
     try {
       // T3 is told once it is in sight, which can take a few seconds after
       // this mod was reloaded. A dialog in the terminal takes the request if
       // T3 does not show; with no terminal it waits for T3 as long as T3 has
       // been around at all.
-      if (!(await t3InSightSoon($, () => settledCalls.has(toolUseId), !withTerminal)) && (withTerminal || !t3Expected())) return next(e)
+      if (!(await t3InSightSoon($, () => settledCalls.has(toolUseId), !withTerminal)) && (withTerminal || !t3Expected())) {
+        untold.delete(toolUseId)
+        return next(e)
+      }
       const request = { toolUseId: toolUseId, tool: e.tool_name, input: e.tool_input, reason: ask.because, turnId: activeTurn ? activeTurn.turnId : undefined, alsoInTerminal: true, suggestions: Array.isArray(e.permission_suggestions) ? e.permission_suggestions : undefined, agentType: e.agent_id ? String(e.agent_type || 'subagent') : undefined, approveWithMode: await modeWithApproval($, e) }
       const askT3 = () => emit($, 'approval.request', request)
       await askT3()
+      untold.delete(toolUseId)
       const keepT3Told = t3Teller($, askT3, () => emit($, 'approval.resolved', { toolUseId: toolUseId, decision: 'ask', by: 'detached' }))
       let unseenFor = 0
       for (;;) {
@@ -1906,6 +1924,7 @@ export function register(on) {
         await sleepOutsideBudget($)
       }
     } finally {
+      untold.delete(toolUseId)
       await noteWaiting($, toolUseId, null)
     }
   })
