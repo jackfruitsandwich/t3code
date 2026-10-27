@@ -60,6 +60,22 @@ export interface SessionImporterShape {
   }) => Effect.Effect<void>;
 
   /**
+   * Give the thread holding a running Claude Code session a line its
+   * terminal drew between turns that the record does not hold (another
+   * plugin's toast, a dialog open there): a notice after the run that was
+   * the latest when it was drawn, as the record's own notices between turns
+   * are placed. Does nothing when no thread holds the session.
+   */
+  readonly addLiveClaudeNotice: (input: {
+    readonly sessionId: string;
+    readonly transcriptPath: string;
+    /** Names the notice: the same one is added once. */
+    readonly noticeId: string;
+    readonly text: string;
+    readonly atMs: number;
+  }) => Effect.Effect<void>;
+
+  /**
    * The session under whose id T3 holds the conversation a Claude Code
    * session is part of: the session itself, or an earlier one whose record
    * says the conversation continued here (a session sent to the background

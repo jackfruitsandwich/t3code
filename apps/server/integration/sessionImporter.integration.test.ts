@@ -3452,6 +3452,77 @@ runtimeTest(
     }),
 );
 
+runtimeTest(
+  "a line the terminal drew between turns, which the record does not hold, follows the run before it",
+  (h) =>
+    Effect.gen(function* () {
+      // Oct 26: another plugin's toast and a dialog open in the terminal, heard
+      // with no turn open, were dropped.
+      const claudeId = "aaaaaaaa-1111-4111-8111-1111111111f9";
+      const c = claudeSession({ sessionId: claudeId, cwd: h.workspace });
+      const claudePath = h.claudeFile(claudeId);
+      const threadId = importedThreadId(claudeId);
+      yield* h.write(claudePath, [
+        c.user("user-1", "Fix the login bug please", "2026-07-01T10:00:00.000Z"),
+        c.assistant("assistant-1", "I fixed the login bug.", "2026-07-01T10:00:05.000Z"),
+      ]);
+      const importer = yield* h.importer({ bridgeDir: yield* h.makeDir("bridge") });
+      yield* importer.sweepNow();
+      for (const run of [
+        { ordinal: 1, iso: "2026-07-01T12:00:00.000Z", text: "Run the tests" },
+        { ordinal: 2, iso: "2026-07-01T14:00:00.000Z", text: "Ship it" },
+      ]) {
+        yield* seedT3Run(h, threadId, CLAUDE, "completed", run);
+        yield* h.eventSink.write({
+          events: [
+            seedTimelineRow({
+              threadId,
+              key: `prompt-${run.ordinal}`,
+              messageId: MessageId.make(`seed-prompt:${threadId}:${run.ordinal}`),
+              role: "user",
+              text: run.text,
+              at: DateTime.makeUnsafe(run.iso),
+              runId: RunId.make(
+                run.ordinal === 1 ? `seed-run:${threadId}` : `seed-run:${threadId}:2`,
+              ),
+            }),
+          ],
+        });
+      }
+      yield* importer.addLiveClaudeNotice({
+        sessionId: claudeId,
+        transcriptPath: claudePath,
+        noticeId: "notice-instance-1-7",
+        text: "Indexed 40 files",
+        atMs: Date.parse("2026-07-01T13:00:00.000Z"),
+      });
+      // A session no thread holds has nowhere to say it.
+      yield* importer.addLiveClaudeNotice({
+        sessionId: "aaaaaaaa-1111-4111-8111-1111111111fa",
+        transcriptPath: "",
+        noticeId: "notice-instance-2-1",
+        text: "Do you trust the files in this folder?",
+        atMs: Date.parse("2026-07-01T13:00:00.000Z"),
+      });
+      const items = (yield* h.threads.getThreadRecords(threadId, ["turnItems"])).turnItems
+        .toSorted((left, right) => left.ordinal - right.ordinal)
+        .flatMap((item) =>
+          item.type === "user_message" || item.type === "assistant_message"
+            ? [item.text]
+            : item.type === "system_notice"
+              ? [`notice: ${item.message} (run ${item.runId ?? "none"})`]
+              : [],
+        );
+      assert.deepEqual(items, [
+        "Fix the login bug please",
+        "I fixed the login bug.",
+        "Run the tests",
+        "notice: Indexed 40 files (run none)",
+        "Ship it",
+      ]);
+    }),
+);
+
 runtimeTest("a message sent into a turn that took it after its reply moves below that reply", (h) =>
   Effect.gen(function* () {
     const claudeId = "aaaaaaaa-1111-4111-8111-1111111111f5";

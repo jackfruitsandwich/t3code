@@ -32,6 +32,7 @@ import { CLAUDE_PROVIDER } from "../orchestration-v2/Adapters/ClaudeAdapterV2.ts
 import * as ProviderContinuationRequests from "../orchestration-v2/ProviderContinuationRequests.ts";
 import * as ProviderRuntimeRecoveryService from "../orchestration-v2/ProviderRuntimeRecoveryService.ts";
 import {
+  claudeBetweenTurnsNotificationText,
   claudeBridgeRequestTurnText,
   claudeTurnPromptLabel,
   isClaudeHarnessPrompt,
@@ -403,9 +404,32 @@ const make = Effect.gen(function* () {
     }),
   );
 
+  // What the terminal drew of a call for the person's attention with no turn
+  // open in T3 to show it in: the thread keeps it between turns.
+  const keepNotice: ClaudeBridgeRegistry.ClaudeBridgeNotificationHandler = (event, entry) => {
+    const text = claudeBetweenTurnsNotificationText(event);
+    if (text === null) return Effect.void;
+    return importer.addLiveClaudeNotice({
+      sessionId: entry.sid,
+      transcriptPath: entry.session.transcriptPath,
+      noticeId: `notice-${entry.instanceId}-${event.seq}`,
+      text,
+      atMs: event.at,
+    });
+  };
+  yield* registry.onNoticeBetweenTurns(keepNotice);
+
   yield* registry.judgeContinuations((input) => importer.claudeSessionHeldElsewhere(input));
+  // With nothing attached, no card is shown for the session: a call heard
+  // while it runs no turn and holds nothing for T3 is between turns.
   yield* registry.onUnattachedEvent((event, entry) =>
-    event.type === "turn.start" ? offerTurn(entry, event) : Effect.void,
+    event.type === "turn.start"
+      ? offerTurn(entry, event)
+      : event.type === "notification" &&
+          entry.session.activeTurn === null &&
+          (entry.session.waiting ?? []).length === 0
+        ? keepNotice(event, entry)
+        : Effect.void,
   );
   yield* registry.onUnattachedRequest(offerRequest);
   // A turn T3 let go of when it lost contact with the session, running on now

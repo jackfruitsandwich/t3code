@@ -129,6 +129,9 @@ const COMMAND_TURN_WAIT_MS = 1500
 const COMMAND_PANEL_WAIT_MS = 6000
 // After the first look, how often a command still out looks for a dialog it opened.
 const COMMAND_PANEL_RELOOK_MS = 1000
+// How long a tool call of the main loop is out before a dialog open in the
+// terminal is taken for its own (see sayCallDialog); looked at again as often.
+const CALL_DIALOG_WAIT_MS = 3000
 // Built-in commands that, typed with no argument, open a panel in the terminal
 // (observed on Claude Code 2.1.296 by running each one). A panel can only be
 // closed by the person at that terminal and everything queued behind it waits,
@@ -142,6 +145,11 @@ const ARGUMENT_PANELS = new Set(['add-dir', 'usage-credits', 'extra-usage', 'sto
 // up Claude in Chrome, connected or not now; pick a role) and writes it into
 // the call's input.
 const TERMINAL_DIALOG_TOOLS = new Set(['OfferChromeSetup', 'ShowOnboardingRolePicker'])
+// Tools whose call draws a dialog of its own in the terminal, which T3 has no
+// card for: the choice dialogs above and ProposeGoal's approval (2.1.310 tool
+// inputs). Only their calls are looked at for it; a dialog open beside any
+// other call (a panel the person opened mid-turn) is not the call's.
+const CALL_DIALOG_TOOLS = new Set([...TERMINAL_DIALOG_TOOLS, 'ProposeGoal'])
 const KNOWN_PANELS = new Set([${CLAUDE_BARE_PANEL_COMMANDS.map((name) => `'${name}'`).join(", ")}])
 
 const instanceId = Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8)
@@ -201,6 +209,13 @@ const drawing = new Map()
 // the calls whose result is already in the record (answered, here or anywhere).
 const asks = []
 const settledCalls = new Set()
+// The main loop's tool calls not over yet, by call: the tool, when it began,
+// and whether T3 was told it waits in a dialog of the terminal. How many calls
+// subagents have out; when the session last called the person to a dialog
+// open in the terminal (classic.Notification).
+const callsOut = new Map()
+let agentCallsOut = 0
+let dialogCalledAt = 0
 let mcpSession = null
 let mcpRequestId = 0
 let effort = null
@@ -677,6 +692,26 @@ async function dialogOpen($) {
   } catch {
     return false
   }
+}
+
+// A call of the main loop still out a few seconds after it began, with a
+// dialog holding the prompt box and nothing held for T3: the dialog is the
+// call's own (ProposeGoal's one-key choice, OfferChromeSetup's), which only
+// the terminal can show and answer, and T3 is told so once. Not while the
+// dialog may be for something else (a request T3 shows as a card, a panel a
+// command from T3 opened, a subagent's call, another call out beside it), nor
+// once the session itself has called the person to it. A call merely running
+// finds no dialog, and is looked at again until it is over.
+async function sayCallDialog($, toolUseId) {
+  const call = callsOut.get(toolUseId)
+  if (!call || call.told || settledCalls.has(toolUseId) || dialogCalledAt >= call.at) return
+  if (waiting.size > 0 || untold.size > 0 || panelsOpen > 0 || agentCallsOut > 0 || callsOut.size > 1 || !(await dialogOpen($))) {
+    $.clock.after(CALL_DIALOG_WAIT_MS, () => { sayCallDialog($, toolUseId).catch(() => {}) })
+    return
+  }
+  if (call.told || !callsOut.has(toolUseId) || dialogCalledAt >= call.at) return
+  call.told = true
+  await emit($, 'notification', { message: call.tool, title: '', kind: 'tool_dialog', dialog: true })
 }
 
 async function opensPanel($, name) {
@@ -1435,6 +1470,7 @@ export function register(on) {
         // Whether it calls the person to something open in the terminal.
         const dialog = await dialogOpen($)
         const call = { message: e.message, title: typeof e.title === 'string' ? e.title : '', kind: String(e.notification_type || ''), dialog: dialog }
+        if (dialog) dialogCalledAt = Date.now()
         // A call about a request held for T3 is passed on once T3 has been
         // told of the request (T3 then shows it as a card, not as a dialog
         // only the terminal can answer) or the terminal's dialog took it.
@@ -1445,16 +1481,12 @@ export function register(on) {
     return next(e)
   })
 
-  // Another plugin's lines for the person, in its words: a transcript line
-  // (one kept to the debug log is not), a toast, the line under a call's
-  // open dialog; and a pane it opened, which only the terminal draws. T3
-  // shows each as a notice. This mod's own calls skip its hooks.
-  on('ui.log', async ($, e, next) => {
-    const out = await next(e)
-    if (e && e.to !== 'debug') await pluginLine($, out, e.text, 'ui.log')
-    return out
-  })
-
+  // Another plugin's lines for the person, in its words: a toast, the line
+  // under a call's open dialog; and a pane it opened, which only the terminal
+  // draws. T3 shows each as a notice. A transcript line (ui.log) is not among
+  // them: the session's record holds it ("<plugin>: <text>", an informational
+  // row) and T3 shows it from there (measured on 2.1.301 to 2.1.310; passing it
+  // on here as well showed it twice). This mod's own calls skip its hooks.
   on('ui.toast', async ($, e, next) => {
     const out = await next(e)
     if (e) await pluginLine($, out, e.text, 'ui.toast')
@@ -1714,6 +1746,21 @@ export function register(on) {
       }
     } catch {}
     return next(e)
+  })
+
+  // Every tool call, from when the engine is about to run it until it is
+  // over: its permission prompt and the tool itself run beneath. One of the
+  // main loop still out a few seconds on may wait in a dialog of its own.
+  on('tool.call', async ($, e, next) => {
+    if (passive || !e || typeof e.tool_use_id !== 'string') return next(e)
+    if (e.agentId) {
+      agentCallsOut += 1
+      try { return await next(e) } finally { agentCallsOut -= 1 }
+    }
+    const toolUseId = e.tool_use_id
+    callsOut.set(toolUseId, { tool: String(e.tool || ''), at: Date.now(), told: false })
+    if (CALL_DIALOG_TOOLS.has(String(e.tool || ''))) $.clock.after(CALL_DIALOG_WAIT_MS, () => { sayCallDialog($, toolUseId).catch(() => {}) })
+    try { return await next(e) } finally { callsOut.delete(toolUseId) }
   })
 
   on('tool.call', { tool: 'EndConversation' }, async ($, e, next) => {

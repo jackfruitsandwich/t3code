@@ -31,7 +31,7 @@ import type {
 import { isRecord, parseJsonlLine } from "../import/sessionImportTypes.ts";
 
 export const CLAUDE_BRIDGE_PROTOCOL_VERSION = 2;
-export const CLAUDE_BRIDGE_MOD_VERSION = "0.3.39";
+export const CLAUDE_BRIDGE_MOD_VERSION = "0.3.40";
 /**
  * The first protocol whose mod runs slash commands, answers questions with
  * their answers and reports the session's own commands. A process still on an
@@ -1274,6 +1274,26 @@ export const claudeSessionNotificationText = (input: {
   readonly message: string;
   readonly dialog: boolean;
 }): string => (input.dialog ? `${input.message}\n\n${CLAUDE_TERMINAL_DIALOG_MARK}` : input.message);
+
+/**
+ * What the thread keeps, as a notice between turns, of a call for the
+ * person's attention that came with no turn open to show it in: what the
+ * terminal draws of it. A dialog open there, with T3's mark; another
+ * plugin's toast, or the line for a pane it opened. Null for the rest: a
+ * call with no dialog (Claude Code's idle reminder) reaches only the
+ * desktop's notifications, and a plugin's transcript line is a row of the
+ * record (`<plugin>: <text>`), which the thread takes from there.
+ */
+export const claudeBetweenTurnsNotificationText = (input: {
+  readonly message: string;
+  readonly kind: string;
+  readonly dialog: boolean;
+}): string | null =>
+  input.dialog
+    ? claudeSessionNotificationText(input)
+    : input.kind === "ui.toast" || input.kind === "ui.open"
+      ? input.message
+      : null;
 
 /**
  * The frame the thread shows a session notice from: what a `system` row said,

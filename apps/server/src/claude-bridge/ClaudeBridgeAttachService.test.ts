@@ -18,7 +18,10 @@ import {
   isHarnessPrompt,
   layer as attachLayer,
 } from "./ClaudeBridgeAttachService.ts";
-import { parseClaudeBridgeSessionFile } from "./ClaudeBridgeProtocol.ts";
+import {
+  CLAUDE_TERMINAL_DIALOG_MARK,
+  parseClaudeBridgeSessionFile,
+} from "./ClaudeBridgeProtocol.ts";
 import * as ClaudeBridgeRegistry from "./ClaudeBridgeRegistry.ts";
 
 describe("isHarnessPrompt", () => {
@@ -189,6 +192,7 @@ describe("the first turn of a session that carries a conversation on", () => {
                 adopted.push(input.sessionId);
               }),
             healLiveClaudeSession: () => Effect.void,
+            addLiveClaudeNotice: () => Effect.void,
             // Claude Code makes the new record a moment after the session starts its turn.
             claudeConversationHolder: () => Effect.succeed(null),
             claudeSessionHeldElsewhere: () => Effect.succeed(false),
@@ -374,6 +378,7 @@ describe("a turn the session was running when the server came up", () => {
             sweepNow: () => Effect.void,
             adoptLiveClaudeSession: () => Effect.void,
             healLiveClaudeSession: () => Effect.void,
+            addLiveClaudeNotice: () => Effect.void,
             claudeConversationHolder: () => Effect.succeed(null),
             claudeSessionHeldElsewhere: () => Effect.succeed(false),
           }),
@@ -529,6 +534,7 @@ describe("a turn T3 let go of when it lost contact with the session", () => {
             sweepNow: () => Effect.void,
             adoptLiveClaudeSession: () => Effect.void,
             healLiveClaudeSession: () => Effect.void,
+            addLiveClaudeNotice: () => Effect.void,
             claudeConversationHolder: () => Effect.succeed(null),
             claudeSessionHeldElsewhere: () => Effect.succeed(false),
           }),
@@ -577,5 +583,131 @@ describe("a turn T3 let go of when it lost contact with the session", () => {
         ["thread-live", "provider-thread-live", "agent", undefined],
       );
     }).pipe(Effect.scoped, Effect.provide(SqlitePersistence.layerMemory)),
+  );
+});
+
+describe("a call for the person's attention with no turn open in T3", () => {
+  /** What the thread was given to keep between turns, from each of the two ways in. */
+  const kept = Effect.gen(function* () {
+    const notices: Array<{ readonly noticeId: string; readonly text: string }> = [];
+    let onEvent: ClaudeBridgeRegistry.ClaudeBridgeEventHandler | null = null;
+    let onNotice: ClaudeBridgeRegistry.ClaudeBridgeNotificationHandler | null = null;
+    const none = yield* ClaudeBridgeRegistry.ClaudeBridgeRegistry.pipe(
+      Effect.provide(ClaudeBridgeRegistry.layerTest),
+    );
+    yield* Layer.build(attachLayer).pipe(
+      Effect.provideService(
+        ClaudeBridgeRegistry.ClaudeBridgeRegistry,
+        ClaudeBridgeRegistry.ClaudeBridgeRegistry.of({
+          ...none,
+          onUnattachedEvent: (handler) =>
+            Effect.sync(() => {
+              onEvent = handler;
+            }),
+          onNoticeBetweenTurns: (handler) =>
+            Effect.sync(() => {
+              onNotice = handler;
+            }),
+        }),
+      ),
+      Effect.provideService(
+        SessionImporter.SessionImporter,
+        SessionImporter.SessionImporter.of({
+          start: () => Effect.void,
+          sweepNow: () => Effect.void,
+          adoptLiveClaudeSession: () => Effect.void,
+          healLiveClaudeSession: () => Effect.void,
+          addLiveClaudeNotice: (input) =>
+            Effect.sync(() => {
+              notices.push({ noticeId: input.noticeId, text: input.text });
+            }),
+          claudeConversationHolder: () => Effect.succeed(null),
+          claudeSessionHeldElsewhere: () => Effect.succeed(false),
+        }),
+      ),
+      Effect.provideService(
+        ProviderRuntimeRecoveryService.ProviderRuntimeRecoveryService,
+        ProviderRuntimeRecoveryService.ProviderRuntimeRecoveryService.of({
+          reconcile: () => Effect.die("unused"),
+          prepareForShutdown: Effect.void,
+          recover: Effect.die("unused"),
+          awaitStartupRecovery: Effect.void,
+        }),
+      ),
+      Effect.provideService(ProviderContinuationRequests.ProviderContinuationRequests, {
+        offer: () => Effect.void,
+        take: Effect.never,
+      }),
+    );
+    const entry = (fields: Record<string, unknown> = {}) => {
+      const session = parseClaudeBridgeSessionFile({
+        sid: "live",
+        instanceId: "instance-live",
+        heartbeatAt: 1_750_000_000_000,
+        isInteractive: true,
+        transcriptPath: "/records/live.jsonl",
+        ...fields,
+      });
+      assert.isNotNull(session);
+      return { sid: "live", instanceId: "instance-live", dir: "/bridge/live", session: session! };
+    };
+    const call = (seq: number, kind: string, message: string, dialog = false) => ({
+      seq,
+      at: 1_750_000_000_000 + seq,
+      type: "notification" as const,
+      message,
+      title: "",
+      kind,
+      dialog,
+    });
+    assert.isNotNull(onEvent);
+    assert.isNotNull(onNotice);
+    const unattached = onEvent as unknown as ClaudeBridgeRegistry.ClaudeBridgeEventHandler;
+    const attached = onNotice as unknown as ClaudeBridgeRegistry.ClaudeBridgeNotificationHandler;
+    // An attachment between turns hands its calls on.
+    yield* attached(call(1, "ui.toast", "Indexed 40 files"), entry());
+    yield* attached(
+      call(2, "ui.open", "Build log: it is shown in the Claude Code terminal only."),
+      entry(),
+    );
+    yield* attached(
+      call(3, "trust_dialog", "Do you trust the files in this folder?", true),
+      entry(),
+    );
+    // The desktop's reminder, which the terminal does not draw; a transcript
+    // line, which the record holds and the thread takes from there.
+    yield* attached(call(4, "idle_prompt", "Claude is waiting for your input"), entry());
+    yield* attached(call(5, "ui.log", "Indexed 41 files"), entry());
+    // With nothing attached: while the session runs no turn and holds nothing for T3.
+    yield* unattached(call(6, "ui.toast", "Indexed 42 files"), entry());
+    yield* unattached(
+      call(7, "ui.toast", "Indexed 43 files"),
+      entry({
+        activeTurn: { turnId: "turn-1", startedAt: 1_749_999_990_000, transcriptOffset: 0 },
+      }),
+    );
+    yield* unattached(
+      call(8, "permission_prompt", "Claude needs your permission to use Bash", true),
+      entry({ waiting: [{ toolUseId: "tool-1", kind: "approval" }] }),
+    );
+    return notices;
+  }).pipe(Effect.scoped, Effect.provide(SqlitePersistence.layerMemory));
+
+  // Oct 26: every call heard while no turn was open in T3 was dropped, though the terminal drew it.
+  it.effect("is kept between turns when the terminal draws it, and only then", () =>
+    Effect.gen(function* () {
+      assert.deepStrictEqual(yield* kept, [
+        { noticeId: "notice-instance-live-1", text: "Indexed 40 files" },
+        {
+          noticeId: "notice-instance-live-2",
+          text: "Build log: it is shown in the Claude Code terminal only.",
+        },
+        {
+          noticeId: "notice-instance-live-3",
+          text: `Do you trust the files in this folder?\n\n${CLAUDE_TERMINAL_DIALOG_MARK}`,
+        },
+        { noticeId: "notice-instance-live-6", text: "Indexed 42 files" },
+      ]);
+    }),
   );
 });

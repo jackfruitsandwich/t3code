@@ -129,6 +129,8 @@ const loadMod = (
     assert.isDefined(path, "the mod wrote its session file");
     return JSON.parse(writes.get(path ?? "") ?? "{}") as Record<string, unknown>;
   };
+  /** Whether the mod hooks `event` at all. */
+  const hooked = (event: string) => hooks.has(event);
   /** What the mod told T3, in order. */
   const events = () =>
     [...writes.keys()]
@@ -178,6 +180,7 @@ const loadMod = (
     fire,
     sessionFile,
     events,
+    hooked,
     send,
     submits,
     put,
@@ -440,6 +443,130 @@ describe("the mod's call for the person about a request T3 is not told of yet", 
   });
 });
 
+describe("the mod's word on a tool call that waits in a dialog only the terminal can answer", () => {
+  const said = (mod: ReturnType<typeof loadMod>) =>
+    mod
+      .events()
+      .filter((event) => event.type === "notification")
+      .map((event) => `${String(event.message)} ${String(event.kind)} ${String(event.dialog)}`);
+  const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+  const started = async () => {
+    const mod = loadMod();
+    await mod.fire("session.start", { cwd: "/repo", surface: "terminal", isInteractive: true });
+    await mod.fire("turn.start", { turnId: "t1", text: "go" });
+    return mod;
+  };
+  /** A call the engine runs (its permission prompt and the tool beneath), out until it ends. */
+  const callOut = (mod: ReturnType<typeof loadMod>, e: Record<string, unknown>) => {
+    let finish: (value: unknown) => void = () => {};
+    const result = new Promise((resolve) => {
+      finish = resolve;
+    });
+    const out = mod.fire("tool.call", e, { next: () => result });
+    return async () => {
+      finish({ ref: "r", text: "", result: {} });
+      await out;
+    };
+  };
+
+  // Claude Code 2.1.310: ProposeGoal asks in a one-key dialog from inside the call.
+  it("says it once, naming the tool, when the call's own dialog holds the terminal", async () => {
+    const mod = await started();
+    const end = callOut(mod, { tool: "ProposeGoal", tool_use_id: "tu1", condition: "tests pass" });
+    mod.box.dialog = true;
+    await mod.within(3000);
+    assert.deepEqual(said(mod), ["ProposeGoal tool_dialog true"]);
+    await mod.within(3000);
+    assert.deepEqual(said(mod), ["ProposeGoal tool_dialog true"]);
+    await end();
+  });
+
+  it("looks again while the call is out, and says nothing of a call merely running", async () => {
+    const mod = await started();
+    const endBash = callOut(mod, { tool: "Bash", tool_use_id: "tu1", command: "sleep 30" });
+    await mod.within(3000);
+    // A panel the person opened in the terminal mid-turn is not the call's dialog.
+    mod.box.dialog = true;
+    await mod.within(3000);
+    assert.deepEqual(said(mod), []);
+    mod.box.dialog = false;
+    await endBash();
+    // Over: it is looked at no more.
+    mod.box.dialog = true;
+    await mod.within(3000);
+    assert.deepEqual(said(mod), []);
+    // A permission dialog the terminal alone can answer opens a moment into the call.
+    mod.box.dialog = false;
+    const endChrome = callOut(mod, { tool: "OfferChromeSetup", tool_use_id: "tu2" });
+    await mod.within(3000);
+    assert.deepEqual(said(mod), []);
+    mod.box.dialog = true;
+    await mod.within(3000);
+    assert.deepEqual(said(mod), ["OfferChromeSetup tool_dialog true"]);
+    await endChrome();
+  });
+
+  it("says nothing while a subagent's call is out: the dialog may be the subagent's", async () => {
+    const mod = await started();
+    mod.box.dialog = true;
+    const endMain = callOut(mod, { tool: "ProposeGoal", tool_use_id: "tu-main" });
+    const endAgent = callOut(mod, {
+      tool: "AskUserQuestion",
+      tool_use_id: "tu-agent",
+      agentId: "agent-1",
+      questions: [],
+    });
+    await mod.within(3000);
+    await mod.within(3000);
+    assert.deepEqual(said(mod), []);
+    await endAgent();
+    await endMain();
+  });
+
+  it("says nothing while a request T3 shows as a card waits", async () => {
+    const mod = await started();
+    mod.put("t3.json", { heartbeatAt: Date.now(), pid: 1 });
+    const end = callOut(mod, { tool: "ProposeGoal", tool_use_id: "tu0" });
+    await mod.fire(
+      "tool.check",
+      { tool: "Write", tool_use_id: "tu1", input: {} },
+      { next: async () => ({ decision: "ask" }) },
+    );
+    const answer = mod.fire(
+      "classic.PermissionRequest",
+      { tool_name: "Write", tool_input: {} },
+      { next: async () => "the terminal's dialog" },
+    );
+    for (let waited = 0; waited < 40; waited += 1) {
+      if (mod.events().some((event) => event.type === "approval.request")) break;
+      await tick();
+    }
+    // Asked in T3 and in the terminal's dialog at once.
+    mod.box.dialog = true;
+    await mod.within(3000);
+    await mod.within(3000);
+    assert.deepEqual(said(mod), []);
+    await mod.fire("session.append", {
+      message: { content: [{ type: "tool_result", tool_use_id: "tu1" }] },
+    });
+    assert.equal(await answer, "the terminal's dialog");
+    await end();
+  });
+
+  it("leaves it to the session's own call for the person when that came", async () => {
+    const mod = await started();
+    const end = callOut(mod, { tool: "OfferChromeSetup", tool_use_id: "tu1" });
+    mod.box.dialog = true;
+    await mod.fire("classic.Notification", {
+      message: "Claude needs your permission",
+      notification_type: "permission_prompt",
+    });
+    await mod.within(3000);
+    assert.deepEqual(said(mod), ["Claude needs your permission permission_prompt true"]);
+    await end();
+  });
+});
+
 describe("the mod's report of another plugin's lines", () => {
   const notices = (mod: ReturnType<typeof loadMod>) =>
     mod
@@ -452,17 +579,14 @@ describe("the mod's report of another plugin's lines", () => {
     return mod;
   };
 
-  it("passes on a transcript line and a toast in its words, not a line kept to the debug log", async () => {
+  it("passes on a toast in its words, and leaves a transcript line to the record that holds it", async () => {
     const mod = await started();
-    await mod.fire("ui.log", { text: "prompt from composer: 12 chars", to: "transcript" });
-    await mod.fire("ui.log", { text: "cache miss for tu1", to: "debug" });
     await mod.fire("ui.toast", { text: "turn took 4 s" });
     // Refused by a hook below: the terminal draws nothing.
     await mod.fire("ui.toast", { text: "refused" }, { next: async () => ({ deny: "no" }) });
-    assert.deepEqual(notices(mod), [
-      ["prompt from composer: 12 chars", false],
-      ["turn took 4 s", false],
-    ]);
+    assert.deepEqual(notices(mod), [["turn took 4 s", false]]);
+    // The record's informational row ("<plugin>: <text>") is what T3 shows of a ui.log line.
+    assert.isFalse(mod.hooked("ui.log"));
   });
 
   it("passes on each new line under a call's open dialog once", async () => {

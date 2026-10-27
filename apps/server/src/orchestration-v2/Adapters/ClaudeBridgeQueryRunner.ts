@@ -2305,8 +2305,10 @@ export const layer: Layer.Layer<
             }
             case "notification": {
               // What it calls about is on a card here already, or no turn of
-              // the session's is open to show it in.
-              const shown = state.asking.size === 0 && sessionTurnOpen();
+              // the session's is open to show it in: the thread may keep that
+              // between turns.
+              const carded = state.asking.size > 0;
+              const shown = !carded && sessionTurnOpen();
               yield* Effect.logInfo("claude-bridge.notification", {
                 sid,
                 kind: event.kind,
@@ -2314,6 +2316,7 @@ export const layer: Layer.Layer<
                 dialog: event.dialog,
                 shown,
               });
+              if (!carded && !shown) yield* registry.noteNoticeBetweenTurns(bridgeProcess, event);
               if (!shown) return;
               const uuid = yield* crypto.randomUUIDv4.pipe(Effect.orDie);
               yield* emit([

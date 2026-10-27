@@ -651,7 +651,7 @@ function messageEvents(input: {
 /** The timeline row for a notice the harness wrote between turns, as a live run shows one. */
 function noticeEvent(
   threadId: ThreadId,
-  notice: ParsedSessionSystemNotice,
+  notice: Pick<ParsedSessionSystemNotice, "sourceId" | "text" | "timestamp">,
 ): OrchestrationV2DomainEvent {
   const at = dateTime(notice.timestamp);
   return {
@@ -4131,6 +4131,40 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
         ),
       );
 
+    const addLiveClaudeNotice: SessionImporterShape["addLiveClaudeNotice"] = (input) =>
+      Effect.gen(function* () {
+        const transcriptPath =
+          input.transcriptPath.length === 0 ? "" : yield* recordFilePath(input.transcriptPath);
+        const held = yield* claudeConversationThread(input.sessionId, transcriptPath);
+        if (held === undefined) return;
+        const { threadId } = held;
+        const notice = {
+          sourceId: input.noticeId,
+          text: input.text,
+          timestamp: DateTime.formatIso(DateTime.makeUnsafe(input.atMs)),
+        };
+        yield* turnItemPositions.allocate({
+          threadId,
+          turnItemId: importedTurnItemId(threadId, notice.sourceId),
+          runId: null,
+          runOrdinal: bandForTime(yield* threadRuns(threadId), input.atMs),
+        });
+        yield* eventSink.write({ events: [noticeEvent(threadId, notice)] });
+      }).pipe(
+        Effect.catch((error: unknown) =>
+          Effect.logWarning("session.importer.live-notice-failed", {
+            sessionId: input.sessionId,
+            error,
+          }),
+        ),
+        Effect.catchDefect((defect: unknown) =>
+          Effect.logWarning("session.importer.live-notice-defect", {
+            sessionId: input.sessionId,
+            defect,
+          }),
+        ),
+      );
+
     const claudeConversationHolder: SessionImporterShape["claudeConversationHolder"] = (input) =>
       claudeConversationThread(input.sessionId, input.transcriptPath).pipe(
         Effect.map((held) => held?.heldAs ?? null),
@@ -4150,6 +4184,7 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
       sweepNow: () => guardedSweep,
       adoptLiveClaudeSession,
       healLiveClaudeSession,
+      addLiveClaudeNotice,
       claudeConversationHolder,
       claudeSessionHeldElsewhere,
     } satisfies SessionImporterShape;

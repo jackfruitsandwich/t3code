@@ -39,6 +39,7 @@ import {
   isClaudePromptOfThePerson,
   claudeCompactingFrame,
   claudeSessionNoticeFrame,
+  claudeBetweenTurnsNotificationText,
   claudeSessionNotificationText,
   CLAUDE_TERMINAL_DIALOG_MARK,
   parseClaudeBridgeSessionFile,
@@ -1333,10 +1334,13 @@ describe("ClaudeBridgeProtocol parsers", () => {
 
   it("reads the terminal's draft, null where none is shared, and nothing from an older mod", () => {
     const base = { sid: SID, instanceId: "abc", heartbeatAt: 1000 };
-    assert.deepEqual(parseClaudeBridgeSessionFile({ ...base, draft: { text: "fix it", rev: 4 } })?.draft, {
-      text: "fix it",
-      rev: 4,
-    });
+    assert.deepEqual(
+      parseClaudeBridgeSessionFile({ ...base, draft: { text: "fix it", rev: 4 } })?.draft,
+      {
+        text: "fix it",
+        rev: 4,
+      },
+    );
     assert.isNull(parseClaudeBridgeSessionFile({ ...base, draft: null })?.draft);
     assert.isNull(parseClaudeBridgeSessionFile({ ...base, draft: { text: 3 } })?.draft);
     const older = parseClaudeBridgeSessionFile(base);
@@ -1455,6 +1459,30 @@ describe("ClaudeBridgeProtocol parsers", () => {
     });
     assert.isTrue(isClaudeBridgeNoticeFrame(frame));
     assert.isNull(parseClaudeBridgeEvent({ seq: 5, at: 7, type: "notification", message: "  " }));
+  });
+
+  it("keeps between turns what the terminal draws of a call, and what its record does not hold", () => {
+    const call = (kind: string, message: string, dialog = false) => ({ kind, message, dialog });
+    assert.equal(
+      claudeBetweenTurnsNotificationText(call("trust", "Do you trust this folder?", true)),
+      `Do you trust this folder?\n\n${CLAUDE_TERMINAL_DIALOG_MARK}`,
+    );
+    assert.equal(
+      claudeBetweenTurnsNotificationText(call("ui.toast", "Indexed 40 files")),
+      "Indexed 40 files",
+    );
+    assert.equal(
+      claudeBetweenTurnsNotificationText(
+        call("ui.open", "Build log: it is shown in the Claude Code terminal only."),
+      ),
+      "Build log: it is shown in the Claude Code terminal only.",
+    );
+    // The desktop's idle reminder is not drawn in the terminal.
+    assert.isNull(
+      claudeBetweenTurnsNotificationText(call("idle_prompt", "Claude is waiting for your input")),
+    );
+    // A plugin's transcript line is a row of the record ("plugin: text"): the thread has it from there.
+    assert.isNull(claudeBetweenTurnsNotificationText(call("ui.log", "Indexed 41 files")));
   });
 
   it("reads the session's word that it began to compact, and that it stopped", () => {

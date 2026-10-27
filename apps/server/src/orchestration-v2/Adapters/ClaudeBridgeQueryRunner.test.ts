@@ -131,6 +131,8 @@ const attach = (input: {
     const recordChanges: Array<ClaudeBridgeRegistry.ClaudeBridgeRecordChange> = [];
     /** The rows the runner left to the record to place, by uuid. */
     const leftToRecord: Array<string> = [];
+    /** The calls for the person's attention the runner left to the thread between turns. */
+    const noticesBetweenTurns: Array<string> = [];
     const subscribed = yield* Deferred.make<ClaudeBridgeRegistry.ClaudeBridgeEventHandler>();
     /** The sessions whose live process the runner asked for. */
     const asked: Array<string> = [];
@@ -189,6 +191,11 @@ const attach = (input: {
         Effect.sync(() => {
           recordChanges.push(change);
           leftToRecord.push(...(rows ?? []));
+        }),
+      onNoticeBetweenTurns: () => Effect.void,
+      noteNoticeBetweenTurns: (_process, event) =>
+        Effect.sync(() => {
+          noticesBetweenTurns.push(event.message);
         }),
       readClientSelection: () => Effect.succeed(null),
       writeClientSelection: () => Effect.void,
@@ -295,6 +302,7 @@ const attach = (input: {
       now,
       recordChanges,
       leftToRecord,
+      noticesBetweenTurns,
       asked,
       letGo,
       deliveries,
@@ -4263,4 +4271,110 @@ describe("claudeBridgePromptText", () => {
       null,
     );
   });
+});
+
+describe("ClaudeBridgeQueryRunner calls for the person's attention", () => {
+  const call = (
+    bridge: { readonly now: number },
+    seq: number,
+    kind: string,
+    message: string,
+    dialog = false,
+  ) => ({
+    seq,
+    at: bridge.now,
+    type: "notification" as const,
+    message,
+    title: "",
+    kind,
+    dialog,
+  });
+
+  // Oct 26: one heard with no turn open here was dropped, though the terminal drew it.
+  it.live("shows one in a turn, and hands one between turns on for the thread to keep", () =>
+    Effect.gen(function* () {
+      const bridge = yield* attach({ protocol: 2, bridgeCanUseTool: () => null, transcript: "" });
+      const base = { seq: 1, at: bridge.now, transcriptOffset: 0 };
+      yield* bridge.handler(
+        { ...base, type: "turn.start", turnId: "turn-a", text: "index it" },
+        bridge.process,
+      );
+      yield* bridge.handler(call(bridge, 2, "ui.toast", "Indexed 40 files"), bridge.process);
+      const opened = Array.from(
+        yield* bridge.session.messages.pipe(Stream.take(3), Stream.runCollect),
+      );
+      assert.deepStrictEqual(
+        opened.map((frame) => frame.type),
+        ["user", "system", "system"],
+      );
+      assert.isTrue(isClaudeBridgeNoticeFrame(opened[2]));
+      yield* bridge.handler(
+        {
+          ...base,
+          seq: 3,
+          type: "turn.complete",
+          turnId: "turn-a",
+          reason: "answer",
+          answer: "done",
+          isAborted: false,
+          durationMs: 10,
+        },
+        bridge.process,
+      );
+      const ended = Array.from(
+        yield* bridge.session.messages.pipe(Stream.take(1), Stream.runCollect),
+      );
+      assert.strictEqual(ended[0]?.type, "result");
+      yield* bridge.handler(call(bridge, 4, "ui.toast", "Indexed 41 files"), bridge.process);
+      yield* bridge.handler(
+        call(bridge, 5, "elicitation_dialog", "Claude Code needs your attention", true),
+        bridge.process,
+      );
+      // No run shows them: the next turn opens with its own frames and nothing before them.
+      yield* bridge.handler(
+        { ...base, seq: 6, type: "turn.start", turnId: "turn-b", text: "next" },
+        bridge.process,
+      );
+      const next = Array.from(
+        yield* bridge.session.messages.pipe(Stream.take(2), Stream.runCollect),
+      );
+      assert.deepStrictEqual(
+        next.map((frame) => frame.type),
+        ["user", "system"],
+      );
+      assert.deepStrictEqual(bridge.noticesBetweenTurns, [
+        "Indexed 41 files",
+        "Claude Code needs your attention",
+      ]);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.live("leaves a call about a request it is asking to that request's card", () =>
+    Effect.gen(function* () {
+      const bridge = yield* attach({
+        protocol: 2,
+        transcript: "",
+        bridgeCanUseTool: () => new Promise<PermissionResult>(() => {}),
+      });
+      yield* bridge.handler(
+        {
+          type: "approval.request",
+          seq: 1,
+          at: bridge.now,
+          toolUseId: "agent-tool",
+          tool: "Bash",
+          input: { command: "rm -rf build" },
+          alsoInTerminal: true,
+          agentType: "general-purpose",
+        },
+        bridge.process,
+      );
+      yield* until(() => bridge.bridgeCalls.length === 1, "the request asked");
+      yield* bridge.handler(
+        call(bridge, 2, "permission_prompt", "Claude needs your permission to use Bash", true),
+        bridge.process,
+      );
+      assert.deepStrictEqual(bridge.noticesBetweenTurns, []);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
 });

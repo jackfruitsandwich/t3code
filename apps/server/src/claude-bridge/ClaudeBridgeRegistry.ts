@@ -279,6 +279,13 @@ export type ClaudeBridgeRecordChange =
    */
   | "commands-left-to-record";
 
+export type ClaudeBridgeNotification = Extract<ClaudeBridgeEvent, { type: "notification" }>;
+
+export type ClaudeBridgeNotificationHandler = (
+  event: ClaudeBridgeNotification,
+  process: ClaudeBridgeProcess,
+) => Effect.Effect<void>;
+
 export type ClaudeBridgeRecordHandler = (
   process: ClaudeBridgeProcess,
   change: ClaudeBridgeRecordChange,
@@ -383,6 +390,18 @@ export class ClaudeBridgeRegistry extends Context.Service<
       process: ClaudeBridgeProcess,
       change: ClaudeBridgeRecordChange,
       rows?: ReadonlyArray<string>,
+    ) => Effect.Effect<void>;
+    /**
+     * Told of a call for the person's attention that the session's
+     * attachment heard with no turn of the session's open to show it in, and
+     * no card of its own for: the thread may keep it between turns.
+     */
+    readonly onNoticeBetweenTurns: (
+      handler: ClaudeBridgeNotificationHandler,
+    ) => Effect.Effect<void, never, Scope.Scope>;
+    readonly noteNoticeBetweenTurns: (
+      process: ClaudeBridgeProcess,
+      event: ClaudeBridgeNotification,
     ) => Effect.Effect<void>;
     /**
      * The last turn the session began while nobody was subscribed, with its
@@ -673,6 +692,13 @@ const make = Effect.gen(function* () {
     }).pipe(
       Effect.catchCause((cause) =>
         Effect.logWarning("claude-bridge.record-handler-failed", { sid: entry.sid, cause }),
+      ),
+    );
+  const noticeHandlers = new Set<ClaudeBridgeNotificationHandler>();
+  const noteNoticeBetweenTurns = (entry: ClaudeBridgeProcess, event: ClaudeBridgeNotification) =>
+    Effect.forEach(noticeHandlers, (handler) => handler(event, entry), { discard: true }).pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("claude-bridge.notice-handler-failed", { sid: entry.sid, cause }),
       ),
     );
 
@@ -1257,6 +1283,17 @@ const make = Effect.gen(function* () {
         }),
     ).pipe(Effect.asVoid);
 
+  const onNoticeBetweenTurns = (handler: ClaudeBridgeNotificationHandler) =>
+    Effect.acquireRelease(
+      Effect.sync(() => {
+        noticeHandlers.add(handler);
+      }),
+      () =>
+        Effect.sync(() => {
+          noticeHandlers.delete(handler);
+        }),
+    ).pipe(Effect.asVoid);
+
   const isPluginInstalled = (configDir: string) =>
     Effect.gen(function* () {
       const installed = yield* readJson(path.join(configDir, "plugins", "installed_plugins.json"));
@@ -1555,6 +1592,8 @@ const make = Effect.gen(function* () {
     onUnattachedRequest,
     onRecordChange,
     noteRecordChange,
+    onNoticeBetweenTurns,
+    noteNoticeBetweenTurns,
     readClientSelection,
     writeClientSelection,
     peekMissedTurn,
@@ -1606,6 +1645,8 @@ export const layerTest = Layer.succeed(
     onUnattachedRequest: () => Effect.void,
     onRecordChange: () => Effect.void,
     noteRecordChange: () => Effect.void,
+    onNoticeBetweenTurns: () => Effect.void,
+    noteNoticeBetweenTurns: () => Effect.void,
     readClientSelection: () => Effect.succeed(null),
     writeClientSelection: () => Effect.void,
     peekMissedTurn: () => Effect.succeed(null),
