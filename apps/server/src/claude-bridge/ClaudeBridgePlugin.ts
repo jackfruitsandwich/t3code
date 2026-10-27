@@ -1600,7 +1600,7 @@ export function register(on) {
       } catch {}
     }
     const plugin = e.origin && e.origin.kind === 'plugin' && typeof e.origin.name === 'string' ? e.origin.name : undefined
-    submitted ={ text: e.text, origin: e.origin && typeof e.origin.kind === 'string' ? e.origin.kind : undefined, plugin: plugin, asUser: plugin !== undefined && e.origin.asUser === true }
+    submitted = { text: e.text, origin: e.origin && typeof e.origin.kind === 'string' ? e.origin.kind : undefined, plugin: plugin, asUser: plugin !== undefined && e.origin.asUser === true }
     // The person typed it over the running turn: the session holds it until
     // the model is handed it, and T3 shows it waiting meanwhile.
     if (typeof e.turnId === 'string' && !e.command && e.isMeta !== true && e.origin && (e.origin.kind === 'composer' || e.origin.kind === 'bridge') && typeof e.text === 'string' && e.text.trim() !== '') {
