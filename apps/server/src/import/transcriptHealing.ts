@@ -100,6 +100,37 @@ export const bandForTime = (runs: ReadonlyArray<HealingRun>, atMs: number): numb
 };
 
 /**
+ * The runs as the session began them. A run T3 made late for a turn begun in
+ * the terminal (adopted, or read under load, after the session wrote rows of
+ * it) began no later than the earliest record row it shows, by the row's
+ * provider id (`nativeId`, or a Claude row's uuid): rows written after that
+ * belong after it, not before its prompt.
+ */
+export const runsAsBegun = (
+  runs: ReadonlyArray<HealingRun>,
+  rows: ReadonlyArray<{
+    readonly sourceId: string;
+    readonly nativeId?: string;
+    readonly timestamp: string;
+  }>,
+  shown: ReadonlyArray<{ readonly runId: string; readonly nativeId: string }>,
+): ReadonlyArray<HealingRun> => {
+  const writtenAt = new Map(
+    rows.map((row) => [row.nativeId ?? row.sourceId, timeMs(row.timestamp)]),
+  );
+  const earliest = new Map<string, number>();
+  for (const item of shown) {
+    const atMs = writtenAt.get(item.nativeId);
+    if (atMs === undefined || atMs === 0) continue;
+    earliest.set(item.runId, Math.min(atMs, earliest.get(item.runId) ?? atMs));
+  }
+  return runs.map((run) => {
+    const atMs = earliest.get(run.id);
+    return atMs === undefined || atMs >= run.startedAtMs ? run : { ...run, startedAtMs: atMs };
+  });
+};
+
+/**
  * The transcript rows the thread does not show, oldest first, each with the
  * run it follows.
  *

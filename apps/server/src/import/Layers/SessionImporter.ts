@@ -141,6 +141,7 @@ import {
   planTranscriptHealing,
   recordKeyOfTurnItem,
   RUN_BAND,
+  runsAsBegun,
   sentPromptLines,
 } from "../transcriptHealing.ts";
 
@@ -1424,6 +1425,23 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
           })),
         ),
       );
+
+    /** The thread's runs, each begun no later than the first row of `parsed` it shows (runsAsBegun). */
+    const threadRunsAsBegun = (threadId: ThreadId, parsed: ParsedCliSession) =>
+      Effect.gen(function* () {
+        const runs = yield* threadRuns(threadId);
+        if (runs.length === 0) return runs;
+        const shown = yield* sql<{ readonly run_id: string; readonly native_id: string }>`
+          SELECT run_id, json_extract(payload_json, '$.nativeItemRef.nativeId') AS native_id
+          FROM orchestration_v2_projection_turn_items
+          WHERE thread_id = ${threadId} AND run_id IS NOT NULL AND native_id IS NOT NULL
+        `;
+        return runsAsBegun(
+          runs,
+          [...parsed.messages, ...(parsed.systemNotices ?? []), ...(parsed.items ?? [])],
+          shown.map((row) => ({ runId: row.run_id, nativeId: row.native_id })),
+        );
+      });
 
     /** Gives an imported row its place in the thread before its events are written. */
     const placeImportedRow = (threadId: ThreadId, placement: HealingPlacement) =>
@@ -2722,7 +2740,7 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
       if (freshTurnSinceMs !== undefined) fileFingerprints.delete(input.filePath);
       const settledBeforeMs =
         turnInFlight.length === 0 ? undefined : Math.min(...turnInFlight) - IN_FLIGHT_MARGIN_MS;
-      const runs = yield* threadRuns(input.threadId);
+      const runs = yield* threadRunsAsBegun(input.threadId, input.parsed);
       const reseat = {
         driver: input.driver,
         sessionId: input.sessionId,
@@ -2835,7 +2853,7 @@ const makeSessionImporter = (options?: SessionImporterLiveOptions) =>
       if ((yield* activeRunStartsMs(input.threadId)).length > 0) return;
       yield* showCodexSessionState({ threadId: input.threadId, parsed: input.parsed });
       yield* showClaudeGoal({ threadId: input.threadId, parsed: input.parsed });
-      const runs = yield* threadRuns(input.threadId);
+      const runs = yield* threadRunsAsBegun(input.threadId, input.parsed);
       const reseat = {
         driver: input.driver,
         sessionId: input.sessionId,

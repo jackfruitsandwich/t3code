@@ -4,6 +4,7 @@ import type { ParsedSessionMessage, ParsedSessionSystemNotice } from "./sessionI
 import {
   claudeRecordLines,
   type HealingKnownMessage,
+  type HealingRun,
   planImportedRowOrdering,
   planImportedRowReseating,
   planNoticeHealing,
@@ -12,6 +13,7 @@ import {
   planTranscriptHealing,
   planWithdrawnRuns,
   recordKeyOfTurnItem,
+  runsAsBegun,
   type SeatingRow,
   sentPromptLines,
 } from "./transcriptHealing.ts";
@@ -283,6 +285,43 @@ describe("planNoticeHealing", () => {
 
   it("leaves a running turn's notices to its run", () => {
     assert.deepEqual(planned({ fromLine: 5, settledBeforeMs: ms(40) }), ["1:between-runs"]);
+  });
+
+  // Oct 26 rig: the turn ran 04:28:44-48, a plugin's line was written between
+  // turns at 04:28:50.9, and T3 requested the turn's run at 04:28:54.5.
+  it("adds a notice after a run made late for its turn, by the rows that run shows", () => {
+    const rows = [
+      row("user", "prompt", "count to 300", 1),
+      row("assistant", "reply", "1 2 3", 2),
+      notice("between-turns", 3),
+    ];
+    const late = [{ id: "run-1", ordinal: 1, startedAtMs: ms(4) }];
+    const placed = (runs: ReadonlyArray<HealingRun>) =>
+      planNoticeHealing({
+        notices: [notice("between-turns", 3)],
+        fromLine: 0,
+        shownIds: new Set(),
+        runs,
+      }).map((placement) => `${placement.band}:${placement.notice.sourceId}`);
+    assert.deepEqual(placed(late), ["0:between-turns"]);
+    const begun = runsAsBegun(late, rows, [{ runId: "run-1", nativeId: "reply" }]);
+    assert.deepEqual(begun, [{ id: "run-1", ordinal: 1, startedAtMs: ms(2) }]);
+    assert.deepEqual(placed(begun), ["1:between-turns"]);
+  });
+
+  it("leaves a run begun before its rows, and one showing no row of the record, as T3 began it", () => {
+    const runs = [
+      { id: "run-1", ordinal: 1, startedAtMs: ms(1) },
+      { id: "run-2", ordinal: 2, startedAtMs: ms(5) },
+    ];
+    const rows = [row("assistant", "reply-1", "one", 2), row("assistant", "reply-2", "two", 6)];
+    assert.deepEqual(
+      runsAsBegun(runs, rows, [
+        { runId: "run-1", nativeId: "reply-1" },
+        { runId: "run-2", nativeId: "a-toast-the-record-never-kept" },
+      ]),
+      runs,
+    );
   });
 });
 
