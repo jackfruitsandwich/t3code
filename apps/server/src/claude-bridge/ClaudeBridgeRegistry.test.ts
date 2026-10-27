@@ -260,6 +260,149 @@ describe("claudeBridgeMissedTurnsAfter", () => {
     );
     assert.deepStrictEqual(claudeBridgeMissedTurnsAfter(turns, endOf("turn-9", 7)), turns);
   });
+
+  // Oct 26 uilines2: a toast drawn 1.5 s into a turn begun in the terminal,
+  // before T3 had adopted the session, reached no run.
+  it("keeps what the session drew in a turn still open, and nothing between turns", () => {
+    const toast = (at: number) =>
+      ({
+        seq: at,
+        at,
+        type: "notification",
+        message: `toast-${at}`,
+        title: "",
+        kind: "ui.toast",
+        dialog: false,
+      }) as const;
+    const drawn = (turnId: string, at: number) =>
+      ({ seq: at, at, type: "message.display", turnId, messageId: `m-${at}`, text: "x" }) as const;
+    assert.strictEqual(claudeBridgeMissedTurnsAfter(none, toast(1)), none);
+    const turns = [
+      startOf("turn-a", 1),
+      toast(2),
+      endOf("turn-a", 3),
+      toast(4),
+      startOf("turn-b", 5),
+      drawn("turn-a", 6),
+      drawn("turn-b", 7),
+      toast(8),
+    ].reduce(claudeBridgeMissedTurnsAfter, none);
+    assert.deepStrictEqual(
+      turns.map((turn) => (turn.heard ?? []).map((event) => event.seq)),
+      [[2], [7, 8]],
+    );
+    // After the end of a turn whose run is on its way, while that run may
+    // still show it: the toast stands after that turn's run.
+    const offered = [startOf("turn-c", 10), endOf("turn-c", 11)]
+      .reduce(claudeBridgeMissedTurnsAfter, none)
+      .map((turn) => ({ ...turn, offered: true }));
+    const heardAfter = (at: number) =>
+      claudeBridgeMissedTurnsAfter(offered, toast(at))[0]?.heard?.map((event) => event.seq);
+    assert.deepStrictEqual(heardAfter(12), [12]);
+    assert.isUndefined(heardAfter(11 + CLAUDE_BRIDGE_OFFERED_TURN_HOLD_MS));
+  });
+});
+
+describe("what a session draws while the run for its turn is on its way", () => {
+  const platform = Layer.mergeAll(NodeServices.layer, NodeCrypto.layer);
+  // Oct 26 rig, server stalled 26 s: a toast drawn in a turn and one after it
+  // were kept between turns and also shown by the turn's run.
+  it.live("is kept for that run alone; a call heard with no turn awaiting a run is not", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const registry = yield* ClaudeBridgeRegistry;
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const sid = "dddddddd-4444-4444-8444-444444444444";
+        const home = path.join(registry.bridgeDir, "home");
+        const record = path.join(home, "projects", "-work", `${sid}.jsonl`);
+        yield* fs.makeDirectory(path.dirname(record), { recursive: true });
+        yield* fs.writeFileString(record, "");
+        const dir = path.join(registry.bridgeDir, "claude", sid, "instance-1");
+        yield* fs.makeDirectory(path.join(dir, "events"), { recursive: true });
+        const now = yield* Clock.currentTimeMillis;
+        yield* fs.writeFileString(
+          path.join(dir, "session.json"),
+          yield* encodeJson({
+            sid,
+            instanceId: "instance-1",
+            configDir: home,
+            heartbeatAt: now,
+            transcriptPath: record,
+            isInteractive: true,
+          }),
+        );
+        const toast = (seq: number) => ({
+          seq,
+          at: now,
+          type: "notification",
+          message: `toast-${seq}`,
+          title: "",
+          kind: "ui.toast",
+          dialog: false,
+        });
+        const turnEvent = (seq: number, type: "turn.start" | "turn.complete", turnId: string) =>
+          type === "turn.start"
+            ? { seq, at: now, type, turnId, text: "count", transcriptOffset: 0 }
+            : {
+                seq,
+                at: now,
+                type,
+                turnId,
+                reason: "answer",
+                answer: "",
+                isAborted: false,
+                durationMs: 1,
+                transcriptOffset: 0,
+              };
+        const events = [
+          toast(1),
+          turnEvent(2, "turn.start", "turn-1"),
+          toast(3),
+          turnEvent(4, "turn.complete", "turn-1"),
+          toast(5),
+          turnEvent(6, "turn.start", "turn-2"),
+        ];
+        for (const event of events) {
+          yield* fs.writeFileString(
+            path.join(dir, "events", `${String(event.seq).padStart(6, "0")}.json`),
+            yield* encodeJson(event),
+          );
+        }
+        const unattached: Array<string> = [];
+        const last = yield* Deferred.make<void>();
+        yield* registry.onUnattachedEvent((event) =>
+          Effect.gen(function* () {
+            if (event.type === "notification") unattached.push(event.message);
+            // As the attach service does when it offers the turn a run.
+            if (event.type === "turn.start") yield* registry.noteTurnOffered(sid, event.turnId);
+            if (event.type === "turn.start" && event.turnId === "turn-2") {
+              yield* Deferred.succeed(last, undefined);
+            }
+          }),
+        );
+        yield* Deferred.await(last);
+        assert.deepStrictEqual(unattached, ["toast-1"]);
+        const missed = yield* registry.peekMissedTurns(sid);
+        assert.deepStrictEqual(
+          missed.map((turn) => [turn.start.turnId, (turn.heard ?? []).map((event) => event.seq)]),
+          [
+            ["turn-1", [3, 5]],
+            ["turn-2", []],
+          ],
+        );
+      }),
+    ).pipe(
+      Effect.provide(
+        registryLayer.pipe(
+          Layer.provide(
+            ServerConfig.layerTest(process.cwd(), { prefix: "t3-bridge-registry-test-" }),
+          ),
+          Layer.provideMerge(platform),
+        ),
+      ),
+    ),
+  );
 });
 
 describe("the record a mod process speaks for", () => {

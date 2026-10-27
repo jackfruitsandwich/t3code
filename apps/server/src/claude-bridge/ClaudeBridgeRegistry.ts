@@ -84,21 +84,36 @@ export class ClaudeBridgeLaunchError extends Schema.TaggedError<ClaudeBridgeLaun
   }
 }
 
+/** What the terminal drew in a turn that the record does not keep. */
+export type ClaudeBridgeHeardInTurn = Extract<
+  ClaudeBridgeEvent,
+  { readonly type: "notification" | "message.display" }
+>;
+
 export interface ClaudeBridgeMissedTurn {
   readonly start: Extract<ClaudeBridgeEvent, { readonly type: "turn.start" }>;
   readonly complete: Extract<ClaudeBridgeEvent, { readonly type: "turn.complete" }> | null;
   /** A run was offered for this turn (see `noteTurnOffered`). */
   readonly offered?: boolean;
+  /** What the session drew in this turn before anything attached, oldest first. */
+  readonly heard?: ReadonlyArray<ClaudeBridgeHeardInTurn>;
 }
 
 /** How many of the turns a session began while nobody was subscribed are kept. */
 const MISSED_TURNS_KEPT = 4;
+/** How much of what each of them drew is kept. */
+const HEARD_IN_TURN_KEPT = 16;
 
 /**
  * The turns a session began while nobody was subscribed, oldest first, once
  * `event` came with nobody subscribed. Each keeps its own end: a turn begun
  * before the run offered for the one before it attached does not take that
- * one's place.
+ * one's place. A message drawn belongs to the turn it names, a call for the
+ * person's attention to the last turn while it is open or its run is on its
+ * way: that run shows them where they would have been, in the turn or after
+ * it (Oct 26: a toast drawn 1.5 s into a turn begun in the terminal came
+ * before T3 had adopted the session, and no run showed it; one drawn after a
+ * turn the rig's stalled server read late was kept before the turn's run).
  */
 export const claudeBridgeMissedTurnsAfter = (
   turns: ReadonlyArray<ClaudeBridgeMissedTurn>,
@@ -112,7 +127,21 @@ export const claudeBridgeMissedTurnsAfter = (
       turn.start.turnId === event.turnId ? { ...turn, complete: event } : turn,
     );
   }
-  return turns;
+  if (event.type !== "notification" && event.type !== "message.display") return turns;
+  const last = turns.at(-1);
+  const at =
+    event.type === "message.display"
+      ? turns.findIndex((turn) => turn.start.turnId === event.turnId && turn.complete === null)
+      : last !== undefined &&
+          (last.complete === null ||
+            (last.offered === true &&
+              event.at - last.complete.at < claudeBridgeMissedTurnReplayMs(last)))
+        ? turns.length - 1
+        : -1;
+  if (at === -1) return turns;
+  const turn = turns[at]!;
+  const heard = [...(turn.heard ?? []), event].slice(-HEARD_IN_TURN_KEPT);
+  return turns.with(at, { ...turn, heard });
 };
 
 /**
@@ -1072,14 +1101,13 @@ const make = Effect.gen(function* () {
       const subscriber = subscribers.get(entry.sid);
       // Noted before the record is compared: the comparison asks whether a
       // turn nobody was attached for is still a run's to show.
-      if (
-        subscriber === undefined &&
-        (event.type === "turn.start" || event.type === "turn.complete")
-      ) {
-        missedTurns.set(
-          entry.sid,
-          claudeBridgeMissedTurnsAfter(missedTurns.get(entry.sid) ?? [], event),
-        );
+      let heldForItsRun = false;
+      if (subscriber === undefined) {
+        const turns = missedTurns.get(entry.sid) ?? [];
+        const after = claudeBridgeMissedTurnsAfter(turns, event);
+        if (after !== turns) missedTurns.set(entry.sid, after);
+        heldForItsRun =
+          after !== turns && (event.type === "notification" || event.type === "message.display");
       }
       if (event.type === "turn.start" || event.type === "turn.complete") {
         yield* noteRecordChange(entry, event.type);
@@ -1088,6 +1116,8 @@ const make = Effect.gen(function* () {
         yield* subscriber(event, entry);
         return;
       }
+      // What a turn's run is on its way for is that run's to show, once.
+      if (heldForItsRun) return;
       for (const handler of unattachedHandlers) {
         yield* handler(event, entry);
       }

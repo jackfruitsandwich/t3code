@@ -133,6 +133,8 @@ const attach = (input: {
     const leftToRecord: Array<string> = [];
     /** The calls for the person's attention the runner left to the thread between turns. */
     const noticesBetweenTurns: Array<string> = [];
+    /** When each of those was said to have been drawn. */
+    const noticesBetweenTurnsAt: Array<number> = [];
     const subscribed = yield* Deferred.make<ClaudeBridgeRegistry.ClaudeBridgeEventHandler>();
     /** The sessions whose live process the runner asked for. */
     const asked: Array<string> = [];
@@ -196,6 +198,7 @@ const attach = (input: {
       noteNoticeBetweenTurns: (_process, event) =>
         Effect.sync(() => {
           noticesBetweenTurns.push(event.message);
+          noticesBetweenTurnsAt.push(event.at);
         }),
       readClientSelection: () => Effect.succeed(null),
       writeClientSelection: () => Effect.void,
@@ -303,6 +306,7 @@ const attach = (input: {
       recordChanges,
       leftToRecord,
       noticesBetweenTurns,
+      noticesBetweenTurnsAt,
       asked,
       letGo,
       deliveries,
@@ -4346,6 +4350,134 @@ describe("ClaudeBridgeQueryRunner calls for the person's attention", () => {
         "Indexed 41 files",
         "Claude Code needs your attention",
       ]);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  // Oct 26 uilines2: a toast drawn 1.5 s into a turn begun in the terminal
+  // came before T3 had adopted the session; the run offered for the turn
+  // attached after it and never showed it.
+  it.live("shows one heard in the turn before it attached", () =>
+    Effect.gen(function* () {
+      const now = yield* Clock.currentTimeMillis;
+      const start = {
+        type: "turn.start",
+        seq: 1,
+        at: now - 2_000,
+        turnId: "turn-a",
+        text: "index it",
+        transcriptOffset: 0,
+      } as const;
+      const toast = call({ now: now - 500 }, 2, "ui.toast", "Indexed 40 files");
+      const bridge = yield* attach({
+        protocol: 2,
+        bridgeCanUseTool: () => null,
+        transcript: "",
+        activeTurn: { turnId: "turn-a", startedAt: start.at, transcriptOffset: 0 },
+        missedTurns: () => [{ start, complete: null, offered: true, heard: [toast] }],
+      });
+      const frames = yield* shownFrames(bridge);
+      const notices = () =>
+        frames.flatMap((frame) => (isClaudeBridgeNoticeFrame(frame) ? [frame.content] : []));
+      for (let attempt = 0; attempt < 40 && notices().length === 0; attempt += 1) {
+        yield* Effect.sleep("50 millis");
+      }
+      assert.deepStrictEqual(notices(), ["Indexed 40 files"]);
+      assert.deepStrictEqual(bridge.noticesBetweenTurns, []);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  // Oct 26 rig, server stalled 26 s: the run offered for a short turn attached
+  // after it had ended; a toast drawn after it stood before the turn.
+  it.live("shows one heard in a turn over before it attached in it, one after it after it", () =>
+    Effect.gen(function* () {
+      const now = yield* Clock.currentTimeMillis;
+      const start = {
+        type: "turn.start",
+        seq: 1,
+        at: now - 3_000,
+        turnId: "turn-a",
+        text: "index it",
+        transcriptOffset: 0,
+      } as const;
+      const complete = {
+        type: "turn.complete",
+        seq: 3,
+        at: now - 2_000,
+        turnId: "turn-a",
+        reason: "answer",
+        answer: "",
+        isAborted: false,
+        durationMs: 1_000,
+        transcriptOffset: 0,
+      } as const;
+      const bridge = yield* attach({
+        protocol: 2,
+        bridgeCanUseTool: () => null,
+        transcript: "",
+        missedTurns: () => [
+          {
+            start,
+            complete,
+            offered: true,
+            heard: [
+              call({ now: now - 2_500 }, 2, "ui.toast", "Indexed 40 files"),
+              call({ now: now - 1_500 }, 4, "ui.toast", "Index saved"),
+            ],
+          },
+        ],
+      });
+      const frames = yield* shownFrames(bridge);
+      const notices = () =>
+        frames.flatMap((frame) => (isClaudeBridgeNoticeFrame(frame) ? [frame.content] : []));
+      for (
+        let attempt = 0;
+        attempt < 60 &&
+        !(frames.some((f) => f.type === "result") && bridge.noticesBetweenTurns.length > 0);
+        attempt += 1
+      ) {
+        yield* Effect.sleep("50 millis");
+      }
+      assert.deepStrictEqual(notices(), ["Indexed 40 files"]);
+      assert.deepStrictEqual(bridge.noticesBetweenTurns, ["Index saved"]);
+      // Dated no earlier than this run, so the thread keeps it after the run.
+      assert.isAtLeast(bridge.noticesBetweenTurnsAt[0] ?? 0, now);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  // Oct 27 rig: kept at once, a toast drawn after the turn stood between the
+  // prompt and the reply T3 was still reading.
+  it.live("keeps one heard after the session ended the turn once the turn closes here", () =>
+    Effect.gen(function* () {
+      const bridge = yield* attach({ protocol: 2, bridgeCanUseTool: () => null, transcript: "" });
+      const base = { seq: 1, at: bridge.now, transcriptOffset: 0 };
+      yield* bridge.handler(
+        { ...base, type: "turn.start", turnId: "turn-a", text: "index it" },
+        bridge.process,
+      );
+      yield* bridge.session.messages.pipe(Stream.take(2), Stream.runCollect);
+      yield* bridge.handler(
+        {
+          ...base,
+          seq: 2,
+          type: "turn.complete",
+          turnId: "turn-a",
+          reason: "answer",
+          answer: "done",
+          isAborted: false,
+          durationMs: 10,
+        },
+        bridge.process,
+      );
+      yield* bridge.handler(call(bridge, 3, "ui.toast", "Index saved"), bridge.process);
+      assert.deepStrictEqual(bridge.noticesBetweenTurns, []);
+      const ended = Array.from(
+        yield* bridge.session.messages.pipe(Stream.take(1), Stream.runCollect),
+      );
+      assert.strictEqual(ended[0]?.type, "result");
+      for (let attempt = 0; attempt < 40 && bridge.noticesBetweenTurns.length === 0; attempt += 1) {
+        yield* Effect.sleep("50 millis");
+      }
+      assert.deepStrictEqual(bridge.noticesBetweenTurns, ["Index saved"]);
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
