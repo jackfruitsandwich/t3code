@@ -101,6 +101,19 @@ describe.each([
     ).toBe(true);
   });
 
+  it("hides a message the person pulled back to edit", () => {
+    const item = {
+      type: "user_message",
+      inputIntent: "steer",
+      pulledBack: true,
+      runId,
+      nodeId,
+    } as const;
+    expect(
+      isVisible({ item, runs: [{ id: runId, status: "running" }], attempts: [], items: [item] }),
+    ).toBe(false);
+  });
+
   it("does not hide an interruption because another attempt was superseded", () => {
     expect(
       isVisible({

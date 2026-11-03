@@ -2549,7 +2549,7 @@ describe("ClaudeBridgeQueryRunner what the person typed over a running turn", ()
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
-  it.live("is not taken when the person takes it back into the prompt to edit", () =>
+  it.live("is pulled back when the person takes it back into the prompt to edit", () =>
     Effect.gen(function* () {
       const { bridge, write } = yield* opened;
       yield* bridge.handler(typed(bridge, 2, TYPED), bridge.process);
@@ -2559,7 +2559,7 @@ describe("ClaudeBridgeQueryRunner what the person typed over a running turn", ()
         queueRow("popAll", bridge.now + 2_000, TYPED) + toolRow("t1", bridge.now + 2_001),
       );
       yield* take(bridge, 1);
-      assert.deepStrictEqual(bridge.deliveries, [`dropped ${waiting?.uuid}`]);
+      assert.deepStrictEqual(bridge.deliveries, [`pulled_back ${waiting?.uuid}`]);
       // Sent again, it is another message, waiting in its turn.
       yield* bridge.handler(typed(bridge, 3, TYPED), bridge.process);
       yield* write(queueRow("enqueue", bridge.now + 3_000, TYPED));

@@ -388,7 +388,8 @@ export interface ClaudeAgentSdkQueryOpenInput {
 
 export interface ClaudeBridgePromptDelivery {
   readonly promptUuid: string;
-  readonly delivery: "waiting" | "taken" | "dropped";
+  /** `pulled_back`: the person took it back into the terminal's prompt box to edit. */
+  readonly delivery: "waiting" | "taken" | "dropped" | "pulled_back";
 }
 
 const CLAUDE_PROMPT_UUID_PATTERN =

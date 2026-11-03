@@ -1388,7 +1388,8 @@ layer("ProviderEventIngestorV2", (it) => {
       const taken = userMessage("taken", "steer", 0);
       const dropped = userMessage("dropped", "steer", 1);
       const prompt = userMessage("prompt", "turn_start", 2);
-      const items = [taken, dropped, prompt];
+      const pulled = userMessage("pulled", "steer", 3);
+      const items = [taken, dropped, prompt, pulled];
       const itemEvents: Array<OrchestrationV2DomainEvent> = [];
       for (const item of items) {
         itemEvents.push({
@@ -1400,7 +1401,10 @@ layer("ProviderEventIngestorV2", (it) => {
         });
       }
       yield* eventSink.write({ events: [threadEvent, ...itemEvents] });
-      const say = (messageId: MessageId, delivery: "waiting" | "taken" | "dropped") =>
+      const say = (
+        messageId: MessageId,
+        delivery: "waiting" | "taken" | "dropped" | "pulled_back",
+      ) =>
         ingestor
           .ingestNormalized({
             providerSessionId,
@@ -1438,6 +1442,15 @@ layer("ProviderEventIngestorV2", (it) => {
         { ...after, completedAt: null, updatedAt: null },
         { ...placed, completedAt: null, updatedAt: null },
       );
+
+      // Pulled back to edit: untaken, and marked so clients leave it out.
+      assert.equal(yield* say(pulled.messageId, "waiting"), 1);
+      assert.equal(yield* say(pulled.messageId, "pulled_back"), 1);
+      const pulledRow = yield* shown(pulled);
+      assert.equal(pulledRow?.status, "cancelled");
+      assert.equal(pulledRow?.type === "user_message" && pulledRow.pulledBack, true);
+      // Only a pulled-back row says so.
+      assert.notProperty((yield* shown(taken)) ?? {}, "pulledBack");
 
       // Let go of untaken, then heard taken after all: the session's word stands.
       assert.equal(yield* say(dropped.messageId, "waiting"), 1);
@@ -1581,6 +1594,8 @@ it("gives a steering message's row the status its session's word calls for", () 
   assert.equal(next(row("cancelled"), "taken"), "completed");
   assert.isNull(next(row("completed"), "taken"));
   assert.equal(next(row("pending"), "dropped"), "cancelled");
+  assert.equal(next(row("pending"), "pulled_back"), "cancelled");
+  assert.isNull(next(row("completed"), "pulled_back"));
   assert.isNull(next(row("completed"), "dropped"));
   assert.isNull(next(row("completed", "turn_start"), "waiting"));
   assert.isNull(next(null, "taken"));

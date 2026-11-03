@@ -222,6 +222,7 @@ export function steerDeliveryStatus(
     case "taken":
       return item.status === "completed" ? null : "completed";
     case "dropped":
+    case "pulled_back":
       return item.status === "pending" ? "cancelled" : null;
   }
 }
@@ -627,6 +628,7 @@ export const layer: Layer.Layer<
                 payload: {
                   ...item,
                   status,
+                  ...(input.event.delivery === "pulled_back" ? { pulledBack: true } : {}),
                   completedAt: status === "pending" ? null : occurredAt,
                   updatedAt: occurredAt,
                 },

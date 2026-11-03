@@ -151,7 +151,7 @@ export const ProviderAdapterV2Event = Schema.Union([
     driver: ProviderDriverKind,
     threadId: ThreadId,
     messageId: MessageId,
-    delivery: Schema.Literals(["waiting", "taken", "dropped"]),
+    delivery: Schema.Literals(["waiting", "taken", "dropped", "pulled_back"]),
   }),
   Schema.Struct({
     type: Schema.Literal("runtime_request.updated"),

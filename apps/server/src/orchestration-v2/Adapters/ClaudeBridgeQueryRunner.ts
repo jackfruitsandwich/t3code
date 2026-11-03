@@ -686,11 +686,12 @@ export const layer: Layer.Layer<
        * What the person typed is held no more, untaken: taken back into the
        * prompt to edit, or nothing more will be heard of it here.
        */
-      const letGoOfTyped = Effect.gen(function* () {
-        const shown = state.typed.filter((entry) => entry.shown);
-        state.typed = [];
-        for (const entry of shown) yield* reportDelivery(entry.key, "dropped");
-      });
+      const letGoOfTyped = (delivery: "pulled_back" | "dropped") =>
+        Effect.gen(function* () {
+          const shown = state.typed.filter((entry) => entry.shown);
+          state.typed = [];
+          for (const entry of shown) yield* reportDelivery(entry.key, delivery);
+        });
 
       /** Follows the record's account of the prompts the session holds behind its turn. */
       const followQueue = (queued: NonNullable<ReturnType<typeof claudeQueueOperation>>) =>
@@ -724,7 +725,7 @@ export const layer: Layer.Layer<
               if (queued.content !== null) yield* typedTaken(queued.content);
               return;
             case "popAll":
-              yield* letGoOfTyped;
+              yield* letGoOfTyped("pulled_back");
               return;
             case "dequeue":
               // The turn it begins says which it was (see takeTypedTurn).
@@ -737,7 +738,7 @@ export const layer: Layer.Layer<
         state.closed = true;
         state.requestTurn = null;
         yield* letGoOfHeldSteers;
-        yield* letGoOfTyped;
+        yield* letGoOfTyped("dropped");
         for (const controller of state.approvals.values()) controller.abort();
         state.approvals.clear();
         yield* Queue.end(messages);
@@ -1695,7 +1696,7 @@ export const layer: Layer.Layer<
           }
           yield* keepNoticesAfterEnd;
           yield* letGoOfHeldSteers;
-          yield* letGoOfTyped;
+          yield* letGoOfTyped("dropped");
           yield* emit(lostContact ? translator.onLostContact(reason) : translator.onEnded(reason));
           yield* finish;
         });

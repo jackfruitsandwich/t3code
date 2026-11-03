@@ -1461,6 +1461,8 @@ export const OrchestrationV2TurnItem = Schema.Union([
     scheduledTaskId: Schema.optional(ScheduledTaskId),
     senderThreadId: Schema.optional(ThreadId),
     inputIntent: OrchestrationV2UserMessageInputIntent,
+    /** The person took it back into the session's prompt to edit: it is not in the conversation. */
+    pulledBack: Schema.optional(Schema.Boolean),
     text: Schema.String,
     context: Schema.optional(OrchestrationMessageContext),
     attachments: Schema.Array(ChatAttachment),
@@ -2256,6 +2258,8 @@ export const OrchestrationV2TurnItemJson = Schema.Union([
     scheduledTaskId: Schema.optional(ScheduledTaskId),
     senderThreadId: Schema.optional(ThreadId),
     inputIntent: OrchestrationV2UserMessageInputIntent,
+    /** The person took it back into the session's prompt to edit: it is not in the conversation. */
+    pulledBack: Schema.optional(Schema.Boolean),
     text: Schema.String,
     context: Schema.optional(OrchestrationMessageContext),
     attachments: Schema.Array(ChatAttachment),
