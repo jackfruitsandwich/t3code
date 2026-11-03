@@ -224,6 +224,36 @@ describe("summarizeToolGroup", () => {
     expect(toolGroupSummaryKind([thought])).toBe("reasoning");
   });
 
+  it("heads Codex's image views as Codex does, apart from file reads", () => {
+    const view = (id: string) =>
+      entry(id, {
+        itemType: "dynamic_tool",
+        label: "Viewed an image",
+        toolTitle: "Viewed an image",
+        viewedImagePath: `/workspace/${id}.png`,
+        structuredPayload: {
+          type: "dynamic_tool",
+          toolName: "view_image",
+          input: { path: `/workspace/${id}.png` },
+        } as NonNullable<WorkLogPresentationEntry["structuredPayload"]>,
+      });
+    const read = entry("read", {
+      itemType: "dynamic_tool",
+      label: "Read",
+      toolTitle: "Read",
+      viewedImagePath: "/workspace/read.png",
+      structuredPayload: {
+        type: "dynamic_tool",
+        toolName: "Read",
+        input: { file_path: "/workspace/read.png" },
+      } as NonNullable<WorkLogPresentationEntry["structuredPayload"]>,
+    });
+    expect(summarizeToolGroup([view("a")]).summary).toBe("Viewed an image");
+    expect(summarizeToolGroup([view("a"), view("b")]).summary).toBe("Viewed 2 images");
+    expect(summarizeToolGroup([read]).summary).toBe("Read 1 file");
+    expect(summarizeToolGroup([view("a"), read]).summary).toBe("Viewed an image and read 1 file");
+  });
+
   it("counts created threads alongside adjacent commands", () => {
     expect(
       summarizeToolGroup([

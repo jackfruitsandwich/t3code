@@ -15,6 +15,7 @@ import {
   toolGroupAction,
   toolGroupSummaryKind,
   type ToolGroupSummaryKind,
+  workEntryIsImageView,
 } from "@t3tools/client-runtime/work-log/presentation";
 export {
   normalizeCompactToolLabel,
@@ -123,6 +124,7 @@ export function workEntryDisplayLabel(entry: WorkLogEntry, workspaceRoot: string
   }
   const toolPresentation = resolveWorkEntryToolPresentation(entry);
   if (toolPresentation) return toolPresentation.displayName;
+  if (workEntryIsImageView(entry)) return entry.toolTitle || entry.label;
   if (entry.command?.trim()) return commandDisplayText(entry.command);
   const action = toolGroupAction(entry);
   if (action === "code-search" || action === "search") {

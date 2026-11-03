@@ -26,6 +26,7 @@ import {
   type ToolGroupSummaryKind,
   type WorkLogPresentationEntry,
   type WorkLogToolLifecycleStatus,
+  workEntryIsImageView,
 } from "@t3tools/client-runtime/work-log/presentation";
 import {
   resolveT3McpToolDefinition,
@@ -246,6 +247,7 @@ export function workEntryRowLabel(entry: WorkLogPresentationEntry, expanded = fa
     return entry.toolLifecycleStatus === "inProgress" ? "Thinking" : "Thought";
   const presentation = resolveWorkEntryToolPresentation(entry);
   if (presentation) return presentation.displayName;
+  if (workEntryIsImageView(entry)) return entry.label;
   if (entry.command?.trim()) return compactWorkEntryText(commandDisplayText(entry.command));
   const action = toolGroupAction(entry);
   const isToolRead = action === "read" && entry.itemType === "dynamic_tool";

@@ -1361,6 +1361,20 @@ describe("buildThreadFeed", () => {
     expect(activity?.workEntry.viewedImagePath).toBe("/workspace/reference.png");
   });
 
+  it("heads a Codex image view as Codex does", () => {
+    const item = {
+      ...base("image-view", "2026-06-20T00:00:04.000Z", 3),
+      type: "dynamic_tool" as const,
+      toolName: "view_image",
+      title: "Viewed an image",
+      input: { path: "/workspace/reference.png" },
+      viewedImagePath: "/workspace/reference.png",
+    } satisfies OrchestrationV2TurnItem;
+    const feed = buildThreadFeed([projected(item, 0)]);
+    const activity = feed[0]?.type === "activity-group" ? feed[0].activities[0] : null;
+    expect(activity ? workEntryRowLabel(activity.workEntry) : null).toBe("Viewed an image");
+  });
+
   it("pretty prints T3 MCP dynamic tool activities and attaches the product logo", () => {
     const toolItem: OrchestrationV2TurnItem = {
       ...base("item-t3-tool", "2026-06-20T00:00:04.000Z", 3),

@@ -474,6 +474,16 @@ export function toolGroupAction(entry: WorkLogPresentationEntry): ToolGroupActio
   return workLogEntryIsToolLike(entry) ? "other" : "update";
 }
 
+/** Codex's record of looking at an image. Codex heads it as a view, not as a file read. */
+export function workEntryIsImageView(
+  entry: Pick<WorkLogPresentationEntry, "structuredPayload">,
+): boolean {
+  return (
+    entry.structuredPayload?.type === "dynamic_tool" &&
+    entry.structuredPayload.toolName === "view_image"
+  );
+}
+
 export function workEntryViewedImagePath(entry: WorkLogPresentationEntry): string | null {
   const viewedImagePath = entry.viewedImagePath?.trim();
   if (
@@ -655,10 +665,11 @@ export function summarizeToolGroup(entries: ReadonlyArray<WorkLogPresentationEnt
   }
   entries = toolEntries;
   const groups = new Map<
-    ToolGroupAction | T3McpToolSummaryAction,
+    ToolGroupAction | T3McpToolSummaryAction | "image-view",
     {
       action: ToolGroupAction;
       t3Action: T3McpToolSummaryAction | null;
+      imageView: boolean;
       entries: WorkLogPresentationEntry[];
     }
   >();
@@ -670,22 +681,24 @@ export function summarizeToolGroup(entries: ReadonlyArray<WorkLogPresentationEnt
       continue;
     }
     const action = toolGroupAction(entry);
-    const key = t3Action ?? action;
+    const imageView = t3Action === null && workEntryIsImageView(entry);
+    const key = t3Action ?? (imageView ? "image-view" : action);
     const group = groups.get(key);
     if (group) group.entries.push(entry);
-    else groups.set(key, { action, t3Action, entries: [entry] });
+    else groups.set(key, { action, t3Action, imageView, entries: [entry] });
   }
-  const summaries = [...groups].map(([action, group], index) => ({
+  const summaries = [...groups].map(([, group], index) => ({
     index,
     count: group.entries.length,
-    priority: summaryActionPriority(action),
+    priority: summaryActionPriority(group.t3Action ?? group.action),
     ...(group.t3Action
       ? summarizeT3ToolCalls(group.t3Action, group.entries.map(t3ToolSummaryCall))
       : {
-          label: toolGroupActionLabel(
-            group.action,
-            toolGroupActionCount(group.action, group.entries),
-          ),
+          label: group.imageView
+            ? group.entries.length === 1
+              ? "Viewed an image"
+              : `Viewed ${group.entries.length} images`
+            : toolGroupActionLabel(group.action, toolGroupActionCount(group.action, group.entries)),
           failedCount: group.entries.filter(workEntryDisplayIndicatesToolFailure).length,
         }),
   }));

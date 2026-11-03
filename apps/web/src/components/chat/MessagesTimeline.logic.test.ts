@@ -186,6 +186,20 @@ describe("work entry labels", () => {
       } as NonNullable<WorkLogEntry["structuredPayload"]>,
     };
     expect(workEntryDisplayLabel(readEntry, undefined)).toBe("Read src/env.ts");
+    const imageView = {
+      ...entry,
+      itemType: "dynamic_tool" as const,
+      toolTitle: "Viewed an image",
+      label: "Viewed an image",
+      viewedImagePath: "/workspace/shot.png",
+      toolData: { input: { path: "/workspace/shot.png" } },
+      structuredPayload: {
+        type: "dynamic_tool",
+        toolName: "view_image",
+        input: { path: "/workspace/shot.png" },
+      } as NonNullable<WorkLogEntry["structuredPayload"]>,
+    };
+    expect(workEntryDisplayLabel(imageView, undefined)).toBe("Viewed an image");
     expect(workEntryReadOutput(readEntry, undefined)).toBe("src/env.ts");
     expect(workEntryReadOutput(readEntry, "/workspace/ohseearr")).toBe(
       "/workspace/ohseearr/src/env.ts",
