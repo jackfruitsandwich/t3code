@@ -84,6 +84,7 @@ import {
 import { ServerConfig } from "../../config.ts";
 import {
   projectCodexDynamicToolItem,
+  projectCodexImageView,
   type CodexDynamicToolItem,
 } from "../../orchestration-v2/Adapters/CodexAdapterV2.ts";
 import * as EventSink from "../../orchestration-v2/EventSink.ts";
@@ -787,6 +788,11 @@ const recordItemEvent = Effect.fn("SessionImporter.recordItemEvent")(function* (
   switch (item.type) {
     case "tool_call": {
       const projection = yield* projectCodexDynamicToolItem(item.call as CodexDynamicToolItem);
+      payload = { ...base, title: projection.title ?? null, type: "dynamic_tool", ...projection };
+      break;
+    }
+    case "image_view": {
+      const projection = projectCodexImageView(item.path);
       payload = { ...base, title: projection.title ?? null, type: "dynamic_tool", ...projection };
       break;
     }

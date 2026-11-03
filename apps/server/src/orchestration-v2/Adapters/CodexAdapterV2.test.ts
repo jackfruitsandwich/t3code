@@ -812,6 +812,20 @@ describe("CodexAdapterV2 process spawning", () => {
 });
 
 describe("CodexAdapterV2 dynamic tool projection", () => {
+  it("shows an image the agent viewed as Codex's app heads it, at a plain path", () => {
+    assert.deepEqual(CodexAdapterV2.projectCodexImageView("file:///repo/my%20shots/a.png"), {
+      toolName: "view_image",
+      title: "Viewed an image",
+      viewedImagePath: "/repo/my shots/a.png",
+      input: { path: "/repo/my shots/a.png" },
+      status: "completed",
+    });
+    assert.equal(
+      CodexAdapterV2.projectCodexImageView("/repo/a.png").viewedImagePath,
+      "/repo/a.png",
+    );
+  });
+
   it.effect("uses the CUA call title while leaving other MCP titles as tool arguments", () =>
     Effect.gen(function* () {
       const call = {

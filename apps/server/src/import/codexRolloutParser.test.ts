@@ -303,6 +303,23 @@ describe("parseCodexRolloutJsonl", () => {
     );
   });
 
+  it("reads an image the agent viewed under the id Codex gave it", () => {
+    const completed = (second: number, item: Record<string, unknown>) =>
+      line({
+        timestamp: `2026-07-02T08:00:0${second}.000Z`,
+        type: "event_msg",
+        payload: { type: "item_completed", item },
+      });
+    const parsed = parseCodexRolloutJsonl(
+      completed(1, { type: "ImageView", id: "exec-1", path: "file:///repo/shot.png" }) +
+        completed(2, { type: "ImageView", id: "exec-2" }),
+    );
+    assert.deepEqual(
+      parsed.items?.map((row) => [row.nativeId, row.item]),
+      [["exec-1", { type: "image_view", path: "file:///repo/shot.png" }]],
+    );
+  });
+
   it("reads interrupted turns and compactions as notices, a compaction once", () => {
     const event = (second: number, payload: Record<string, unknown>) =>
       line({

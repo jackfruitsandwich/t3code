@@ -1,3 +1,5 @@
+import { fileURLToPath } from "node:url";
+
 import { revertCodexThread } from "../../provider/CodexThreadRevert.ts";
 import { historyResponseItems } from "../ContextHandoffBudget.ts";
 import { makeProviderTextDeltaCoalescer } from "./ProviderTextDeltaCoalescer.ts";
@@ -454,9 +456,34 @@ export function codexBackgroundCommandDetail(item: {
 export interface CodexDynamicToolProjection extends McpToolPresentation {
   readonly toolName: string;
   readonly title?: string;
+  readonly viewedImagePath?: string;
   readonly input: unknown;
   readonly output?: unknown;
   readonly status: OrchestrationV2TurnItem["status"];
+}
+
+function codexImagePath(path: string): string {
+  if (!path.startsWith("file://")) return path;
+  try {
+    return fileURLToPath(path);
+  } catch {
+    return path;
+  }
+}
+
+/**
+ * An image the agent looked at, under the heading Codex's own app gives it.
+ * Its record writes the path as a file URL.
+ */
+export function projectCodexImageView(path: string): CodexDynamicToolProjection {
+  const viewedImagePath = codexImagePath(path.trim());
+  return {
+    toolName: "view_image",
+    title: "Viewed an image",
+    viewedImagePath,
+    input: { path: viewedImagePath },
+    status: "completed",
+  };
 }
 
 function codexMcpToolOutput(
@@ -1228,6 +1255,12 @@ type PendingCodexRuntimeRequest =
       readonly requestId: RuntimeRequestId;
       readonly answers: Deferred.Deferred<ProviderUserInputAnswers, never>;
     };
+
+type CodexImageViewItem = {
+  readonly id: string;
+  readonly type: "imageView";
+  readonly path: string;
+};
 
 type CodexWebSearchItem = {
   readonly id: string;
@@ -3713,22 +3746,31 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
           context: ActiveCodexTurnContext,
           item: CodexDynamicToolItem,
         ) =>
+          projectCodexDynamicToolItem(item).pipe(
+            Effect.provideService(Crypto.Crypto, crypto),
+            Effect.flatMap((projection) =>
+              buildToolRowArtifacts(context, item.id, codexItemStatus(item.status), projection),
+            ),
+          );
+
+        const buildToolRowArtifacts = (
+          context: ActiveCodexTurnContext,
+          nativeItemId: string,
+          status: ReturnType<typeof codexItemStatus>,
+          projection: CodexDynamicToolProjection,
+        ) =>
           Effect.gen(function* () {
             const updatedAt = yield* DateTime.now;
-            const status = codexItemStatus(item.status);
             const completedAt = status.completed ? updatedAt : null;
             const nodeId = idAllocator.derive.nodeFromProviderItem({
               driver: CODEX_PROVIDER,
-              nativeItemId: item.id,
+              nativeItemId,
             });
             const turnItemId = idAllocator.derive.turnItemFromProviderItem({
               driver: CODEX_PROVIDER,
-              nativeItemId: item.id,
+              nativeItemId,
             });
-            const { ordinal, startedAt } = yield* resolveItemPosition(context, item.id);
-            const projection = yield* projectCodexDynamicToolItem(item).pipe(
-              Effect.provideService(Crypto.Crypto, crypto),
-            );
+            const { ordinal, startedAt } = yield* resolveItemPosition(context, nativeItemId);
             const node: OrchestrationV2ExecutionNode = {
               id: nodeId,
               threadId: context.projectionThreadId,
@@ -3740,7 +3782,7 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
               countsForRun: false,
               providerThreadId: context.providerThread.id,
               providerTurnId: context.providerTurnId,
-              nativeItemRef: codexNativeItemRef(item.id),
+              nativeItemRef: codexNativeItemRef(nativeItemId),
               runtimeRequestId: null,
               checkpointScopeId: null,
               startedAt,
@@ -3753,7 +3795,7 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
               nodeId,
               providerThreadId: context.providerThread.id,
               providerTurnId: context.providerTurnId,
-              nativeItemRef: codexNativeItemRef(item.id),
+              nativeItemRef: codexNativeItemRef(nativeItemId),
               parentItemId: null,
               ordinal,
               title: projection.title ?? null,
@@ -4772,6 +4814,27 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
               if (artifacts === null) {
                 return;
               }
+              yield* emitProviderEvent({
+                type: "node.updated",
+                driver: CODEX_PROVIDER,
+                node: artifacts.node,
+              });
+              yield* emitProviderEvent({
+                type: "turn_item.updated",
+                driver: CODEX_PROVIDER,
+                turnItem: artifacts.turnItem,
+              });
+              return;
+            }
+
+            if (payload.item.type === "imageView") {
+              const item: CodexImageViewItem = payload.item;
+              const artifacts = yield* buildToolRowArtifacts(
+                context,
+                item.id,
+                codexItemStatus("completed"),
+                projectCodexImageView(item.path),
+              );
               yield* emitProviderEvent({
                 type: "node.updated",
                 driver: CODEX_PROVIDER,

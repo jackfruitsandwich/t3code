@@ -193,6 +193,10 @@ const completedItems = (item: Record<string, unknown>): ReadonlyArray<ParsedReco
         : [];
     case "ContextCompaction":
       return [{ type: "compaction", status: "completed" }];
+    case "ImageView": {
+      const path = readString(item.path);
+      return path === undefined ? [] : [{ type: "image_view", path }];
+    }
     default:
       return [];
   }

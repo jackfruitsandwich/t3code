@@ -89,6 +89,8 @@ export type ParsedRecordItem =
       readonly patterns: ReadonlyArray<string>;
     }
   | { readonly type: "compaction"; readonly status: "completed" }
+  /** An image the agent looked at, the path as the record wrote it. */
+  | { readonly type: "image_view"; readonly path: string }
   | { readonly type: "system_notice"; readonly status: "completed"; readonly message: string }
   | {
       /**
