@@ -10528,7 +10528,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           : [],
       );
 
-    it.effect("tracks a /goal through unmet checks until Claude stops on its own", () =>
+    it.effect("does not call a /goal complete because a turn ended", () =>
       Effect.gen(function* () {
         const harness = yield* makeWakeHarness;
         const condition = "all tests pass";
@@ -10553,16 +10553,57 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         }
         const terminal = yield* Queue.take(harness.terminalReceipts);
         assert.equal(terminal.status, "completed");
+        const unmet = {
+          objective: condition,
+          status: "active" as const,
+          checks: 1,
+          lastCheck: "One test still fails.",
+        };
+        // The last is the turn's end, which writes the goal as it stands.
         assert.deepEqual(goalStatuses(harness.events), [
           { objective: condition, status: "active", checks: 0 },
-          {
-            objective: condition,
-            status: "active",
-            checks: 1,
-            lastCheck: "One test still fails.",
-          },
-          { objective: condition, status: "complete", checks: 1 },
+          unmet,
+          unmet,
         ]);
+      }).pipe(Effect.scoped, Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+    );
+
+    it.effect("takes the goal the thread holds at the start of each turn", () =>
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        const condition = "the deploy succeeds";
+        const start = (attempt: string, providerThread: typeof harness.providerThread) =>
+          Effect.gen(function* () {
+            yield* harness.runtime.startTurn(
+              makeClaudeTestTurnInput({
+                threadId: harness.threadId,
+                providerThread,
+                now: yield* DateTime.now,
+                attemptId: RunAttemptId.make(attempt),
+                text: "Carry on.",
+                attachments: [],
+              }),
+            );
+            yield* Queue.offer(
+              harness.sdkMessages,
+              makeResultFrame({ uuid: `${attempt}-result`, result: "Done." }),
+            );
+            yield* Queue.take(harness.terminalReceipts);
+          });
+        yield* start("goal-held-1", {
+          ...harness.providerThread,
+          goal: { objective: condition, status: "active", checks: 1 },
+        });
+        // The importer read the check that met it from the record between the turns.
+        yield* start("goal-held-2", {
+          ...harness.providerThread,
+          goal: { objective: condition, status: "complete", checks: 2 },
+        });
+        assert.deepEqual(goalStatuses(harness.events).at(-1), {
+          objective: condition,
+          status: "complete",
+          checks: 2,
+        });
       }).pipe(Effect.scoped, Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
     );
 

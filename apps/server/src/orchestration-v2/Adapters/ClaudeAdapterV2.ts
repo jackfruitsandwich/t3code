@@ -1204,7 +1204,8 @@ const CLAUDE_GOAL_ACTIVE = /^Goal active: ([\s\S]+?) \((?:not yet evaluated|(\d+
 
 /**
  * The goal after one root SDK frame, or undefined when the frame says nothing
- * about it. Completion has no frame of its own; see finalizeActiveTurn.
+ * about it. Whether a check met it is only in the session's record, and the
+ * importer shows that; the end of a turn says nothing either way.
  */
 function nextClaudeGoal(
   current: OrchestrationV2ProviderGoal | null,
@@ -3380,8 +3381,6 @@ export function makeClaudeAdapterV2(
           string,
           Pick<OrchestrationV2ProviderThread, "contextUsage" | "nativeStatus">
         >();
-        // Turns whose model output met an active goal's Stop hook check at its end.
-        const goalCheckedTurns = new Set<string>();
         // Subagent registry that survives turn settle: a background subagent
         // (Agent with run_in_background) can complete after the root turn
         // ended, and its task_notification must both count as wake evidence
@@ -3820,18 +3819,9 @@ export function makeClaudeAdapterV2(
         /** Applies one root frame's goal signal and writes any change onto the provider thread. */
         const trackClaudeGoal = Effect.fnUntraced(function* (input: {
           readonly nativeThreadId: string;
-          readonly context: ActiveClaudeTurnContext;
           readonly message: SDKMessage;
         }) {
           const current = goalsByNativeThread.get(input.nativeThreadId) ?? null;
-          if (
-            current?.status === "active" &&
-            input.message.type === "assistant" &&
-            input.message.parent_tool_use_id === null &&
-            input.message.message.model !== "<synthetic>"
-          ) {
-            goalCheckedTurns.add(input.context.providerTurnId);
-          }
           const next = nextClaudeGoal(current, input.message);
           if (next === undefined || providerGoalsEqual(current, next)) return;
           goalsByNativeThread.set(input.nativeThreadId, next);
@@ -5483,29 +5473,6 @@ export function makeClaudeAdapterV2(
                 const clearConversationHead =
                   input.status === "completed" &&
                   input.context.input.providerThread.nativeConversationHeadRef !== null;
-                // While a goal is set, Claude ends a turn on its own only after the
-                // goal's Stop hook passes. It defers that check while background
-                // work runs, and a hook that stops the turn reports another reason.
-                // SDK mode does not report an evaluator timeout or an impossible
-                // verdict, so those still read as complete.
-                const goal =
-                  nativeThreadId === null ? undefined : goalsByNativeThread.get(nativeThreadId);
-                const goalChecked = goalCheckedTurns.delete(input.context.providerTurnId);
-                const terminalReason = input.result?.terminal_reason;
-                if (
-                  nativeThreadId !== null &&
-                  goal?.status === "active" &&
-                  goalChecked &&
-                  input.status === "completed" &&
-                  (terminalReason === undefined || terminalReason === "completed") &&
-                  roster.size === 0
-                ) {
-                  goalsByNativeThread.set(nativeThreadId, {
-                    objective: goal.objective,
-                    status: "complete",
-                    ...(goal.checks === undefined ? {} : { checks: goal.checks }),
-                  });
-                }
                 const providerThread: OrchestrationV2ProviderThread = {
                   ...input.context.input.providerThread,
                   providerSessionId: session.id,
@@ -6299,7 +6266,7 @@ export function makeClaudeAdapterV2(
             }
             return;
           }
-          yield* trackClaudeGoal({ nativeThreadId: liveQuery.nativeThreadId, context, message });
+          yield* trackClaudeGoal({ nativeThreadId: liveQuery.nativeThreadId, message });
 
           // Subagent narration belongs to its child thread, never the parent log.
           if (message.type === "stream_event" && !message.parent_tool_use_id) {
@@ -8225,9 +8192,8 @@ export function makeClaudeAdapterV2(
               return updated;
             });
             yield* rememberProviderThread(turnInput.providerThread);
-            if (!goalsByNativeThread.has(nativeThreadId)) {
-              goalsByNativeThread.set(nativeThreadId, turnInput.providerThread.goal ?? null);
-            }
+            // The thread holds what the record last said of the goal (see the importer).
+            goalsByNativeThread.set(nativeThreadId, turnInput.providerThread.goal ?? null);
             const context: ActiveClaudeTurnContext = {
               input: turnInput,
               nativeTurnId,
