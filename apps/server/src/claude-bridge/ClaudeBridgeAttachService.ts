@@ -104,7 +104,10 @@ const make = Effect.gen(function* () {
       FROM orchestration_v2_projection_provider_threads AS provider_thread
       JOIN orchestration_v2_projection_threads AS thread
         ON thread.thread_id = provider_thread.thread_id
-      WHERE json_extract(provider_thread.payload_json, '$.nativeThreadRef.nativeId') = ${sid}
+      WHERE (
+          json_extract(provider_thread.payload_json, '$.nativeThreadRef.nativeId') = ${sid}
+          OR provider_thread.provider_thread_id = ${`provider-thread:provider:${CLAUDE_PROVIDER}:native-thread:${sid}`}
+        )
         AND json_extract(provider_thread.payload_json, '$.driver') = ${CLAUDE_PROVIDER}
         AND thread.deleted_at IS NULL
         AND thread.archived_at IS NULL

@@ -19,21 +19,39 @@ export function shouldShowThreadErrorBanner(
   return getThreadErrorBannerKey(threadKey, error) !== null && !isDismissed;
 }
 
-// Session-scoped (module-level so it survives ChatView remounts, e.g. route
-// changes between threads). Mirrors the branch-mismatch banner: a dismissal
-// is remembered per thread key plus message, so navigating away to a thread
-// with no error cannot resurrect the banner, while a different error message
-// on the same thread still appears.
-const sessionDismissedThreadErrorBannerKeys = new Set<string>();
+// A dismissal is remembered per thread key plus message, so navigating away to
+// a thread with no error cannot resurrect the banner, while a different error
+// message on the same thread still appears. It outlasts a restart too: a failed
+// run's error stays on the thread until its next turn, which can be days away.
+const DISMISSED_STORAGE_KEY = "t3code:dismissed-thread-errors:v1";
+const DISMISSED_LIMIT = 200;
 
-export function dismissThreadErrorBannerForSession(bannerKey: string | null): void {
-  if (bannerKey !== null) {
-    sessionDismissedThreadErrorBannerKeys.add(bannerKey);
+function readDismissedKeys(): Set<string> {
+  try {
+    const stored = JSON.parse(localStorage.getItem(DISMISSED_STORAGE_KEY) ?? "[]");
+    return new Set(Array.isArray(stored) ? stored.filter((key) => typeof key === "string") : []);
+  } catch {
+    return new Set();
   }
 }
 
-export function isThreadErrorBannerDismissedForSession(bannerKey: string | null): boolean {
-  return bannerKey !== null && sessionDismissedThreadErrorBannerKeys.has(bannerKey);
+const dismissedThreadErrorBannerKeys = readDismissedKeys();
+
+export function dismissThreadErrorBanner(bannerKey: string | null): void {
+  if (bannerKey === null) return;
+  dismissedThreadErrorBannerKeys.add(bannerKey);
+  try {
+    localStorage.setItem(
+      DISMISSED_STORAGE_KEY,
+      JSON.stringify([...dismissedThreadErrorBannerKeys].slice(-DISMISSED_LIMIT)),
+    );
+  } catch {
+    // Without storage the dismissal lasts until the app restarts.
+  }
+}
+
+export function isThreadErrorBannerDismissed(bannerKey: string | null): boolean {
+  return bannerKey !== null && dismissedThreadErrorBannerKeys.has(bannerKey);
 }
 
 export const ThreadErrorBanner = memo(function ThreadErrorBanner({

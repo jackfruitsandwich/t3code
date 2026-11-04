@@ -9,6 +9,7 @@ import {
   type OrchestrationV2Run,
   type OrchestrationV2RunAttempt,
   type OrchestrationV2TurnItem,
+  ProviderDriverKind,
   RunId,
   ThreadId,
 } from "@t3tools/contracts";
@@ -62,6 +63,22 @@ import {
  * conversation (and a later prompt can run in both). That turn fails with the
  * resume error instead, and the person decides what to do next.
  */
+
+const CLAUDE_DRIVER = ProviderDriverKind.make("claudeAgent");
+
+/**
+ * Earlier builds answered a failed send by leaving a Claude row on a native id
+ * of T3's own making, with no record behind it. The row's id still names the
+ * session it was made for, so the next turn puts it back.
+ */
+const withOwnClaudeSession = (providerThread: OrchestrationV2ProviderThread) => {
+  const ref = providerThread.nativeThreadRef;
+  if (providerThread.driver !== CLAUDE_DRIVER || ref === null) return providerThread;
+  const own = /native-thread:([0-9a-f-]{36})$/u.exec(providerThread.id)?.[1];
+  return own === undefined || own === ref.nativeId
+    ? providerThread
+    : { ...providerThread, nativeThreadRef: { ...ref, nativeId: own } };
+};
 
 export class ProviderTurnStartError extends Schema.TaggedError<ProviderTurnStartError>()(
   "ProviderTurnStartError",
@@ -240,9 +257,11 @@ export const layer: Layer.Layer<
       }
       const rootNode = projection.nodes.find((candidate) => candidate.id === run.rootNodeId);
       const attempt = projection.attempts.find((candidate) => candidate.id === run.activeAttemptId);
-      const providerThread = projection.providerThreads.find(
+      const storedProviderThread = projection.providerThreads.find(
         (candidate) => candidate.id === run.providerThreadId,
       );
+      const providerThread =
+        storedProviderThread === undefined ? undefined : withOwnClaudeSession(storedProviderThread);
       const message = projection.messages.find((candidate) => candidate.id === run.userMessageId);
       const checkpointScope = projection.checkpointScopes.find(
         (candidate) => candidate.id === rootNode?.checkpointScopeId,
@@ -611,7 +630,15 @@ export const layer: Layer.Layer<
           });
           return undefined;
         });
-      let effectiveHandoffs = handoffs;
+      // What a failed send left for its retry stays within this session; only
+      // a provider switch or a fork brings a handoff from another one.
+      const staysInSession = !handoffs.some((handoff) =>
+        handoff.fromProviderThreadIds.some((id) => id !== providerThread.id),
+      );
+      // A Claude thread is a window onto its session: what never reached the
+      // session is not told to it later. The person can send it again.
+      const tellsNoRetry = session.driver === CLAUDE_DRIVER && staysInSession;
+      let effectiveHandoffs = tellsNoRetry ? [] : handoffs;
       const loadedProviderThread = yield* Effect.gen(function* () {
         if (nativeForkTransfer !== undefined) {
           const sourceProjection = yield* projectionStore.getThreadRecords(
@@ -669,9 +696,8 @@ export const layer: Layer.Layer<
         // A plain next turn carries nothing into the thread: the native session
         // it resumes is the conversation itself, also open in a terminal, and
         // is never swapped for a fresh one (see the note at the top). A run
-        // that follows a provider switch or a fork brings its own handoff and
-        // keeps upstream's fallback.
-        const keepsNativeSession = handoffs.length === 0;
+        // that follows a provider switch or a fork keeps upstream's fallback.
+        const keepsNativeSession = staysInSession;
         const uncertainDelivery = projection.contextHandoffs.some(
           (handoff) =>
             handoff.toProviderThreadId === providerThread.id &&
@@ -1115,7 +1141,7 @@ export const layer: Layer.Layer<
       );
       const missedRunIds = new Set(missedRuns.map((source) => source.id));
       const missedItems =
-        missedRunIds.size === 0
+        missedRunIds.size === 0 || tellsNoRetry
           ? []
           : (yield* projectionStore.getTurnStartHistory(input.threadId, [...missedRunIds])).filter(
               (item) =>

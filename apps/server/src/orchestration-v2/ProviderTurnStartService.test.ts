@@ -177,6 +177,11 @@ function makeLocalCommandHarness(input: {
    */
   readonly resumesNativeSession?: {
     readonly historyOrigin?: OrchestrationV2ThreadProjection["thread"]["historyOrigin"];
+    readonly driver?: string;
+    readonly providerThreadId?: string;
+    readonly nativeId?: string;
+    /** A send failed before reaching the session and left a handoff for its retry. */
+    readonly failedSendHandoff?: boolean;
   };
 }) {
   const now = DateTime.makeUnsafe("2026-09-04T12:00:00Z");
@@ -184,7 +189,9 @@ function makeLocalCommandHarness(input: {
   const runId = RunId.make("run-native-account-command");
   const rootNodeId = NodeId.make("root-native-account-command");
   const attemptId = RunAttemptId.make("attempt-native-account-command");
-  const providerThreadId = ProviderThreadId.make("new-provider-thread");
+  const providerThreadId = ProviderThreadId.make(
+    input.resumesNativeSession?.providerThreadId ?? "new-provider-thread",
+  );
   const providerSessionId = ProviderSessionId.make("new-provider-session");
   const oldProviderThreadId = ProviderThreadId.make("existing-native-provider-thread");
   const oldInstanceId = ProviderInstanceId.make("antigravity-personal");
@@ -210,7 +217,7 @@ function makeLocalCommandHarness(input: {
   };
   const providerThread: OrchestrationV2ThreadProjection["providerThreads"][number] = {
     id: providerThreadId,
-    driver: ProviderDriverKind.make("codex"),
+    driver: ProviderDriverKind.make(input.resumesNativeSession?.driver ?? "codex"),
     providerInstanceId: newInstanceId,
     providerSessionId,
     appThreadId: threadId,
@@ -364,6 +371,7 @@ function makeLocalCommandHarness(input: {
   }
   if (input.resumesNativeSession !== undefined) {
     const { historyOrigin } = input.resumesNativeSession;
+    const nativeId = input.resumesNativeSession.nativeId ?? "019fac53-994e-73c3-b4f6-3226e80366cb";
     projection = {
       ...projection,
       thread: {
@@ -376,12 +384,32 @@ function makeLocalCommandHarness(input: {
               ...candidate,
               nativeThreadRef: {
                 driver: providerThread.driver,
-                nativeId: "019fac53-994e-73c3-b4f6-3226e80366cb",
+                nativeId,
                 strength: "strong" as const,
               },
             }
           : candidate,
       ),
+      contextHandoffs:
+        input.resumesNativeSession.failedSendHandoff === true
+          ? [
+              {
+                id: "failed-send-handoff",
+                threadId,
+                targetRunId: runId,
+                fromProviderThreadIds: [providerThreadId],
+                toProviderThreadId: providerThreadId,
+                coveredRunOrdinals: { from: 1, to: 1 },
+                strategy: "delta_since_target_last_seen",
+                status: "ready",
+                summaryMessageId: null,
+                summaryText: "",
+                delivery: { nativeThreadId: nativeId, status: "pending", itemIds: [] },
+                createdAt: now,
+                updatedAt: now,
+              } as never,
+            ]
+          : [],
     };
   }
   const events: Array<OrchestrationV2DomainEvent> = [];
@@ -592,6 +620,7 @@ function makeLocalCommandHarness(input: {
     oldInstanceId,
     newInstanceId,
     attemptId,
+    resumingSession,
     projection: () => projection,
     start: Effect.gen(function* () {
       yield* (yield* ProviderTurnStart.ProviderTurnStartServiceV2).start({ threadId, runId });
@@ -830,6 +859,72 @@ effectIt.effect("resumes a v1-imported native session as one that already has tu
       "019fac53-994e-73c3-b4f6-3226e80366cb",
     );
     expect(started?.nativeThreadHasTurns).toBe(true);
+  }),
+);
+
+// Measured Nov 3 on a real thread: two sends failed while the terminal had no mod,
+// and the next turn bound the thread to a fresh native id with no record behind it.
+effectIt.effect("does not swap a native session for what a failed send left behind", () =>
+  Effect.gen(function* () {
+    const harness = makeLocalCommandHarness({
+      text: "Continue",
+      resumesNativeSession: { failedSendHandoff: true },
+    });
+
+    yield* harness.start;
+
+    expect(harness.projection().runs.at(-1)?.status).toBe("running");
+    const started = harness.startRootRun.mock.calls[0]?.[0];
+    expect(started?.providerThread.nativeThreadRef?.nativeId).toBe(
+      "019fac53-994e-73c3-b4f6-3226e80366cb",
+    );
+    expect(harness.events.some((event) => event.type === "context-transfer.updated")).toBe(false);
+  }),
+);
+
+effectIt.effect("puts a Claude row left on a fresh native id back on the session it names", () =>
+  Effect.gen(function* () {
+    const session = "2b5b4e85-5ee6-42d5-8901-0db3f2e2521f";
+    const harness = makeLocalCommandHarness({
+      text: "Continue",
+      resumesNativeSession: {
+        driver: "claudeAgent",
+        providerThreadId: `provider-thread:provider:claudeAgent:native-thread:${session}`,
+        nativeId: "1f95a9c1-cffa-4013-9716-32d487355bb5",
+      },
+    });
+
+    yield* harness.start;
+
+    const started = harness.startRootRun.mock.calls[0]?.[0];
+    expect(started?.providerThread.nativeThreadRef?.nativeId).toBe(session);
+    expect(
+      harness.events.some(
+        (event) =>
+          event.type === "provider-thread.updated" &&
+          event.payload.nativeThreadRef?.nativeId === session,
+      ),
+    ).toBe(true);
+  }),
+);
+
+effectIt.effect("tells a Claude session nothing of a send that never reached it", () =>
+  Effect.gen(function* () {
+    const session = "2b5b4e85-5ee6-42d5-8901-0db3f2e2521f";
+    const harness = makeLocalCommandHarness({
+      text: "Continue",
+      resumesNativeSession: {
+        driver: "claudeAgent",
+        providerThreadId: `provider-thread:provider:claudeAgent:native-thread:${session}`,
+        nativeId: session,
+        failedSendHandoff: true,
+      },
+    });
+
+    yield* harness.start;
+
+    // With anything to deliver the session is wrapped to prepend it to the prompt.
+    expect(harness.startRootRun.mock.calls[0]?.[0].session).toBe(harness.resumingSession);
   }),
 );
 

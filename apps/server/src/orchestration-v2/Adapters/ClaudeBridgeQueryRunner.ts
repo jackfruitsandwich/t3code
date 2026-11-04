@@ -395,7 +395,7 @@ export const layer: Layer.Layer<
               sid,
               detail:
                 quiet === null
-                  ? `Session ${sid} is open in a Claude Code terminal under ${terminalHome} without the T3 bridge plugin. Install the plugin in that Claude home and restart the session, or close it.`
+                  ? `Session ${sid} is open in a Claude Code terminal under ${terminalHome} without the T3 bridge plugin running. Type /reload-plugins in that terminal. If that Claude home does not have the plugin, install it there and restart the session, or close it.`
                   : ClaudeBridgeRegistry.claudeBridgeQuietModDetail(sid, quiet.quietForMs),
             }),
             "attach",
