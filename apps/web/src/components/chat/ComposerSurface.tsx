@@ -106,4 +106,20 @@ function ContextStrip({ className, ...props }: ComponentProps<"div">) {
   );
 }
 
-export const ComposerSurface = { Shell, Host, Main, ContextStrip };
+/**
+ * The composer's own material as a backdrop for something else, like the selected sidebar row.
+ * Fills its positioned, isolated parent and takes its corners.
+ */
+function Material({ glass }: { glass: ComposerGlass | undefined }) {
+  return (
+    <Shell
+      glass={glass}
+      aria-hidden
+      className="pointer-events-none absolute inset-0 -z-1 max-w-none rounded-[inherit] before:rounded-[inherit]"
+    >
+      <Host className="absolute inset-0 rounded-[inherit]" />
+    </Shell>
+  );
+}
+
+export const ComposerSurface = { Shell, Host, Main, ContextStrip, Material };

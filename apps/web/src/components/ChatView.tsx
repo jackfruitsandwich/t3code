@@ -486,7 +486,7 @@ import { useLinkedThreadPullRequest } from "./ThreadStatusIndicators";
 import type { ComposerBannerStackItem } from "./chat/ComposerBannerStack";
 import { ComposerSurface } from "./chat/ComposerSurface";
 import "./chat/composerGlass.css";
-import type { ComposerGlass } from "./chat/composerEventScope";
+import { type ComposerGlass, useOnScreenComposerGlass } from "./chat/composerEventScope";
 import { resolveThreadSyncPhase } from "../threadSync";
 import {
   hasAvailableCompactionProvider,
@@ -3253,6 +3253,9 @@ export default function ChatView(props: ChatViewProps) {
     providerInstanceEntries,
     selectedProviderByThreadId,
   ]);
+  useLayoutEffect(() => {
+    useOnScreenComposerGlass.setState({ glass: composerGlass });
+  }, [composerGlass]);
   const activeProviderInstanceId = selectedProviderEntry?.instanceId ?? null;
   const activeProviderStatus = selectedProviderEntry?.snapshot ?? null;
   // A started thread whose session keeps its own model and modes shows the

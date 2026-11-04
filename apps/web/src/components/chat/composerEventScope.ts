@@ -1,4 +1,5 @@
 import { createContext, useContext } from "react";
+import { create } from "zustand";
 
 import { useComposerHandleContext } from "../../composerHandleContext";
 
@@ -9,6 +10,11 @@ export const ComposerGlassContext = createContext<ComposerGlass | undefined>(und
 export function useComposerGlass() {
   return useContext(ComposerGlassContext);
 }
+
+/** The glass of the composer on screen, for the selected sidebar row that shares its material. */
+export const useOnScreenComposerGlass = create<{ glass: ComposerGlass | undefined }>(() => ({
+  glass: undefined,
+}));
 
 const COMPOSER_FLOATING_LAYER_SELECTOR = [
   '[data-composer-drawer-layer="true"]',
