@@ -54,6 +54,7 @@ import {
   buildThreadListV2ListItems,
   threadListV2ListItemsAreEqual,
   threadListInboxReturns,
+  THREAD_LIST_V2_RECENT_EXTRA_COUNT,
   THREAD_LIST_V2_SETTLED_INITIAL_COUNT,
   THREAD_LIST_V2_SETTLED_PAGE_COUNT,
   type ThreadListV2ListItem,
@@ -469,6 +470,7 @@ export function HomeScreen(props: HomeScreenProps) {
     loaded: shelfPreferencesLoaded,
     settledShelfExpanded,
     snoozedShelfExpanded,
+    recentOrderEnabled,
     workingShelfEnabled,
     workingShelfExpanded,
     toggleSettledShelf,
@@ -541,12 +543,18 @@ export function HomeScreen(props: HomeScreenProps) {
           queuedThreadKeys,
         }),
       });
-    // The Working beta orders the inbox by time, so only pins can move.
-    return new Map([
-      ...sectionAvailability("pinned"),
-      ...(workingShelfEnabled ? [] : sectionAvailability("active")),
-    ]);
+    // Most recent first has no arrangement; the Working beta orders the inbox
+    // by time, so only pins can move.
+    return new Map(
+      recentOrderEnabled
+        ? []
+        : [
+            ...sectionAvailability("pinned"),
+            ...(workingShelfEnabled ? [] : sectionAvailability("active")),
+          ],
+    );
   }, [
+    recentOrderEnabled,
     workingShelfEnabled,
     pinReorderEnvironmentIds,
     activeReorderEnvironmentIds,
@@ -573,8 +581,11 @@ export function HomeScreen(props: HomeScreenProps) {
       settlementEnvironmentIds,
       snoozeEnvironmentIds,
       queuedThreadKeys,
-      settledLimit: settledVisibleCount,
+      settledLimit: recentOrderEnabled
+        ? settledVisibleCount + THREAD_LIST_V2_RECENT_EXTRA_COUNT
+        : settledVisibleCount,
       now: new Date().toISOString(),
+      recentOrderEnabled,
       workingShelfEnabled,
       workingShelfExpanded,
       inboxReturnAt: threadListInboxReturns.returnedAt,
@@ -584,6 +595,7 @@ export function HomeScreen(props: HomeScreenProps) {
     });
   }, [
     expandedForkFamilies,
+    recentOrderEnabled,
     workingShelfEnabled,
     workingShelfExpanded,
     pendingOrder,
@@ -780,7 +792,9 @@ export function HomeScreen(props: HomeScreenProps) {
           reorderSupported={
             item.item.pinned
               ? pinReorderEnvironmentIds.has(thread.environmentId)
-              : !workingShelfEnabled && activeReorderEnvironmentIds.has(thread.environmentId)
+              : !recentOrderEnabled &&
+                !workingShelfEnabled &&
+                activeReorderEnvironmentIds.has(thread.environmentId)
           }
           canMoveUp={item.canMoveUp}
           canMoveDown={item.canMoveDown}
@@ -1008,7 +1022,8 @@ export function HomeScreen(props: HomeScreenProps) {
             extraData={v2ExtraData}
             ListHeaderComponent={v2ListHeader}
             ListFooterComponent={
-              settledShelfExpanded && threadListV2Layout.hiddenSettledCount > 0 ? (
+              (recentOrderEnabled || settledShelfExpanded) &&
+              threadListV2Layout.hiddenSettledCount > 0 ? (
                 <ThreadListV2ShowMoreRow
                   hiddenCount={threadListV2Layout.hiddenSettledCount}
                   onPress={showMoreSettled}

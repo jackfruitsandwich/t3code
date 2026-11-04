@@ -72,6 +72,7 @@ import {
   isThreadListV2ListItem,
   threadListV2ListItemsAreEqual,
   threadListInboxReturns,
+  THREAD_LIST_V2_RECENT_EXTRA_COUNT,
   THREAD_LIST_V2_SETTLED_INITIAL_COUNT,
   THREAD_LIST_V2_SETTLED_PAGE_COUNT,
   type ThreadListV2ListItem,
@@ -294,6 +295,7 @@ function ThreadNavigationSidebarPane(
     loaded: shelfPreferencesLoaded,
     settledShelfExpanded,
     snoozedShelfExpanded,
+    recentOrderEnabled,
     workingShelfEnabled,
     workingShelfExpanded,
     toggleSettledShelf,
@@ -364,12 +366,18 @@ function ThreadNavigationSidebarPane(
           queuedThreadKeys,
         }),
       });
-    // The Working beta orders the inbox by time, so only pins can move.
-    return new Map([
-      ...sectionAvailability("pinned"),
-      ...(workingShelfEnabled ? [] : sectionAvailability("active")),
-    ]);
+    // Most recent first has no arrangement; the Working beta orders the inbox
+    // by time, so only pins can move.
+    return new Map(
+      recentOrderEnabled
+        ? []
+        : [
+            ...sectionAvailability("pinned"),
+            ...(workingShelfEnabled ? [] : sectionAvailability("active")),
+          ],
+    );
   }, [
+    recentOrderEnabled,
     workingShelfEnabled,
     pinReorderEnvironmentIds,
     activeReorderEnvironmentIds,
@@ -394,8 +402,11 @@ function ThreadNavigationSidebarPane(
       settlementEnvironmentIds,
       snoozeEnvironmentIds,
       queuedThreadKeys,
-      settledLimit: settledVisibleCount,
+      settledLimit: recentOrderEnabled
+        ? settledVisibleCount + THREAD_LIST_V2_RECENT_EXTRA_COUNT
+        : settledVisibleCount,
       now: new Date().toISOString(),
+      recentOrderEnabled,
       workingShelfEnabled,
       workingShelfExpanded,
       inboxReturnAt: threadListInboxReturns.returnedAt,
@@ -405,6 +416,7 @@ function ThreadNavigationSidebarPane(
     });
   }, [
     expandedForkFamilies,
+    recentOrderEnabled,
     workingShelfEnabled,
     workingShelfExpanded,
     pendingOrder,
@@ -473,7 +485,7 @@ function ThreadNavigationSidebarPane(
       moveAvailability: threadMoveAvailability,
       shelfPreferencesLoading: !shelfPreferencesLoaded,
     });
-    if (settledShelfExpanded && threadListV2Layout.hiddenSettledCount > 0) {
+    if ((recentOrderEnabled || settledShelfExpanded) && threadListV2Layout.hiddenSettledCount > 0) {
       items.push({
         type: "v2-show-more",
         key: "v2-show-more",
@@ -482,6 +494,7 @@ function ThreadNavigationSidebarPane(
     }
     return items;
   }, [
+    recentOrderEnabled,
     nowMinute,
     options.selectedEnvironmentId,
     pendingTasks,
@@ -755,7 +768,9 @@ function ThreadNavigationSidebarPane(
               reorderSupported={
                 item.item.pinned
                   ? pinReorderEnvironmentIds.has(thread.environmentId)
-                  : !workingShelfEnabled && activeReorderEnvironmentIds.has(thread.environmentId)
+                  : !recentOrderEnabled &&
+                    !workingShelfEnabled &&
+                    activeReorderEnvironmentIds.has(thread.environmentId)
               }
               canMoveUp={item.canMoveUp}
               canMoveDown={item.canMoveDown}

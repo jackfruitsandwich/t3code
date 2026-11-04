@@ -45,6 +45,7 @@ export function SettingsThreadsRouteScreen() {
           contentContainerStyle={{ paddingBottom: Math.max(insets.bottom, 18) + 18 }}
         >
           <AutoSettleSettingsRows />
+          <RecentOrderSettingsSection />
           <BetaSettingsSection />
           <LegacySettingsSection />
         </ScrollView>
@@ -236,6 +237,32 @@ function AutoSettleSettingsRows() {
           </View>
         </SettingsSection>
       ) : null}
+    </View>
+  );
+}
+
+/** Device-local counterpart of web's Most recent first in Settings → General. */
+function RecentOrderSettingsSection() {
+  const savePreferences = useAtomSet(updateMobilePreferencesAtom);
+  const preferences = useAtomValue(mobilePreferencesAtom);
+  const recentOrderEnabled =
+    !AsyncResult.isSuccess(preferences) || preferences.value.recentOrderEnabled !== false;
+
+  return (
+    <View className="gap-3">
+      <SettingsSection title="Thread list">
+        <SettingsSwitchRow
+          icon="clock"
+          label="Most recent first"
+          value={recentOrderEnabled}
+          onValueChange={(value) => savePreferences({ recentOrderEnabled: value })}
+        />
+      </SettingsSection>
+      <Text className="px-2 text-sm text-foreground-muted">
+        Show every thread in one list, newest activity first. Pins, the Working section and the
+        snoozed and settled shelves are not drawn, and threads cannot be moved by hand. Your
+        arrangement comes back when this is off.
+      </Text>
     </View>
   );
 }

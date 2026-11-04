@@ -376,8 +376,8 @@ export function useEnvironmentIdentificationMode(): EnvironmentIdentificationMod
  */
 export function useLegacySidebarEnabled(): boolean {
   const settingsHydrated = useClientSettingsHydrated();
-  const legacySidebarEnabled = useClientSettingsValue().legacySidebarEnabled;
-  return settingsHydrated && legacySidebarEnabled;
+  const { legacySidebarEnabled, sidebarRecentOrderEnabled } = useClientSettingsValue();
+  return settingsHydrated && legacySidebarEnabled && !sidebarRecentOrderEnabled;
 }
 
 /** Read current settings for one environment, merged with client-local preferences. */

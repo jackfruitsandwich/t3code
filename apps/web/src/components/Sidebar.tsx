@@ -1,6 +1,7 @@
 import {
   paginateForkFamilies,
   foldForkFamilies,
+  unfoldedForkFamilies,
   forkFamilyThreadKey,
   type ForkFamilyRowMeta,
 } from "@t3tools/client-runtime/state/thread-fork-family";
@@ -41,7 +42,9 @@ import {
 import { createInboxReturnTracker } from "@t3tools/client-runtime/state/thread-inbox";
 import {
   resolveSettledThreadTimestamp,
+  resolveThreadActivityTimestamp,
   sortSettledThreads,
+  sortThreadsByActivity,
 } from "@t3tools/client-runtime/state/thread-sort";
 import {
   threadSearchMatchKey,
@@ -311,7 +314,7 @@ function compactSidebarTimeLabel(label: string): string {
 }
 
 function threadTimeLabel(thread: SidebarThreadSummary): string {
-  const timestamp = thread.latestUserMessageAt ?? thread.updatedAt;
+  const timestamp = resolveThreadActivityTimestamp(thread) ?? thread.updatedAt;
   return compactSidebarTimeLabel(formatRelativeTimeLabel(timestamp));
 }
 
@@ -2379,7 +2382,9 @@ export default function Sidebar() {
   const confirmThreadArchive = useClientSettings((s) => s.confirmThreadArchive);
   const sidebarProjectSortOrder = useClientSettings((s) => s.sidebarProjectSortOrder);
   const timestampFormat = useClientSettings((s) => s.timestampFormat);
-  const workingShelfEnabled = useClientSettings((s) => s.sidebarWorkingShelfEnabled);
+  const recentOrderEnabled = useClientSettings((s) => s.sidebarRecentOrderEnabled);
+  const workingShelfSetting = useClientSettings((s) => s.sidebarWorkingShelfEnabled);
+  const workingShelfEnabled = workingShelfSetting && !recentOrderEnabled;
   const projectGroupingSettings = useClientSettings(selectProjectGroupingSettings);
   const {
     settleThread,
@@ -2766,6 +2771,20 @@ export default function Sidebar() {
     const settled: EnvironmentThreadShell[] = [];
     const draggable = new Set<string>();
     const activeReorderable = new Set<string>();
+    // One list and nothing to arrange: every shelf stays empty, and with no
+    // draggable keys no row can be moved.
+    if (recentOrderEnabled) {
+      return {
+        pinnedThreads: pinned,
+        draggableThreadKeys: draggable,
+        activeReorderableThreadKeys: activeReorderable,
+        activeThreads: sortThreadsByActivity(visible),
+        workingThreads: working,
+        snoozedThreads: snoozed,
+        settledThreads: settled,
+        snoozeNow: preciseNow,
+      };
+    }
     for (const thread of visible) {
       const capabilities = serverConfigs.get(thread.environmentId)?.environment.capabilities;
       // Threads on servers without the settlement capability (old server,
@@ -2856,6 +2875,7 @@ export default function Sidebar() {
   }, [
     nowMinute,
     optimisticDrop,
+    recentOrderEnabled,
     scopedProjectKeys,
     serverConfigs,
     snoozeWakeTick,
@@ -3049,18 +3069,20 @@ export default function Sidebar() {
 
   const foldedSections = useMemo(() => {
     const pinned = foldForkFamilies(pinnedThreads, expandedForkFamilies, routeThreadKey);
-    const foldedActive = foldForkFamilies(
-      activeThreads,
-      expandedForkFamilies,
-      routeThreadKey,
-      keepActiveThreadVisible,
-    );
+    const foldedActive = recentOrderEnabled
+      ? unfoldedForkFamilies(activeThreads)
+      : foldForkFamilies(
+          activeThreads,
+          expandedForkFamilies,
+          routeThreadKey,
+          keepActiveThreadVisible,
+        );
     const active = {
       rows: paginateForkFamilies(
         foldedActive,
         activeVisibleCount,
         routeThreadKey,
-        keepActiveThreadVisible,
+        recentOrderEnabled ? undefined : keepActiveThreadVisible,
       ),
       metaByThreadId: foldedActive.metaByThreadId,
     };
@@ -3102,6 +3124,7 @@ export default function Sidebar() {
     foldedSettledThreads,
     activeVisibleCount,
     keepActiveThreadVisible,
+    recentOrderEnabled,
   ]);
 
   const orderedThreads = useMemo(
@@ -3838,6 +3861,7 @@ export default function Sidebar() {
     ) {
       return [];
     }
+    if (recentOrderEnabled) return rowsOf(foldedSections.active.rows, "active");
     const items: SidebarListItem[] = [{ kind: "marker", marker: "pinned-header" }];
     const pinnedRows = rowsOf(foldedSections.pinned.rows, "pinned");
     items.push(...pinnedRows);
@@ -3862,6 +3886,7 @@ export default function Sidebar() {
     foldedSections,
     activeThreads,
     pinnedThreads,
+    recentOrderEnabled,
     renderedSettledThreads,
     settledThreads.length,
     snoozedThreads.length,
@@ -5506,7 +5531,7 @@ export default function Sidebar() {
                           className="flex h-9 w-full cursor-pointer items-center gap-2.5 rounded-md px-2.5 text-left text-sm text-sidebar-muted-foreground/55 hover:bg-sidebar-row-hover hover:text-sidebar-foreground"
                         >
                           <PlusIcon aria-hidden className="size-4 shrink-0" />
-                          Show more active conversations
+                          {recentOrderEnabled ? "Show more" : "Show more active conversations"}
                         </button>
                       </li>
                     ) : null}

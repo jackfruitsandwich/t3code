@@ -2,6 +2,7 @@ import {
   paginateForkFamilies,
   foldForkFamilies,
   forkFamilyThreadKey,
+  unfoldedForkFamilies,
   type ForkFamilyRowMeta,
 } from "@t3tools/client-runtime/state/thread-fork-family";
 import { threadPullRequestSearchTerms } from "@t3tools/shared/threadPullRequests";
@@ -26,8 +27,10 @@ import {
 import {
   sortActiveThreadsByOrderKey,
   resolveSettledThreadTimestamp,
+  resolveThreadActivityTimestamp,
   sortPinnedThreadsByOrderKey,
   sortSettledThreads,
+  sortThreadsByActivity,
 } from "@t3tools/client-runtime/state/thread-sort";
 import type { EnvironmentId, ProjectId } from "@t3tools/contracts";
 
@@ -166,6 +169,8 @@ export function resolveThreadListV2SnoozeGateExpiryMs(
 // the iPad sidebar so both page identically.
 export const THREAD_LIST_V2_SETTLED_INITIAL_COUNT = 10;
 export const THREAD_LIST_V2_SETTLED_PAGE_COUNT = 25;
+/** The most-recent-first list is the whole screen, so its first page is longer. */
+export const THREAD_LIST_V2_RECENT_EXTRA_COUNT = 40;
 
 /**
  * Completed-but-not-yet-seen, mirroring the web sidebar's
@@ -479,7 +484,7 @@ function resolveThreadListV2ItemTimeLabel(
   const settledTimestamp =
     variant === "slim" && !snoozed ? resolveSettledThreadTimestamp(thread) : null;
   return relativeTime(
-    settledTimestamp ?? thread.latestUserMessageAt ?? thread.updatedAt ?? thread.createdAt,
+    settledTimestamp ?? resolveThreadActivityTimestamp(thread) ?? thread.createdAt,
   );
 }
 
@@ -641,6 +646,9 @@ export function buildThreadListV2Items(input: {
   readonly settledLimit?: number;
   /** Second-precise clock used for time-based classification. */
   readonly now: string;
+  /** Most recent first: one list of every thread, newest activity first and
+      paged by `settledLimit`, with no shelves, pins, fork folding or moves. */
+  readonly recentOrderEnabled?: boolean;
   /** Working section beta: unpinned working threads fold into the Working
       shelf, and the inbox orders by when each thread came back to the user
       instead of the saved arrangement. */
@@ -692,6 +700,7 @@ export function buildThreadListV2Items(input: {
   const working: EnvironmentThreadShell[] = [];
   const settled: EnvironmentThreadShell[] = [];
   const snoozed: EnvironmentThreadShell[] = [];
+  const recent: EnvironmentThreadShell[] = [];
   let nextSnoozeWakeAt: string | null = null;
   for (const thread of input.threads) {
     if (thread.archivedAt !== null || thread.lineage.relationshipToParent === "subagent") continue;
@@ -713,6 +722,10 @@ export function buildThreadListV2Items(input: {
         }),
       ) !== true
     ) {
+      continue;
+    }
+    if (input.recentOrderEnabled === true) {
+      recent.push(thread);
       continue;
     }
     const supportsSettlement = input.settlementEnvironmentIds?.has(thread.environmentId) ?? true;
@@ -740,6 +753,33 @@ export function buildThreadListV2Items(input: {
     } else {
       active.push(thread);
     }
+  }
+
+  if (input.recentOrderEnabled === true) {
+    const ordered = sortThreadsByActivity(recent);
+    const page = paginateForkFamilies(
+      unfoldedForkFamilies(ordered),
+      input.settledLimit ?? Number.POSITIVE_INFINITY,
+      input.selectedThreadKey ?? null,
+    );
+    return {
+      items: page.map((thread, index) => ({
+        thread,
+        forkFamily: null,
+        variant: "card",
+        snoozed: false,
+        pinned: false,
+        isLast: index === page.length - 1,
+      })),
+      hiddenSettledCount: ordered.length - page.length,
+      workingCount: 0,
+      workingShelfHeaderIndex: null,
+      snoozedCount: 0,
+      snoozedShelfHeaderIndex: null,
+      settledCount: 0,
+      settledShelfHeaderIndex: null,
+      nextSnoozeWakeAt: null,
+    };
   }
 
   // The beta inbox is time-ordered, so the saved arrangement (and any move in

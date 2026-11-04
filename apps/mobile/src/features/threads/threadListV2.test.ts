@@ -206,6 +206,74 @@ describe("resolveThreadListV2Status", () => {
   });
 });
 
+describe("most recent first", () => {
+  const at = (minute: number) => `2026-06-01T00:${String(minute).padStart(2, "0")}:00.000Z`;
+  const threads = [
+    makeThread({
+      id: ThreadId.make("pinned-old"),
+      title: "Pinned",
+      pinnedAt: at(50),
+      updatedAt: at(1),
+    }),
+    makeThread({
+      id: ThreadId.make("settled-new"),
+      title: "Settled",
+      settledOverride: "settled",
+      settledAt: at(2),
+      updatedAt: at(5),
+    }),
+    makeThread({
+      id: ThreadId.make("snoozed-mid"),
+      title: "Snoozed",
+      snoozedAt: at(3),
+      snoozedUntil: "2099-01-01T00:00:00.000Z",
+      updatedAt: at(3),
+    }),
+  ];
+
+  it("lists every thread in one block by activity, with no shelf", () => {
+    const layout = buildThreadListV2Items({
+      threads,
+      environmentId: null,
+      searchQuery: "",
+      now: NOW,
+      recentOrderEnabled: true,
+    });
+    expect(layout.items.map((item) => [item.thread.id, item.variant, item.pinned])).toEqual([
+      ["settled-new", "card", false],
+      ["snoozed-mid", "card", false],
+      ["pinned-old", "card", false],
+    ]);
+    expect(layout.settledShelfHeaderIndex).toBeNull();
+    expect(layout.snoozedShelfHeaderIndex).toBeNull();
+    expect(layout.items.at(-1)?.isLast).toBe(true);
+  });
+
+  it("pages the list and counts what is left", () => {
+    const layout = buildThreadListV2Items({
+      threads,
+      environmentId: null,
+      searchQuery: "",
+      now: NOW,
+      recentOrderEnabled: true,
+      settledLimit: 2,
+    });
+    expect(layout.items.map((item) => item.thread.id)).toEqual(["settled-new", "snoozed-mid"]);
+    expect(layout.hiddenSettledCount).toBe(1);
+  });
+
+  it("still narrows by search", () => {
+    const layout = buildThreadListV2Items({
+      threads,
+      environmentId: null,
+      searchQuery: "pinned",
+      now: NOW,
+      recentOrderEnabled: true,
+    });
+    expect(layout.items.map((item) => item.thread.id)).toEqual(["pinned-old"]);
+  });
+});
+
 describe("queued messages keep a settled thread active", () => {
   const threads = [
     makeThread({ id: ThreadId.make("active"), title: "Active" }),

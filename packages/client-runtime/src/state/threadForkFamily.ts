@@ -118,6 +118,13 @@ export function foldForkFamilies<T extends ForkFamilyThread>(
   return { rows, metaByThreadId };
 }
 
+/** The same rows with no family folded, for a list where each thread stands alone. */
+export function unfoldedForkFamilies<T extends ForkFamilyThread>(
+  rows: ReadonlyArray<T>,
+): FoldedForkFamilies<T> {
+  return { rows: [...rows], metaByThreadId: new Map() };
+}
+
 /** Page by conversations, keeping selected and attention-worthy families intact. */
 export function paginateForkFamilies<T extends ForkFamilyThread>(
   folded: FoldedForkFamilies<T>,

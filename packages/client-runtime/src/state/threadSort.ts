@@ -31,7 +31,14 @@ export function resolveSettledThreadTimestamp(thread: SettledThreadTimestampInpu
   if (thread.settledAt != null && toSortableTimestamp(thread.settledAt) !== null) {
     return thread.settledAt;
   }
+  return resolveThreadActivityTimestamp(thread);
+}
 
+/** When a thread's conversation last moved: the latest message or turn stamp,
+    then updatedAt. The most-recent-first list sorts and labels by it. */
+export function resolveThreadActivityTimestamp(
+  thread: Pick<EnvironmentThreadShell, "latestUserMessageAt" | "latestRun" | "updatedAt">,
+): string | null {
   let latest: string | null = null;
   let latestMs = Number.NEGATIVE_INFINITY;
   for (const candidate of [
@@ -56,9 +63,24 @@ export function resolveSettledThreadTimestamp(thread: SettledThreadTimestampInpu
 export function sortSettledThreads<T extends SettledThreadTimestampInput & { readonly id: string }>(
   threads: readonly T[],
 ): T[] {
+  return sortNewestFirst(threads, resolveSettledThreadTimestamp);
+}
+
+/** Every thread by when its conversation last moved, newest first. Shared by
+    web and mobile so both render the same order. */
+export function sortThreadsByActivity<
+  T extends Parameters<typeof resolveThreadActivityTimestamp>[0] & { readonly id: string },
+>(threads: readonly T[]): T[] {
+  return sortNewestFirst(threads, resolveThreadActivityTimestamp);
+}
+
+function sortNewestFirst<T extends { readonly id: string }>(
+  threads: readonly T[],
+  resolveTimestamp: (thread: T) => string | null,
+): T[] {
   return threads
     .map((thread) => {
-      const timestamp = resolveSettledThreadTimestamp(thread);
+      const timestamp = resolveTimestamp(thread);
       return { thread, timestampMs: timestamp === null ? 0 : Date.parse(timestamp) };
     })
     .sort(

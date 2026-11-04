@@ -12,6 +12,8 @@ import {
   sortActiveThreadsByOrderKey,
   sortPinnedThreadsByOrderKey,
   sortSettledThreads,
+  sortThreadsByActivity,
+  resolveThreadActivityTimestamp,
   sortThreads,
   type SettledThreadTimestampInput,
   type ThreadSortInput,
@@ -70,6 +72,38 @@ describe("resolveSettledThreadTimestamp", () => {
         updatedAt: "2026-03-09T12:00:00.000Z",
       }),
     ).toBe("2026-03-09T12:00:00.000Z");
+  });
+});
+
+describe("sortThreadsByActivity", () => {
+  const thread = (
+    id: string,
+    fields: Partial<Parameters<typeof resolveThreadActivityTimestamp>[0]>,
+  ) => ({
+    id,
+    updatedAt: "2026-01-01T00:00:00.000Z",
+    latestUserMessageAt: null,
+    latestRun: null,
+    ...fields,
+  });
+
+  it("uses the later of the last message and the last turn, and ignores a settle", () => {
+    const replied = thread("replied", {
+      latestUserMessageAt: "2026-06-01T00:00:00.000Z",
+      latestRun: {
+        requestedAt: "2026-06-01T00:00:00.000Z",
+        startedAt: "2026-06-01T00:00:01.000Z",
+        completedAt: "2026-06-01T00:09:00.000Z",
+      } as never,
+    });
+    expect(resolveThreadActivityTimestamp(replied)).toBe("2026-06-01T00:09:00.000Z");
+    const asked = thread("asked", { latestUserMessageAt: "2026-06-01T00:05:00.000Z" });
+    const settled = { ...thread("settled", {}), settledAt: "2026-07-01T00:00:00.000Z" };
+    expect(sortThreadsByActivity([settled, asked, replied]).map(({ id }) => id)).toEqual([
+      "replied",
+      "asked",
+      "settled",
+    ]);
   });
 });
 

@@ -569,6 +569,9 @@ export function useSettingsRestore(onRestored?: () => void) {
       ...(settings.sidebarProjectSortOrder !== DEFAULT_UNIFIED_SETTINGS.sidebarProjectSortOrder
         ? ["Project order"]
         : []),
+      ...(settings.sidebarRecentOrderEnabled !== DEFAULT_UNIFIED_SETTINGS.sidebarRecentOrderEnabled
+        ? ["Most recent first"]
+        : []),
       ...(settings.sidebarWorkingShelfEnabled !==
       DEFAULT_UNIFIED_SETTINGS.sidebarWorkingShelfEnabled
         ? ["Working section"]
@@ -708,6 +711,7 @@ export function useSettingsRestore(onRestored?: () => void) {
       settings.snoozeLimitedThreads,
       settings.sidebarProjectGroupingMode,
       settings.sidebarProjectSortOrder,
+      settings.sidebarRecentOrderEnabled,
       settings.sidebarWorkingShelfEnabled,
       settings.sidebarThreadPreviewCount,
       settings.showSkillsInSlashMenu,
@@ -808,6 +812,7 @@ export function useSettingsRestore(onRestored?: () => void) {
       sidebarThreadPreviewCount: DEFAULT_UNIFIED_SETTINGS.sidebarThreadPreviewCount,
       sidebarProjectGroupingMode: DEFAULT_UNIFIED_SETTINGS.sidebarProjectGroupingMode,
       sidebarProjectSortOrder: DEFAULT_UNIFIED_SETTINGS.sidebarProjectSortOrder,
+      sidebarRecentOrderEnabled: DEFAULT_UNIFIED_SETTINGS.sidebarRecentOrderEnabled,
       sidebarWorkingShelfEnabled: DEFAULT_UNIFIED_SETTINGS.sidebarWorkingShelfEnabled,
       sidebarAutoSettleAfterDays: DEFAULT_UNIFIED_SETTINGS.sidebarAutoSettleAfterDays,
       sidebarAutoSettleOnMerge: DEFAULT_UNIFIED_SETTINGS.sidebarAutoSettleOnMerge,
@@ -2359,6 +2364,33 @@ export function GeneralSettingsPanel() {
                 updateSettings({ snoozeLimitedThreads: Boolean(checked) })
               }
               aria-label="Snooze limited threads"
+            />
+          }
+        />
+
+        <SettingsRow
+          {...searchableSetting("recent-order")}
+          description="Show every thread in one list, newest activity first. Project folders, pins, the Working section and the snoozed and settled shelves are not drawn, and threads cannot be moved by hand. Those settings and your arrangement come back when this is off."
+          resetAction={
+            settings.sidebarRecentOrderEnabled !==
+            DEFAULT_UNIFIED_SETTINGS.sidebarRecentOrderEnabled ? (
+              <SettingResetButton
+                label="most recent first"
+                onClick={() =>
+                  updateSettings({
+                    sidebarRecentOrderEnabled: DEFAULT_UNIFIED_SETTINGS.sidebarRecentOrderEnabled,
+                  })
+                }
+              />
+            ) : null
+          }
+          control={
+            <Switch
+              checked={settings.sidebarRecentOrderEnabled}
+              onCheckedChange={(checked) =>
+                updateSettings({ sidebarRecentOrderEnabled: Boolean(checked) })
+              }
+              aria-label="Most recent first"
             />
           }
         />

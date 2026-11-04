@@ -309,6 +309,12 @@ export const SETTINGS_SEARCH_ITEMS = [
     searchTerms: ["usage quota rate limit reset recover continue"],
   },
   {
+    id: "recent-order",
+    title: "Most recent first",
+    to: "/settings/general",
+    searchTerms: ["sidebar threads sessions list recency sort order flat no project folders"],
+  },
+  {
     id: "working-shelf",
     title: "Working section (beta)",
     to: "/settings/general",
