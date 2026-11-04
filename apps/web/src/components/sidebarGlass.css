@@ -1,0 +1,48 @@
+/* Sidebar rows wear their provider's composer glass in place of a logo. Sidebar.tsx sets
+   data-sidebar-glass on a row; the colors come from composerGlass.css. The sidebar is an opaque
+   surface, so there is nothing to blur: no backdrop-filter, just painted tint, sheen and rim. */
+
+[data-sidebar-glass] {
+  --sidebar-glass-top: 14%;
+  --sidebar-glass-bottom: 5%;
+  --sidebar-glass-sheen: linear-gradient(rgb(255 255 255 / 40%), rgb(255 255 255 / 0%) 50%);
+  --sidebar-glass-rim: linear-gradient(
+    to bottom right,
+    rgb(255 255 255 / 100%),
+    rgb(var(--composer-glass-ink) / 16%) 50%,
+    rgb(var(--composer-glass-ink) / 24%)
+  );
+  position: relative;
+  background-image:
+    var(--sidebar-glass-sheen),
+    linear-gradient(
+      rgb(var(--composer-glass-rgb) / var(--sidebar-glass-top)),
+      rgb(var(--composer-glass-rgb) / var(--sidebar-glass-bottom))
+    );
+}
+
+.dark [data-sidebar-glass] {
+  --sidebar-glass-top: 19%;
+  --sidebar-glass-bottom: 7.5%;
+  --sidebar-glass-sheen: linear-gradient(rgb(255 255 255 / 7%), rgb(255 255 255 / 0%) 50%);
+  --sidebar-glass-rim: linear-gradient(
+    to bottom right,
+    rgb(255 255 255 / 45%),
+    rgb(255 255 255 / 6%) 50%,
+    rgb(255 255 255 / 22.5%)
+  );
+}
+
+/* Rim light on the rows, with the same mask the composer uses. */
+[data-sidebar-glass]::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border: 1px solid transparent;
+  border-radius: inherit;
+  background: var(--sidebar-glass-rim) border-box;
+  mask-image: linear-gradient(#000 0 0), linear-gradient(#000 0 0);
+  mask-clip: padding-box, border-box;
+  mask-composite: exclude;
+  pointer-events: none;
+}

@@ -4,6 +4,12 @@ import { useComposerHandleContext } from "../../composerHandleContext";
 
 /** The provider look of the composer that owns a floating layer; portaled menus carry it. */
 export type ComposerGlass = "claude" | "codex";
+// Providers that wear their LimitBar card glass, on the composer and on their sidebar rows.
+export const COMPOSER_GLASS_BY_DRIVER: Partial<Record<string, ComposerGlass>> = {
+  claudeAgent: "claude",
+  codex: "codex",
+};
+
 export const ComposerGlassContext = createContext<ComposerGlass | undefined>(undefined);
 
 export function useComposerGlass() {

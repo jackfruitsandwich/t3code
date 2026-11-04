@@ -486,7 +486,7 @@ import { useLinkedThreadPullRequest } from "./ThreadStatusIndicators";
 import type { ComposerBannerStackItem } from "./chat/ComposerBannerStack";
 import { ComposerSurface } from "./chat/ComposerSurface";
 import "./chat/composerGlass.css";
-import type { ComposerGlass } from "./chat/composerEventScope";
+import { COMPOSER_GLASS_BY_DRIVER } from "./chat/composerEventScope";
 import { resolveThreadSyncPhase } from "../threadSync";
 import {
   hasAvailableCompactionProvider,
@@ -602,12 +602,6 @@ import {
   ATTACHMENT_ONLY_BOOTSTRAP_PROMPT,
   recallableComposerPrompt,
 } from "./chat/composerPromptHistory";
-
-// Providers whose composer wears their LimitBar card glass.
-const COMPOSER_GLASS_BY_DRIVER: Partial<Record<string, ComposerGlass>> = {
-  claudeAgent: "claude",
-  codex: "codex",
-};
 
 const EMPTY_PROVIDERS: ServerProvider[] = [];
 const EMPTY_PROVIDER_MODELS: ServerProvider["models"] = [];
