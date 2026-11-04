@@ -426,6 +426,8 @@ export const make = Effect.gen(function* () {
     yield* rendererHistory.register(window.webContents, { surface: "main" });
     if (environment.platform === "darwin") {
       window.setAutoHideCursor(false);
+      // No red, yellow and green buttons. Cmd+W, Cmd+M and the Window menu still work.
+      window.setWindowButtonVisibility(false);
     }
     let boundsPersistFiber: Fiber.Fiber<void, never> | undefined;
     let pendingBoundsPersistFiber: Fiber.Fiber<void, never> | undefined;

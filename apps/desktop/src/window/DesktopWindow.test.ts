@@ -122,6 +122,7 @@ function makeFakeBrowserWindow() {
     setTitle: vi.fn(),
     setTitleBarOverlay: vi.fn(),
     setWindowButtonPosition: vi.fn(),
+    setWindowButtonVisibility: vi.fn(),
     show: vi.fn(),
     webContents,
   };
@@ -141,6 +142,7 @@ function makeFakeBrowserWindow() {
     send: webContents.send,
     setZoomLevel: webContents.setZoomLevel,
     setWindowButtonPosition: window.setWindowButtonPosition,
+    setWindowButtonVisibility: window.setWindowButtonVisibility,
     setBackgroundThrottling: webContents.setBackgroundThrottling,
     setAutoHideCursor: window.setAutoHideCursor,
     setFullScreen: window.setFullScreen,
@@ -792,6 +794,7 @@ describe("DesktopWindow", () => {
       yield* Effect.gen(function* () {
         const desktopWindow = yield* DesktopWindow.DesktopWindow;
         yield* desktopWindow.handleBackendReady(new URL("http://127.0.0.1:3773"));
+        assert.deepEqual(fakeWindow.setWindowButtonVisibility.mock.lastCall, [false]);
 
         for (const direction of ["in", "in", "out", "reset", "out"] as const) {
           yield* desktopWindow.zoomMain(direction);
